@@ -74,12 +74,46 @@ pynative trainer 有回调系统：`mindformers/pynative/callback/callback.py:22
 
 > ⚠ 首次使用确认 `state` 的步计数属性名（grep `mindformers/pynative/callback/callback.py` 的 `state` 用法；常见 `state.global_step`）。脚本里已做容错（多候选属性名）。
 
-## 3. 启动 pynative（缩层）训练
+## 3. 启动 pynative（缩层）训练 —— 已验证 DSv3 端到端（2026-06-30）
 
-路由：`run_mindformer.py:62` —— YAML 顶层 `mode: 1` → `PynativeTrainer(config.config).train()`（否则走 GRAPH_MODE）。
-- 单机多卡：`bash scripts/msrun_launcher.sh "python run_mindformer.py --config <yaml>" <WORKER_NUM> ...`（msrun 拉起多 rank；具体参数见脚本头）。
-- **缩层**：把 YAML 的模型 `num_layers` 改小（如 61→2~4 层）做"缩层规格"——per-layer 同质，峰值可按层数外推，省卡省时（设计 P0/缩层 profiling 的核心）。
-- 仓库内 `configs/`、`research/deepseek3/` 只有**推理** yaml；**pynative 训练 yaml 需用用户自己的**（位置首次运行时与用户确认；结构 = 顶层 `mode:1` + `config:` 块，含 `training/parallelism/recompute/swap/model/context`，对应 `mindformers/pynative/config/config.py:TrainConfig`）。
+**入口**：`PynativeTrainer(config="<yaml>").train()`（参考测试 `run_deepseek3.py` 的用法）。yaml 顶层直接是 `checkpoint/training/parallelism/recompute/model/...`（**无** `mode:`/`config:` 块）；trainer 内部**自动补** `context.mode:1` + `max_device_memory:"59GB"`(=OOM 阈值)，并把 model 转成 megatron `TransformerConfig`。（`run_mindformer.py:62` 的 `mode==1` 是另一条等价入口。）
+
+**参考配置**（DSv3 MLA+MoE）：`<CK>/tests/st/test_multi_cards_cases/test_pynative/test_models/test_deepseek3/pynarive_ds3.yaml`，同目录 `run_deepseek3.py`、`test_two_cards.py`（含 `generate_mindrecord_file` 造合成数据）。
+> 116 上有两份 mindformers：`deepseek_v4/mindformers`(主代码) 与 `mindformers/mindformers`(含本测试 harness，本 skill 在此跑通)。下文 `CK=/home/suhaibo/workspace/mindformers/mindformers`。
+
+**缩层**：改 model `num_hidden_layers`（如 61→4）—— per-layer 同质、峰值按层数外推，省卡省时。
+
+### 已验证一键跑法（bundled `prep_ds3_sim.py` + `run_ds3_memprobe.py`）
+```bash
+CK=/home/suhaibo/workspace/mindformers/mindformers
+REF=$CK/tests/st/test_multi_cards_cases/test_pynative/test_models/test_deepseek3
+# 传脚本（本机 → 容器，stdin 必须 docker exec -i）：
+ssh 192.168.9.116 "docker exec -i shb.ms.2.9 bash -c 'cat > $REF/prep_ds3_sim.py'"     < prep_ds3_sim.py
+ssh 192.168.9.116 "docker exec -i shb.ms.2.9 bash -c 'cat > $REF/run_ds3_memprobe.py'" < run_ds3_memprobe.py
+# 跑（关键 env：source set_env + conda bin 上 PATH(找 msrun) + 仓库根上 PYTHONPATH）：
+ssh 192.168.9.116 "docker exec shb.ms.2.9 bash -lc '
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+  export PATH=/root/miniconda3/envs/mindspore2.10/bin:\$PATH
+  export PYTHONPATH=$CK:\$PYTHONPATH
+  cd $CK && SIM_LAYERS=4 SIM_STEPS=3 python $REF/prep_ds3_sim.py
+  msrun --worker_num=2 --local_worker_num=2 --master_port=8124 --log_dir=$REF/log_sim --join=True \
+        $REF/run_ds3_memprobe.py --config $REF/ds3_sim.yaml
+'"
+# 取结果：
+ssh 192.168.9.116 "docker exec shb.ms.2.9 bash -c 'grep -h MEMPROBE $REF/log_sim/worker_*.log'"
+```
+
+### 实测结果（4 层 DSv3，FSDP-2，seq4096，full 重算，compute=bf16/params=fp32）
+```
+[MEMPROBE] rank=0 peak_alloc_MiB=12473.1 peak_reserved_MiB=13446.0 framework_reserve_MiB=972.9
+[MEMPROBE] rank=1 peak_alloc_MiB=12473.1 peak_reserved_MiB=13474.0 framework_reserve_MiB=1000.9
+```
+→ 每卡峰值 **~12.47 GB 已分配 / ~13.45 GB 预留**，**framework_reserve ≈ 0.97–1.0 GB**（即评估器 `O_framework` 标定值）。首步 6.6s（kernel 编译）、后续 ~430ms/步，exit 0。
+
+### 关键 env 坑（实测踩过）
+- **msrun 不在默认 PATH** → 在 `/root/miniconda3/envs/mindspore2.10/bin/`，需 `export PATH=...:$PATH`。
+- **PYTHONPATH 必须含 mindformers 仓库根**（否则 `tests.utils` / 本仓库 `mindformers` import 失败）。
+- 嵌套 `ssh→docker exec bash -lc '...'` 里 echo **别带 `()` 等元字符**（inner bash 会语法报错）。
 
 ## 4. 测量 vs 预测：验证 / 标定回路
 
@@ -90,6 +124,8 @@ pynative trainer 有回调系统：`mindformers/pynative/callback/callback.py:22
 5. **回填**：把标定出的 `framework_reserve`（及将来 η）写回评估器默认值——**只换常数、不动结构**（设计铁律）。
 
 期望：标定后显存预测 <10%。差异系统性偏大→检查评估器某条 op 的 `saves`/切分是否与真实实现不符（对照 `mindformers/pynative/` 源码核实，勿杜撰）。
+
+> **当前缺口（→评估器下一步）**：真机采集管线已通（§3 实测 12.47GB）；但 `cost_eval` P0 只有 **dense-GQA + 标准 MoE** op 图，**DSv3 的 MLA（kv_lora/q_lora/rope+nope 拆分/v_head_dim）尚无 op 图**——要直接对比"预测 vs 实测 12.47GB"，需先在 `cost_eval/layers/` 加 `mla_decoder` op 图（对照 `multi_latent_attention.py`）。在此之前，本 skill 的真机侧可独立产出标定数据（如 `framework_reserve≈1GB`）。
 
 ## 5. 安全 / 礼仪（共享机）
 - 8 卡共享：探针/缩层只占 1–2 卡（msrun `WORKER_NUM` 小、或单卡），只跑 **3–10 步**即够采峰值。
