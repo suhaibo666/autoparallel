@@ -273,9 +273,17 @@ peak = max over events ( Σ 上述桶 )  +  framework_reserve(config)   # framew
 
 ### 8.3 大 vocab 的 fp32 loss 区（真机峰值大头）
 
-对照 `loss.py`：`_LogSoftmax` 把 logits **cast fp32**、`log_softmax`(fp32) saved；`_NLLLoss` 反向 `probs=exp(−log_softmax)` 物化 fp32。vocab×seq 巨大时这是峰值主导项。建模：
-- `act_live` += logits(bf16) + **log_softmax(fp32, per-tensor dtype=4)**。
-- lm_head/loss op 的 `bwd_scratch` = **probs(fp32) = 4·S·B·vocab**。
+对照 `pynative/loss/loss.py`（非 chunk 的 `CrossEntropyLoss` = `_LogSoftmax`+`_NLLLoss`）：
+`_LogSoftmax.forward` 把 logits **cast fp32**、返回的 `log_softmax`(fp32) 被 saved（`ctx.log_softmax`）；
+**`_NLLLoss.backward`（loss.py:80-82）同时物化** `probs=exp(−log_softmax)`(fp32) 与 `scatter_add` 出的
+`grad_log_softmax`(fp32)，二者与 saved `log_softmax` **共存** → 反向峰值瞬时压着 **3 个满 vocab fp32 张量**。
+vocab×seq 巨大时这是**真机峰值的绝对大头**。建模：
+- `act_live` += logits(bf16) + **log_softmax(fp32, per-tensor dtype=4)**（前向 saved 的两个）。
+- nll/loss op 的 `bwd_scratch` = **probs + grad_log_softmax = 2×(4·S·B·vocab)**（反向新物化、不在 saves 里的两个满 vocab fp32 张量）。
+- ⚠ **修正（2026-06-30）**：此前只建了 `probs`（1×4·S·B·vocab），**漏了 `scatter_add` 的 `grad_log_softmax`**，
+  导致 ~2020 MiB（@seq4096, vocab129280）被错误兜进 `framework_reserve`。补建后 `framework_reserve` 从 **2197→177**（§8.6），
+  pred 不变（仍 1.000）——即"这 2GB 是 loss 反向激活、不是框架开销"，详见 §8.6。
+- 注：`_ChunkCrossEntropyLoss`（loss.py:249）分块重算正是为消除这多份满 size logits 梯度而设计；本配置未开 chunk，故残余恰 ≈ 1 份满 V_fp32。
 
 ### 8.4 grad 不是常驻（真机修正）
 
@@ -299,10 +307,13 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 | 项 | 归属 | 缩放律 / 现状 |
 |---|---|---|
 | **HCCL 通信缓冲** | **reserved 池**（≠ allocated 峰值） | `200MB × 通信组数`；仅当预测 reserved 时用（`hccl_reserved_buffer(pc)`） |
-| `framework_reserve`(allocated) | allocated 峰值残余 | = MoE all-to-all staging + flash workspace + bf16 cast + 池碎片；**真机 ep=1/2、层 4/8 下近恒定 ≈2197 MiB @ seq4096** |
-| 其随 seq 的缩放（flash_ws） | allocated | 待 **seq-varying 真机点**验证（开放项） |
+| `framework_reserve`(allocated) | allocated 峰值残余 | = flash workspace + MoE all-to-all staging + 分配器块对齐取整；**真机标定 ≈177 MiB @ seq4096**（**原 2197，其中 ~2020 是 loss 反向 `grad_log_softmax`，已于 §8.3 显式建进 `bwd_scratch` 剔出**） |
+| 其随 seq 的缩放（flash_ws） | allocated | 待 **seq-varying 真机点**验证（开放项；注：loss 区 ~4040 MiB 现已随 seq·vocab 自动缩放，不再靠常数兜） |
 
-→ 即：HCCL 不进 allocated；`framework_reserve(allocated)` 经 ep=1/2 验证**对 ep 恒定**，随 seq 等的进一步分解待 seq-varying 点。
+→ 即：HCCL 不进 allocated；loss 反向 fp32 大头（probs+grad_log_softmax）现**显式建模、随 seq·vocab 缩放**；
+`framework_reserve(allocated)` 收窄为 ≈177 MiB 的小残余（flash/MoE staging/对齐），经 ep=1/2 验证对 ep 恒定。
+**关键认知**：原 2197 的"framework_reserve"并非真·框架开销，其 92% 是漏建的 loss 反向激活——`framework_reserve` 是**记账兜底位**，
+不是物理实体；把可建模项逐一建出来后它应持续收窄（理想 →仅分配器碎片）。
 
 ### 8.7 真机验证现状（DeepSeek-V3，2026-06-30，3 个数据点）
 

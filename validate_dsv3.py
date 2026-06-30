@@ -18,9 +18,11 @@ GiB = 2 ** 30
 import os
 # 真机实测 (peak_alloc_MiB, resident_MiB) by (层数, ep)
 MEASURED = {(4, 1): (12473.1, 3862.0), (8, 1): (13953.3, None), (4, 2): (12474.1, None)}
-# framework_reserve(allocated) = residual（MoE staging+flash+cast+碎片，**不含 HCCL**，ep=2 修正 §8.6）
-# 真机 ep=1/2、层4/8 下近恒定 2197；HCCL 在 reserved 池不计入 allocated 峰值
-RESIDUAL_MiB = 2197
+# framework_reserve(allocated) = residual（**不含 HCCL**，ep=2 修正 §8.6）。
+# 原 2197 里 ~2020 MiB 是 loss 反向漏建的 grad_log_softmax(fp32 满 vocab)，现已显式建进
+# nll.bwd_scratch（probs + grad 共 2×4·S·B·vocab，loss.py:80-82）；残余 ~177 = flash workspace
+# + MoE all-to-all staging + 分配器块对齐取整。HCCL 在 reserved 池不计入 allocated 峰值。
+RESIDUAL_MiB = 177
 
 
 def build_embedding(d):
@@ -39,8 +41,9 @@ def build_lm_head(d):
     return LayerSpec(ops=[
         OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x]),
         OpSpec("logsoftmax", OpType.NORM, [logits], logsm, saves=[logits]),
-        # NLL 反向 probs=exp(-log_softmax) 物化 fp32（loss.py:80）
-        OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch="4*S*B*vocab"),
+        # NLL 反向同时物化 probs=exp(-log_softmax) 与 scatter_add 出的 grad_log_softmax，
+        # 二者皆 fp32 满 vocab 张量、与 saved log_softmax 共存（loss.py:80-82）→ 2×(4·S·B·vocab)
+        OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch="8*S*B*vocab"),
     ])
 
 
