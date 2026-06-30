@@ -23,6 +23,11 @@ class DimTable:
     H: int; F: int; n_heads: int; n_kv: int; head_dim: int
     S: int; B: int; vocab: int; n_layers: int
     n_experts: int = 0; topk: int = 0; n_shared: int = 0; moe_F: int = 0
+    # MLA (Multi-Latent Attention) dimensions
+    q_lora_rank: int = 0; kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0; qk_nope_head_dim: int = 0; v_head_dim: int = 0
+    # Shared expert intermediate size (MoE + MLA combined layers)
+    moe_shared_F: int = 0
     capacity_factor: float = 1.0
     dtype_bytes: int = 2
 
