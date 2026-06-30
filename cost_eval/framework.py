@@ -15,9 +15,15 @@ MIB = 2 ** 20
 HCCL_BYTES_PER_GROUP = 200 * MIB   # 真机日志 hcclBufferSize=200MB（CANN 9.0）；属 reserved 池
 
 
-def num_comm_groups(pc) -> int:
-    """启用的 HCCL 通信组数 = world + 各启用并行域（随 ep/tp/... 缩放）。"""
-    n = 1  # hccl_world_group 恒有
+def num_distinct_communicators(pc) -> int:
+    """启用的**不同** HCCL 子通信器数（world + 各启用并行域的子组）。
+
+    ⚠ 这些子域**复用同一 rank 网格**（`parallel_dims.py`: EP/CP/TP 从 dp_shard·cp·tp 区
+    carve 出，非新增 rank）——即都是 world group 的**子通信器**，**不是独立叠加的**。
+    每个不同子通信器在 **reserved** 池里预留一份缓冲，但因域重叠、buffer 可部分共享，
+    **不是干净的 ×200MB**；且这一切只影响 reserved、**不进 allocated 峰值**（ep=2 真机证实）。
+    """
+    n = 1  # hccl_world_group
     if pc.dp_shard * pc.cp > 1:
         n += 1
     if pc.tp > 1:
@@ -34,8 +40,8 @@ def num_comm_groups(pc) -> int:
 
 
 def hccl_reserved_buffer(pc) -> int:
-    """HCCL 通信缓冲（在 **reserved** 池，不进 allocated 峰值）。仅当预测 reserved 时用。"""
-    return HCCL_BYTES_PER_GROUP * num_comm_groups(pc)
+    """HCCL 缓冲粗估（**reserved** 池，不进 allocated）。仅 reserved 预测用，且因域复用为上界估计。"""
+    return HCCL_BYTES_PER_GROUP * num_distinct_communicators(pc)
 
 
 def framework_reserve(pc, residual_calibrated: int = 0) -> int:

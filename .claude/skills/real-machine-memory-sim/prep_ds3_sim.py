@@ -17,6 +17,8 @@ STEPS = int(os.environ.get("SIM_STEPS", "3"))
 SEQ = int(os.environ.get("SIM_SEQ", "4096"))
 EP = int(os.environ.get("SIM_EP", "1"))         # 专家并行度（变配置验证用）
 TP = int(os.environ.get("SIM_TP", "1"))         # 张量并行度
+PP = int(os.environ.get("SIM_PP", "1"))         # 流水并行度
+DPSHARD = int(os.environ.get("SIM_DPSHARD", "-1"))  # FSDP shard 度（-1=auto）
 
 # 1) 合成数据集（input_ids/labels/loss_mask/position_ids），仅几十条
 if not os.path.exists(DS_FILE):
@@ -48,6 +50,10 @@ cfg["recompute"]["full_recompute_layer"] = [f"0-{N_LAYERS - 1}"]
 cfg["checkpoint"]["enable_save"] = False
 cfg["parallelism"]["expert_parallel"] = EP      # 变配置：EP
 cfg["parallelism"]["tensor_parallel"] = TP      # 变配置：TP
+cfg["parallelism"]["pipeline_parallel"] = PP    # 变配置：PP
+cfg["parallelism"]["data_parallel_shard"] = DPSHARD
+if PP > 1:
+    cfg["parallelism"]["pipeline_parallel_microbatch_size"] = PP   # 至少 PP 个 microbatch
 
 out = os.path.join(CUR, "ds3_sim.yaml")
 with open(out, "w") as f:

@@ -62,12 +62,18 @@ layer_pattern = ["embedding"] + ["mla_dense"] + ["mla_moe"] * (N - 1) + ["lm_hea
 spec = ModelSpec(f"dsv3-{N}L", d, layer_pattern, layer_specs)
 full_layers = set(range(1, N + 1))   # transformer 层（embedding=0, head=N+1 不重算）
 
-MEASURED_PEAK_MiB, MEASURED_RESIDENT_MiB = MEASURED.get((N, EP), (None, None))
+# 任意并行配置（env 驱动，用于 FSDP/EP/TP/PP 组合矩阵研究）
+TP = int(os.environ.get("SIM_TP", "1"))
+PP = int(os.environ.get("SIM_PP", "1"))
+WORLD = int(os.environ.get("SIM_WORLD", "2"))
+DPSHARD = int(os.environ.get("SIM_DPSHARD", "-1"))
+dp_shard = DPSHARD if DPSHARD > 0 else max(WORLD // (TP * PP), 1)   # dp_replicate=cp=1
+mbs = PP if PP > 1 else 1   # PP 时在飞 microbatch 数
 
-pc = ParallelConfig(dp_shard=2, tp=1, ep=EP, pp=1, cp=1, sequence_parallel=True,
-                    num_microbatches=1)
-# fp32 AdamW：持久 = param(4)+m(4)+v(4) = 12 B/param；grad(4B) 是反向瞬态(grad_buf)
+pc = ParallelConfig(dp_shard=dp_shard, tp=TP, ep=EP, pp=PP, cp=1, sequence_parallel=True,
+                    num_microbatches=mbs)
 opt = OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4)
+# framework_reserve(allocated)=residual(剔HCCL); 研究模式下也看"结构峰值"(剔framework)
 ev = Evaluator(spec, pc, opt,
                HardwareSpec(max_device_memory=59 * GiB,
                             framework_reserve=RESIDUAL_MiB * MiB),
@@ -76,15 +82,10 @@ rep = ev.evaluate()
 p = rep.per_stage[0]
 b = p.breakdown
 pk = p.peak_bytes / MiB
-print(f"=== DSv3 {N}L  FSDP-2  full-recompute（fp32, 常驻12B/param, framework_reserve=HCCL(200×组)+residual{RESIDUAL_MiB}MiB）===")
-if MEASURED_RESIDENT_MiB:
-    print(f"[静态] 预测常驻 = {b.persistent/MiB:8.1f} MiB  vs 真机 {MEASURED_RESIDENT_MiB:.0f} MiB"
-          f"   误差 {abs(b.persistent/MiB-MEASURED_RESIDENT_MiB)/MEASURED_RESIDENT_MiB*100:.1f}%")
-if MEASURED_PEAK_MiB:
-    print(f"[峰值] 预测 = {pk:8.1f} MiB  vs 真机 {MEASURED_PEAK_MiB:.0f} MiB"
-          f"   ratio {pk/MEASURED_PEAK_MiB:.3f}")
-else:
-    print(f"[峰值] 预测 = {pk:8.1f} MiB  (真机待测)")
+struct = pk - b.framework / MiB    # 结构峰值（剔 framework_reserve）
+from cost_eval.framework import num_distinct_communicators
+print(f"=== DSv3 {N}L  world={WORLD} dp_shard={dp_shard} tp={TP} ep={EP} pp={PP}  (hccl子通信器={num_distinct_communicators(pc)}) ===")
+print(f"[峰值] 预测(含reserve) = {pk:8.1f} MiB ; 结构(剔reserve) = {struct:8.1f} MiB ; persistent={b.persistent/MiB:.0f}")
 print(f"--- 预测 breakdown (MiB) ---")
 for k in ("persistent", "act_live", "gather_buf", "grad_buf", "recomp_scratch",
           "bwd_scratch", "swap_buf", "workspace", "framework"):

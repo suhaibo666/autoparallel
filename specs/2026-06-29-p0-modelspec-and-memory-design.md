@@ -293,6 +293,8 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 ### 8.6 `framework_reserve`：**allocated 峰值的残余，不含 HCCL**（ep=2 真机修正）
 
 > ⚠ **ep=2 真机点证伪了"HCCL×组数"假设（2026-06-30）**：ep=1→2 多一个 EP 通信组，**allocated 峰值不变**（12473→12474），但 **reserved 涨**（13446→13750）。结论：**HCCL 通信缓冲在 reserved 池、不在 allocated 峰值**。评估器预测 `max_memory_allocated`（张量占用，OOM 相关），故 **HCCL 不计入 framework_reserve(allocated)**。
+>
+> **根因（用户洞见）**：EP/CP/TP 子通信域**复用同一 rank 网格**——`parallel_dims.py: efsdp·ep = dp_shard·cp·tp`，EP 是从 `dp_shard·cp·tp` 区 **carve** 出来的，是 world group 的**子通信器、复用 DP/FSDP 的 rank**，不是新增独立通信域。所以子域是**重叠**的、其 buffer **不可按域数叠加**，且只落 reserved。`num_comm_groups×200MB` 这种线性叠加是错的（已改名 `num_distinct_communicators` 并标注"仅 reserved 上界粗估"）。
 
 | 项 | 归属 | 缩放律 / 现状 |
 |---|---|---|
