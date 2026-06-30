@@ -133,6 +133,7 @@ MLA op 图（`cost_eval/layers/mla.py`）+ 框架反向瞬态建模已加。对 
 | **常驻 persistent**（param+m+v, fp32=12B/param, /dp_shard） | 3829.9 MiB | 3862 MiB | **误差 0.8% ✅** |
 | **峰值 peak（纯结构）** | 10275 MiB | 12473 MiB | ratio **0.82** |
 | **峰值 peak（+ framework_reserve=2197）** | 12472.5 MiB | 12473 MiB | ratio **1.000** ✅ |
+| **8L 峰值（同一 reserve，泛化复验）** | 13896.1 MiB | 13953.3 MiB | ratio **0.996** ✅ |
 
 峰值预测演进：**0.39 →(加 loss 区 fp32)→ 0.66 →(加 FSDP gather/grad + bwd_scratch)→ 0.82 →(标定 reserve)→ 1.00**。
 
@@ -144,7 +145,7 @@ MLA op 图（`cost_eval/layers/mla.py`）+ 框架反向瞬态建模已加。对 
 3. **大 vocab loss 区是峰值大头**：`loss.py` log_softmax/probs 走 **fp32**，vocab=129280×seq4096 → log_softmax(saved 2118MiB)+probs(反向 2118MiB)≈4.2GB。已用 per-tensor dtype + `OpSpec.bwd_scratch` 建模。
 4. **残余 2.2GB = 框架不可解析瞬态**（MoE all-to-all/hccl 200MB×组/flash workspace/碎片）→ 收进标定的 `framework_reserve`（每平台标一次）。
 
-> 结论：**静态 0.8% + 峰值结构 0.82 + 标定后 1.00**。结构项全部 source-grounded；`framework_reserve` 是 1 个平台常数。泛化性用 8 层真机复验（结构应随层数线性升、reserve 恒定）。
+> 结论：**评估器已真机验证（2 数据点）**：静态 0.8%；峰值标定后 **4L=1.000 / 8L=0.996**。`framework_reserve=2197` 从 4 层标定、**泛化到 8 层仅差 0.4%**（结构项随层数 persistent 3830→5198 自动升、reserve 恒定）。结构项全部 source-grounded，仅 1 个平台常数。
 
 ## 5. 安全 / 礼仪（共享机）
 - 8 卡共享：探针/缩层只占 1–2 卡（msrun `WORKER_NUM` 小、或单卡），只跑 **3–10 步**即够采峰值。

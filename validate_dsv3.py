@@ -15,7 +15,7 @@ GiB = 2 ** 30
 import os
 N = int(os.environ.get("SIM_LAYERS", "4"))   # transformer 层数（与真机 SIM_LAYERS 对齐）
 # 真机实测 (peak_alloc_MiB, resident_MiB) by 层数
-MEASURED = {4: (12473.1, 3862.0), 8: (None, None)}
+MEASURED = {4: (12473.1, 3862.0), 8: (13953.3, None)}
 FRAMEWORK_RESERVE_MiB = 2197   # 从 4 层标定：框架 comm/workspace/碎片(MoE all-to-all/hccl/flash)
 
 d = DimTable(
