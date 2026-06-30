@@ -19,7 +19,7 @@
 | M2 | `config_adapter` | 加载 TrainConfig → 切出并行/重算/swap/优化器配置；构建 ModelSpec、HardwareSpec | 复用 trainer 配置=单一真相源、零漂移 | P0 |
 | M3 | `parallel_model` | 并行度数 + mesh 关系 + PP 的 stage→层分配 | TorchTitan `ParallelDims`（efsdp·ep=dp_shard·cp·tp） | P0 |
 | M4 | `shape_eval` | 符号 shape 求值 + sharding 代入(local shape) + reshard 检测(派生通信) → ResolvedGraph | 符号代数；DTensor placement∘mesh-degree；reshard=placement mismatch（GSPMD 传播） | P0 |
-| M5 | `static_mem` | 持久 param+grad+opt（切分后、按优化器倍数） | ZeRO 混合精度显存账（16–18B/param）+ Megatron 切分 | P0 |
+| M5 | `static_mem` | 持久 **param+opt**（切分后，剔 grad，真机修正） | ZeRO 混合精度（fp32=12B/param，grad 瞬态）+ Megatron 切分 | P0 |
 | M6 | `mem_timeline` | 事件驱动峰值仿真（buckets + 1F1B 调度 + recompute/FSDP预取/swap） | 离散事件仿真；"peak=max over time"(liveness)；rematerialization；ZeRO-3 all-gather 双缓冲 | P0 |
 | M7 | `report` | 组装输出：峰值+OOM+拆解+最紧 stage；挂验证 | `max_device_memory` 预算约束 | P0 |
 | M8 | `roofline`（扩展点） | 每 op FLOPs/bytes/受限分类 + η（time） | Roofline 模型；α-β 通信 | P1 |
@@ -85,7 +85,7 @@ class HardwareSpec:
     peak_flops: dict[str, float]      # dtype -> FLOPS
     hbm_bw: float; intra_bw: float; inter_bw: float; pcie_bw: float
     max_device_memory: int            # 来自 ContextConfig.max_device_memory
-    framework_reserve: int            # O_framework 标定常数
+    framework_reserve: int            # 平台 frag 小常数；hccl/moe_comm/flash 按配置分解(见 P0 §8.6)
 
 @dataclass(frozen=True)
 class ParallelConfig:                 # 从 ParallelismConfig 抽取
@@ -97,7 +97,7 @@ class ParallelConfig:                 # 从 ParallelismConfig 抽取
 @dataclass(frozen=True)
 class OptimizerSpec:
     type:str
-    state_bytes_per_param:int         # AdamW=16/18; Muon 另算（param+grad+master+m(+v)）
+    state_bytes_per_param:int         # 持久=param+opt(剔grad,真机修正): bf16~14/fp32 12; grad→grad_buf瞬态
 
 # ---- 中间（M4 产出，不可变）----
 @dataclass(frozen=True)
@@ -108,8 +108,8 @@ class ResolvedTensor:
 class ResolvedOp:
     name:str; type:str
     inputs:list[ResolvedTensor]; output:ResolvedTensor
-    params:list[ResolvedTensor]; saves:list[ResolvedTensor]   # 内存契约(已代入 local)
-    workspace_bytes:int
+    params:list[ResolvedTensor]; saves:list[ResolvedTensor]   # 内存契约(已代入 local; saves 支持 per-tensor dtype)
+    workspace_bytes:int; bwd_scratch_bytes:int   # bwd_scratch=op 反向物化(如 loss probs fp32)
     collectives:list["CommSpec"]      # reshard 派生 / 显式
 
 @dataclass(frozen=True)
@@ -124,12 +124,12 @@ class ResolvedGraph:
 @dataclass(frozen=True)
 class MemBreakdown:
     persistent:int; act_live:int; gather_buf:int; grad_buf:int
-    recomp_scratch:int; swap_buf:int; workspace:int; framework:int
+    recomp_scratch:int; bwd_scratch:int; swap_buf:int; workspace:int; framework:int
 
 @dataclass(frozen=True)
 class StagePeak:
     stage:int; peak_bytes:int; breakdown:MemBreakdown
-    peak_event:str; oom:bool          # peak_event: "fwd_end" | "bwd_recompute@layer_i" | ...
+    peak_event:str; oom:bool          # peak_event: "bwd@loss" | "bwd@layer_i" | "fwd_end" | ...
 
 @dataclass(frozen=True)
 class PeakMemoryReport:
@@ -185,7 +185,7 @@ class ShapeEval:
 ```
 
 ### M5 `static_mem`
-- **目标**：每 stage 持久 param+grad+opt 字节（§P0 §6）。
+- **目标**：每 stage 持久 **param+opt** 字节（剔 grad，§P0 §6.3）；grad 是 M6 反向瞬态。
 - **理论依据**：attn/dense 权重 /(tp·dp_shard·cp)；专家 /(dp_shard·cp·tp)；复制 /(dp_shard·cp)；× `state_bytes_per_param`。
 - **接口**：
 ```python
@@ -224,7 +224,7 @@ class Evaluator:   # 门面
 |---|---|
 | M3 | 给 ParallelConfig，断言 degree/mesh/stage 分配（对 `parallel_dims.py` 不变量） |
 | M4 | 给小 ModelSpec + degrees，断言 local shape 与派生通信（含退化 tp=1） |
-| M5 | 给 ResolvedGraph，断言 Σ切分态=全局（守恒）、对 ZeRO 16/18B 律 |
+| M5 | 给 ResolvedGraph，断言 Σ切分态=全局（守恒）、持久=param+opt（剔grad，fp32=12B/param）对真机常驻 |
 | M6 | 给构造的事件序列，断言峰值落点（注入"无重算"vs"full 重算"看尖峰转移） |
 | M7 | 给 static+timeline，断言 OOM 判定与最紧 stage |
 | 端到端 | 1 dense + 1 MoE worked config，对 Megatron 2205.05198 公式互证 |

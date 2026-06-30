@@ -115,7 +115,7 @@ def compute(g, opt, pm, cpu_offload) -> dict[int, int]:
     return out
 ```
 - `is_expert(w)`：该权重 placement 含 `ep`（来自 M4 标记）。
-- `state_bytes_per_param`：AdamW=16（bf16 param2+grad2+master4+m4+v4）或 18（fp32 grad）；Muon 另算。
+- `state_bytes_per_param`：**持久 = param+opt（剔除 grad，真机修正）**——bf16 params ~14、fp32 params(DSv3) 12；grad 是反向瞬态(`grad_buf`，§M6.3①)。Muon 另算。详见 §P0 6.3/8.4。
 - `cpu_offload=True`：持久态下沉 CPU → 设备持久≈0，仅 M6 的 `gather_buf` 瞬时驻留。
 
 ### M5.3 自检
@@ -127,7 +127,7 @@ def compute(g, opt, pm, cpu_offload) -> dict[int, int]:
 
 ## M6 `mem_timeline` — 事件驱动峰值仿真
 
-**目标**：沿 1F1B 执行时间线 walk alloc/free 事件，`peak = O_framework + max_t Σ桶`，显式建模 recompute 反向尖峰 / FSDP 预取双缓冲 / swap 预取。
+**目标**：沿 1F1B 执行时间线 walk alloc/free 事件，`peak = max_t Σ桶 + framework_reserve(config)`，显式建模 recompute 反向尖峰 / FSDP gather+full grad / loss 区 fp32 / swap（BWD 共存采峰）。
 
 ### M6.1 调度模型（1F1B）
 
@@ -165,46 +165,47 @@ def simulate(g, recompute, swap, pc, static_persistent) -> dict[int, StagePeak]:
                 if pc.reshard_after_forward == "always":
                     _free_gather(gathered, ev.layer, B)
                 peak, peak_ev = _rec(B, peak, peak_ev, "fwd_end")
-            else:  # BWD
-                _ensure_gather_bwd(gathered, ev.layer, pc, B)
-                if _is_recomputed(ev.layer, recompute):           # 见 M6.3②
-                    B.recomp_scratch = _full_saves(ev.layer)
-                    peak, peak_ev = _rec(B, peak, peak_ev, f"bwd_recompute@{ev.layer}")
-                    B.recomp_scratch = 0
-                B.grad_buf = _grad_bytes(ev.layer)                # reduce-scatter 前
-                peak, peak_ev = _rec(B, peak, peak_ev, f"bwd_grad@{ev.layer}")
-                B.grad_buf = 0
+            else:  # BWD（逆序层）—— gather + full grad + recompute + bwd_scratch 共存采峰
+                B.gather_buf = _layer_param_bytes(ev.layer)           # FSDP re-gather 整层(compute dtype)
+                B.grad_buf = _layer_grad_bytes(ev.layer, grad_dtype)  # full grad(grad dtype, 可 fp32)
+                if _is_recomputed(ev.layer, recompute):
+                    B.recomp_scratch = _recomp_workingset(ev.layer)   # §M6.3② 修正
+                B.bwd_scratch = _layer_bwd_scratch(ev.layer)          # op 反向物化(loss probs)
+                peak, peak_ev = _rec(B, peak, peak_ev, f"bwd@{ev.layer}")   # 四者一次采样
+                B.gather_buf = B.grad_buf = B.recomp_scratch = B.bwd_scratch = 0
                 B.act_live -= pinned.pop((ev.mb, ev.layer))
-                _free_gather(gathered, ev.layer, B)
-        res[stage] = StagePeak(stage, peak + B.framework, breakdown_at(peak_ev),
-                               peak_ev, oom=(peak + B.framework) > hw.max_device_memory)
+        fr = framework_reserve(pc)                                    # §M6.4, 按配置分解
+        res[stage] = StagePeak(stage, peak + fr, breakdown_at(peak_ev),
+                               peak_ev, oom=(peak + fr) > hw.max_device_memory)
     return res
 ```
 
-### M6.3 三类峰值影响的精确规则
+### M6.3 反向桶的精确规则（2026-06-30 真机修订）
 
-**① FSDP all-gather + 预取双缓冲**（`_ensure_gather`）
+**关键修正：BWD 一层的 `gather_buf` / `grad_buf` / `recomp_scratch` / `bwd_scratch` 必须共存采峰**（旧版分开采样、且先释放 `act_live` 再算 grad → 漏算反向叠加，导致峰值低估约 2×）。
+
+**① FSDP gather / grad**：`gather_buf=整层权重(compute dtype)`、`grad_buf=full grad(grad dtype，可 fp32)`；`reshard_after_forward` 控 FWD 是否即释（"never" 累积，峰高）。**grad 是反向瞬态、不入持久**（§8.4）。
+
+**② recompute（三处修正，⚠ 未被真机验证，见 §8.5）**：
+- `recomp_scratch = 该层 saves − checkpoint 输入`（**去双算**——输入已在 `act_live`）。
+- 严格应为 `_recomp_workingset` = 该层 forward 的 **max-live**（非 saves 之和；对单层做 mini-forward 时间线求峰；MLA/MoE 多中间量层尤其）。
+- **验证缺口**：DSv3 峰值落在 loss 层，`recomp_scratch=0`，这条没被踩到 → 须用"重算 transformer 层成峰值"的配置（大 hidden / 小 vocab / PP 增在飞 microbatch）单独验证。
+
+**③ bwd_scratch（大 vocab fp32 loss 区）**：lm_head/loss op `probs=4·S·B·vocab`；配合 per-tensor dtype 的 fp32 `log_softmax`(saved)。大 vocab 时是峰值大头（对照 `loss.py`）。
+
+**④ swap**：offload 的 saves 从 `act_live` 扣 + `swap_buf` 预取窗口；三态互斥。
+
+### M6.4 输出 + `framework_reserve(config)`（按配置分解，非固定常数）
+
+`StagePeak{peak_bytes, breakdown(8桶+framework), peak_event, oom}`。
 ```
-进入 layer i 计算前：gather 自身 + 预取后 d 层 → gathered = {i, i+1, ..., i+d}
-G_layer = (层 dense 权重 local_numel /tp 已含) gather 成整 bf16 = layer_param_after_tp · 2
-gather_buf = Σ_{l∈gathered} G_l
-reshard_after_forward="always": FWD 用完即 _free_gather(i)，BWD 再 gather
-                      ="never" : 不释放 → gathered 累积到整 stage（峰值大）
+framework_reserve(pc) = hccl(200MB × 通信组数(pc)) + moe_comm(op图 a2a 量) + flash_ws(seq×heads) + frag(平台小常数)
 ```
+随并行配置自动缩放（§8.6）；仅 `frag` 留作每平台标定。`peak_event` 典型 `"bwd@loss"` / `"bwd@layer_i"`。
 
-**② recompute 反向尖峰**（`_is_recomputed` + `_full_saves`）
-- `full`（命中 `full_recompute_layer`）：FWD 时 `_saves_after_recompute_swap` 只留 checkpoint 输入（`act_live` 大降）；BWD 时 `recomp_scratch = _full_saves(layer)`（该层完整激活）瞬时叠加 → **常是全局峰值**。
-- `select`/`exclude_op`：`_saves_after_recompute_swap` 按 `select_module`/`exclude_op` 只减/保留部分。
+### M6.5 自检 + 真机验证现状
 
-**③ swap 预取**（`_saves_after_recompute_swap` + swap_buf）
-- offload 的 saves 从 `act_live` 扣；接近其 BWD 时 `swap_buf += default_prefetch · 单次预取字节`（H2D 预取窗口）。
-- 三态互斥：每个 saves ∈ {resident(act_live) / recomputed(recomp_scratch) / offloaded(swap_buf)}，仿真器保证只进一个桶。
-
-### M6.4 输出
-`StagePeak{peak_bytes, breakdown(7桶+framework), peak_event, oom}`。`peak_event` 标出峰值落点（如 `"fwd_end"` 或 `"bwd_recompute@layer_40"`），使报告能解释**为什么 OOM 发生在反向**。
-
-### M6.5 自检
-- 无重算 + reshard=always：峰值应落在 `fwd_end`（在飞激活最满）。
-- 开 full 重算：峰值落点应**迁移到** `bwd_recompute@*`，且总峰值下降（激活降 > recomp_scratch 升）。
-- reshard `never` vs `always`：`gather_buf` 应显著不同。
-- 单调性：`default_prefetch`↑ → `swap_buf`↑、暴露 stall↓（stall 属 P1 时间）。
+- full 重算降低峰值、峰值落 `bwd@*`（gather/grad 共存使反向 > fwd_end）。
+- reshard never vs always → `gather_buf` 不同。
+- **真机对标（§8.7）**：DSv3 4L **1.000** / 8L **0.996**（已验证 persistent<1% / loss区 fp32 / gather / grad / 跨层数缩放）。
+- **逐桶验证原则**：每桶须设计"让它主导峰值"的配置单独验证。**开放项**：`recomp_scratch`（§M6.3②）、`framework_reserve` 分解（§M6.4，仅 1 个并行配置未跨配置标定）、swap / select-recompute。

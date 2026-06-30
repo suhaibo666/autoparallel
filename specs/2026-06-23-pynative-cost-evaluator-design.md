@@ -177,9 +177,10 @@ t_op = max( FLOPs_op / (peak_FLOPS·d_dtype) , bytes_op / peak_HBM_BW ) / η_op
 **峰值显存（每 stage，事件驱动内存时间线仿真）**：peak 是沿 fwd→bwd 执行时间线取 max，须仿真 alloc/free 事件——recompute 反向尖峰、FSDP 预取双缓冲、swap 预取均为**瞬时叠加**，静态求和抓不准。详见 [[2026-06-29-p0-modelspec-and-memory-design]] §8。
 
 ```
-peak(s) = O_framework + max over events ( Σ 桶 )
-桶 = persistent(分片 param+grad+opt − offload) + act_live(去重 saves)
-   + gather_buf((1+prefetch)·层权重) + grad_buf + recomp_scratch + swap_buf + workspace
+peak(s) = max over events ( Σ 桶 ) + framework_reserve(config)   # framework_reserve 按配置分解(非常数), 见 P0 §8.6
+桶 = persistent(分片 param+opt − offload, **不含 grad**) + act_live(去重 saves, per-tensor dtype 支持 fp32)
+   + gather_buf(整层权重) + grad_buf(**full grad**, 反向瞬态) + recomp_scratch + bwd_scratch(loss probs fp32) + swap_buf + workspace
+# BWD 一层的 gather/grad/recompute/bwd_scratch 共存采峰；真机对标 DSv3 4L=1.000/8L=0.996，见 P0 §8.7
 ```
 OOM ⟺ 任一 stage peak > `context.max_device_memory`。
 

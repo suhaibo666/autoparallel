@@ -156,33 +156,34 @@ attn 权重:    N_attn_stage  / (tp · dp_shard · cp)
 
 记 `P_dev = attn + 专家 + 复制` 三项之和（元素数）。
 
-### 6.3 乘优化器字节倍数（AdamW 混合精度）
+### 6.3 乘优化器字节倍数（持久 = param + opt，**不含 grad**）
 
-每个**已分片**参数元素的持久字节：
+> ⚠ **真机修正（2026-06-30）**：grad **不是常驻**——反向 reduce-scatter 后即释（真机训练后常驻只剩 param+m+v）。故持久 `b_state` **剔除 grad**，grad 改算到 §8 的反向瞬态 `grad_buf`。
 
-| 项 | dtype | 字节 |
+每个**已分片**参数元素的**持久**字节（按 params_dtype）：
+
+| 项 | bf16 params | fp32 params（如 DSv3） |
 |---|---|---|
-| param 分片 | bf16 | 2 |
-| grad 分片 | bf16(或fp32) | 2（或4） |
-| master 权重 | fp32 | 4 |
-| Adam m | fp32 | 4 |
-| Adam v | fp32 | 4 |
-| **合计 `b_state`** | | **16（或18）** |
+| param（持久 master） | 2（bf16）+ 4（fp32 master） | 4（fp32 即 master，无额外 bf16 持久） |
+| Adam m | 4 | 4 |
+| Adam v | 4 | 4 |
+| **持久 `b_state`** | **~14** | **12** |
+| ~~grad~~（→`grad_buf` 瞬态） | ~~2/4~~ | ~~4~~ |
 
-> Muon：state 不同（动量 + Newton-Schulz 无 v），`b_state` 改对应值，配置化。
+> 真机实测（DSv3 fp32）：训练后常驻 3862 MiB = 12 B/param × P_dev，**对得上**（§8.7）。Muon：state 不同（动量、无 v），`b_state` 配置化。
 
 ```
-S_state(每卡) = P_dev · b_state
+S_state(每卡, 持久) = P_dev · b_state          # 不含 grad；grad 见 §8 grad_buf
 ```
-（FSDP just-in-time all-gather 的整层 bf16 权重属**临时 buffer**，计入 §8 workspace，不入持久 state。）
+（FSDP just-in-time all-gather 的整层权重属**反向瞬态 `gather_buf`**，不入持久 state。）
 
 ### 6.4 worked example（dense，Llama2-7B 量纲）
 
-H=4096, n_heads=n_kv=32, hd=128, F=11008, vocab=32000, n_layers=32；TP=8, dp_shard=8, cp=1, pp=1, ep=1, AdamW b_state=16。
+H=4096, n_heads=n_kv=32, hd=128, F=11008, vocab=32000, n_layers=32；TP=8, dp_shard=8, cp=1, pp=1, ep=1, AdamW **持久 b_state=14**（bf16 param2+fp32 master4+m4+v4，**剔 grad**）。
 
 - 每层 attn 权重 N_attn = 4096·4096 (qkv, n_kv=n_heads) ·... 简化：≈ 4·H² + 3·H·F ≈ 4·16.8M + 3·45.1M ≈ 202M 元素/层 → 32 层 ≈ 6.45B + embedding 2·(32000·4096)=262M ≈ **6.7B 参数**（对得上 7B）。
 - 每卡 P_dev = 6.7B / (tp·dp_shard·cp) = 6.7B/64 ≈ 105M 元素。
-- S_state = 105M · 16B ≈ **1.68 GB/卡**。
+- S_state(持久) = 105M · 14B ≈ **1.47 GB/卡**（grad 1276MiB 另计反向 `grad_buf`）。
 
 ## 7. 激活内存计算过程
 
@@ -244,52 +245,81 @@ full recompute → 每层降到 checkpoint 输入 ~2B·4096·4096 ≈ 34MB，峰
 
 ## 8. 每卡峰值显存：内存时间线仿真（取代静态求和）
 
-峰值是**沿执行时间线取 max**，必须仿真 alloc/free 事件——recompute 反向尖峰、FSDP 预取双缓冲、swap 预取都是**瞬时叠加**，静态求和抓不准。**纯解析**：确定性 walk 一个建模的调度，不执行脚本、不上 NPU。
+峰值是**沿执行时间线取 max**，必须仿真 alloc/free 事件——recompute 反向尖峰、FSDP gather/grad、loss 区 fp32 物化都是**瞬时叠加**，静态求和抓不准。**纯解析**：确定性 walk 一个建模的调度，不执行脚本、不上 NPU。
+> 本节经 DeepSeek-V3 真机对标修订（2026-06-30，见 §8.7）。
 
 ### 8.1 内存桶（沿时间线维护）
 
 | 桶 | 内容 | 释放时机 |
 |---|---|---|
-| `persistent` | 分片 param+grad+opt /(fsdp) − cpu_offload | 全程常驻 |
-| `act_live` | 当前 pinned 的 `saves`（去重） | 对应 bwd 消费后 |
-| `gather_buf` | FSDP all-gather 的整层 bf16 权重 | reshard policy 控（§8.3） |
-| `grad_buf` | bwd 中 reduce-scatter 前的整层全量 grad | reduce-scatter 后 |
-| `recomp_scratch` | 重算层反向时重物化的该层激活 | 该层 bwd 结束 |
+| `persistent` | 分片 **param+opt** /(fsdp) − cpu_offload（**不含 grad**，见 §8.4） | 全程常驻 |
+| `act_live` | 当前 pinned 的 `saves`（去重；支持 per-tensor dtype，如 fp32 loss 张量） | 对应 bwd 消费后 |
+| `gather_buf` | FSDP all-gather 的整层权重（compute dtype） | reshard policy 控 |
+| `grad_buf` | bwd reduce-scatter 前的整层 **full grad**（grad dtype，可 fp32） | reduce-scatter 后 |
+| `recomp_scratch` | 重算层反向重物化的该层正向激活（见 §8.5 的修正） | 该层 bwd 结束 |
+| `bwd_scratch` | op 级反向临时物化（如 loss `probs` fp32，对照 `loss.py`） | 该 op bwd 结束 |
 | `swap_buf` | 从 CPU 预取回的激活 | 消费后 |
 | `workspace` | 当前 op 的 kernel scratch | op 结束 |
 
 ```
-peak = O_framework + max over events ( Σ 所有桶 )      # O_framework=allocator 预留+碎片(标定常数)
+peak = max over events ( Σ 上述桶 )  +  framework_reserve(config)   # framework_reserve 见 §8.6，非常数
 ```
 
 ### 8.2 调度与事件 walk
 
-- 1F1B：warm-up（PP−s 个 fwd，累积 `act_live` 到 ≈ PP 份）→ steady（1F1B 交替）→ cool-down；`interleave_num=v` 用交错式。
-- per-op 事件（一步数千个，确定性瞬算）：fwd 分配 output/workspace、pin `saves`、释放无用输入；bwd 分配 grad、消费 `saves`、（重算层）重跑 fwd。
+1F1B：warm-up（PP−1−s 个 fwd）→ steady（1F1B 交替）→ cool-down；`interleave_num=v` 用交错式。
+- **FWD 每层**：`gather_buf=整层权重`（reshard 后即释）+ `workspace` → 采样；pin `saves`（重算层只 pin checkpoint 输入；swap 层 pin 0）→ `act_live`。
+- **BWD 每层（逆序）**：`gather_buf`(re-gather) + `grad_buf`(full grad) + `recomp_scratch`(重算层) + `bwd_scratch`(op) **四者共存** → 采样 → 清零 → 释放该层 pinned `act_live`。
 
-### 8.3 三类峰值影响的精确建模
+### 8.3 大 vocab 的 fp32 loss 区（真机峰值大头）
 
-**① recompute 反向尖峰**：fwd 时重算层 `saves` 即释（`act_live` 降），bwd 走到该层重跑 fwd → `recomp_scratch += 1 层完整激活`，叠在 `persistent + 其余 checkpoint 输入 + grad_buf + 该层 gather` 之上 → **全局峰值常在此处，不在 fwd 末**。
+对照 `loss.py`：`_LogSoftmax` 把 logits **cast fp32**、`log_softmax`(fp32) saved；`_NLLLoss` 反向 `probs=exp(−log_softmax)` 物化 fp32。vocab×seq 巨大时这是峰值主导项。建模：
+- `act_live` += logits(bf16) + **log_softmax(fp32, per-tensor dtype=4)**。
+- lm_head/loss op 的 `bwd_scratch` = **probs(fp32) = 4·S·B·vocab**。
 
-**② FSDP all-gather + 预取双缓冲**：
-```
-gather_buf = (1 + prefetch_depth) · G_layer          # G_layer = 层权重(/tp) gather 成整 bf16
-reshard_after_forward = "always": 用完即释、bwd 再 gather（峰低/通信多）
-                      = "never" : 各层 gather 全程驻留 → gather_buf 累成 Σ层（峰高）
-```
-bwd 另有一轮 all-gather 双缓冲 + reduce-scatter 前的 `grad_buf`。
+### 8.4 grad 不是常驻（真机修正）
 
-**③ swap 预取**：`swap_buf = default_prefetch · 单次预取激活字节`；offload 的 `saves` 从 `act_live` 扣、预取窗口的重新计入。三态（resident/recomputed/offloaded）互斥，不重复扣减。
+fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）；**grad(4B) 是反向瞬态**，reduce-scatter 后即释。故：
+- `persistent`（§6）= param + optimizer state（**剔除 grad**）。
+- grad 进 `grad_buf`（反向瞬态，full-unsharded，grad dtype）。
 
-### 8.4 输出
+### 8.5 recompute 反向的三处修正（⚠ 当前未被真机验证）
 
-报告：**峰值落点事件**（典型两处：fwd 末"在飞激活最满 + 最深预取" vs 首个重算层 bwd"recomp_scratch + grad_buf + gather"）+ 该刻**桶拆解** + 是否 > `ContextConfig.max_device_memory` + 最紧 stage。能解释"为什么 OOM 发生在反向"这类真实现象。
+`recomp_scratch` = 重算层反向重跑 forward 重物化的正向激活。三个问题须修：
+1. **双算 checkpoint 输入**：full 重算层 fwd 时 checkpoint 输入已 pin 进 `act_live`，而 `recomp_scratch=该层 saves 之和`又含层输入 → 应 `recomp_scratch = 该层 saves − checkpoint 输入`。
+2. **应取 forward 峰值工作集，非 saves 之和**：重跑 forward 时非 saved 中间量也瞬时活着，峰值可能 > saves；严格应对该层做一次 **mini-forward 时间线求 max-live**（MLA/MoE 多中间量层尤其）。
+3. **验证缺口**：DSv3 4L/8L 峰值落在 loss 层反向（`bwd_scratch` 主导），`recomp_scratch=0`——**这条对已验证的 1.000/0.996 毫无贡献，是未验证项**。须设计**让重算 transformer 层成为峰值**的配置（大 hidden / 小 vocab / PP 增在飞 microbatch）单独验证它。
+
+### 8.6 `framework_reserve` 必须按配置分解（不是固定常数）
+
+固定常数只在"变层数"下成立（HCCL/comm/flash 缓冲与层数无关），**换并行配置即失效**。分解为可缩放项 + 小残余：
+
+| 分项 | 缩放律 | 来源 |
+|---|---|---|
+| `hccl_buf` | `200MB × 通信组数` | 日志 `hcclBufferSize=200MB`；组数由 `ParallelConfig` 启用的并行域数（world+FSDP+EP+CP+TP+PP…）数出 |
+| `moe_comm` | `~tokens/ep × H × 倍数` | dispatch/combine all-to-all staging，由 op 图 all-to-all 量推 |
+| `flash_ws` | `seq × heads × …` | op 图 attention workspace（峰值处需采到） |
+| `frag` | 池块开销（小、平台固定） | reserved−allocated（实测 ~973MB），唯一保留为标定常数的项 |
+
+→ 前三项随配置自动缩放，仅 `frag` 留作每平台标一次。**须用变并行配置真机点（ep=2 / 4 卡 / 变 seq）标定并验证各分项系数**。
+
+### 8.7 真机验证现状（DeepSeek-V3，2026-06-30）
+
+| 配置 | 静态 persistent | 峰值（结构+分解 reserve） | 真机 | ratio |
+|---|---|---|---|---|
+| 4L FSDP-2 | 3830 vs 3862 | 12472.5 | 12473 | **1.000**（标定点） |
+| 8L FSDP-2 | — | 13896 | 13953 | **0.996**（跨层数泛化） |
+
+**已验证**：persistent（<1%）、loss 区 fp32、FSDP gather/grad、跨层数缩放。
+**未验证（开放项）**：`recomp_scratch`（§8.5，峰值没踩到）；`framework_reserve` 分解（§8.6，仅 1 个并行配置，未跨配置标定）；swap/select-recompute/op-level swap（无真机点）。
+
+> **逐桶验证原则**：每个关键桶须设计一个**能让它主导峰值**的真机配置去单独验证；否则"建了模型但峰值没踩到 = 等于没验证"。
 
 ## 9. 验证（P0，纯软件）
 
 1. **参数守恒**：Σ 全局 param = 已知模型参数量（dense 6.7B / MoE 总量）；各卡 P_dev × 切分度数 = 全局。
 2. **退化**：tp=cp=ep=dp_shard=pp=1、无重算无 swap → 还原单卡公式。
-3. **跨公式互证**：A_layer 对 Megatron 2205.05198 激活公式；S_state 对 ZeRO 16/18 字节/参数律。
+3. **跨公式互证**：A_layer 对 Megatron 2205.05198 激活公式；S_state 对 ZeRO **持久 12–14 B/param（剔 grad）** + 真机常驻（§8.7）。
 4. **单调性**：tp↑→S_state↓、A↓；recompute 开→A↓；ep↑→专家 state↓、MoE 激活↓；pp↑→单 stage state↓ 但在飞激活↑。
 5. **MoE balanced 自洽**：Σ_expert T_local = S·B·topk（不丢 token）。
 
