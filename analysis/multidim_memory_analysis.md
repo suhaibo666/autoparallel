@@ -12,10 +12,16 @@
   其余为峰值时刻 8 桶快照（MiB）；`hccl` = `num_distinct_communicators(pc)`（不同 HCCL 子通信器数，**仅 reserved 池、不进 allocated 峰值**）。
 - 全部数据为 `analyze_matrix.py` 实跑输出（单位 MiB）。`swap_buf` 全程为 0（SwapSpec 未启用），故从表中略去。
 
-> **峰值发生位置（关键）**：除 PP 的 stage 0 外，所有配置的峰值事件都落在 **lm_head 的反向（`bwd@<head>`）**——
-> 此处 `bwd_scratch`（NLL 的 fp32 probs = `4·S·B·vocab` ≈ 2020 MiB）+ lm_head 的 saved logits(bf16)+logsm(fp32)
-> 主导 `act_live`。lm_head **不被 tp/ep 切**、只有一层（不被 pp 拆），是大多数维度下"切不动"的硬底。
-> 这解释了下面多数桶为何不随某些并行维变化。
+> **峰值发生位置（关键）**：所有配置（含 **PP 的 tightest stage**，即含 lm_head 的末 stage）的峰值事件都落在
+> **lm_head 的反向（`bwd@<head>`）**——此处 `bwd_scratch`（NLL 的 fp32 probs = `4·S·B·vocab` ≈ 2020 MiB）
+> + lm_head 的 saved logits(bf16)+logsm(fp32) 主导 `act_live`。lm_head **不被 tp/ep 切**、只有一层（**不可被 pp 拆**），
+> 是所有维度下"切不动"的硬底，恒钉在末 PP stage。这解释了下面多数桶为何不随某些并行维变化。
+
+> **PP 逐 stage 仿真（本次新增）**：评估器对 PP **逐 stage 仿真**——`PeakMemoryReport.per_stage` 含**全部 stage**
+> （层分布由 `parallel_model.py` 切，持久态由 `static_mem.py` 逐 stage 算，激活由 `mem_timeline.py` 按各 stage 的
+> 1F1B warmup 深度 `min(pp-1-stage, m)` 仿真），`tightest_stage` 给出**真实单卡设备峰值**所在。
+> **不同 stage 负载不一致**（末 stage 含 lm_head 最重、早 stage 在飞 microbatch 多但 full 重算下极轻），
+> 故 **PP 的设备峰值必须取 tightest stage，绝不能用 stage 0**（stage 0 会把 PP 收益夸大近 3 倍）。详见 Sweep D。
 
 ---
 
@@ -63,32 +69,44 @@
 `gather_buf`/`grad_buf`/`bwd_scratch` 全不变——峰值在 **lm_head**，其权重不被 tp 切，故峰值处的 gather/grad 缓冲与 tp 无关
 （若峰值落在 transformer 层，gather/grad 才会 ∝1/tp）。
 
-## Sweep D — PP，N=8，dp_shard=2，tp=ep=1（报告 per-stage[0]）
+## Sweep D — PP，N=8，dp_shard=2，tp=ep=1（**全 PP stage 仿真**）
 
-| config | pred_peak | struct_peak | persistent | act_live | gather_buf | grad_buf | recomp_scratch | bwd_scratch | workspace | hccl |
-|---|---|---|---|---|---|---|---|---|---|---|
-| pp=1 | 13896.1 | 11699.1 | 5197.5 | 3156.0 | 441.9 | 883.8 | 0.0 | 2020.0 | 0.0 | 2 |
-| pp=2 |  6082.9 |  3885.9 | 2504.2 |   56.0 | 441.9 | 883.8 | 0.0 |    0.0 | 0.0 | 3 |
-| pp=4 |  5043.2 |  2846.2 | 1478.5 |   42.0 | 441.9 | 883.8 | 0.0 |    0.0 | 0.0 | 3 |
+评估器对 PP **逐 stage 仿真**，设备单卡峰值取 **tightest stage**（含 lm_head 的末 stage），**不是 stage 0**。
 
-stage 拓扑：pp=1 → stage0 = 全 10 layer（含 lm_head），warmup mb=0，peak@bwd(lm_head)；
-pp=2 → stage0 = layer[0..4]（embedding+1 dense+3 moe，**无 lm_head**），warmup mb=1，peak@bwd(layer0)；
-pp=4 → stage0 = layer[0,1]（embedding+dense），warmup mb=3，peak@bwd(layer0)。
+**① 设备峰值（= tightest stage，OOM 相关的真实单卡峰值）**：
 
-**Trend**：per-stage[0] 峰值大降，但**主要不是因为 PP 本身省内存，而是 lm_head 这块巨头(2020 MiB bwd_scratch + ~2.1 GB logits/logsm 激活)被切到了最后一个 stage、离开了 stage 0**：
-stage 0 的 `bwd_scratch=0`、`act_live` 暴跌到 ~56 MiB（只剩在飞 microbatch 的 checkpoint 输入）。
-`persistent` 随 stage 层数减少而降（5197.5→2504.2→1478.5）。在飞 microbatch（warmup 1、3）在 full 重算下每个只 pin 极小 checkpoint 输入，故只给 `act_live` 加几十 MiB，未抵消省下的量。
-**关键 caveat**：stage 0 是**最轻** stage，**不是**真实设备峰值——见下表（tightest stage）。
+| config | device_peak (tightest) | struct_peak | persistent | act_live | gather_buf | grad_buf | bwd_scratch | hccl | 对 pp=1 降幅 |
+|---|---|---|---|---|---|---|---|---|---|
+| pp=1 | 13896.1 (stage0) | 11699.1 | 5197.5 | 3156.0 | 441.9 | 883.8 | 2020.0 | 2 | — |
+| pp=2 | **11335.9** (stage1) | 9138.9 | 2693.2 | 3100.0 | 441.9 | 883.8 | 2020.0 | 3 | −18% |
+| pp=4 | **10980.0** (stage3) | 8783.0 | 2351.3 | 3086.0 | 441.9 | 883.8 | 2020.0 | 3 | −21% |
 
-> **PP tightest-stage（真实单卡峰值）**：评估器 `tightest_stage` 给出的设备峰值远高于 stage 0：
->
-> | config | per-stage[0] | tightest stage | tightest peak | 对 pp=1 降幅 |
-> |---|---|---|---|---|
-> | pp=2 | 6082.9 (stage0) | stage1（含 lm_head） | **11335.9** | −18% |
-> | pp=4 | 5043.2 (stage0) | stage3（含 lm_head） | **10980.0** | −21% |
->
-> lm_head 单层、`bwd_scratch`(2020) + logits/logsm 激活（~3.1 GB）**不可被 PP 拆分**，恒钉在末 stage，
-> 成为 PP 下的真实瓶颈。故 PP 在本缩层 + 巨 vocab 配置下对**设备峰值**只有 ~20% 改善，远小于 per-stage[0] 表面看到的 ~56% 降幅。
+**② 全 stage 仿真明细**（层分布 / 在飞 microbatch / 各 stage 峰值 / 关键桶）：
+
+`pp=2`（n_stages=2，设备峰值 = stage1 的 11335.9）
+
+| stage | layers | inflight_mb | peak | persist | act_live | gather | grad | bwd_scr | event |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | [0–4] | 2 | 6082.9 | 2504.2 | 56.0 | 441.9 | 883.8 | 0.0 | bwd@0 |
+| 1 **(tightest)** | [5–9] | 1 | 11335.9 | 2693.2 | 3100.0 | 441.9 | 883.8 | 2020.0 | bwd@9 |
+
+`pp=4`（n_stages=4，设备峰值 = stage3 的 10980.0）
+
+| stage | layers | inflight_mb | peak | persist | act_live | gather | grad | bwd_scr | event |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | [0–1] | 4 | 5043.2 | 1478.5 | 42.0 | 441.9 | 883.8 | 0.0 | bwd@0 |
+| 1 | [2–3] | 3 | 3668.8 | 683.8 | 84.0 | 114.0 | 227.9 | 0.0 | bwd@3 |
+| 2 | [4–5] | 2 | 3640.8 | 683.8 | 56.0 | 114.0 | 227.9 | 0.0 | bwd@5 |
+| 3 **(tightest)** | [6–9] | 1 | 10980.0 | 2351.3 | 3086.0 | 441.9 | 883.8 | 2020.0 | bwd@9 |
+
+**Trend / 关键结论**：
+- **stage 间负载严重不均**：含 lm_head 的**末 stage 恒为瓶颈**（pp=2 stage1=11336、pp=4 stage3=10980），早 stage 轻得多
+  （pp=4 stage0 仅 5043）。lm_head 的 `bwd_scratch`(2020) + logits/logsm 激活(~3.1 GB)**不可被 PP 拆分**，恒钉末 stage。
+- **早 stage 的在飞 microbatch 几乎不费内存**：full 重算下每个在飞 microbatch 只 pin 极小 checkpoint 输入
+  （pp=4 stage0 有 4 个在飞，`act_live` 仅 42 MiB）→ 1F1B warmup 堆叠**不是**本配置瓶颈，lm_head 才是。
+  （若关掉 full 重算，早 stage 的 warmup 堆叠会成为另一个瓶颈来源——届时逐 stage 仿真同样能捕获。）
+- **PP 对设备峰值仅 ~18–21% 改善**，远小于"只看 stage 0"会误以为的 ~56%（6083/5043）。
+  对比 Sweep A：**FSDP `dp_shard=4` 单独就到 10557.6，已优于 PP-4 的 10980**——本（缩层 + 巨 vocab）配置下 PP 不是降单卡峰值的高效手段。
 
 ## Sweep E — Combinations
 
@@ -97,12 +115,14 @@ stage 0 的 `bwd_scratch=0`、`act_live` 暴跌到 ~56 MiB（只剩在飞 microb
 | dp_shard=2,ep=2 | 12472.5 | 10275.5 | 3829.9 | 3100.0 | 441.9 | 883.8 | 0.0 | 2020.0 | 0.0 | 3 |
 | dp_shard=4,tp=2 | 10227.9 |  8030.9 | 1620.3 | 3065.0 | 441.9 | 883.8 | 0.0 | 2020.0 | 0.0 | 3 |
 | dp_shard=2,tp=2,ep=2 | 11848.2 | 9651.2 | 3240.6 | 3065.0 | 441.9 | 883.8 | 0.0 | 2020.0 | 0.0 | 4 |
-| dp_shard=2,pp=2 (N=8) | 6082.9 | 3885.9 | 2504.2 | 56.0 | 441.9 | 883.8 | 0.0 | 0.0 | 0.0 | 3 |
-| dp_shard=2,tp=2,ep=2,pp=2 (N=8) | 5465.6 | 3268.6 | 1914.9 | 28.0 | 441.9 | 883.8 | 0.0 | 0.0 | 0.0 | 5 |
+| dp_shard=2,pp=2 (N=8) | 11335.9 | 9138.9 | 2693.2 | 3100.0 | 441.9 | 883.8 | 0.0 | 2020.0 | 0.0 | 3 |
+| dp_shard=2,tp=2,ep=2,pp=2 (N=8) | 10617.1 | 8420.1 | 2009.4 | 3065.0 | 441.9 | 883.8 | 0.0 | 2020.0 | 0.0 | 5 |
+
+> 注：含 PP 的两行 `pred_peak` 现报 **tightest stage（设备峰值）**，非 stage 0。
 
 **Trend**：各维叠加效果**可加且单调下降**，无相互抵消异常。`dp_shard=2,ep=2` ≡ `dp_shard=2`（ep 不动峰值，Sweep B）；
 加 tp=2 在其上再省 ~620 MiB（`12472.5→11848.2`）；`dp_shard=4,tp=2` 把 persistent 压到 1620.3（FSDP×TP 双切权重）。
-含 PP 的两行报的是 stage 0（最轻），同样需用 tightest-stage 看真实峰值（见 Sweep D caveat）。
+含 PP 的两行已按 tightest stage 报设备峰值（`dp_shard=2,pp=2`=11335.9，叠 tp2/ep2 进一步到 10617.1，主要省在 persistent）。
 `hccl` 随启用的并行域线性增（最多 5），但**不进 allocated 峰值**。
 
 ---
@@ -139,8 +159,10 @@ stage 0 的 `bwd_scratch=0`、`act_live` 暴跌到 ~56 MiB（只剩在飞 microb
   (a) efsdp 设计使专家持久态对 ep 恒定（专家始终切满 `dp_shard·tp` region）；
   (b) 专家激活虽 ∝1/ep，但在 full 重算下只活在 transformer 反向 `recomp_scratch`，而峰值在 lm_head 处，二者错峰。
   此结论**已被真机 ep=1≈ep=2 佐证**，是正确行为。若未来关掉 full 重算、或峰值移到 MoE 层，EP 才会显现于峰值。
-- **PP 的 per-stage[0] 严重低估设备峰值**：stage 0 不含 lm_head，是最轻 stage；真实单卡峰值由含 lm_head 的末 stage 决定
-  （pp=2: 11335.9, pp=4: 10980.0），PP 对设备峰值仅 ~20% 改善。**读 PP 结果务必看 tightest stage，而非 stage 0。**
+- **PP 逐 stage 仿真、设备峰值取 tightest stage（本次已落地）**：评估器对每个 PP stage 独立仿真（层分布 + 各 stage
+  1F1B warmup 深度），`stage 0` 不含 lm_head、是最轻 stage，用它会把 PP 收益夸大近 3 倍（6083 vs 真实 11336）；
+  真实单卡峰值由含 lm_head 的末 stage 决定（pp=2: 11335.9, pp=4: 10980.0），PP 对设备峰值仅 ~18–21% 改善
+  （本缩层+巨 vocab 配置下甚至不及 FSDP-4 的 10557.6）。`analyze_matrix.py` 现默认对 PP 报 tightest 并打印**全 stage 明细**。
 - **`recomp_scratch`/`workspace` 在所有峰值快照中均为 0**：因峰值统一落在 lm_head 反向（无重算、workspace 已释放）。
   这不代表它们恒为 0——只是从不在峰值时刻；transformer 层反向时 `recomp_scratch` 非 0，但低于 lm_head 峰。
 
