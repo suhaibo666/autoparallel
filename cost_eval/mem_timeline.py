@@ -206,7 +206,10 @@ class MemTimeline:
                         B.gather_buf = _layer_param_bytes(layer)
                         B.grad_buf = _layer_grad_bytes(layer, grad_dtype_bytes)
                         if recompute.is_full(lid):
-                            B.recomp_scratch = _layer_saves_bytes(layer)
+                            # 去双算：checkpoint 输入已在 act_live（fwd 时 pin），不再计入重物化
+                            # TODO(§8.5②): 严格应为该层 forward 的 max-live(mini-fwd 时间线)，非 saves 之和
+                            B.recomp_scratch = max(
+                                0, _layer_saves_bytes(layer) - _checkpoint_input_bytes(layer))
                         B.bwd_scratch = _layer_bwd_scratch(layer)
                         rec(f"bwd@{lid}")
                         B.gather_buf = B.grad_buf = B.recomp_scratch = B.bwd_scratch = 0

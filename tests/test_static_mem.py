@@ -28,7 +28,7 @@ def test_single_device_equals_global_times_bytes():
     pm = ParallelModel(ParallelConfig(), n_layers=2, world_size=1)
     g = ShapeEval().resolve(_spec(), pm)
     out = StaticMem().compute(g, OptimizerSpec.adamw(), pm, cpu_offload=False)
-    assert out[0] == _global_param_numel() * 16
+    assert out[0] == _global_param_numel() * 14   # 持久 b_state=14（param+opt，剔 grad）
 
 
 def test_conservation_under_sharding():
@@ -36,7 +36,7 @@ def test_conservation_under_sharding():
     pm = ParallelModel(ParallelConfig(tp=2, dp_shard=2), n_layers=2, world_size=4)
     g = ShapeEval().resolve(_spec(), pm)
     out = StaticMem().compute(g, OptimizerSpec.adamw(), pm, cpu_offload=False)
-    per_dev_numel = out[0] // 16       # undo state_bytes_per_param
+    per_dev_numel = out[0] // 14       # undo state_bytes_per_param（持久 14）
     assert per_dev_numel * (2 * 2) == _global_param_numel()   # tp * fsdp = 4
 
 

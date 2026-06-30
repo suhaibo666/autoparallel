@@ -10,6 +10,7 @@ from .parallel_model import ParallelModel
 from .shape_eval import ShapeEval
 from .static_mem import StaticMem
 from .mem_timeline import MemTimeline, StagePeak
+from .framework import framework_reserve
 
 
 @dataclass(frozen=True)
@@ -39,9 +40,12 @@ class Evaluator:
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
         g = ShapeEval().resolve(self.spec, pm)
         persistent = StaticMem().compute(g, self.opt, pm, self.pc.cpu_offload)
+        # framework_reserve 按配置分解：HCCL(200MB×组数) + hw.framework_reserve(残余标定项)
+        fr = framework_reserve(self.pc, self.hw.framework_reserve)
         peaks = MemTimeline().simulate(
             g, self.recompute, self.swap, pm, persistent,
-            self.hw.framework_reserve, self.hw.max_device_memory)
+            fr, self.hw.max_device_memory,
+            grad_dtype_bytes=getattr(self.opt, "grad_dtype_bytes", 4))
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         return PeakMemoryReport(per_stage, tightest, any(p.oom for p in per_stage))

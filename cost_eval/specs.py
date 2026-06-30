@@ -25,11 +25,14 @@ class ParallelConfig:
 @dataclass
 class OptimizerSpec:
     type: str = "AdamW"
-    state_bytes_per_param: int = 16          # bf16 param2+grad2+master4+m4+v4
+    # 持久 = param + optimizer state（**剔除 grad**，真机修正 §8.4）
+    state_bytes_per_param: int = 14          # bf16 params: bf16 2 + fp32 master4 + m4 + v4
+    grad_dtype_bytes: int = 4                # 反向瞬态 grad(grad_buf) 的 dtype：fp32=4 / bf16=2
 
     @classmethod
-    def adamw(cls, fp32_grad: bool = False) -> "OptimizerSpec":
-        return cls("AdamW", 18 if fp32_grad else 16)
+    def adamw(cls, params_fp32: bool = False, grad_dtype_bytes: int = 4) -> "OptimizerSpec":
+        # 持久(剔grad): fp32 params=master4+m4+v4=12; bf16 params=bf16 2+master4+m4+v4=14
+        return cls("AdamW", 12 if params_fp32 else 14, grad_dtype_bytes)
 
 
 @dataclass

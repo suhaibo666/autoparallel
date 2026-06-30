@@ -16,7 +16,9 @@ import os
 N = int(os.environ.get("SIM_LAYERS", "4"))   # transformer 层数（与真机 SIM_LAYERS 对齐）
 # 真机实测 (peak_alloc_MiB, resident_MiB) by 层数
 MEASURED = {4: (12473.1, 3862.0), 8: (13953.3, None)}
-FRAMEWORK_RESERVE_MiB = 2197   # 从 4 层标定：框架 comm/workspace/碎片(MoE all-to-all/hccl/flash)
+# framework_reserve 分解(§8.6): 总残余 2197 = HCCL(200×组数, 此配置 2 组=400) + residual(其余)
+# hw.framework_reserve 现在只填 residual；HCCL 由 framework_reserve(pc) 按组数自动加
+RESIDUAL_MiB = 2197 - 200 * 2   # = 1797（MoE comm/flash/cast/碎片，待变配置真机点拆分验证）
 
 d = DimTable(
     H=1792, F=3072, n_heads=8, n_kv=8, head_dim=192, S=4096, B=1, vocab=129280,
@@ -63,17 +65,17 @@ MEASURED_PEAK_MiB, MEASURED_RESIDENT_MiB = MEASURED.get(N, (None, None))
 
 pc = ParallelConfig(dp_shard=2, tp=1, ep=1, pp=1, cp=1, sequence_parallel=True,
                     num_microbatches=1)
-# fp32 AdamW 常驻 = param(4)+m(4)+v(4) = 12 B/param；grad(4B) 是反向瞬态不常驻
-opt = OptimizerSpec(type="AdamW", state_bytes_per_param=12)
+# fp32 AdamW：持久 = param(4)+m(4)+v(4) = 12 B/param；grad(4B) 是反向瞬态(grad_buf)
+opt = OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4)
 ev = Evaluator(spec, pc, opt,
                HardwareSpec(max_device_memory=59 * GiB,
-                            framework_reserve=FRAMEWORK_RESERVE_MiB * MiB),
+                            framework_reserve=RESIDUAL_MiB * MiB),
                RecomputeSpec(mode="full", full_layers=full_layers), SwapSpec())
 rep = ev.evaluate()
 p = rep.per_stage[0]
 b = p.breakdown
 pk = p.peak_bytes / MiB
-print(f"=== DSv3 {N}L  FSDP-2  full-recompute（fp32, 常驻12B/param, framework_reserve={FRAMEWORK_RESERVE_MiB}MiB）===")
+print(f"=== DSv3 {N}L  FSDP-2  full-recompute（fp32, 常驻12B/param, framework_reserve=HCCL(200×组)+residual{RESIDUAL_MiB}MiB）===")
 if MEASURED_RESIDENT_MiB:
     print(f"[静态] 预测常驻 = {b.persistent/MiB:8.1f} MiB  vs 真机 {MEASURED_RESIDENT_MiB:.0f} MiB"
           f"   误差 {abs(b.persistent/MiB-MEASURED_RESIDENT_MiB)/MEASURED_RESIDENT_MiB*100:.1f}%")

@@ -2,7 +2,9 @@ from cost_eval.specs import (
     ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec)
 
 def test_optimizer_adamw_bytes():
-    assert OptimizerSpec.adamw().state_bytes_per_param == 16
+    # 持久 = param+opt（剔 grad）：bf16 params=14, fp32 params=12
+    assert OptimizerSpec.adamw().state_bytes_per_param == 14
+    assert OptimizerSpec.adamw(params_fp32=True).state_bytes_per_param == 12
 
 def test_parallelconfig_defaults_single():
     pc = ParallelConfig()
