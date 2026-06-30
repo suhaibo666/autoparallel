@@ -92,3 +92,26 @@ def test_no_reshard_when_equal():
     from cost_eval.shape_eval import detect_reshard, Placement
     p = Placement(shard={2: "tp"}, partial=None)
     assert detect_reshard(p, p, 64, 2) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — ResolvedGraph + ShapeEval.resolve
+# ---------------------------------------------------------------------------
+
+def _toy_dense_layer():
+    x = TensorRef("x", ("S", "B", "H"))
+    w1 = TensorRef("w1", ("H", "2*F"), shard={1: "tp"}, is_weight=True)
+    h = TensorRef("h", ("S", "B", "2*F"), shard={2: "tp"})
+    op = OpSpec("fc1", OpType.MATMUL, inputs=[x, w1], output=h, params=[w1], saves=[x])
+    return LayerSpec(ops=[op])
+
+
+def test_resolve_graph_groups_by_stage():
+    from cost_eval.shape_eval import ShapeEval
+    spec = ModelSpec("toy", DIMS, ["dense", "dense"], {"dense": _toy_dense_layer()})
+    pm = _pm(tp=8, dp_shard=8, pp=2)
+    g = ShapeEval().resolve(spec, pm)
+    assert set(g.stages.keys()) == {0, 1}
+    op0 = g.stages[0][0].ops[0]
+    assert op0.params[0].local_numel == 8 * (2 * 16 // 8)   # H * (2F/tp)
+    assert op0.saves[0].name == "x"

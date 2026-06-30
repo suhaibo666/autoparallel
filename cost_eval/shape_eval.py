@@ -122,3 +122,70 @@ def detect_reshard(src: Placement, dst: Placement,
     else:
         return None
     return CommSpec(ctype, numel * dtype_bytes, axis)
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — ResolvedOp / ResolvedLayer / ResolvedGraph + ShapeEval
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ResolvedOp:
+    name: str
+    type: str
+    inputs: tuple
+    output: ResolvedTensor
+    params: tuple
+    saves: tuple
+    workspace_bytes: int
+    collectives: tuple
+
+
+@dataclass(frozen=True)
+class ResolvedLayer:
+    layer_id: int
+    layer_type: str
+    ops: tuple
+
+
+@dataclass(frozen=True)
+class ResolvedGraph:
+    stages: dict          # int -> list[ResolvedLayer]
+
+
+class ShapeEval:
+    def resolve(self, spec: ModelSpec, pm) -> ResolvedGraph:
+        """遍历 layer_pattern → stage_of 分组；逐 op 解析 inputs/output/params/saves，
+        算 workspace，按相邻 op 的 placement 不匹配派生 collectives。"""
+        stages: dict = {}
+        for layer_id, ltype in enumerate(spec.layer_pattern):
+            stage = pm.stage_of(layer_id)
+            lspec = spec.get_layer(ltype)
+            r_ops = []
+            produced: dict = {}          # tensor name -> Placement of producer
+            for op in lspec.ops:
+                r_in = tuple(resolve_tensor(t, spec.dims, pm) for t in op.inputs)
+                r_out = resolve_tensor(op.output, spec.dims, pm)
+                r_par = tuple(resolve_tensor(t, spec.dims, pm) for t in op.params)
+                r_sav = tuple(resolve_tensor(t, spec.dims, pm) for t in op.saves)
+                ws = eval_expr(op.workspace, spec.dims) if op.workspace else 0
+                comms = []
+                for t in op.inputs:
+                    src = produced.get(t.name)
+                    c = detect_reshard(
+                        src,
+                        Placement.of(t),
+                        resolve_tensor(t, spec.dims, pm).local_numel,
+                        spec.dims.dtype_bytes,
+                    )
+                    if c:
+                        comms.append(c)
+                r_ops.append(ResolvedOp(
+                    op.name, op.type.value,
+                    r_in, r_out, r_par, r_sav,
+                    ws, tuple(comms),
+                ))
+                produced[op.output.name] = Placement.of(op.output)
+            stages.setdefault(stage, []).append(
+                ResolvedLayer(layer_id, ltype, tuple(r_ops))
+            )
+        return ResolvedGraph(stages)
