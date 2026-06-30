@@ -10,7 +10,12 @@
 
 **设计依据:** [[2026-06-23-pynative-cost-evaluator-design]] / [[2026-06-29-p0-modelspec-and-memory-design]] / [[2026-06-29-evaluator-implementation-design]] / [[2026-06-29-core-modules-m4-m5-m6-internals]]
 
-**代码位置:** `mindformers/pynative/cost_eval/`，测试 `tests/st/test_ut/test_pynative/test_cost_eval/`。
+**代码位置（执行时路径重映射）:** 经核实本机无 mindspore（`import mindformers` 即失败于 `from mindspore import nn`），为保持评估器**离线/解耦**且本机可测，代码落在**独立仓库 `autoparallel` 根**，做成独立包：
+- 代码：~~`mindformers/pynative/cost_eval/`~~ → **`cost_eval/`**
+- 测试：~~`tests/st/test_ut/test_pynative/test_cost_eval/`~~ → **`tests/`**
+- 导入前缀：~~`mindformers.pynative.cost_eval.`~~ → **`cost_eval.`**
+- 跑测试：仓库根 `python -m pytest tests/ -q`
+（下文各 Task 的文件名/类名/逻辑/代码不变，仅按上表替换路径与导入前缀。）
 
 ---
 
