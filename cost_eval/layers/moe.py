@@ -14,7 +14,8 @@ from ..model_spec import DimTable, LayerSpec, OpSpec, OpType, TensorRef
 from .dense import build_dense_decoder
 
 # 每卡 token 数（balanced dispatch 假设 capacity_factor=1）
-TLOCAL = "S*B*topk//ep"
+# 注：ep 切分由 shard={0:"ep"} 在 resolve_tensor 中处理，此处用全量符号
+TLOCAL = "S*B*topk"
 
 
 def build_moe_decoder(d: DimTable) -> LayerSpec:
@@ -52,10 +53,10 @@ def build_moe_decoder(d: DimTable) -> LayerSpec:
     # combine 输出（all-to-all 还原到原始 token 序列）
     comb = TensorRef("comb",  ("S", "B", "H"),                  shard={0: "sp"})
 
-    # ── 专家权重（纯 EP：dim 0 = 专家数//ep，不含 tp）──────────────────────
-    # shape[0] = n_experts//ep 保证 eval_expr 可求值（整除 ep 轴）
-    w1 = TensorRef("e_w1", ("n_experts//ep", "H",      "2*moe_F"), shard={0: "ep"}, is_weight=True)
-    w2 = TensorRef("e_w2", ("n_experts//ep", "moe_F",  "H"),       shard={0: "ep"}, is_weight=True)
+    # ── 专家权重（纯 EP：dim 0 按 ep 轴切分，不含 tp）─────────────────────
+    # shape 用全量维度（n_experts），shard={0:"ep"} 在 resolve_tensor 中做整除
+    w1 = TensorRef("e_w1", ("n_experts", "H",     "2*moe_F"), shard={0: "ep"}, is_weight=True)
+    w2 = TensorRef("e_w2", ("n_experts", "moe_F", "H"),       shard={0: "ep"}, is_weight=True)
 
     ffn_ops = [
         # 1. Router（softmax + top-k 选择，输出 logits 存 backward 用）
