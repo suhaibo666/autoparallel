@@ -317,6 +317,45 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 
 > **逐桶验证原则（已见成效）**：每桶须设计"能让它主导峰值"的真机配置单独验证。ep=2 点正是如此**证伪了一个错误假设**（HCCL 本不在 allocated）——这就是变配置验证的价值。
 
+### 8.8 输出契约：PP **逐 stage 全量 profile**（不是只取 max）
+
+> **核心约定**：内存仿真的产出是**每个 PP stage 各自的完整内存 profile**，而**不是**单一的全局峰值。`tightest_stage` 只是\
+> 为 OOM 判定派生出的便利量，**绝不是唯一产出**。每个 PP stage 跑在**不同的物理设备组**上、**负载彼此不同**，\
+> 因此必须把**所有 stage**都仿真出来、逐 stage 报，供流水线层划分 / 负载均衡 / 逐设备 OOM 决策使用。
+
+仿真器（`mem_timeline.py: MemTimeline.simulate`）对 **`g.stages` 里的每个 stage 独立**跑一遍 §8.2 的事件 walk，
+逐 stage 产出 `StagePeak{stage, peak_bytes, breakdown(8桶快照), peak_event, oom}`。门面（`report.py: Evaluator.evaluate`）
+聚合为：
+
+```python
+@dataclass(frozen=True)
+class PeakMemoryReport:
+    per_stage: list[StagePeak]   # ★ 主产出：全部 stage（按 stage 升序），各带完整 8 桶 breakdown
+    tightest_stage: int          # 派生便利量：peak_bytes 最大的 stage（仅用于"是否 OOM/选谁卡最紧"）
+    oom: bool                    # 任意 stage 超 max_device_memory 即 True（逐 stage 判，非只判 max）
+```
+
+**stage 间为何不同**（两个独立来源，缺一不可，都必须逐 stage 建模）：
+1. **层分布不同**（`parallel_model.py: _layer_to_stage`）：每个 stage 只承载自己那段层；含 embedding / lm_head / loss 的
+   首尾 stage 通常显著重于中间 stage（lm_head 的 fp32 loss 区不可被 PP 拆，恒钉末 stage）。
+2. **在飞 microbatch 数不同**（1F1B warmup 深度 `min(PP−1−s, m)`，§8.2）：靠前的 stage warmup 更深、`act_live` 堆叠更多份
+   microbatch 的 saved 激活（full 重算时每份仅 checkpoint 输入、堆叠很轻；关重算时这是另一处峰值来源）。
+
+**worked example（DSv3 缩层 N=8, dp_shard=2, full 重算；`analyze_matrix.py` 实跑）** —— 同一配置下各 stage 峰值差到 2 倍：
+
+| pp | stage | 层 | 在飞 mb | 峰值 MiB | 主导 | 备注 |
+|---|---|---|---|---|---|---|
+| 2 | 0 | [0–4] | 2 | 6082.9 | persistent | 无 lm_head，轻 |
+| 2 | 1 | [5–9] | 1 | **11335.9** | lm_head bwd_scratch+act | tightest |
+| 4 | 0 | [0–1] | 4 | 5043.2 | persistent | 4 份在飞仅 +42MiB act |
+| 4 | 1 | [2–3] | 3 | 3668.8 | persistent | |
+| 4 | 2 | [4–5] | 2 | 3640.8 | persistent | |
+| 4 | 3 | [6–9] | 1 | **10980.0** | lm_head | tightest |
+
+> 结论与教训：**只读 `per_stage[0]`（最轻 stage）会把 PP 收益夸大近 3 倍**（6083 vs 真实 11336）。消费方（策略搜索 / 选型）
+> 应消费**整条 `per_stage`**：逐 stage 判 OOM、看负载是否均衡（首尾 stage 偏重提示需调 `layers_per_stage` 重新切层）。
+> `tightest_stage` 仅用于"该配置在最紧设备上是否放得下"的快速判定。
+
 ## 9. 验证（P0，纯软件）
 
 1. **参数守恒**：Σ 全局 param = 已知模型参数量（dense 6.7B / MoE 总量）；各卡 P_dev × 切分度数 = 全局。
@@ -327,6 +366,6 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 
 ## 10. P0 交付物与边界
 
-**交付**：`model_spec.py`(数据结构 + 内存契约 `params`/`saves`/`workspace`) + `dense`/`moe` 两张 op 图 + `shape_eval`(符号求值+sharding 代入) + `static_mem`(§6) + `act_mem`(§7，Σ去重 saves) + **`mem_timeline.py`(§8 事件驱动峰值仿真：recompute 反向尖峰 / FSDP 预取双缓冲 / swap 预取)** + 验证单测(§9) + 1 dense + 1 MoE worked config。
+**交付**：`model_spec.py`(数据结构 + 内存契约 `params`/`saves`/`workspace`) + `dense`/`moe` 两张 op 图 + `shape_eval`(符号求值+sharding 代入) + `static_mem`(§6) + `act_mem`(§7，Σ去重 saves) + **`mem_timeline.py`(§8 事件驱动峰值仿真：recompute 反向尖峰 / FSDP 预取双缓冲 / swap 预取)** + **`report.py`(§8.8 门面 `Evaluator` + 输出契约 `PeakMemoryReport`：PP **逐 stage 全量 profile** + 派生 `tightest_stage`/`oom`)** + 验证单测(§9) + 1 dense + 1 MoE worked config。
 
 **边界（→P1）**：所有**时间**（roofline、通信、bubble、swap stall）；EP all-to-all 的**时间**；MLA/CSA/hybrid 的 op 图（P0 先 dense+标准 MoE，§3/§4 的 GQA+SwiGLU 打底）。
