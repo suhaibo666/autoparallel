@@ -199,9 +199,11 @@ def simulate(g, recompute, swap, pc, static_persistent) -> dict[int, StagePeak]:
 
 `StagePeak{peak_bytes, breakdown(8桶+framework), peak_event, oom}`。
 ```
-framework_reserve(pc) = hccl(200MB × 通信组数(pc)) + moe_comm(op图 a2a 量) + flash_ws(seq×heads) + frag(平台小常数)
+framework_reserve(pc, residual) = residual    # allocated 峰值残余, **不含 HCCL**(ep=2 真机修正 §8.6)
+                                               # residual = moe staging + flash_ws + cast + 碎片
+hccl_reserved_buffer(pc) = 200MB × 通信组数    # 在 reserved 池, 仅预测 reserved 时用, 不进 allocated
 ```
-随并行配置自动缩放（§8.6）；仅 `frag` 留作每平台标定。`peak_event` 典型 `"bwd@loss"` / `"bwd@layer_i"`。
+真机验证：`residual` 对 ep 恒定（ep=1/2 均 1.000）；随 seq 的缩放待 seq-varying 点（§8.7）。`peak_event` 典型 `"bwd@loss"` / `"bwd@layer_i"`。
 
 ### M6.5 自检 + 真机验证现状
 

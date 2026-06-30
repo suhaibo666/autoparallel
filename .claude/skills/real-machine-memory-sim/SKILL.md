@@ -134,6 +134,9 @@ MLA op 图（`cost_eval/layers/mla.py`）+ 框架反向瞬态建模已加。对 
 | **峰值 peak（纯结构）** | 10275 MiB | 12473 MiB | ratio **0.82** |
 | **峰值 peak（+ framework_reserve=2197）** | 12472.5 MiB | 12473 MiB | ratio **1.000** ✅ |
 | **8L 峰值（同一 reserve，泛化复验）** | 13896.1 MiB | 13953.3 MiB | ratio **0.996** ✅ |
+| **4L ep=2 峰值（跨 ep，证伪 HCCL 假设）** | 12472.5 MiB | 12474.1 MiB | ratio **1.000** ✅ |
+
+> **ep=2 真机点的关键发现**：多一个 EP 通信组，**allocated 峰值不变**（12473→12474）、**reserved 涨**（13446→13750）→ **HCCL 缓冲在 reserved 池、不在 allocated 峰值**。评估器预测 `max_memory_allocated`(OOM 相关) 故 **HCCL 不计入 framework_reserve**；framework_reserve 经 ep=1/2 验证**对 ep 恒定**。这证伪了之前"HCCL×组数进 allocated"的假设——变配置真机验证的价值。
 
 峰值预测演进：**0.39 →(加 loss 区 fp32)→ 0.66 →(加 FSDP gather/grad + bwd_scratch)→ 0.82 →(标定 reserve)→ 1.00**。
 

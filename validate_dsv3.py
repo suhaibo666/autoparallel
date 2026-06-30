@@ -14,11 +14,12 @@ MiB = 2 ** 20
 GiB = 2 ** 30
 import os
 N = int(os.environ.get("SIM_LAYERS", "4"))   # transformer 层数（与真机 SIM_LAYERS 对齐）
-# 真机实测 (peak_alloc_MiB, resident_MiB) by 层数
-MEASURED = {4: (12473.1, 3862.0), 8: (13953.3, None)}
-# framework_reserve 分解(§8.6): 总残余 2197 = HCCL(200×组数, 此配置 2 组=400) + residual(其余)
-# hw.framework_reserve 现在只填 residual；HCCL 由 framework_reserve(pc) 按组数自动加
-RESIDUAL_MiB = 2197 - 200 * 2   # = 1797（MoE comm/flash/cast/碎片，待变配置真机点拆分验证）
+EP = int(os.environ.get("SIM_EP", "1"))       # 专家并行度（变配置验证）
+# 真机实测 (peak_alloc_MiB, resident_MiB) by (层数, ep)
+MEASURED = {(4, 1): (12473.1, 3862.0), (8, 1): (13953.3, None), (4, 2): (12474.1, None)}
+# framework_reserve(allocated) = residual（MoE staging+flash+cast+碎片，**不含 HCCL**，ep=2 修正 §8.6）
+# 真机 ep=1/2、层4/8 下近恒定 2197；HCCL 在 reserved 池不计入 allocated 峰值
+RESIDUAL_MiB = 2197
 
 d = DimTable(
     H=1792, F=3072, n_heads=8, n_kv=8, head_dim=192, S=4096, B=1, vocab=129280,
@@ -61,9 +62,9 @@ layer_pattern = ["embedding"] + ["mla_dense"] + ["mla_moe"] * (N - 1) + ["lm_hea
 spec = ModelSpec(f"dsv3-{N}L", d, layer_pattern, layer_specs)
 full_layers = set(range(1, N + 1))   # transformer 层（embedding=0, head=N+1 不重算）
 
-MEASURED_PEAK_MiB, MEASURED_RESIDENT_MiB = MEASURED.get(N, (None, None))
+MEASURED_PEAK_MiB, MEASURED_RESIDENT_MiB = MEASURED.get((N, EP), (None, None))
 
-pc = ParallelConfig(dp_shard=2, tp=1, ep=1, pp=1, cp=1, sequence_parallel=True,
+pc = ParallelConfig(dp_shard=2, tp=1, ep=EP, pp=1, cp=1, sequence_parallel=True,
                     num_microbatches=1)
 # fp32 AdamW：持久 = param(4)+m(4)+v(4) = 12 B/param；grad(4B) 是反向瞬态(grad_buf)
 opt = OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4)

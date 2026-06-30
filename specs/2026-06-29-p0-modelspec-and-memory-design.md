@@ -290,30 +290,30 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 2. **应取 forward 峰值工作集，非 saves 之和**：重跑 forward 时非 saved 中间量也瞬时活着，峰值可能 > saves；严格应对该层做一次 **mini-forward 时间线求 max-live**（MLA/MoE 多中间量层尤其）。
 3. **验证缺口**：DSv3 4L/8L 峰值落在 loss 层反向（`bwd_scratch` 主导），`recomp_scratch=0`——**这条对已验证的 1.000/0.996 毫无贡献，是未验证项**。须设计**让重算 transformer 层成为峰值**的配置（大 hidden / 小 vocab / PP 增在飞 microbatch）单独验证它。
 
-### 8.6 `framework_reserve` 必须按配置分解（不是固定常数）
+### 8.6 `framework_reserve`：**allocated 峰值的残余，不含 HCCL**（ep=2 真机修正）
 
-固定常数只在"变层数"下成立（HCCL/comm/flash 缓冲与层数无关），**换并行配置即失效**。分解为可缩放项 + 小残余：
+> ⚠ **ep=2 真机点证伪了"HCCL×组数"假设（2026-06-30）**：ep=1→2 多一个 EP 通信组，**allocated 峰值不变**（12473→12474），但 **reserved 涨**（13446→13750）。结论：**HCCL 通信缓冲在 reserved 池、不在 allocated 峰值**。评估器预测 `max_memory_allocated`（张量占用，OOM 相关），故 **HCCL 不计入 framework_reserve(allocated)**。
 
-| 分项 | 缩放律 | 来源 |
+| 项 | 归属 | 缩放律 / 现状 |
 |---|---|---|
-| `hccl_buf` | `200MB × 通信组数` | 日志 `hcclBufferSize=200MB`；组数由 `ParallelConfig` 启用的并行域数（world+FSDP+EP+CP+TP+PP…）数出 |
-| `moe_comm` | `~tokens/ep × H × 倍数` | dispatch/combine all-to-all staging，由 op 图 all-to-all 量推 |
-| `flash_ws` | `seq × heads × …` | op 图 attention workspace（峰值处需采到） |
-| `frag` | 池块开销（小、平台固定） | reserved−allocated（实测 ~973MB），唯一保留为标定常数的项 |
+| **HCCL 通信缓冲** | **reserved 池**（≠ allocated 峰值） | `200MB × 通信组数`；仅当预测 reserved 时用（`hccl_reserved_buffer(pc)`） |
+| `framework_reserve`(allocated) | allocated 峰值残余 | = MoE all-to-all staging + flash workspace + bf16 cast + 池碎片；**真机 ep=1/2、层 4/8 下近恒定 ≈2197 MiB @ seq4096** |
+| 其随 seq 的缩放（flash_ws） | allocated | 待 **seq-varying 真机点**验证（开放项） |
 
-→ 前三项随配置自动缩放，仅 `frag` 留作每平台标一次。**须用变并行配置真机点（ep=2 / 4 卡 / 变 seq）标定并验证各分项系数**。
+→ 即：HCCL 不进 allocated；`framework_reserve(allocated)` 经 ep=1/2 验证**对 ep 恒定**，随 seq 等的进一步分解待 seq-varying 点。
 
-### 8.7 真机验证现状（DeepSeek-V3，2026-06-30）
+### 8.7 真机验证现状（DeepSeek-V3，2026-06-30，3 个数据点）
 
-| 配置 | 静态 persistent | 峰值（结构+分解 reserve） | 真机 | ratio |
+| 配置 | 静态 persistent | 峰值预测 | 真机 alloc | ratio |
 |---|---|---|---|---|
-| 4L FSDP-2 | 3830 vs 3862 | 12472.5 | 12473 | **1.000**（标定点） |
-| 8L FSDP-2 | — | 13896 | 13953 | **0.996**（跨层数泛化） |
+| 4L FSDP-2 ep1 | 3830 vs 3862 | 12472.5 | 12473 | **1.000**（标定点） |
+| 8L FSDP-2 ep1 | — | 13896 | 13953 | **0.996**（跨层数） |
+| **4L FSDP-2 ep2** | — | 12472.5 | **12474** | **1.000**（跨 ep，证伪 HCCL-in-alloc） |
 
-**已验证**：persistent（<1%）、loss 区 fp32、FSDP gather/grad、跨层数缩放。
-**未验证（开放项）**：`recomp_scratch`（§8.5，峰值没踩到）；`framework_reserve` 分解（§8.6，仅 1 个并行配置，未跨配置标定）；swap/select-recompute/op-level swap（无真机点）。
+**已验证**：persistent（<1%）、loss 区 fp32、FSDP gather/grad、跨层数缩放、**跨 ep（framework_reserve 对 ep 恒定 + HCCL 归 reserved）**。
+**未验证（开放项）**：`recomp_scratch`（§8.5，峰值没踩到）；`framework_reserve` 随 **seq/tp** 的缩放（仅 seq4096/tp1，需 seq-varying / tp-varying 点）；swap/select-recompute（无真机点）。
 
-> **逐桶验证原则**：每个关键桶须设计一个**能让它主导峰值**的真机配置去单独验证；否则"建了模型但峰值没踩到 = 等于没验证"。
+> **逐桶验证原则（已见成效）**：每桶须设计"能让它主导峰值"的真机配置单独验证。ep=2 点正是如此**证伪了一个错误假设**（HCCL 本不在 allocated）——这就是变配置验证的价值。
 
 ## 9. 验证（P0，纯软件）
 
