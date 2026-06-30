@@ -63,3 +63,62 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
         sizes[dim_idx] //= deg
     numel = prod(sizes) if sizes else 1
     return ResolvedTensor(t.name, numel, dims.dtype_bytes, t.is_weight, t.has_ep())
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — Placement algebra + CommSpec + detect_reshard
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Placement:
+    """Placement 描述张量在通信轴上的分布状态。
+
+    shard: tuple of (dim_index, axis) pairs（内部存为有序 tuple，可哈希）。
+    构造时 shard 入参可接受 dict 或 tuple；partial 为未规约轴名或 None。
+    """
+    shard: tuple = ()
+    partial: str = None
+
+    def __init__(self, shard=(), partial=None):
+        items = tuple(sorted(shard.items())) if isinstance(shard, dict) else tuple(shard)
+        object.__setattr__(self, "shard", items)
+        object.__setattr__(self, "partial", partial)
+
+    @staticmethod
+    def of(t: TensorRef) -> "Placement":
+        return Placement(t.shard, t.partial)
+
+
+@dataclass(frozen=True)
+class CommSpec:
+    ctype: str          # all_reduce | reduce_scatter | all_gather | all_to_all
+    volume_bytes: int
+    group_axis: str
+    phase: str = "fwd"
+
+
+def detect_reshard(src: Placement, dst: Placement,
+                   numel: int, dtype_bytes: int):
+    """推导两个 placement 之间的 collective；相等或 src=None 返回 None。"""
+    if src is None or src == dst:
+        return None
+    # 推断 collective 轴
+    if src.partial:
+        axis = src.partial
+    elif src.shard:
+        axis = src.shard[0][1]
+    elif dst.shard:
+        axis = dst.shard[0][1]
+    else:
+        return None
+    if src.partial and not dst.partial and not dst.shard:
+        ctype = "all_reduce"
+    elif src.partial and dst.shard:
+        ctype = "reduce_scatter"
+    elif src.shard and not dst.shard and not dst.partial:
+        ctype = "all_gather"
+    elif src.shard and dst.shard:
+        ctype = "all_to_all"
+    else:
+        return None
+    return CommSpec(ctype, numel * dtype_bytes, axis)

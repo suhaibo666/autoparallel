@@ -67,3 +67,28 @@ def test_resolve_indivisible_raises():
     pm = _pm(tp=3)
     with pytest.raises(ValueError):
         resolve_tensor(TensorRef("y", ("H",), shard={0: "tp"}), DIMS, pm)  # 8%3 != 0
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — Placement / CommSpec / detect_reshard
+# ---------------------------------------------------------------------------
+
+def test_partial_to_replicate_allreduce():
+    from cost_eval.shape_eval import detect_reshard, Placement
+    src = Placement(shard={}, partial="tp")
+    dst = Placement(shard={}, partial=None)
+    c = detect_reshard(src, dst, numel=128, dtype_bytes=2)
+    assert c.ctype == "all_reduce" and c.group_axis == "tp" and c.volume_bytes == 256
+
+
+def test_shard_to_shard_alltoall():
+    from cost_eval.shape_eval import detect_reshard, Placement
+    src = Placement(shard={0: "ep"}, partial=None)
+    dst = Placement(shard={1: "ep"}, partial=None)
+    assert detect_reshard(src, dst, 64, 2).ctype == "all_to_all"
+
+
+def test_no_reshard_when_equal():
+    from cost_eval.shape_eval import detect_reshard, Placement
+    p = Placement(shard={2: "tp"}, partial=None)
+    assert detect_reshard(p, p, 64, 2) is None
