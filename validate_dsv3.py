@@ -12,11 +12,15 @@ from cost_eval.report import Evaluator
 
 MiB = 2 ** 20
 GiB = 2 ** 30
-MEASURED_ALLOC_MiB = 12473.1   # 真机 rank0
+import os
+N = int(os.environ.get("SIM_LAYERS", "4"))   # transformer 层数（与真机 SIM_LAYERS 对齐）
+# 真机实测 (peak_alloc_MiB, resident_MiB) by 层数
+MEASURED = {4: (12473.1, 3862.0), 8: (None, None)}
+FRAMEWORK_RESERVE_MiB = 2197   # 从 4 层标定：框架 comm/workspace/碎片(MoE all-to-all/hccl/flash)
 
 d = DimTable(
     H=1792, F=3072, n_heads=8, n_kv=8, head_dim=192, S=4096, B=1, vocab=129280,
-    n_layers=6,                       # = len(layer_pattern)（含 embedding + head）
+    n_layers=N + 2,                   # = len(layer_pattern)（含 embedding + head）
     n_experts=8, topk=4, n_shared=1, moe_F=1024, capacity_factor=1.0,
     q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128,
     v_head_dim=192, moe_shared_F=1024,
@@ -51,29 +55,33 @@ layer_specs = {
     "mla_moe": build_mla_moe_decoder(d),
     "lm_head": build_lm_head(d),
 }
-layer_pattern = ["embedding", "mla_dense", "mla_moe", "mla_moe", "mla_moe", "lm_head"]
-spec = ModelSpec("dsv3-4L", d, layer_pattern, layer_specs)
+layer_pattern = ["embedding"] + ["mla_dense"] + ["mla_moe"] * (N - 1) + ["lm_head"]
+spec = ModelSpec(f"dsv3-{N}L", d, layer_pattern, layer_specs)
+full_layers = set(range(1, N + 1))   # transformer 层（embedding=0, head=N+1 不重算）
 
-# 真机数据点（4层DSv3 缩层 run）
-MEASURED_PEAK_MiB = 12473.1     # max_memory_allocated（训练反向中峰值）
-MEASURED_RESIDENT_MiB = 3862.0  # 训练后当前 allocated（= param+m+v 常驻，grad 已释）
+MEASURED_PEAK_MiB, MEASURED_RESIDENT_MiB = MEASURED.get(N, (None, None))
 
 pc = ParallelConfig(dp_shard=2, tp=1, ep=1, pp=1, cp=1, sequence_parallel=True,
                     num_microbatches=1)
 # fp32 AdamW 常驻 = param(4)+m(4)+v(4) = 12 B/param；grad(4B) 是反向瞬态不常驻
 opt = OptimizerSpec(type="AdamW", state_bytes_per_param=12)
-ev = Evaluator(spec, pc, opt, HardwareSpec(max_device_memory=59 * GiB),
-               RecomputeSpec(mode="full", full_layers={1, 2, 3, 4}), SwapSpec())
+ev = Evaluator(spec, pc, opt,
+               HardwareSpec(max_device_memory=59 * GiB,
+                            framework_reserve=FRAMEWORK_RESERVE_MiB * MiB),
+               RecomputeSpec(mode="full", full_layers=full_layers), SwapSpec())
 rep = ev.evaluate()
 p = rep.per_stage[0]
 b = p.breakdown
-print("=== DSv3 4L  FSDP-2  full-recompute（fp32 params, 常驻=param+m+v=12B/param）===")
-print(f"[静态验证] 预测常驻 persistent = {b.persistent/MiB:8.1f} MiB   vs 真机常驻 {MEASURED_RESIDENT_MiB:.0f} MiB"
-      f"   误差 {abs(b.persistent/MiB-MEASURED_RESIDENT_MiB)/MEASURED_RESIDENT_MiB*100:.1f}%")
-print(f"[峰值对标] 预测 peak = {p.peak_bytes/MiB:8.1f} MiB   vs 真机 peak {MEASURED_PEAK_MiB:.0f} MiB"
-      f"   ratio {(p.peak_bytes/MiB)/MEASURED_PEAK_MiB:.3f}")
-gap = MEASURED_PEAK_MiB - p.peak_bytes / MiB
-print(f"[缺口] 真机峰值 - 预测 = {gap:8.1f} MiB  ~ 框架反向瞬态(FSDP all-gather全参/full grad/大vocab loss区/MoE all-to-all/hccl+flash workspace)")
+pk = p.peak_bytes / MiB
+print(f"=== DSv3 {N}L  FSDP-2  full-recompute（fp32, 常驻12B/param, framework_reserve={FRAMEWORK_RESERVE_MiB}MiB）===")
+if MEASURED_RESIDENT_MiB:
+    print(f"[静态] 预测常驻 = {b.persistent/MiB:8.1f} MiB  vs 真机 {MEASURED_RESIDENT_MiB:.0f} MiB"
+          f"   误差 {abs(b.persistent/MiB-MEASURED_RESIDENT_MiB)/MEASURED_RESIDENT_MiB*100:.1f}%")
+if MEASURED_PEAK_MiB:
+    print(f"[峰值] 预测 = {pk:8.1f} MiB  vs 真机 {MEASURED_PEAK_MiB:.0f} MiB"
+          f"   ratio {pk/MEASURED_PEAK_MiB:.3f}")
+else:
+    print(f"[峰值] 预测 = {pk:8.1f} MiB  (真机待测)")
 print(f"--- 预测 breakdown (MiB) ---")
 for k in ("persistent", "act_live", "gather_buf", "grad_buf", "recomp_scratch",
           "bwd_scratch", "swap_buf", "workspace", "framework"):

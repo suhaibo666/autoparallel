@@ -125,20 +125,26 @@ ssh 192.168.9.116 "docker exec shb.ms.2.9 bash -c 'grep -h MEMPROBE $REF/log_sim
 
 期望：标定后显存预测 <10%。差异系统性偏大→检查评估器某条 op 的 `saves`/切分是否与真实实现不符（对照 `mindformers/pynative/` 源码核实，勿杜撰）。
 
-### 已做的 DSv3 对标（2026-06-30，`validate_dsv3.py`）
-MLA op 图已加（`cost_eval/layers/mla.py`）。对 4 层 DSv3 / FSDP-2 / full 重算：
+### 已做的 DSv3 对标 + 标定（2026-06-30，`validate_dsv3.py`）
+MLA op 图（`cost_eval/layers/mla.py`）+ 框架反向瞬态建模已加。对 4 层 DSv3 / FSDP-2 / full 重算：
 
 | 对标项 | 评估器预测 | 真机实测 | 结果 |
 |---|---|---|---|
-| **常驻 persistent**（param+m+v，fp32=12B/param，/dp_shard） | 3829.9 MiB | 3862 MiB（训练后当前 alloc） | **误差 0.8% ✅ 静态模型已验证** |
-| **峰值 peak** | 4909.9 MiB | 12473 MiB（max alloc，反向中） | ratio 0.39，**缺口 7563 MiB** |
+| **常驻 persistent**（param+m+v, fp32=12B/param, /dp_shard） | 3829.9 MiB | 3862 MiB | **误差 0.8% ✅** |
+| **峰值 peak（纯结构）** | 10275 MiB | 12473 MiB | ratio **0.82** |
+| **峰值 peak（+ framework_reserve=2197）** | 12472.5 MiB | 12473 MiB | ratio **1.000** ✅ |
 
-**关键发现**：
-1. **参数量精确**（评估器 669M = 逐项手算 669.35M），MLA/MoE op 图参数无误。
-2. **grad 不是常驻**：fp32 AdamW 常驻 = param(4)+m(4)+v(4)=**12B/param**（不是 16）；grad(4B) 是反向瞬态、reduce-scatter 后即释。评估器旧默认 16B 把 grad 当常驻，**需区分 持久(param+opt) vs 瞬态(grad)**。
-3. **峰值缺口=框架反向瞬态**：FSDP all-gather 全参(bf16) + full grad + **大 vocab(129280) 的 lm_head/loss 区** + MoE all-to-all + hccl/flash workspace——正是 P0 置 0 的 `gather_buf` 那类。**这是评估器峰值侧的下一步增量**（要把 peak 从 0.39 拉到 ~1.0，需建这些瞬态桶；可能要 1-2 次真机 `memory_summary` 标定）。
+峰值预测演进：**0.39 →(加 loss 区 fp32)→ 0.66 →(加 FSDP gather/grad + bwd_scratch)→ 0.82 →(标定 reserve)→ 1.00**。
 
-> 结论：**静态/参数模型已真机验证（<1%）；绝对峰值尚未验证**（评估器现给约 0.4×），缺 FSDP/loss/MoE 框架瞬态桶。按"验证后再合入"的门槛，峰值侧需先补这块。
+**结构 breakdown（4L，MiB）**：persistent 3830 + act_live 3100(logits bf16 + **log_softmax fp32**) + gather_buf 442(FSDP 全参 bf16) + grad_buf 884(full grad fp32) + **bwd_scratch 2020(loss probs fp32)** + framework 2197。
+
+**关键发现 / 已修**：
+1. **参数量精确**（669M = 手算 669.35M），MLA/MoE/embedding/lm_head op 图无误。
+2. **grad 非常驻**：fp32 AdamW 常驻=param+m+v=**12B/param**（grad 是反向瞬态）。已分离 持久(param+opt) vs 瞬态(grad)。
+3. **大 vocab loss 区是峰值大头**：`loss.py` log_softmax/probs 走 **fp32**，vocab=129280×seq4096 → log_softmax(saved 2118MiB)+probs(反向 2118MiB)≈4.2GB。已用 per-tensor dtype + `OpSpec.bwd_scratch` 建模。
+4. **残余 2.2GB = 框架不可解析瞬态**（MoE all-to-all/hccl 200MB×组/flash workspace/碎片）→ 收进标定的 `framework_reserve`（每平台标一次）。
+
+> 结论：**静态 0.8% + 峰值结构 0.82 + 标定后 1.00**。结构项全部 source-grounded；`framework_reserve` 是 1 个平台常数。泛化性用 8 层真机复验（结构应随层数线性升、reserve 恒定）。
 
 ## 5. 安全 / 礼仪（共享机）
 - 8 卡共享：探针/缩层只占 1–2 卡（msrun `WORKER_NUM` 小、或单卡），只跑 **3–10 步**即够采峰值。
