@@ -38,6 +38,13 @@ def main():
     print(f"[MEMPROBE] rank={_rank()} peak_alloc_MiB={alloc:.1f} "
           f"peak_reserved_MiB={reserved:.1f} framework_reserve_MiB={reserved - alloc:.1f}",
           flush=True)
+    # rank0 dump 详细拆解（调试评估器用，可注释）
+    if _rank() == 0:
+        try:
+            print("[MEMSUMMARY-BEGIN]\n" + ms.runtime.memory_summary() + "\n[MEMSUMMARY-END]",
+                  flush=True)
+        except Exception as e:
+            print(f"[MEMSUMMARY] unavailable: {e}", flush=True)
 
 
 if __name__ == "__main__":
