@@ -43,6 +43,7 @@ class TensorRef:
     shard: dict = field(default_factory=dict)
     is_weight: bool = False
     partial: Optional[str] = None      # 该张量在此轴上是未规约部分和
+    dtype_bytes: Optional[int] = None  # 覆盖 DimTable.dtype_bytes（如 fp32 loss 张量=4）
 
     def has_ep(self) -> bool:
         return "ep" in self.shard.values()
@@ -57,7 +58,8 @@ class OpSpec:
     output: TensorRef
     params: list = field(default_factory=list)   # is_weight 张量 → param/grad/opt
     saves: list = field(default_factory=list)     # save_for_backward → 激活
-    workspace: Optional[str] = None               # 符号字节表达式
+    workspace: Optional[str] = None               # fwd 期 kernel scratch（符号字节）
+    bwd_scratch: Optional[str] = None             # bwd 期临时物化（符号字节），如 loss probs(fp32)
     attrs: dict = field(default_factory=dict)
 
 

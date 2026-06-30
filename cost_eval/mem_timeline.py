@@ -43,12 +43,13 @@ class Buckets:
     gather_buf: int = 0       # FSDP all-gather 缓冲（P0 简化：暂置 0）
     grad_buf: int = 0         # 参数梯度缓冲（BWD 一层的瞬时峰值）
     recomp_scratch: int = 0   # full 重算时临时重建的 saves
+    bwd_scratch: int = 0      # 反向临时物化（如 loss probs fp32）
     swap_buf: int = 0         # swap prefetch 缓冲（P0 简化：暂置 0）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
-                + self.recomp_scratch + self.swap_buf + self.workspace)
+                + self.recomp_scratch + self.bwd_scratch + self.swap_buf + self.workspace)
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ class MemBreakdown:
     gather_buf: int
     grad_buf: int
     recomp_scratch: int
+    bwd_scratch: int
     swap_buf: int
     workspace: int
     framework: int
@@ -93,8 +95,19 @@ def _checkpoint_input_bytes(layer) -> int:
 
 
 def _layer_param_bytes(layer) -> int:
-    """该层所有 op 的参数张量总字节（BWD grad_buf 估算）。"""
+    """该层 full-unsharded 参数（compute dtype）——FSDP all-gather 缓冲；
+    权重 local_numel 已含 tp/ep 切但未含 fsdp，故即 full-unsharded。"""
     return sum(w.local_numel * w.dtype_bytes for op in layer.ops for w in op.params)
+
+
+def _layer_grad_bytes(layer, grad_dtype_bytes: int) -> int:
+    """反向 reduce-scatter 前的 full-unsharded 梯度（按 grad dtype）。"""
+    return sum(w.local_numel * grad_dtype_bytes for op in layer.ops for w in op.params)
+
+
+def _layer_bwd_scratch(layer) -> int:
+    """该层各 op 反向临时物化之和（如 loss probs fp32）。"""
+    return sum(getattr(op, "bwd_scratch_bytes", 0) for op in layer.ops)
 
 
 def _layer_workspace(layer) -> int:
@@ -115,7 +128,8 @@ class MemTimeline:
     """
 
     def simulate(self, g, recompute, swap, pm, static_persistent: dict,
-                 framework_reserve: int, max_device_memory: int) -> dict:
+                 framework_reserve: int, max_device_memory: int,
+                 grad_dtype_bytes: int = 4) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -153,7 +167,8 @@ class MemTimeline:
                     peak_ev = tag
                     peak_bd = MemBreakdown(
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
-                        B.recomp_scratch, B.swap_buf, B.workspace, framework_reserve,
+                        B.recomp_scratch, B.bwd_scratch, B.swap_buf, B.workspace,
+                        framework_reserve,
                     )
 
             # (mb, layer_id) -> saved bytes currently pinned in act_live
@@ -163,10 +178,12 @@ class MemTimeline:
                 if ev.kind == "FWD":
                     for lid in layer_ids:
                         layer = by_id[lid]
-                        # 1. workspace 临时占用 → 触发峰值采样
+                        # 1. FSDP all-gather 整层参数(compute dtype) + workspace → 采样
+                        B.gather_buf = _layer_param_bytes(layer)
                         B.workspace = _layer_workspace(layer)
                         rec(f"fwd:{lid}")
                         B.workspace = 0
+                        B.gather_buf = 0   # reshard_after_forward(default)：用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
                             saved = _checkpoint_input_bytes(layer)   # 仅保留层入口
@@ -179,22 +196,22 @@ class MemTimeline:
                     # 所有层 pin 完毕 → 该 microbatch FWD 峰
                     rec("fwd_end")
 
-                else:  # BWD（逆序层）
+                else:  # BWD（逆序层）—— FSDP gather + full grad + recompute + bwd_scratch 共存
                     for lid in reversed(layer_ids):
                         layer = by_id[lid]
-                        # 3a. full 重算：先在 recomp_scratch 重建全量 saves → 采样峰值
-                        #     此时 checkpoint 输入仍在 act_live，所以内存是 ckpt+recomp
+                        # 反向某层峰值 = 该层 FSDP 重新 gather 的整层参数(compute)
+                        #   + reduce-scatter 前 full 梯度(grad dtype)
+                        #   + (full 重算)重物化激活 + (op)反向临时物化(如 loss probs)
+                        #   共存，叠在 persistent + 其余 act_live 之上
+                        B.gather_buf = _layer_param_bytes(layer)
+                        B.grad_buf = _layer_grad_bytes(layer, grad_dtype_bytes)
                         if recompute.is_full(lid):
                             B.recomp_scratch = _layer_saves_bytes(layer)
-                            rec(f"bwd_recompute@{lid}")
-                            B.recomp_scratch = 0
-                        # 3b. 释放该层 pinned activation（非重算时为全量 saves，重算时为 ckpt）
-                        #     先释放再算 grad_buf，使无重算情形下 fwd_end 保持为全局峰
+                        B.bwd_scratch = _layer_bwd_scratch(layer)
+                        rec(f"bwd@{lid}")
+                        B.gather_buf = B.grad_buf = B.recomp_scratch = B.bwd_scratch = 0
+                        # 该层反向结束，释放其 pinned 激活
                         B.act_live -= pinned.pop((ev.mb, lid))
-                        # 3c. 参数梯度缓冲（瞬时）→ 采样 → 清零
-                        B.grad_buf = _layer_param_bytes(layer)
-                        rec(f"bwd_grad@{lid}")
-                        B.grad_buf = 0
 
             res[stage] = StagePeak(
                 stage=stage,

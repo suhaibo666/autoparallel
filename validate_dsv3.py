@@ -31,10 +31,18 @@ def build_embedding(d):
 
 
 def build_lm_head(d):
+    # 对照 loss.py：logits(bf16) → cast fp32 → log_softmax(fp32,saved) → NLL；反向物化 probs(fp32)
     x = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
     w = TensorRef("head_w", ("H", "vocab"), is_weight=True)
-    logits = TensorRef("logits_lm", ("S", "B", "vocab"))          # 巨大，saved 给 loss
-    return LayerSpec(ops=[OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x, logits])])
+    logits = TensorRef("logits_lm", ("S", "B", "vocab"))                      # bf16, saved(ctx.logits)
+    logsm = TensorRef("logsm", ("S", "B", "vocab"), dtype_bytes=4)            # fp32, saved
+    loss = TensorRef("loss", ("B",))
+    return LayerSpec(ops=[
+        OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x]),
+        OpSpec("logsoftmax", OpType.NORM, [logits], logsm, saves=[logits]),
+        # NLL 反向 probs=exp(-log_softmax) 物化 fp32（loss.py:80）
+        OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch="4*S*B*vocab"),
+    ])
 
 
 layer_specs = {
@@ -68,5 +76,5 @@ gap = MEASURED_PEAK_MiB - p.peak_bytes / MiB
 print(f"[缺口] 真机峰值 - 预测 = {gap:8.1f} MiB  ~ 框架反向瞬态(FSDP all-gather全参/full grad/大vocab loss区/MoE all-to-all/hccl+flash workspace)")
 print(f"--- 预测 breakdown (MiB) ---")
 for k in ("persistent", "act_live", "gather_buf", "grad_buf", "recomp_scratch",
-          "swap_buf", "workspace", "framework"):
+          "bwd_scratch", "swap_buf", "workspace", "framework"):
     print(f"  {k:16s} = {getattr(b, k)/MiB:9.1f}")

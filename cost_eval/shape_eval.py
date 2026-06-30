@@ -62,7 +62,8 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
                 f"{t.name} dim{dim_idx}={sizes[dim_idx]} 不被 {axis}={deg} 整除")
         sizes[dim_idx] //= deg
     numel = prod(sizes) if sizes else 1
-    return ResolvedTensor(t.name, numel, dims.dtype_bytes, t.is_weight, t.has_ep())
+    dtype_bytes = t.dtype_bytes if t.dtype_bytes is not None else dims.dtype_bytes
+    return ResolvedTensor(t.name, numel, dtype_bytes, t.is_weight, t.has_ep())
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,7 @@ class ResolvedOp:
     saves: tuple
     workspace_bytes: int
     collectives: tuple
+    bwd_scratch_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,7 @@ class ShapeEval:
                 r_par = tuple(resolve_tensor(t, spec.dims, pm) for t in op.params)
                 r_sav = tuple(resolve_tensor(t, spec.dims, pm) for t in op.saves)
                 ws = eval_expr(op.workspace, spec.dims) if op.workspace else 0
+                bws = eval_expr(op.bwd_scratch, spec.dims) if op.bwd_scratch else 0
                 comms = []
                 for t in op.inputs:
                     src = produced.get(t.name)
@@ -182,7 +185,7 @@ class ShapeEval:
                 r_ops.append(ResolvedOp(
                     op.name, op.type.value,
                     r_in, r_out, r_par, r_sav,
-                    ws, tuple(comms),
+                    ws, tuple(comms), bws,
                 ))
                 produced[op.output.name] = Placement.of(op.output)
             stages.setdefault(stage, []).append(
