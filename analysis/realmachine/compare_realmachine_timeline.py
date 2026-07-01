@@ -89,6 +89,7 @@ def main():
     print(f"  峰值比 仿真/真机 = {sim_peak / peak:.4f}   仿真/实测锚点 = {sim_peak / measured:.4f}")
 
     _plot(t, alloc, reserved, events, sim_tot, peak, ipeak, measured)
+    _plot_onestep(t, alloc, base, events, sim_tot, peak, ipeak)
 
 
 def _plot(t, alloc, reserved, events, sim_tot, peak, ipeak, measured):
@@ -121,6 +122,50 @@ def _plot(t, alloc, reserved, events, sim_tot, peak, ipeak, measured):
     fig.savefig(out, dpi=120)
     plt.close(fig)
     print(f"\n[已写] {out}")
+
+
+def _plot_onestep(t, alloc, base, events, sim_tot, peak, ipeak):
+    """把真机曲线放大到**峰值所在的那一个 step**（去掉 warmup/编译/步间），与仿真同尺度对比。
+
+    这样比 comparison.png（整 8.7s 全程）更公平：同为"一个 step 的形状"。
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    # 以峰值为中心，向两侧走到 allocated 回落到接近基线（step 边界），限幅 ±0.35s
+    lo = hi = ipeak
+    thr = base + 1200
+    while lo > 0 and (t[ipeak] - t[lo]) < 0.35 and alloc[lo] > thr:
+        lo -= 1
+    while hi < len(t) - 1 and (t[hi] - t[ipeak]) < 0.35 and alloc[hi] > thr:
+        hi += 1
+    tt = [t[i] - t[ipeak] for i in range(lo, hi + 1)]     # 相对峰值秒
+    aa = alloc[lo:hi + 1]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    ax1.plot(tt, aa, lw=0.9, color="tab:blue")
+    ax1.scatter([0], [peak], color="r", zorder=5, s=25, label=f"peak {peak:.0f} (ScatterAddExt)")
+    ax1.axhline(base, color="gray", ls=":", lw=0.8, label=f"persistent {base:.0f}")
+    ax1.set_xlabel("time relative to peak (s)")
+    ax1.set_ylabel("MB")
+    ax1.set_title("Real machine — ONE step (zoom around loss-backward peak)")
+    ax1.legend(fontsize=8)
+    xs = list(range(len(events)))
+    ax2.plot(xs, sim_tot, "-o", ms=4, color="tab:orange")
+    ax2.scatter([sim_tot.index(max(sim_tot))], [max(sim_tot)], color="r", zorder=5, s=25,
+               label=f"sim peak {max(sim_tot):.0f} (bwd@lm_head)")
+    ax2.set_xticks(xs)
+    ax2.set_xticklabels(events, rotation=60, ha="right", fontsize=7)
+    ax2.set_ylabel("MB")
+    ax2.set_title("Simulator — one step (per-event)")
+    ax2.legend(fontsize=8)
+    fig.tight_layout()
+    out = os.path.join(HERE, "comparison_onestep.png")
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"[已写] {out}  (真机单步窗口 [{t[lo]:.2f},{t[hi]:.2f}]s)")
 
 
 if __name__ == "__main__":

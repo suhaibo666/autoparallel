@@ -323,8 +323,10 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 | 8L FSDP-2 ep1 | — | 13896 | 13953 | **0.996**（跨层数） |
 | **4L FSDP-2 ep2** | — | 12472.5 | **12474** | **1.000**（跨 ep，证伪 HCCL-in-alloc） |
 
-**已验证**：persistent（<1%）、loss 区 fp32、FSDP gather/grad、跨层数缩放、**跨 ep（framework_reserve 对 ep 恒定 + HCCL 归 reserved）**。
-**未验证（开放项）**：`recomp_scratch`（§8.5，峰值没踩到）；`framework_reserve` 随 **seq/tp** 的缩放（仅 seq4096/tp1，需 seq-varying / tp-varying 点）；swap/select-recompute（无真机点）。
+**已验证**：persistent（<1%）、loss 区 fp32、FSDP gather/grad、跨层数缩放、**跨 ep（framework_reserve 对 ep 恒定 + HCCL 归 reserved）**、
+**loss 反向 grad_log_softmax（真机 Profiler 峰值算子 = `ScatterAddExt` 点名，§8.9）**、**内存 timeline 曲线级（峰值+峰值位置，§8.9）**。
+**未验证（开放项）**：`recomp_scratch`（§8.5，峰值没踩到；§8.9 观察到真机 transformer 反向台阶比仿真高 ~1500 MiB，属 off-peak，与 §8.5② 欠建一致，待"让重算层成峰值"的配置验证）；
+`framework_reserve` 随 **seq/tp** 的缩放（仅 seq4096/tp1，需 seq-varying / tp-varying 点）；swap/select-recompute（无真机点）。
 
 > **逐桶验证原则（已见成效）**：每桶须设计"能让它主导峰值"的真机配置单独验证。ep=2 点正是如此**证伪了一个错误假设**（HCCL 本不在 allocated）——这就是变配置验证的价值。
 
@@ -366,6 +368,38 @@ class PeakMemoryReport:
 > 结论与教训：**只读 `per_stage[0]`（最轻 stage）会把 PP 收益夸大近 3 倍**（6083 vs 真实 11336）。消费方（策略搜索 / 选型）
 > 应消费**整条 `per_stage`**：逐 stage 判 OOM、看负载是否均衡（首尾 stage 偏重提示需调 `layers_per_stage` 重新切层）。
 > `tightest_stage` 仅用于"该配置在最紧设备上是否放得下"的快速判定。
+
+### 8.9 内存 timeline 曲线级验证（真机 Profiler vs 仿真逐事件，2026-07-01）
+
+除峰值标量（§8.7）外，还做了**曲线级**对标：真机用 `ms.Profiler(profile_memory=True)` 采逐时刻 allocated
+（`memory_record.csv`）+ 逐算子内存（`operator_memory.csv`）；仿真用 `Evaluator.evaluate(record_timeline=True)`
+产出逐事件 `StagePeak.timeline`。runner/脚本见 skill `real-machine-memory-sim` §6 与 `analysis/realmachine/`。
+
+**DSv3 4L FSDP-2 结果**：
+
+| 项 | 真机 | 仿真 | 结论 |
+|---|---|---|---|
+| persistent 基线 | 3922 MB | 4064 MB | ≈（真机 resident 3862） |
+| 峰值 peak | **12473.1**（算子级） | **12472.5** | **1.0000** |
+| **峰值算子** | **`ScatterAddExt`** | `bwd@lm_head` | **同一处**（loss 反向） |
+
+> **关键佐证**：真机把 allocated 顶到峰值的算子是 `ScatterAddExt` = `loss.py:82` `_NLLLoss.backward` 的 `scatter_add`，
+> 其 `Allocation Total Allocated = 12473.1 MB` = MEMPROBE 峰值。这**独立证实** §8.3 的建模：峰值就在 loss 反向 `grad_log_softmax`
+> 物化那一刻，即 §8.6 从 `framework_reserve` 拆进 `bwd_scratch` 的那 ~2020 MiB 是**真实 loss 激活、非框架开销**。
+
+**如何看"真机 vs 仿真曲线波动差异大"**（这是设计层面的口径，不是 bug）：
+1. **分辨率**：真机 ~2400 采样/s（**逐 kernel** alloc/free）vs 仿真 **13 点/步**（逐 layer 事件）。真机每个 kernel 的微小 alloc/free 都记，
+   仿真把整层塌成 1–2 个采样 → 真机天然锯齿、仿真平滑。**仿真是峰值包络模型，不是逐 kernel tracer**。
+2. **范围**：仿真只建**一个稳态 step 的逻辑峰值包络**；真机曲线是整 8.7s 全程——含 warmup + kernel 编译（首步 hump）、
+   步间/优化器/数据集空档（~7100 MB 平台且采样稀疏）、以及末尾 3 个 fast step。多数"波动"是仿真**故意不建**的运行时行为。
+3. **该匹配的匹配了**：把真机**缩到单个 step**（`comparison_onestep.png`），形状与仿真一致——前向低平 → loss 反向**单尖峰**（ScatterAddExt）
+   → transformer 层反向若干小台阶 → 回落。峰值值 + 峰值位置（用于 OOM/选型的两件事）都对上。
+4. **一个 off-peak 观察**：真机 transformer 层反向台阶 ~6000–6800 MB，比仿真的 bwd@transformer ~4700–5300 高 ~1500 MiB。
+   这在峰值以下、**不影响峰值/OOM 预测**，但与 §8.5② 一致（`recomp_scratch` 当前取 `saves−checkpoint` 而非重跑 forward 的 max-live，**欠建**）——
+   若未来配置把峰值移到重算的 transformer 层，需按 §8.5② 修 `recomp_scratch`。曲线级验证正好把这个欠建**看见**了。
+
+> **口径总结**：内存仿真的验收标准是**峰值大小 + 峰值发生位置**（OOM 与选型只关心这两件），已 1.000 + 算子级点名对上；
+> 曲线细结构（kernel 级抖动、warmup、步间）不在仿真目标内，差异属**分辨率与范围**、非精度问题。
 
 ## 9. 验证（P0，纯软件）
 
