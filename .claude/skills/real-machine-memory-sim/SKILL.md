@@ -184,6 +184,26 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 --local_worker_num=2 --master
 
 > ⚠ 本 skill §4 表中的 `framework_reserve=2197` / `bwd_scratch=2020` 为**旧值**；2026-06-30/07-01 已改为 **177 / 4040**（loss-grad 显式建模，见 `validate_dsv3.py`、设计 §8.3/§8.6）。峰值预测比不变（仍 1.000）。
 
+## 7. DeepSeek-V4 缩层 harness（dsv4_hybrid + mHC + MTP，验证前沿 op 图）
+
+bundled `prep_ds4_sim.py` 生成缩层 DeepSeek-V4 config（`ds4_sim.yaml`），验证统一构建器的 `deepseek_v4` preset。
+**关键：无 hyper_parallel 融合算子也能跑** —— `apply_dsa_kernel_fusion=False` + `use_fused_mhc=False`（走 unfused 小算子回退，`csa.py:187` / `hyper_connection.py` 非融合路径）。
+
+**模型选择**：`model.model_type: deepseek_v4` → pynative 自动选 `PyNativeDeepseekV4ForCausalLM`。前沿开关：
+`experimental_attention_variant: dsv4_hybrid` + `compress_ratios`（**长度=num_layers+mtp**，值∈{0,4,128}）+ `sliding_window/o_groups/o_lora_rank/index_*`；
+`enable_hyper_connections + hc_mult`（残差流数）；`num_nextn_predict_layers`（MTP）。约束：`(num_heads·v_head_dim)%o_groups==0`、`qk_nope+qk_rope==v_head_dim`（v4 head_dim=512→qk_nope=448,v_head=512）。
+
+跑法（同 §3/§6，config 换 ds4_sim.yaml）：
+```bash
+CK=/home/suhaibo/workspace/mindformers/mindformers
+REF=$CK/tests/st/test_multi_cards_cases/test_pynative/test_models/test_deepseek3
+# 传 prep_ds4_sim.py，SIM_LAYERS=4 SIM_STEPS=3 python prep_ds4_sim.py → ds4_sim.yaml
+ASCEND_RT_VISIBLE_DEVICES=<free cards> msrun --worker_num=2 ... run_ds3_memprobe.py --config $REF/ds4_sim.yaml   # 峰值
+# 或 run_ds3_memtimeline.py（+Profiler 峰值算子），对标评估器 deepseek_v4(N) preset
+```
+
+> **状态（2026-07-01）**：harness 已就绪、config 生成通过、run 到 `hccl_world_group` init；**首次实测被共享机占满阻断**（另一用户 8 卡作业，PID 3526705-12，港 16666 被占）——非 v4 问题。机器空闲后一条命令即可补测。前沿 op 图（index_scores O(S²)/kv_gathered O(S·topk)/residual ×n）目前仍是评估器外推（设计 §14），待此真机点。
+
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
 - 设计：`specs/2026-06-29-p0-modelspec-and-memory-design.md` §10 验证阶梯、`specs/2026-06-23-...-design.md` §3 精度预期（η 标定缝）。
