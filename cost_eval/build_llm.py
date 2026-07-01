@@ -17,7 +17,12 @@ from .llm_config import LLMConfig, to_dimtable
 from .model_spec import DimTable, LayerSpec, ModelSpec
 from .layers.registry import ATTN_REGISTRY, FFN_REGISTRY
 from .layers.ffn import build_shared_expert_ops
-from .layers.head import build_embedding_ops, build_head_and_loss_ops
+from .layers.head import build_embedding_ops, build_head_and_loss_ops, build_mtp_ops
+from .layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
+from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
+
+# dsv4_hybrid 层 key 前缀：`dsv4hyb_r{ratio}_{dense|moe}` 编码 per-layer compress_ratio。
+_DSV4_KEY_PREFIX = "dsv4hyb_r"
 
 
 def _is_moe_layer(cfg: LLMConfig, layer_idx: int) -> bool:
@@ -41,45 +46,95 @@ def _is_moe_layer(cfg: LLMConfig, layer_idx: int) -> bool:
     return layer_idx >= k
 
 
+def _compress_ratio(cfg: LLMConfig, layer_idx: int) -> int:
+    """dsv4_hybrid 本层压缩比 = `cfg.csa_compress_ratios[layer_idx]`（设计 §5/§7.3）。
+
+    未给 ratios 或越界时退化为 0（滑窗 == MLA base，内存中性 §7.4）。
+    """
+    ratios = cfg.csa_compress_ratios
+    if ratios and layer_idx < len(ratios):
+        return int(ratios[layer_idx])
+    return 0
+
+
 def gen_layer_pattern(cfg: LLMConfig) -> list:
     """展开层序列（设计 §5 步骤 2）。
 
-    `["embedding"]` + 每个 transformer 层一个 key `f"{attn_type}_{dense|moe}"`
-    （ffn 由 `_is_moe_layer` 决定）+ `["mtp"] * mtp_num_layers` + `["lm_head"]`。
+    `["embedding"]` + 每个 transformer 层一个 decoder key + `["mtp"] * mtp_num_layers`
+    + `["lm_head"]`。decoder key：
+      - 一般 attn：`f"{attn_type}_{dense|moe}"`；
+      - `dsv4_hybrid`：`f"dsv4hyb_r{ratio}_{dense|moe}"`，`ratio=csa_compress_ratios[layer]`
+        （§5：层 key 需编码 per-layer compress_ratio，`_build_layer_ops` 据此内部分支）。
+    ffn（dense/moe）由 `_is_moe_layer` 决定。
     """
     pattern = ["embedding"]
     for layer_idx in range(cfg.num_layers):
         ffn = "moe" if _is_moe_layer(cfg, layer_idx) else "dense"
-        pattern.append(f"{cfg.attn_type}_{ffn}")
+        if cfg.attn_type == "dsv4_hybrid":
+            ratio = _compress_ratio(cfg, layer_idx)
+            pattern.append(f"{_DSV4_KEY_PREFIX}{ratio}_{ffn}")
+        else:
+            pattern.append(f"{cfg.attn_type}_{ffn}")
     pattern += ["mtp"] * cfg.mtp_num_layers
     pattern.append("lm_head")
     return pattern
 
 
+def _use_mhc(cfg: LLMConfig) -> bool:
+    """是否启用 mHC 残差包装（设计 §9）。plain 或 n<=1 → False（DSv3 逐字节不变）。"""
+    return cfg.residual_variant == "mhc" and cfg.num_residual_streams > 1
+
+
+def _build_decoder_body(key: str, cfg: LLMConfig, dims: DimTable) -> list:
+    """组装一个 decoder 层的 body op（attn 段 + ffn 段，未套 mHC）。
+
+    - `dsv4hyb_r{ratio}_{ffn}` → `build_dsv4_hybrid_attn_ops(dims, ratio)`（按 ratio 内部分支，§7.3）。
+    - 其它 `{attn}_{ffn}` → `ATTN_REGISTRY[attn](dims)`。
+    ffn 段：`FFN_REGISTRY[ffn](dims)`（+ `build_shared_expert_ops` 当 moe & 有 shared expert）。
+    """
+    if key.startswith(_DSV4_KEY_PREFIX):
+        # key = f"dsv4hyb_r{ratio}_{ffn}"：先剥 ffn 后缀，再从前缀解析 ratio。
+        prefix, ffn = key.rsplit("_", 1)                    # prefix = f"dsv4hyb_r{ratio}"
+        ratio = int(prefix[len(_DSV4_KEY_PREFIX):])
+        attn_ops = list(build_dsv4_hybrid_attn_ops(dims, ratio))
+    else:
+        attn, ffn = key.rsplit("_", 1)
+        attn_ops = list(ATTN_REGISTRY[attn](dims))
+    ffn_ops = list(FFN_REGISTRY[ffn](dims))
+    if ffn == "moe" and cfg.moe_shared_expert_num > 0:
+        ffn_ops += build_shared_expert_ops(dims)
+    return attn_ops + ffn_ops
+
+
 def _build_layer_ops(key: str, cfg: LLMConfig, dims: DimTable) -> list:
     """为一种层 key 组装 op 列表（设计 §5 步骤 3）。
 
-    - `"embedding"` / `"lm_head"` → 装配件 op-builder（head.py）。
-    - `"mtp"` → Phase 2（Task 2.x）；DeepSeek-V3 无 MTP，此处显式报错。
-    - decoder key `f"{attn}_{dense|moe}"` → `ATTN_REGISTRY[attn](dims) +
-      FFN_REGISTRY[ffn](dims) (+ build_shared_expert_ops(dims) 当 moe & 有 shared expert)`。
+    - `"embedding"` → embedding op（+ mHC 时追加 `hc_expand`：`[S,B,H]→[S,B,n·H]`，§9 stack entry）。
+    - `"lm_head"` → head+loss op（+ mHC 时前插 `hc_collapse`：`[S,B,n·H]→[S,B,H]`，§9 stack exit）。
+    - `"mtp"` → `build_mtp_ops(cfg)`（embedding + 1 decoder 层 + 共享 head，§10）。
+    - decoder key → `_build_decoder_body`；`residual_variant=="mhc"` 时整体套 `mhc_wrap`
+      （每层前插 attn_hc/ffn_hc + 残差承载张量 ×n，§9）。
 
-    **不另加 norm op**：attn 段已内嵌 ln1/residual，ffn 段已内嵌 ln2/residual —— 直接
-    拼接即与 `build_mla_dense_decoder`/`build_mla_moe_decoder` 逐字段一致（1.3 硬门）。
+    **不另加 norm op**：attn 段已内嵌 ln1/residual，ffn 段已内嵌 ln2/residual —— plain 路径下
+    直接拼接即与 `build_mla_dense_decoder`/`build_mla_moe_decoder` 逐字段一致（1.3 硬门）。
     """
     if key == "embedding":
-        return build_embedding_ops(cfg)
+        ops = build_embedding_ops(cfg)
+        if _use_mhc(cfg):
+            ops = list(ops) + [build_hc_expand_op(dims)]
+        return ops
     if key == "lm_head":
-        return build_head_and_loss_ops(cfg)
+        ops = build_head_and_loss_ops(cfg)
+        if _use_mhc(cfg):
+            ops = [build_hc_collapse_op(dims)] + list(ops)
+        return ops
     if key == "mtp":
-        raise NotImplementedError("mtp 层 op 图属 Phase 2（Task 2.x）；DeepSeek-V3 无 MTP")
+        return build_mtp_ops(cfg)
 
-    # decoder key：`{attn}_{ffn}`（attn 可含下划线，如未来 dsv4_hybrid，故 rsplit 一次）
-    attn, ffn = key.rsplit("_", 1)
-    ops = list(ATTN_REGISTRY[attn](dims)) + list(FFN_REGISTRY[ffn](dims))
-    if ffn == "moe" and cfg.moe_shared_expert_num > 0:
-        ops += build_shared_expert_ops(dims)
-    return ops
+    body = _build_decoder_body(key, cfg, dims)
+    if _use_mhc(cfg):
+        body = mhc_wrap(body, cfg.num_residual_streams, dims)
+    return body
 
 
 def build_llm_spec(cfg: LLMConfig) -> ModelSpec:
@@ -94,6 +149,10 @@ def build_llm_spec(cfg: LLMConfig) -> ModelSpec:
     """
     dims = to_dimtable(cfg)
     pattern = gen_layer_pattern(cfg)
+    # n_layers 必须 = len(layer_pattern)（stage 分配用，ParallelModel._layer_to_stage）。
+    # to_dimtable 只算 num_layers+2（embedding+head），未含 MTP 层；此处按实际 pattern 长度校正。
+    # mtp_num_layers==0（如 DSv3）时 len(pattern)==num_layers+2 → 无变化，逐字节不变（1.3 硬门）。
+    dims.n_layers = len(pattern)
     layer_specs = {
         key: LayerSpec(_build_layer_ops(key, cfg, dims))
         for key in dict.fromkeys(pattern)          # 唯一 key，保序去重

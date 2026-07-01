@@ -55,6 +55,92 @@ def deepseek_v3(num_layers: int = 4) -> LLMConfig:
     )
 
 
+def _v4_compress_ratios(num_layers: int) -> tuple:
+    """每层 compress_ratio（`configuration_deepseek_v4.py:250` `compress_ratios=[128]*61+[0]`）。
+
+    真机为「几乎全 HCA(128) + 末层滑窗(0)」；缩层预设改混 `0`(滑窗/MLA base)、`4`(CSA+DSA 索引器)、
+    `128`(HCA) 三档循环，以在小 N 下同时覆盖三条注意力分支（§7.3）。
+    """
+    cycle = (0, 4, 128)
+    return tuple(cycle[i % len(cycle)] for i in range(num_layers))
+
+
+def deepseek_v4(num_layers: int = 4) -> LLMConfig:
+    """DeepSeek-V4 缩层预设（dsv4_hybrid 注意力 + MoE + mHC 残差 + MTP）。
+
+    结构三派发轴（设计 §3/§11）：
+      ① 注意力 = `dsv4_hybrid`（DSA/CSA/HCA，每层按 compress_ratio 分支，§7.3）；
+      ② FFN = MoE + shared expert（first_k_dense=1，与 V3 同）；
+      ③ 残差 = `mhc`（HyperConnection，num_residual_streams=hc_mult=4，§9）；外加 MTP 头。
+
+    **核心维度取自 DeepSeek-V3 缩层锚点**（H=1792 等，复用 V3 已真机验证的 MLA/MoE base，
+    使峰值落在与 DSv3 锚点可比的量级）；**dsv4 前沿字段取自** mindformers
+    `models/deepseek4/configuration_deepseek_v4.py`（下方逐字段标注 file:line）：
+
+      - `attn_type="dsv4_hybrid"`      ← `experimental_attention_variant="dsv4_hybrid"`（:211）
+      - `q_lora_rank=1536`             ← `q_lora_rank=1536`（:182）
+      - `qk_rope_head_dim=64`          ← `qk_rope_head_dim=64`（:183）
+      - `o_lora_rank=1024`             ← `o_lora_rank=1024`（:184）
+      - `o_groups=16`                  ← `o_groups=16`（:185）
+      - `dsa_indexer_n_heads=64`       ← `index_n_heads=64`（:186）
+      - `dsa_indexer_head_dim=128`     ← `index_head_dim=128`（:187）
+      - `dsa_indexer_topk=1024`        ← `index_topk=1024`（:188）
+      - `csa_window_size=128`/`window_size=128` ← `sliding_window=128`（:192，内存中性 §7.4）
+      - `moe_router_topk=6`            ← `num_experts_per_tok=6`（:172）
+      - `moe_ffn_hidden_size=3072`     ← `moe_intermediate_size=3072`（:168）
+      - `moe_shared_expert_num=1`      ← `n_shared_experts=1`（:173）
+      - `num_residual_streams=4`       ← `hc_mult=4`（enable_hyper_connections=True，:195/:212）
+      - `mtp_num_layers=1`             ← `num_nextn_predict_layers=1`（:171）
+      - `vocab_size=129280`            ← `vocab_size=129280`（:167）
+
+    缩放注记：真机 `hidden_size=7168`（:168）、`num_attention_heads=128`（:174）、`head_dim=512`
+    （:181）、`n_routed_experts=384`（:169）、`num_hidden_layers=61`（:170）在此缩到 V3 锚点量级
+    （H=1792、8 头、head_dim=192、8 专家、num_layers=N），`num_key_value_heads=1`（:175，MLA 下惰性）。
+    """
+    return LLMConfig(
+        num_layers=num_layers,
+        # 核心维度（DeepSeek-V3 缩层锚点，复用已验证 MLA/MoE base）
+        hidden_size=1792,
+        num_attention_heads=8,
+        num_query_groups=1,                     # num_key_value_heads=1（:175，MLA 下惰性）
+        vocab_size=129280,                      # :167
+        seq_length=4096,
+        batch_size=1,
+        head_dim=192,
+        # ① dsv4_hybrid 注意力
+        attn_type="dsv4_hybrid",                # experimental_attention_variant（:211）
+        q_lora_rank=1536,                       # :182
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,                    # :183
+        qk_nope_head_dim=128,
+        v_head_dim=192,
+        csa_compress_ratios=_v4_compress_ratios(num_layers),  # compress_ratios（:250）
+        csa_window_size=128,                    # sliding_window（:192）
+        dsa_indexer_n_heads=64,                 # index_n_heads（:186）
+        dsa_indexer_head_dim=128,               # index_head_dim（:187）
+        dsa_indexer_topk=1024,                  # index_topk（:188）
+        o_groups=16,                            # o_groups（:185）
+        o_lora_rank=1024,                       # o_lora_rank（:184）
+        window_size=128,                        # sliding_window（:192，内存中性 §7.4）
+        # ② FFN / MoE（first_k_dense=1 + shared expert，与 V3 同）
+        ffn_hidden_size=3072,
+        num_moe_experts=8,                      # 缩层（真机 n_routed_experts=384，:169）
+        moe_router_topk=6,                      # num_experts_per_tok（:172）
+        moe_ffn_hidden_size=3072,               # moe_intermediate_size（:168）
+        moe_shared_expert_num=1,                # n_shared_experts（:173）
+        moe_shared_ffn_hidden_size=3072,
+        moe_capacity_factor=1.0,
+        first_k_dense_replace=1,
+        # ③ mHC 残差
+        residual_variant="mhc",                 # enable_hyper_connections=True（:212）
+        num_residual_streams=4,                 # hc_mult（:195）
+        # MTP
+        mtp_num_layers=1,                       # num_nextn_predict_layers（:171）
+        loss_type="logsoftmax_nll",
+        compute_dtype_bytes=2,
+    )
+
+
 def llama(
     num_layers: int = 32,
     hidden_size: int = 4096,

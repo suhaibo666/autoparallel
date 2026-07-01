@@ -29,7 +29,10 @@ from __future__ import annotations
 
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
 
-__all__ = ["build_hyper_connection_ops", "mhc_wrap"]
+__all__ = [
+    "build_hyper_connection_ops", "mhc_wrap",
+    "build_hc_expand_op", "build_hc_collapse_op",
+]
 
 # ── mHC 符号维度表达式（与 DimTable 字段名一致，供 eval_expr 求值）──────────────
 # 打包残差流维 n*H（HyperConnectionModule 输入/RMSNorm 维，hyper_connection.py:158）
@@ -104,6 +107,31 @@ def build_hyper_connection_ops(prefix: str, d: DimTable) -> list:
         # 3. sinkhorn → h_res [S,B,n,n]（saved：output_cell 反向 h_res @ streams）
         OpSpec(f"{prefix}_hc_sinkhorn", OpType.ELEMENTWISE, [h_proj], h_res, saves=[h_res]),
     ]
+
+
+def build_hc_expand_op(d: DimTable) -> OpSpec:
+    """block 入口 `expand`：hidden `[S,B,H] → [S,B,n·H]`（源：`transformer_block.py:18-38`
+    `expand_hyper_connection_streams`，tile+reshape）。
+
+    装配器在 embedding 之后插入本 op，把 SP 分布的 `emb_out [S,B,H]` 打包为 n 条残差流
+    `hc_streams [S,B,n·H]`，供 mHC decoder 栈流动（设计 §9 stack entry）。ELEMENTWISE、无 saves
+    （反向即 collapse-mean，无大激活）。
+    """
+    emb = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})
+    streams = TensorRef("hc_streams", ("S", "B", NH), shard={0: "sp"})
+    return OpSpec("hc_expand", OpType.ELEMENTWISE, [emb], streams, saves=[])
+
+
+def build_hc_collapse_op(d: DimTable) -> OpSpec:
+    """block 出口 `collapse`：`[S,B,n·H] → [S,B,H]`（源：`transformer_block.py:18-38`
+    `collapse_hyper_connection_streams`，mean over streams）。
+
+    装配器在 lm_head 之前插入本 op，把 n 条残差流 `hc_streams [S,B,n·H]` 规约回
+    `h_final [S,B,H]`（lm_head 段的输入，设计 §9 stack exit）。ELEMENTWISE、无 saves。
+    """
+    streams = TensorRef("hc_streams", ("S", "B", NH), shard={0: "sp"})
+    h_final = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
+    return OpSpec("hc_collapse", OpType.ELEMENTWISE, [streams], h_final, saves=[])
 
 
 def _ffn_split_index(body_ops: list) -> int:
