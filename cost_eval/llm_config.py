@@ -136,5 +136,7 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         csa_window_size=cfg.csa_window_size,
         moe_shared_F=cfg.moe_shared_ffn_hidden_size,
         capacity_factor=cfg.moe_capacity_factor,
+        # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
+        num_residual_streams=cfg.num_residual_streams,
         dtype_bytes=cfg.compute_dtype_bytes,
     )

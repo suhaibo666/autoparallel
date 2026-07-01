@@ -33,6 +33,9 @@ class DimTable:
     # Shared expert intermediate size (MoE + MLA combined layers)
     moe_shared_F: int = 0
     capacity_factor: float = 1.0
+    # mHC residual streams (设计 §9)：hidden 打包为 n 条残差流 [S,B,n*H]。
+    # 默认 1 → 完全惰性（plain 残差，n*H==H），不影响任何现有 spec。
+    num_residual_streams: int = 1
     dtype_bytes: int = 2
 
     def as_dict(self) -> dict:
