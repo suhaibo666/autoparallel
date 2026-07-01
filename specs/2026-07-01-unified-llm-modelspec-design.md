@@ -265,6 +265,6 @@ config：`loss_type`、`chunk_loss_num`。
 
 ## 14. 非目标 / 已知取舍
 - 数值项（router score/aux-loss/dropout/init/eps）不建模——不改内存结构。
-- dsv4_hybrid 的 index_scores O(S²) 与 kv_gathered O(S·topk) 目前**无真机点**，属评估器外推（待 DSv4 真机验证，类比 P0 §8.7 逐桶验证原则）。
-- mHC 的 `act_live ×n` 未真机验证。
+- **dsv4_hybrid 首个真机锚点（2026-07-01）**：DSv4 缩层 4L / seq2048 / heads64 / v_head512 / FSDP-2 / **无重算**（该 MS 版本 dsv4 全重算路径触发 `recompute() context_fn` 冲突，故关重算跑）/ unfused（`apply_dsa_kernel_fusion=False`）。真机 `max_memory_allocated=21310.6 MiB`；评估器结构峰值 **15558.8 MiB（0.73）**，残差 **5752 MiB**。真机峰值算子 = 一个 **2.5 GB 的 `Add`**（dsv4 激活/反向）+ `ScatterAddExt`(loss，21209.6) 紧邻其下。**诊断**：无重算下 4 层 dsv4 激活全存，评估器**低估了 unfused-DSA 的激活足迹**（kv_gathered/compressed_kv/稀疏中间量 + 那个 2.5GB Add）约 5.7 GB。→ 待办：要么给 dsv4 标一个（大得多的）framework_reserve，要么细化 unfused-DSA 的 saves 建模。index_scores O(S²) 在 seq2048 下仅 ~16MB（非大头，S 小）。
+- mHC 的 `act_live ×n` 仍未真机验证（此 align 配置未开 mHC/MTP）。
 - 精确 CSA-vs-HCA overlap 差异在实施期按源码落 op。

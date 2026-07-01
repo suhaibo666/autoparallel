@@ -203,8 +203,20 @@ R4=$V4/tests/st/test_multi_cards_cases/test_pynative/test_models/test_deepseekv4
 ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 ... run_ds3_memprobe.py --config $R4/dsv4_sim.yaml
 ```
 
-> **状态（2026-07-01，阻断项）**：harness 全就绪、缩层 config 生成通过、机器已空闲（HCCL OK）。**但 `deepseek_v4/mindformers` checkout 正处于 upstream/master 合并中途**——`transformer_config.py`(11 处) + `csa.py`/`gpt_layer_specs.py`/`gpt_model.py`/`rope_utils.py`/`activation.py`/`muon.py`/`trainer/utils.py` 等 **10+ 文件带 `<<<<<<< HEAD` 冲突标记，import 直接语法错**。这是用户在改的 WIP 合并，**不由本 skill 解**。合并完成（或给出干净 v4 checkout）后，一条命令即可跑 dsv4_hybrid 真机点。
-> 备注：`prep_ds4_sim.py`（我手搭的 model_type=deepseek_v4 版）**弃用**——用上面 `prep_dsv4align.py`（走现成 align 基座）。前沿 op 图（index_scores O(S²)/kv_gathered O(S·topk)/residual ×n）仍待此真机点（设计 §14）。
+### 已跑通结果（DSv4 缩层 4L，2026-07-01）
+合并解决后跑通。`prep_dsv4align.py` 现为**自包含**（不依赖已删的 align 基座），关键坑（依序踩过）：
+1. **checkout**：用 `deepseek_v4/mindformers`（有 deepseek4 + dsv4 attn）；harness checkout 无。
+2. **model_type**：`deepseek_v3` + `experimental_attention_variant: dsv4_hybrid`（非 `deepseek_v4`）。
+3. **关融合**：错误 `Fused DSA op 'npu_sparse_attn_shared_kv' unavailable` → 必须 `apply_dsa_kernel_fusion: False`（`force_unfused_dsa` 单独不够）。
+4. **重算**：全重算触发 `recompute() got multiple values for context_fn`（此 MS 版 dsv4 bug）→ 关重算（`prep` 默认 pop 掉 recompute 块；`RECOMPUTE=1` 开回）。空 `full_recompute_layer` 会被 config 校验拒。
+
+| 配置 | 真机 alloc | 评估器结构 | 比 |
+|---|---|---|---|
+| DSv4 4L seq2048 heads64 FSDP-2 **无重算** unfused | **21310.6 MiB** | 15558.8 | **0.73** |
+
+- 真机峰值算子 = **2.5 GB 的 `Add`**（dsv4 激活/反向，21310.55）+ `ScatterAddExt`(loss,21209.6) 紧邻。
+- 残差 5752 MiB = 评估器**低估的 unfused-DSA 激活足迹**（无重算下 4 层全存）。→ 待办：dsv4 专属 framework_reserve 或细化 unfused-DSA saves 建模（设计 §14）。
+- 弃用 `prep_ds4_sim.py`（model_type=deepseek_v4 版）。mHC/MTP 此配置未开，仍待真机点。
 
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
