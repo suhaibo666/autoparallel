@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .obsidian/
+
+# real-machine profiler raw CSVs (large; regenerate from server run)
+analysis/realmachine/*.csv
+analysis/realmachine/prof_mem/

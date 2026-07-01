@@ -155,6 +155,35 @@ MLA op 图（`cost_eval/layers/mla.py`）+ 框架反向瞬态建模已加。对 
 - 跑前 `npu-smi info` 看哪些卡空闲，选空闲卡（`ASCEND_RT_VISIBLE_DEVICES=<id>`）。
 - 不要长跑、不要占满 8 卡、跑完即停；临时脚本用完删。
 
+## 6. 内存 timeline（曲线）比对 —— Profiler(profile_memory) vs 仿真逐事件（已跑通 2026-07-01）
+
+除峰值（§4）外，可采**真机逐时刻 allocated/reserved 曲线**，对标仿真器逐事件曲线（`Evaluator.evaluate(record_timeline=True)` → `StagePeak.timeline`；仿真侧驱动 `timeline_probe.py`）。
+
+**runner**：bundled `run_ds3_memtimeline.py` = trainer + `ms.Profiler(output_path=..., profile_memory=True)` 覆盖 `train()`，`analyse()` 后产出
+`<prof_out>/<host>_<pid>_..._ascend_ms/ASCEND_PROFILER_OUTPUT/`：
+- `memory_record.csv`（`Component,Timestamp(us),Total Allocated(MB),Total Reserved(MB),...`）——**allocated 随时间**曲线；过滤 `Component==MindSpore` 去重。
+- `operator_memory.csv`（`Name,Size(KB),...,Allocation Total Allocated(MB),...`）——**逐算子**；`Allocation Total Allocated` 取 max 的那行 = **峰值算子**。
+
+跑法（同 §3，多加 `ms.Profiler`；cards 0,1，3 步即可）：
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 --local_worker_num=2 --master_port=8126 \
+  --log_dir=$REF/log_tl --join=True $REF/run_ds3_memtimeline.py --config $REF/ds3_sim.yaml --prof_out $REF/prof_mem
+```
+拉 `memory_record.csv`/`operator_memory.csv` 到本地 `analysis/realmachine/`，跑 `compare_realmachine_timeline.py` 出图。
+
+### 已跑通结果（DSv3 4L FSDP-2，2026-07-01）
+| 台阶(MB) | 真机 | 仿真 | 比 |
+|---|---|---|---|
+| persistent | 3922 | 4064 | — |
+| **peak** | **12473.1**（算子级）| **12472.5** | **1.0000** |
+
+- **峰值算子 = `ScatterAddExt`**（= `loss.py:82` `_NLLLoss.backward` 的 `scatter_add`）→ **真机独立证实峰值在 loss 反向 grad_log_softmax 物化那一刻**。
+- 这坐实了 §4 之后的修正：把 loss 反向 `probs+grad_log_softmax`（`bwd_scratch` 4·S·B·vocab→8·S·B·vocab）显式建模、`framework_reserve` **2197→177**（那 2GB 是 loss 激活、非框架开销）。
+- `memory_record` 曲线全局 max=12772（含 ~300MB profiler 开销）；干净峰值以算子级 12473.1 / MEMPROBE 为准。
+- 曲线形状：前向低平（full 重算）→ loss 区抬起 → **loss 反向单尖峰** → 逐层回落，周期性 N 步。详见 `analysis/realmachine/{README.md,comparison.png}`。
+
+> ⚠ 本 skill §4 表中的 `framework_reserve=2197` / `bwd_scratch=2020` 为**旧值**；2026-06-30/07-01 已改为 **177 / 4040**（loss-grad 显式建模，见 `validate_dsv3.py`、设计 §8.3/§8.6）。峰值预测比不变（仍 1.000）。
+
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
 - 设计：`specs/2026-06-29-p0-modelspec-and-memory-design.md` §10 验证阶梯、`specs/2026-06-23-...-design.md` §3 精度预期（η 标定缝）。
