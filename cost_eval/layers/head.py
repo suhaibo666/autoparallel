@@ -23,26 +23,41 @@ def build_embedding_ops(cfg: LLMConfig) -> list:
     return [OpSpec("embedding", OpType.ELEMENTWISE, [], out, params=[w], saves=[])]
 
 
+_LOSS_TYPES = ("logsoftmax_nll", "chunked", "vocab_parallel_ce")
+
+
 def build_head_and_loss_ops(cfg: LLMConfig) -> list:
-    """lm_head + loss 段（3 op），逐字段同 `validate_dsv3.build_lm_head`。
+    """lm_head + loss 段（3 op），按 `cfg.loss_type` 分支（设计 §10）。
 
     对照 loss.py：logits(bf16) → cast fp32 → log_softmax(fp32,saved) → NLL；
     反向物化 probs(fp32)。NLL 反向同时物化 probs=exp(-log_softmax) 与 scatter_add 出的
-    grad_log_softmax，二者皆 fp32 满 vocab、与 saved log_softmax 共存（loss.py:80-82）
+    grad_log_softmax，二者皆 fp32 满 vocab、与 saved log_softmax 共存（loss.py:185-196）
     → ``bwd_scratch="8*S*B*vocab"`` = 2×(4·S·B·vocab)。
+
+    **loss 变体（设计 §10，仅改 loss 区，不动 head 权重语义）**：
+      - ``logsoftmax_nll``（默认，`_LogSoftmax`+`_NLLLoss`）：**逐字节不变**（DSv3 硬门）。
+      - ``chunked``（`_ChunkCrossEntropyLoss`，loss.py:376-465）：分块反向一次只物化 1/k 满
+        vocab 梯度（`grad_logits_chunks` 逐块，:442-464）→ `bwd_scratch = 8*S*B*vocab // k`
+        （k=`chunk_loss_num`，guard ≥1）。
+      - ``vocab_parallel_ce``（`_VocabParallelCrossEntropy`，loss.py:95-134）：logits 按 vocab
+        切（tp），`local_logits [N,V_local]`（:105-113），loss 区 logits/logsm/probs 皆 ∝1/tp。
+        `ctx.exp_vals`（softmax 分子，:120）保存供反向 → 建为 sharded `probs` save。
 
     ``tie_word_embeddings=True`` 时 lm_head 复用 embedding 权重（无独立 head_w 参数，
     ``params=[]``，不重复计入 vocab×H 持久量）；DeepSeek-V3 tie=False，走默认路径，
     逐字段等于 `validate_dsv3.build_lm_head`。
     """
-    if cfg.loss_type != "logsoftmax_nll":
+    if cfg.loss_type not in _LOSS_TYPES:
         raise NotImplementedError(
-            f"loss_type={cfg.loss_type!r} 暂未建 op 图（Phase 2：chunked / vocab_parallel_ce）")
+            f"loss_type={cfg.loss_type!r} 暂未建 op 图（支持：{_LOSS_TYPES}）")
+
+    # vocab_parallel_ce：loss 区大张量按 vocab 轴（dim 2 of [S,B,vocab]）切 tp；其余变体不切。
+    vshard = {2: "tp"} if cfg.loss_type == "vocab_parallel_ce" else {}
 
     # 对照 loss.py：logits(bf16) → cast fp32 → log_softmax(fp32,saved) → NLL；反向物化 probs(fp32)
     x = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
-    logits = TensorRef("logits_lm", ("S", "B", "vocab"))                      # bf16, saved(ctx.logits)
-    logsm = TensorRef("logsm", ("S", "B", "vocab"), dtype_bytes=4)            # fp32, saved
+    logits = TensorRef("logits_lm", ("S", "B", "vocab"), shard=dict(vshard))    # bf16, saved(ctx.logits)
+    logsm = TensorRef("logsm", ("S", "B", "vocab"), shard=dict(vshard), dtype_bytes=4)  # fp32, saved
     loss = TensorRef("loss", ("B",))
 
     if cfg.tie_word_embeddings:
@@ -53,9 +68,78 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
         w = TensorRef("head_w", ("H", "vocab"), is_weight=True)
         head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x])
 
+    # NLL 反向：默认/chunked 用 bwd_scratch（满 vocab 瞬态物化）；vocab_parallel 用 sharded probs save。
+    if cfg.loss_type == "vocab_parallel_ce":
+        # ctx.exp_vals [N,V_local]（loss.py:120）→ softmax 分子，∝1/tp；建为 sharded save。
+        probs = TensorRef("probs", ("S", "B", "vocab"), shard={2: "tp"}, dtype_bytes=4)
+        nll_op = OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss,
+                        saves=[logsm, probs], bwd_scratch=None)
+    else:
+        if cfg.loss_type == "chunked":
+            # 分块 CE：一次物化 1/k 满 vocab 梯度（loss.py:442-464）→ bwd_scratch ÷ k。
+            k = cfg.chunk_loss_num if cfg.chunk_loss_num >= 1 else 1
+            bwd = f"8*S*B*vocab//{k}"
+        else:
+            bwd = "8*S*B*vocab"
+        # NLL 反向同时物化 probs 与 grad_log_softmax（fp32 满 vocab，与 saved log_softmax 共存）
+        nll_op = OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch=bwd)
+
     return [
         head_op,
         OpSpec("logsoftmax", OpType.NORM, [logits], logsm, saves=[logits]),
-        # NLL 反向同时物化 probs 与 grad_log_softmax（fp32 满 vocab，与 saved log_softmax 共存）
-        OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch="8*S*B*vocab"),
+        nll_op,
     ]
+
+
+def build_mtp_ops(cfg: LLMConfig) -> list:
+    """MTP 头 op 列表（设计 §10「MTP 头 ≈ embedding + 1 decoder 层 + head」）。
+
+    忠实映射 `multi_token_prediction.py` `MultiTokenPredictionLayer`（:245-404）：
+      - 共享 embedding（对 roll 后的 input_ids，:441）→ `decoder_input [S,B,H]`。
+      - `enorm(decoder_input)` + `hnorm(hidden_states)`（RMSNorm，:375-376）。
+      - `cat((decoder_input, hidden_states), -1)` → `[S,B,2H]`（:379），
+        `eh_proj` `Linear(2H → H)`（:304-312/:380）→ `[S,B,H]`。
+      - 1 个 transformer 层（`cfg.attn_type` 的 attn + dense/moe ffn，:387）。
+      - 共享 head + loss（`process_mtp_loss` 用同一 output_layer + CrossEntropyLoss，:629/:647）。
+
+    op 序列：embedding(1) + enorm/hnorm/eh_cat/eh_proj(4) + decoder(attn+ffn) + head+loss(3)。
+    """
+    from ..llm_config import to_dimtable
+    from .registry import ATTN_REGISTRY, FFN_REGISTRY
+    from .ffn import build_shared_expert_ops
+
+    dims = to_dimtable(cfg)
+    ops = list(build_embedding_ops(cfg))          # 共享 embedding（:441）
+
+    # ── MTP 专属投影：enorm / hnorm / cat / eh_proj（2H → H，:375-380）─────────────
+    dec_in = TensorRef("decoder_input", ("S", "B", "H"), shard={0: "sp"})   # embedding 输出（roll 后）
+    hid = TensorRef("mtp_hidden", ("S", "B", "H"), shard={0: "sp"})         # 主干 hidden_states
+    en_out = TensorRef("enorm_out", ("S", "B", "H"))
+    hn_out = TensorRef("hnorm_out", ("S", "B", "H"))
+    eh_cat = TensorRef("eh_cat", ("S", "B", "2*H"))                          # cat → 2H（:379）
+    eh_out = TensorRef("x", ("S", "B", "H"), shard={0: "sp"})               # eh_proj 输出 → decoder 输入
+    eh_w = TensorRef("eh_w", ("2*H", "H"), is_weight=True)                   # Linear(2H → H，:304-312)
+    ops += [
+        OpSpec("enorm", OpType.NORM, [dec_in], en_out, saves=[dec_in]),
+        OpSpec("hnorm", OpType.NORM, [hid], hn_out, saves=[hid]),
+        OpSpec("eh_cat", OpType.ELEMENTWISE, [en_out, hn_out], eh_cat, saves=[]),
+        OpSpec("eh_proj", OpType.MATMUL, [eh_cat, eh_w], eh_out, params=[eh_w], saves=[eh_cat]),
+    ]
+
+    # ── 1 个 decoder 层（cfg.attn_type 的 attn + dense/moe ffn，:387）─────────────
+    if cfg.attn_type == "dsv4_hybrid":
+        from .dsv4_hybrid import build_dsv4_hybrid_attn_ops
+        ratios = cfg.csa_compress_ratios
+        ratio = ratios[-1] if ratios else 0
+        attn_ops = build_dsv4_hybrid_attn_ops(dims, ratio)
+    else:
+        attn_ops = list(ATTN_REGISTRY[cfg.attn_type](dims))
+    ffn = "moe" if cfg.num_moe_experts else "dense"
+    ffn_ops = list(FFN_REGISTRY[ffn](dims))
+    if ffn == "moe" and cfg.moe_shared_expert_num > 0:
+        ffn_ops += build_shared_expert_ops(dims)
+    ops += attn_ops + ffn_ops
+
+    # ── 共享 head + loss（final_layernorm 由 head 段的 log_softmax 前的 lm_head 承接）──
+    ops += build_head_and_loss_ops(cfg)
+    return ops
