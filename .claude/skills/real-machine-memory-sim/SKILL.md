@@ -189,20 +189,22 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 --local_worker_num=2 --master
 bundled `prep_ds4_sim.py` 生成缩层 DeepSeek-V4 config（`ds4_sim.yaml`），验证统一构建器的 `deepseek_v4` preset。
 **关键：无 hyper_parallel 融合算子也能跑** —— `apply_dsa_kernel_fusion=False` + `use_fused_mhc=False`（走 unfused 小算子回退，`csa.py:187` / `hyper_connection.py` 非融合路径）。
 
-**模型选择**：`model.model_type: deepseek_v4` → pynative 自动选 `PyNativeDeepseekV4ForCausalLM`。前沿开关：
-`experimental_attention_variant: dsv4_hybrid` + `compress_ratios`（**长度=num_layers+mtp**，值∈{0,4,128}）+ `sliding_window/o_groups/o_lora_rank/index_*`；
-`enable_hyper_connections + hc_mult`（残差流数）；`num_nextn_predict_layers`（MTP）。约束：`(num_heads·v_head_dim)%o_groups==0`、`qk_nope+qk_rope==v_head_dim`（v4 head_dim=512→qk_nope=448,v_head=512）。
+**⚠ 正确 checkout 与 model_type（实测踩过）**：
+- v4 代码在 **`/home/suhaibo/workspace/deepseek_v4/mindformers`**（v4 主代码 + `test_deepseekv4/` 现成 config）；harness checkout `mindformers/mindformers` **只有 deepseek3、无 deepseek4**。
+- **不要用 `model_type: deepseek_v4`**（该 config 类未在此路径注册 → `Can't find class type config ... deepseek_v4`）。用 **`model_type: deepseek_v3` + `experimental_attention_variant: dsv4_hybrid` + `force_unfused_dsa: true`**（现成 `test_deepseekv4/dsv4_align_naive_fsdp.yaml` 就是这么写的）。
+- unfused 关键 flag 是 **`force_unfused_dsa: true`**（不是 `apply_dsa_kernel_fusion`）。
+- 现成基座 config：`test_deepseekv4/dsv4_align_naive_fsdp.yaml`（naive=unfused FSDP，hidden1792/heads64/v_head512/qk_nope448/seq2048/12层/csa_ratios/MoE4-2/**无 mHC 无 MTP**）。约束：`(num_heads·v_head_dim)%o_groups==0`、`qk_nope+qk_rope==v_head_dim`。
 
-跑法（同 §3/§6，config 换 ds4_sim.yaml）：
+跑法：bundled `prep_dsv4align.py` 读该 align 基座 → 缩层 + 合成数据 → `dsv4_sim.yaml`：
 ```bash
-CK=/home/suhaibo/workspace/mindformers/mindformers
-REF=$CK/tests/st/test_multi_cards_cases/test_pynative/test_models/test_deepseek3
-# 传 prep_ds4_sim.py，SIM_LAYERS=4 SIM_STEPS=3 python prep_ds4_sim.py → ds4_sim.yaml
-ASCEND_RT_VISIBLE_DEVICES=<free cards> msrun --worker_num=2 ... run_ds3_memprobe.py --config $REF/ds4_sim.yaml   # 峰值
-# 或 run_ds3_memtimeline.py（+Profiler 峰值算子），对标评估器 deepseek_v4(N) preset
+V4=/home/suhaibo/workspace/deepseek_v4/mindformers
+R4=$V4/tests/st/test_multi_cards_cases/test_pynative/test_models/test_deepseekv4
+# 传 prep_dsv4align.py + run_ds3_memprobe.py 到 $R4；PYTHONPATH=$V4；SIM_LAYERS=4 python prep_dsv4align.py
+ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 ... run_ds3_memprobe.py --config $R4/dsv4_sim.yaml
 ```
 
-> **状态（2026-07-01）**：harness 已就绪、config 生成通过、run 到 `hccl_world_group` init；**首次实测被共享机占满阻断**（另一用户 8 卡作业，PID 3526705-12，港 16666 被占）——非 v4 问题。机器空闲后一条命令即可补测。前沿 op 图（index_scores O(S²)/kv_gathered O(S·topk)/residual ×n）目前仍是评估器外推（设计 §14），待此真机点。
+> **状态（2026-07-01，阻断项）**：harness 全就绪、缩层 config 生成通过、机器已空闲（HCCL OK）。**但 `deepseek_v4/mindformers` checkout 正处于 upstream/master 合并中途**——`transformer_config.py`(11 处) + `csa.py`/`gpt_layer_specs.py`/`gpt_model.py`/`rope_utils.py`/`activation.py`/`muon.py`/`trainer/utils.py` 等 **10+ 文件带 `<<<<<<< HEAD` 冲突标记，import 直接语法错**。这是用户在改的 WIP 合并，**不由本 skill 解**。合并完成（或给出干净 v4 checkout）后，一条命令即可跑 dsv4_hybrid 真机点。
+> 备注：`prep_ds4_sim.py`（我手搭的 model_type=deepseek_v4 版）**弃用**——用上面 `prep_dsv4align.py`（走现成 align 基座）。前沿 op 图（index_scores O(S²)/kv_gathered O(S·topk)/residual ×n）仍待此真机点（设计 §14）。
 
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
