@@ -266,7 +266,14 @@ config：`loss_type`、`chunk_loss_num`。
 ## 14. 非目标 / 已知取舍
 - 数值项（router score/aux-loss/dropout/init/eps）不建模——不改内存结构。
 - **dsv4_hybrid 首个真机锚点（2026-07-01）**：DSv4 缩层 4L / seq2048 / heads64 / v_head512 / FSDP-2 / **无重算**（该 MS 版本 dsv4 全重算路径触发 `recompute() context_fn` 冲突，故关重算跑）/ unfused（`apply_dsa_kernel_fusion=False`）。真机 `max_memory_allocated=21310.6 MiB`；评估器结构峰值 **15558.8 MiB（0.73）**，残差 **5752 MiB**。真机峰值算子 = 一个 **2.5 GB 的 `Add`**（dsv4 激活/反向）+ `ScatterAddExt`(loss，21209.6) 紧邻其下。**诊断**：无重算下 4 层 dsv4 激活全存，评估器**低估了 unfused-DSA 的激活足迹**（kv_gathered/compressed_kv/稀疏中间量 + 那个 2.5GB Add）约 5.7 GB。index_scores O(S²) 在 seq2048 下仅 ~16MB（非大头，S 小）。
-- **fused 分支（2026-07-01，依赖阻断）**：容器 `hyper_parallel` build（`/home/suhaibo/workspace/mindformers/hyper-parallel/`）**缺核心融合稀疏注意力算子 `npu_sparse_attn_shared_kv`**（有 `npu_mhc_*` + indexer loss/softmax，但没这个）→ fused DSA **在本容器跑不了**。**推理（源码 grounded，未实测）**：fused `npu_sparse_attn_shared_kv` 把 gather+QK+softmax+AV 融进**一个 kernel**、中间量走 kernel scratch **不物化成 MindSpore 张量**（unfused 的 `unfused_compressed_sparse_attn` csa.py:187 才逐个物化 kv_gathered/scores/attn_weights + 那 2.5GB Add）。故 **fused 峰值应显著低于 unfused 21310、更接近评估器 15558**。即：**评估器的 dsv4 op 图对应的是 fused（生产）内存画像，不是 unfused 调试路径**；unfused 的 +5.7GB 是小算子物化开销、fused 规避。
-- **两个混淆项使 0.73 是最坏情形**：①无重算（生产开重算→峰值移到 loss、像 DSv3 那样好预测）；②unfused（生产用 fused→无中间量爆炸）。生产配置（重算+fused）预计远好于 0.73。**关闭 gap 需**：完整 hyper_parallel build 跑 fused 实测 + 修 dsv4 重算 bug 后带重算实测。
+- **fused 分支（2026-07-01，已实测 —— 验证到 0.9%）✅**：使能 = 源 vendor OPP 环境变量 `/home/suhaibo/vendors/custom_transformer/bin/set_env.bash`（设 `ASCEND_CUSTOM_OPP_PATH`+`LD_LIBRARY_PATH`）**且** PYTHONPATH 前置 v4 版 hyper_parallel `/home/suhaibo/workspace/deepseek_v4/hyper-parallel`（旧 `mindformers/hyper-parallel` 缺 `npu_sparse_attn_shared_kv` 的 python wrapper、会 shadow）。同配置（4L/seq2048/无重算）：
+
+  | 路径 | 真机峰值 | 峰值算子 | 对评估器 15558.8 |
+  |---|---|---|---|
+  | **fused（生产）** | **15415.5 MiB** | **`ScatterAddExt`(loss)** | **1.009（0.9% 高）✅** |
+  | unfused（调试） | 21310.6 MiB | 2.5GB `Add`+ScatterAddExt | 0.73 |
+
+  **结论**：评估器的 dsv4 op 图**对应 fused（生产）内存画像**——峰值值 0.9%、峰值位置**同为 loss `ScatterAddExt`**（与 DSv3 同签名）。fused `npu_sparse_attn_shared_kv` 把 gather+QK+softmax+AV 融进一个 kernel、中间量走 scratch 不物化；unfused（`unfused_compressed_sparse_attn` csa.py:187）逐个物化 kv_gathered/scores/attn_weights + 那 2.5GB Add，故 +5.9GB。**那 +5.9GB 是 unfused 小算子物化开销、fused 规避，评估器正确地不计**。→ **dsv4 前沿 op 图已真机验证到 ~1%（对生产 fused 路径），无需 dsv4 专属大 reserve。** 0.73-vs-unfused 只是调试路径的物化开销。
+- **仍待验证**：mHC 的 `act_live ×n`（此 align 配置未开 mHC/MTP）；带重算路径（此 MS 版本 dsv4 全重算触发 `recompute() context_fn` bug，待修）。
 - mHC 的 `act_live ×n` 仍未真机验证（此 align 配置未开 mHC/MTP）。
 - 精确 CSA-vs-HCA overlap 差异在实施期按源码落 op。

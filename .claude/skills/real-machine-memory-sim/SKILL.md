@@ -210,13 +210,17 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 ... run_ds3_memprobe.py --con
 3. **关融合**：错误 `Fused DSA op 'npu_sparse_attn_shared_kv' unavailable` → 必须 `apply_dsa_kernel_fusion: False`（`force_unfused_dsa` 单独不够）。
 4. **重算**：全重算触发 `recompute() got multiple values for context_fn`（此 MS 版 dsv4 bug）→ 关重算（`prep` 默认 pop 掉 recompute 块；`RECOMPUTE=1` 开回）。空 `full_recompute_layer` 会被 config 校验拒。
 
-| 配置 | 真机 alloc | 评估器结构 | 比 |
+| 配置（4L seq2048 heads64 FSDP-2 无重算） | 真机 alloc | 峰值算子 | 对评估器 15558.8 |
 |---|---|---|---|
-| DSv4 4L seq2048 heads64 FSDP-2 **无重算** unfused | **21310.6 MiB** | 15558.8 | **0.73** |
+| **fused（生产）** | **15415.5** | **ScatterAddExt(loss)** | **1.009（0.9%）✅** |
+| unfused（调试） | 21310.6 | 2.5GB Add+ScatterAddExt | 0.73 |
 
-- 真机峰值算子 = **2.5 GB 的 `Add`**（dsv4 激活/反向，21310.55）+ `ScatterAddExt`(loss,21209.6) 紧邻。
-- 残差 5752 MiB = 评估器**低估的 unfused-DSA 激活足迹**（无重算下 4 层全存）。→ 待办：dsv4 专属 framework_reserve 或细化 unfused-DSA saves 建模（设计 §14）。
-- 弃用 `prep_ds4_sim.py`（model_type=deepseek_v4 版）。mHC/MTP 此配置未开，仍待真机点。
+**结论：dsv4 前沿 op 图对生产（fused）路径真机验证到 ~1%**（峰值值 + 峰值位置同为 loss ScatterAddExt，与 DSv3 同签名）。unfused +5.9GB = 小算子物化开销、fused 规避、评估器正确地不计。
+
+**5. fused 使能（关键坑）**：除 `apply_dsa_kernel_fusion=True` 外，还需
+① `source /home/suhaibo/vendors/custom_transformer/bin/set_env.bash`（vendor OPP kernel：设 `ASCEND_CUSTOM_OPP_PATH`+`LD_LIBRARY_PATH`）；
+② PYTHONPATH **前置** `/home/suhaibo/workspace/deepseek_v4/hyper-parallel`（v4 版有 `npu_sparse_attn_shared_kv` 的 python wrapper；旧 `mindformers/hyper-parallel` 缺、会 shadow → `unavailable in this hyper_parallel build`）。
+`prep_dsv4align.py` 用 `FUSED=1` 开融合。弃用 `prep_ds4_sim.py`。mHC/MTP 此配置未开、仍待真机点。
 
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
