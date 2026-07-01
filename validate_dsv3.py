@@ -8,8 +8,10 @@ compute=bf16/params=fp32、seq=4096、local_batch=1。
 """
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
-from cost_eval.model_spec import DimTable, TensorRef, OpSpec, OpType, LayerSpec, ModelSpec
-from cost_eval.layers.mla import build_mla_dense_decoder, build_mla_moe_decoder
+from cost_eval.model_spec import LayerSpec
+from cost_eval.build_llm import build_llm_spec
+from cost_eval.presets import deepseek_v3
+from cost_eval.layers.head import build_embedding_ops, build_head_and_loss_ops
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
 from cost_eval.report import Evaluator
 
@@ -26,53 +28,39 @@ RESIDUAL_MiB = 177
 
 
 def build_embedding(d):
-    w = TensorRef("emb_w", ("vocab", "H"), is_weight=True)        # vocab_emb_dp：tp=1 不切
-    out = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})
-    return LayerSpec(ops=[OpSpec("embedding", OpType.ELEMENTWISE, [], out, params=[w], saves=[])])
+    """word embedding 段（1 op），委托统一装配件 `cost_eval.layers.head.build_embedding_ops`。
+
+    保留 `(d: DimTable) -> LayerSpec` 签名（`test_build_llm_tier1` 等仍以 DimTable 调用），
+    但 op 构造已统一到与 `build_llm_spec` 同源的 builder（逐字段一致）。embedding op 与
+    cfg 无关，用 `deepseek_v3()` 作 DSv3 驱动的规范 cfg。
+    """
+    return LayerSpec(build_embedding_ops(deepseek_v3()))
 
 
 def build_lm_head(d):
-    # 对照 loss.py：logits(bf16) → cast fp32 → log_softmax(fp32,saved) → NLL；反向物化 probs(fp32)
-    x = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
-    w = TensorRef("head_w", ("H", "vocab"), is_weight=True)
-    logits = TensorRef("logits_lm", ("S", "B", "vocab"))                      # bf16, saved(ctx.logits)
-    logsm = TensorRef("logsm", ("S", "B", "vocab"), dtype_bytes=4)            # fp32, saved
-    loss = TensorRef("loss", ("B",))
-    return LayerSpec(ops=[
-        OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x]),
-        OpSpec("logsoftmax", OpType.NORM, [logits], logsm, saves=[logits]),
-        # NLL 反向同时物化 probs=exp(-log_softmax) 与 scatter_add 出的 grad_log_softmax，
-        # 二者皆 fp32 满 vocab 张量、与 saved log_softmax 共存（loss.py:80-82）→ 2×(4·S·B·vocab)
-        OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch="8*S*B*vocab"),
-    ])
+    """lm_head + loss 段（3 op），委托 `cost_eval.layers.head.build_head_and_loss_ops`。
+
+    保留 `(d: DimTable) -> LayerSpec` 签名；DSv3 走默认 `logsoftmax_nll` + `tie=False` 路径，
+    与原手写 `build_lm_head` 逐字段一致（`test_build_llm_tier1` 的 verbatim 断言）。
+    """
+    return LayerSpec(build_head_and_loss_ops(deepseek_v3()))
 
 
 def build_dsv3_spec(N):
-    """构建 DSv3 缩层 ModelSpec（N 个 transformer 层）。
+    """构建 DSv3 缩层 ModelSpec（N 个 transformer 层），改走统一 preset 装配路径。
 
-    layer_pattern = [embedding] + [mla_dense] + [mla_moe]*(N-1) + [lm_head]，
-    即 1 个 dense MLA 层 + (N-1) 个 MoE MLA 层，外加 embedding/head（共 N+2 个 layer）。
+    等价于 `build_llm_spec(deepseek_v3(N))`：层序列
+    `["embedding", "mla_dense", "mla_moe"*(N-1), "lm_head"]`（1 个 dense MLA + (N-1) 个 MoE
+    MLA + embedding/head，共 N+2 个 layer），与原手写 `build_dsv3_spec` **逐字节一致**
+    （`tests/test_regression_dsv3.py` 硬门：N=4→12472.5 MiB，N=8→13896.1 MiB）。
 
-    返回 (spec, d, full_layers)：full_layers = 全部 transformer 层（embedding/head 不重算）。
+    返回 `(spec, dims, full_layers)`：`dims = spec.dims`（DimTable），
+    `full_layers = set(range(1, N+1))`（transformer 层；embedding=0 / head=N+1 不重算）。
+    签名不变，供 `analyze_matrix` / `timeline_probe` 解包复用。
     """
-    d = DimTable(
-        H=1792, F=3072, n_heads=8, n_kv=8, head_dim=192, S=4096, B=1, vocab=129280,
-        n_layers=N + 2,                   # = len(layer_pattern)（含 embedding + head）
-        n_experts=8, topk=4, n_shared=1, moe_F=1024, capacity_factor=1.0,
-        q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128,
-        v_head_dim=192, moe_shared_F=1024,
-        dtype_bytes=2,                    # compute bf16
-    )
-    layer_specs = {
-        "embedding": build_embedding(d),
-        "mla_dense": build_mla_dense_decoder(d),
-        "mla_moe": build_mla_moe_decoder(d),
-        "lm_head": build_lm_head(d),
-    }
-    layer_pattern = ["embedding"] + ["mla_dense"] + ["mla_moe"] * (N - 1) + ["lm_head"]
-    spec = ModelSpec(f"dsv3-{N}L", d, layer_pattern, layer_specs)
+    spec = build_llm_spec(deepseek_v3(N))
     full_layers = set(range(1, N + 1))   # transformer 层（embedding=0, head=N+1 不重算）
-    return spec, d, full_layers
+    return spec, spec.dims, full_layers
 
 
 def main():
