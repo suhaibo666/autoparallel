@@ -214,7 +214,7 @@ saves 仍是 Q/K/V/O `[S,B,H]` + logsumexp `[S,n_heads]`，`[S,S]` 分数矩阵�
 ## 9. mHC 残差包装器（**新建**，源：`pynative/.../hyper_connection.py`, `transformer_block.py`）
 `residual_variant="mhc"` 时：
 - **block 入口** `expand`：hidden `[S,B,H] → [S,B,n·H]`（n=`num_residual_streams`），**全栈 `act_live` ×n**（残差承载张量）。block 出口 `collapse` 回 `[S,B,H]`。
-- **每层 2 个 HyperConnection 模块**（attn 前、ffn 前）：RMSNorm(n·H, saved) + `mapping_proj [n·H, 3n+n²]` + sinkhorn → `h_res [S,B,n,n]`(saved) / `h_post` / `h_pre`；输出 cell 做 `h_res @ streams + h_post·sublayer_out`。
+- **每层 2 个 HyperConnection 模块**（attn 前、ffn 前）：RMSNorm(n·H, saved) + `mapping_proj [n·H, 2n+n²]`（源 `hyper_connection.py:141` = `n+n+n²`，非 3n+n²）+ sinkhorn → `h_res [S,B,n,n]`(saved) / `h_post` / `h_pre`；输出 cell 做 `h_res @ streams + h_post·sublayer_out`。
 - **内存**：`act_live` 残差 **×n**；每层多 `h_res [S,B,n,n]` 等小 saves；**params 基本不增**。DeepSeek-V4 全层启用。
 
 装配器把 `mhc_wrap` 施加到**每个 decoder 层**，并在 embedding 后 / lm_head 前插 expand/collapse。
