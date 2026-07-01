@@ -63,6 +63,10 @@ class LLMConfig:
     # ---- ① 注意力 ----
     attn_type: str = "gqa"                 # mha | gqa | mla | dsv4_hybrid
     num_query_groups: int | None = None    # GQA 的 KV 组数（None→=n_heads 即 MHA）
+    # 滑窗注意力（SWA：Mistral/Qwen/Gemma-2）——对训练峰值**内存中性**（flash 下激活仍 O(S)，
+    # 见 §7.4）；留字段以忠实表达模型 + 供 P1 时间/推理 KV-cache 用。
+    window_size: int | None = None         # None=全注意力；int=滑窗宽度
+    window_pattern: tuple | None = None     # 每层 0=全/1=SWA（Gemma-2 交错）；None=全层同 window_size
     # MLA / dsv4 专用
     q_lora_rank: int = 0
     kv_lora_rank: int = 0
@@ -190,6 +194,14 @@ MLA base 之上，**每层按 `compress_ratio` 分支**（`deepseek_v4_hybrid_at
 **内存大头**（评估器须建）：`index_scores` O(S²)、`kv_gathered`/`attn_weights` O(S·topk)、`compressed_kv` O(S/r)。config：`csa_compress_ratios/csa_window_size/dsa_indexer_{n_heads,head_dim,topk}/o_groups/o_lora_rank`。
 > 实现细节（CSA overlap vs HCA non-overlap 的精确 op 差异）在实施期按 `compressor.py:43` RFC §3.4.2.2 落到 op；本设计先定"一个 `build_dsv4_hybrid_attn_ops(d, ratio)` 按 ratio 内部分支 + 上述内存大头"。
 
+### 7.4 SWA 滑窗注意力（Mistral/Qwen/Gemma-2）——对训练峰值**内存中性**
+`mha/gqa/mla` 加 `window_size` 即 SWA。**关键：flash-attention 下 SWA 不改训练激活内存**——
+saves 仍是 Q/K/V/O `[S,B,H]` + logsumexp `[S,n_heads]`，`[S,S]` 分数矩阵从不物化；SWA 只缩：
+(a) flash **workspace**（block scratch，二阶，现归 framework_reserve）；(b) **推理 KV-cache**（推理，出范围）。
+故 **SWA 层 op 图 ≡ 全注意力层 op 图**；`window_size`/`window_pattern` 仅作**忠实表达模型** + 供 P1 时间/推理用，
+`build_llm_spec` 对其**不改 op 图**（Gemma-2 的 SWA/全交错也因此不影响每层内存结构）。
+> 若将来要建 flash-workspace 随 window 的缩放（现为常数），需 window-varying 真机点标定（类比 P0 §8.7）；属 Tier-2。
+
 ---
 
 ## 8. FFN / MoE op 图（已实现，微调）
@@ -245,9 +257,9 @@ config：`loss_type`、`chunk_loss_num`。
 
 ## 13. 覆盖分层
 
-**Tier-1（本设计即建 op 图）**：`mha/gqa/mla` × `dense/moe(+shared)` + 每层 pattern（first_k_dense/moe_layer_freq）+ norm(RMS/LN, pre/post/sandwich, qk-norm) + rope/learned/none + tie/untie + loss(logsoftmax_nll/chunked/vocab_parallel_ce) + bias。覆盖 Llama/Qwen/Mixtral/DeepSeek-V3。
+**Tier-1（本设计即建 op 图）**：`mha/gqa/mla` × `dense/moe(+shared)` + 每层 pattern（first_k_dense/moe_layer_freq）+ norm(RMS/LN, pre/post/sandwich, qk-norm) + rope/learned/none + tie/untie + loss(logsoftmax_nll/chunked/vocab_parallel_ce) + bias + **SWA 滑窗（`window_size`/`window_pattern`，内存中性字段，§7.4）**。覆盖 Llama/Qwen/Mistral/Gemma-2/Mixtral/DeepSeek-V3。
 **Tier-1+（本设计新增，因用户要求前沿）**：`dsv4_hybrid`（DSA/CSA/HCA，按 compress_ratio 分支）、`mhc` 残差、MTP 头。覆盖 DeepSeek-V4。
-**Tier-2（仅留 config 字段 + 清晰报错，暂不建 op 图）**：gated_delta_net 线性注意力、yoco、MRoPE、group-limited routing 的内存细节、window_attn_skip_freq 的 flash-workspace 精细缩放。用到再建。
+**Tier-2（仅留 config 字段 + 清晰报错，暂不建 op 图）**：gated_delta_net 线性注意力、yoco、MRoPE、group-limited routing 的内存细节、**flash-workspace 随 SWA window 的精细缩放**（现为常数，见 §7.4）。用到再建。
 
 ---
 
