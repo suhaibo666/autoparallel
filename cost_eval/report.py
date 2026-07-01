@@ -33,8 +33,11 @@ class Evaluator:
         self.recompute = recompute
         self.swap = swap
 
-    def evaluate(self) -> PeakMemoryReport:
-        """执行全链路评估，返回 PeakMemoryReport。"""
+    def evaluate(self, record_timeline: bool = False) -> PeakMemoryReport:
+        """执行全链路评估，返回 PeakMemoryReport。
+
+        record_timeline=True 时，每个 StagePeak.timeline 记录全事件内存序列（内存曲线）。
+        """
         world = (self.pc.dp_replicate * self.pc.dp_shard * self.pc.cp
                  * self.pc.tp * self.pc.pp)
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
@@ -45,7 +48,8 @@ class Evaluator:
         peaks = MemTimeline().simulate(
             g, self.recompute, self.swap, pm, persistent,
             fr, self.hw.max_device_memory,
-            grad_dtype_bytes=getattr(self.opt, "grad_dtype_bytes", 4))
+            grad_dtype_bytes=getattr(self.opt, "grad_dtype_bytes", 4),
+            record_timeline=record_timeline)
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         return PeakMemoryReport(per_stage, tightest, any(p.oom for p in per_stage))

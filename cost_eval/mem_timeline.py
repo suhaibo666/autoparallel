@@ -67,6 +67,15 @@ class MemBreakdown:
 
 
 @dataclass(frozen=True)
+class TimelineSample:
+    """内存时间线上一个采样点（一次 rec() = 一个事件）。"""
+    idx: int              # 事件序号（0 起）
+    event: str            # 事件标签（如 fwd:3 / fwd_end / bwd@5）
+    total_bytes: int      # 该事件时刻总占用（Σ桶 + framework_reserve）
+    breakdown: MemBreakdown
+
+
+@dataclass(frozen=True)
 class StagePeak:
     """单 stage 仿真结果。"""
     stage: int
@@ -74,6 +83,7 @@ class StagePeak:
     breakdown: MemBreakdown
     peak_event: str
     oom: bool
+    timeline: tuple = ()   # record_timeline=True 时为 tuple[TimelineSample]（全事件序列），否则空
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +139,7 @@ class MemTimeline:
 
     def simulate(self, g, recompute, swap, pm, static_persistent: dict,
                  framework_reserve: int, max_device_memory: int,
-                 grad_dtype_bytes: int = 4) -> dict:
+                 grad_dtype_bytes: int = 4, record_timeline: bool = False) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -141,6 +151,7 @@ class MemTimeline:
         static_persistent  : dict[stage, int]  — M5 StaticMem.compute() 输出
         framework_reserve  : int  — 框架常驻开销（字节）
         max_device_memory  : int  — 设备容量上限（字节）
+        record_timeline    : bool — True 则每个事件都记进 StagePeak.timeline（内存曲线）
 
         返回
         ----
@@ -158,18 +169,25 @@ class MemTimeline:
             peak: int = -1
             peak_ev: str = ""
             peak_bd: MemBreakdown = None  # type: ignore[assignment]
+            series: list = []
 
             def rec(tag: str) -> None:
                 nonlocal peak, peak_ev, peak_bd
                 t = B.total() + framework_reserve
-                if t > peak:
-                    peak = t
-                    peak_ev = tag
-                    peak_bd = MemBreakdown(
+                is_peak = t > peak
+                bd = None
+                if record_timeline or is_peak:
+                    bd = MemBreakdown(
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
                         B.recomp_scratch, B.bwd_scratch, B.swap_buf, B.workspace,
                         framework_reserve,
                     )
+                if record_timeline:
+                    series.append(TimelineSample(len(series), tag, t, bd))
+                if is_peak:
+                    peak = t
+                    peak_ev = tag
+                    peak_bd = bd
 
             # (mb, layer_id) -> saved bytes currently pinned in act_live
             pinned: dict = {}
@@ -222,6 +240,7 @@ class MemTimeline:
                 breakdown=peak_bd,
                 peak_event=peak_ev,
                 oom=(peak > max_device_memory),
+                timeline=tuple(series),
             )
 
         return res
