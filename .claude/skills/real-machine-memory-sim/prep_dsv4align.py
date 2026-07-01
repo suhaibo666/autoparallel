@@ -89,10 +89,10 @@ cfg = {
         "softmax_compute_dtype": "float32",
         "rotary_dtype": "float32",
         "initializer_range": 0.01,
-        # ---- dsv4_hybrid（unfused：无 hyper_parallel 融合算子时必须关融合）----
+        # ---- dsv4_hybrid（FUSED=1 走融合 npu_* 算子，需 hyper_parallel；默认 unfused 小算子）----
         "experimental_attention_variant": "dsv4_hybrid",
-        "apply_dsa_kernel_fusion": False,   # ★ 关融合 → 走 unfused 小算子（错误信息明确要求）
-        "force_unfused_dsa": True,
+        "apply_dsa_kernel_fusion": os.environ.get("FUSED") == "1",
+        "force_unfused_dsa": os.environ.get("FUSED") != "1",
         "csa_compress_ratios": compress_ratios,
         "csa_window_size": 128,
         "csa_compress_rotary_base": 40000.0,
