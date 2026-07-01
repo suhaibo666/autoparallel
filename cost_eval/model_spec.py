@@ -26,6 +26,10 @@ class DimTable:
     # MLA (Multi-Latent Attention) dimensions
     q_lora_rank: int = 0; kv_lora_rank: int = 0
     qk_rope_head_dim: int = 0; qk_nope_head_dim: int = 0; v_head_dim: int = 0
+    # DSv4 hybrid (DSA indexer + compressor + CSA/HCA sparse attention) dimensions.
+    # Defaults 0 → inert for every existing spec (no op图/shape 变化).
+    dsa_indexer_n_heads: int = 0; dsa_indexer_head_dim: int = 0; dsa_indexer_topk: int = 0
+    o_groups: int = 0; o_lora_rank: int = 0; csa_window_size: int = 0
     # Shared expert intermediate size (MoE + MLA combined layers)
     moe_shared_F: int = 0
     capacity_factor: float = 1.0

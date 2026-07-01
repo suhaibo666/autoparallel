@@ -127,6 +127,13 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         qk_rope_head_dim=cfg.qk_rope_head_dim,
         qk_nope_head_dim=cfg.qk_nope_head_dim,
         v_head_dim=cfg.v_head_dim,
+        # dsv4_hybrid dims 直通（DSA 索引器 / 分组输出 / 滑窗）
+        dsa_indexer_n_heads=cfg.dsa_indexer_n_heads,
+        dsa_indexer_head_dim=cfg.dsa_indexer_head_dim,
+        dsa_indexer_topk=cfg.dsa_indexer_topk,
+        o_groups=cfg.o_groups,
+        o_lora_rank=cfg.o_lora_rank,
+        csa_window_size=cfg.csa_window_size,
         moe_shared_F=cfg.moe_shared_ffn_hidden_size,
         capacity_factor=cfg.moe_capacity_factor,
         dtype_bytes=cfg.compute_dtype_bytes,
