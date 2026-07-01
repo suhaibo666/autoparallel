@@ -17,8 +17,13 @@ DS_FILE = os.path.join(DS_DIR, "dataset.mindrecord")
 N = int(os.environ.get("SIM_LAYERS", "4"))
 STEPS = int(os.environ.get("SIM_STEPS", "3"))
 SEQ = int(os.environ.get("SIM_SEQ", "2048"))
+MTP = int(os.environ.get("SIM_MTP", "0"))    # num_nextn_predict_layers（MTP 头数）
+MHC = int(os.environ.get("MHC", "0"))        # 1 → 开 mHC（hc_mult=HC 残差流）
+HC = int(os.environ.get("SIM_HC", "4"))
+FUSED = os.environ.get("FUSED") == "1"
 _CYCLE = [0, 4, 128]
-compress_ratios = [_CYCLE[i % 3] for i in range(N)]   # 覆盖 滑窗(0)/CSA(4)/HCA(128)
+# compress_ratios 长度 = num_layers + mtp（config __post_init__ 约束）；mtp 层用 0（滑窗）
+compress_ratios = [_CYCLE[i % 3] for i in range(N)] + [0] * MTP
 
 # 1) 合成数据集（seq=2048）
 if not os.path.exists(DS_FILE):
@@ -104,8 +109,16 @@ cfg = {
         "dsa_indexer_use_sparse_loss": True,
         "o_groups": 8,
         "o_lora_rank": 1024,
-        # ---- 无 mHC 无 MTP（对齐 align_naive_fsdp）----
-        "num_nextn_predict_layers": 0,
+        # ---- mHC（MHC=1 开；FUSED=1 用融合 npu_mhc_* 算子）----
+        "enable_hyper_connections": MHC == 1,
+        "hc_mult": HC,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1.0e-6,
+        # 注：容器 vendor OPP 无 aclnnMhcPreSinkhorn 融合 kernel → mHC 走 unfused（纯 MS 算子，
+        # 内存与 fused 等价：主导项是 ×n 残差流，sinkhorn n×n 中间量可忽略）。FUSED_MHC=1 强开融合。
+        "use_fused_mhc": os.environ.get("FUSED_MHC") == "1",
+        # ---- MTP（SIM_MTP 头数）----
+        "num_nextn_predict_layers": MTP,
         "mtp_loss_scaling_factor": 0.3,
         # ---- 位置编码 ----
         "position_embedding_type": "yarn",
@@ -133,4 +146,4 @@ out = os.path.join(CUR, "dsv4_sim.yaml")
 with open(out, "w") as f:
     yaml.dump(cfg, f, indent=2, sort_keys=False)
 print("WROTE_CONFIG", out, "layers", N, "seq", SEQ, "compress_ratios", compress_ratios,
-      "heads", cfg["model"]["num_attention_heads"], "v_head", cfg["model"]["v_head_dim"])
+      "mtp", MTP, "mhc", MHC, "fused", FUSED, "use_fused_mhc", cfg["model"]["use_fused_mhc"])

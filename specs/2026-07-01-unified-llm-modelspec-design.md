@@ -274,6 +274,9 @@ config：`loss_type`、`chunk_loss_num`。
   | unfused（调试） | 21310.6 MiB | 2.5GB `Add`+ScatterAddExt | 0.73 |
 
   **结论**：评估器的 dsv4 op 图**对应 fused（生产）内存画像**——峰值值 0.9%、峰值位置**同为 loss `ScatterAddExt`**（与 DSv3 同签名）。fused `npu_sparse_attn_shared_kv` 把 gather+QK+softmax+AV 融进一个 kernel、中间量走 scratch 不物化；unfused（`unfused_compressed_sparse_attn` csa.py:187）逐个物化 kv_gathered/scores/attn_weights + 那 2.5GB Add，故 +5.9GB。**那 +5.9GB 是 unfused 小算子物化开销、fused 规避，评估器正确地不计**。→ **dsv4 前沿 op 图已真机验证到 ~1%（对生产 fused 路径），无需 dsv4 专属大 reserve。** 0.73-vs-unfused 只是调试路径的物化开销。
-- **仍待验证**：mHC 的 `act_live ×n`（此 align 配置未开 mHC/MTP）；带重算路径（此 MS 版本 dsv4 全重算触发 `recompute() context_fn` bug，待修）。
+- **mHC + MTP 真机锚点（2026-07-01，fused DSA + unfused mHC + MTP）**：`hc_mult=4`、`num_nextn_predict_layers=1`。真机 `max_memory_allocated=21153.1 MiB`（3 步跑通，`mtp_1_loss`/`indexer_loss`/`load_balancing_loss` 齐活）；评估器 **23023.5（1.088，过预测 8.8%，OOM 安全向）**。**分解归因**（评估器逐项）：
+  - **mHC(×4) 仅 +688 MiB** —— 与真机吻合好。原因：×4 残差流在**峰值(loss)之前已释放**，峰值处只剩少量，故 ×n 对峰值影响小（不是 ×4 全栈）。
+  - **MTP 仅 +6777 MiB（persistent +3671）** —— **过预测主因**。DeepSeek-V4 MTP **共享(tie) embedding + output head**；评估器 `build_mtp_ops` 当前把它们建成**独立(untied)**（多算了一份 vocab×H embedding + H×vocab head ≈ 2.8 GB 幻影参数）。→ **待修**：MTP 头 tie embedding/head（`build_mtp_ops` + LLMConfig 加 tie 标志），预计把 1.088 拉回 ~1.0。需对照 `pynative/.../multi_token_prediction.py` 确认 tie 语义。
+- **仍待验证**：融合 mHC（容器 vendor OPP 无 `aclnnMhcPreSinkhorn` kernel，本次 mHC 走 unfused，内存与 fused 等价——主导是 ×n 残差、sinkhorn n×n 可忽略）；带重算路径（此 MS 版本 dsv4 全重算触发 `recompute() context_fn` bug，待修）。
 - mHC 的 `act_live ×n` 仍未真机验证（此 align 配置未开 mHC/MTP）。
 - 精确 CSA-vs-HCA overlap 差异在实施期按源码落 op。

@@ -217,10 +217,17 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 ... run_ds3_memprobe.py --con
 
 **结论：dsv4 前沿 op 图对生产（fused）路径真机验证到 ~1%**（峰值值 + 峰值位置同为 loss ScatterAddExt，与 DSv3 同签名）。unfused +5.9GB = 小算子物化开销、fused 规避、评估器正确地不计。
 
-**5. fused 使能（关键坑）**：除 `apply_dsa_kernel_fusion=True` 外，还需
+**5. fused 使能（关键坑）**：除 `apply_dsa_kernel_fusion=True`（`prep` 用 `FUSED=1`）外，还需
 ① `source /home/suhaibo/vendors/custom_transformer/bin/set_env.bash`（vendor OPP kernel：设 `ASCEND_CUSTOM_OPP_PATH`+`LD_LIBRARY_PATH`）；
-② PYTHONPATH **前置** `/home/suhaibo/workspace/deepseek_v4/hyper-parallel`（v4 版有 `npu_sparse_attn_shared_kv` 的 python wrapper；旧 `mindformers/hyper-parallel` 缺、会 shadow → `unavailable in this hyper_parallel build`）。
-`prep_dsv4align.py` 用 `FUSED=1` 开融合。弃用 `prep_ds4_sim.py`。mHC/MTP 此配置未开、仍待真机点。
+② PYTHONPATH = **`$V4:$HP`**（`$HP=/home/suhaibo/workspace/deepseek_v4/hyper-parallel` 有 `npu_sparse_attn_shared_kv` wrapper；旧 `mindformers/hyper-parallel` 缺、会 shadow → `unavailable in this hyper_parallel build`）。**`$V4` 必须在 `$HP` 前**（否则 `$HP/tests` shadow `tests.utils`，prep 建数据集失败）。
+
+**6. mHC/MTP 真机锚点（2026-07-01，fused DSA + unfused mHC + MTP）**：`prep` 用 `MHC=1 SIM_MTP=1`。
+| 配置 | 真机 alloc | 评估器 | 比 |
+|---|---|---|---|
+| fused DSA + mHC(×4) + MTP | **21153.1** | 23023.5 | **1.088（过预测，安全向）** |
+
+分解：**mHC(×4) 仅 +688**（×n 残差流在峰值前已释放）；**MTP +6777 是过预测主因**——评估器 `build_mtp_ops` 把 MTP 的 embedding/head 建成 untied，而 DSv4 MTP 应 **tie**（多算 ~2.8GB 幻影参数）。→ 待修 MTP tie。
+- 融合 mHC kernel（`aclnnMhcPreSinkhorn`）容器 vendor OPP **没有** → mHC 走 unfused（内存与 fused 等价）。`FUSED_MHC=1` 可强开（需该 kernel）。弃用 `prep_ds4_sim.py`。
 
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
