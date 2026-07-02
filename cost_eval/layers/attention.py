@@ -15,6 +15,15 @@ from ..model_spec import DimTable, OpSpec, OpType, TensorRef
 QKV = "(n_heads+2*n_kv)*head_dim"   # qkv 投影输出维：(H + 2·n_kv)·d_h，对称 GQA
 NHD = "n_heads*head_dim"            # o_proj 输入维 = n_heads·head_dim
 
+# ── FlashAttention workspace（机理公式，∝ S·n_heads —— 从 framework_reserve 拆出）──────
+# Ascend `FlashAttentionScore`（`flash_attention.py:136-196` MindSpore 算子）除 attention_out
+# 外还返回 **softmax_max + softmax_sum**（softmax LSE 统计），每个 shape `[B, n_heads, S, 8]`
+# fp32（末维 8 = flash 内层 reduce 分块，CANN 固定），供 `FlashAttentionScoreGrad` 反向复用。
+# 工作集 = 2 张量 × 8 × 4B = **64·B·n_heads·S** bytes。**∝ S·n_heads**（随序列缩放——正是要点），
+# 取代此前 `S·B·n_heads·head_dim`（把整份 Q/O numel 当字节的经验近似）。block scratch（O(block·d)）
+# 二阶、近常数，并入该文档，不单列。仅在该 flash op 的**前向事件**计入（非全局常数、非 loss 峰）。
+FLASH_LSE_WS = "64*B*n_heads*S"
+
 # ── MLA 符号维度表达式（与 DimTable 字段名一致，供 eval_expr 求值）──────────
 # linear_qkv 输出维（q_lora+kv_lora+k_pe）
 QKV_PROJ = "q_lora_rank+kv_lora_rank+qk_rope_head_dim"
@@ -51,8 +60,8 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     qkv_w  = TensorRef("qkv_w", ("H", QKV),   shard={1: "tp"}, is_weight=True)
     o_w    = TensorRef("o_w",   (NHD, "H"),   shard={0: "tp"}, is_weight=True)
 
-    # flash attention workspace（近似值，用于内存建模）
-    fa_ws = "S*B*n_heads*head_dim"
+    # flash attention workspace = softmax LSE 机理公式（∝ S·n_heads，见 FLASH_LSE_WS）
+    fa_ws = FLASH_LSE_WS
 
     return [
         # 1. Pre-norm（LayerNorm / RMSNorm）
@@ -120,7 +129,7 @@ def build_mla_attn_ops(d: DimTable) -> list:
     kvb_w  = TensorRef("kvb_w",  ("kv_lora_rank", KVB_OUT), shard={1: "tp"}, is_weight=True)
     o_w    = TensorRef("o_w",    (ATTN_OUT, "H"),            shard={0: "tp"}, is_weight=True)
 
-    fa_ws = "S*B*n_heads*v_head_dim"
+    fa_ws = FLASH_LSE_WS   # softmax LSE 机理公式（∝ S·n_heads），MLA 与 GQA 同（不依赖 head_dim）
 
     return [
         # 1. Pre-norm

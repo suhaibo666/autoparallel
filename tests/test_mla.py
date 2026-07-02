@@ -194,10 +194,14 @@ def test_mla_resolve_no_error():
 
 
 def test_mla_resolve_flash_workspace():
-    """flash op workspace must evaluate to S*B*n_heads*v_head_dim bytes."""
+    """flash op workspace = softmax LSE 机理公式 64·B·n_heads·S bytes（∝ S·n_heads）。
+
+    Ascend FlashAttentionScore 返回 softmax_max+softmax_sum，各 [B,n_heads,S,8] fp32
+    （flash_attention.py:136-196）→ 2×8×4B×B·n_heads·S。取代旧 S·B·n_heads·v_head_dim 近似。
+    """
     from cost_eval.layers.mla import build_mla_attn_ops
     from cost_eval.shape_eval import eval_expr
     ops = build_mla_attn_ops(DM)
     flash = next(op for op in ops if op.type == OpType.FLASH_ATTN)
     ws = eval_expr(flash.workspace, DM)
-    assert ws == DM.S * DM.B * DM.n_heads * DM.v_head_dim
+    assert ws == 64 * DM.B * DM.n_heads * DM.S

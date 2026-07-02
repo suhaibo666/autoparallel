@@ -32,7 +32,7 @@ dsa_indexer_topk/o_groups/o_lora_rank/csa_window_size`。
 from __future__ import annotations
 
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
-from .attention import build_mla_attn_ops
+from .attention import build_mla_attn_ops, FLASH_LSE_WS
 
 __all__ = ["build_dsv4_hybrid_attn_ops"]
 
@@ -153,9 +153,12 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     )
 
     # ── sparse attention：gather kv_gathered O(S·topk) + attn（csa.py naive path）──
+    # flash workspace = softmax LSE 机理公式（∝ S·n_heads，同标准 flash，见 FLASH_LSE_WS）：
+    # 稀疏 attention 底层仍是 FlashAttentionScore（csa.py:279-284 softmax_max/sum），故同工作集。
     ops.append(
         OpSpec("sparse_attn", OpType.FLASH_ATTN, [q, kv_a_out, compressed_kv], core_out,
-               params=[attn_sink], saves=[kv_gathered, attn_weights, core_out])
+               params=[attn_sink], saves=[kv_gathered, attn_weights, core_out],
+               workspace=FLASH_LSE_WS)
     )
 
     # ── 分组输出：linear_o_group_proj（bmm）→ linear_proj → 残差 ─────────────────

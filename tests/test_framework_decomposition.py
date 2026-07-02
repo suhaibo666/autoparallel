@@ -92,3 +92,46 @@ def test_mtp_plain_residual_has_no_hc_ops():
     cfg = _mtp_cfg(residual_variant="plain")
     names = [op.name for op in build_mtp_ops(cfg)]
     assert not any("_hc_" in n for n in names)
+
+
+# ===========================================================================
+# T2 — flash-attention workspace (mechanism-grounded softmax LSE, ∝ S·n_heads)
+# ===========================================================================
+# Source: flash_attention.py:136-196 — MindSpore FlashAttentionScore returns
+#   softmax_val (softmax_max) + softmax_sum, each [B, n_heads, S, 8] fp32 (the
+#   flash inner reduce block = 8), saved for FlashAttentionScoreGrad. The
+#   workspace is 2 tensors × 8 × 4B = 64·B·n_heads·S bytes — scales with the
+#   sequence (the whole point) and REPLACES the ad-hoc numel-as-bytes fa_ws.
+
+from cost_eval.layers.attention import FLASH_LSE_WS   # noqa: E402
+
+DM = DimTable(
+    H=16, F=32, n_heads=4, n_kv=2, head_dim=8, S=8, B=1, vocab=32, n_layers=3,
+    q_lora_rank=8, kv_lora_rank=4, qk_rope_head_dim=4, qk_nope_head_dim=4, v_head_dim=8,
+    dsa_indexer_n_heads=2, dsa_indexer_head_dim=4, dsa_indexer_topk=4,
+    o_groups=2, o_lora_rank=4, csa_window_size=2,
+)
+
+
+def test_flash_workspace_is_softmax_lse_formula():
+    # GQA + MLA flash ops carry the mechanism LSE workspace (not the old fa_ws).
+    for build in (build_gqa_attn_ops, build_mla_attn_ops):
+        from cost_eval.model_spec import OpType
+        flash = next(op for op in build(DM) if op.type == OpType.FLASH_ATTN)
+        assert flash.workspace == FLASH_LSE_WS == "64*B*n_heads*S"
+
+
+def test_flash_workspace_scales_with_seq():
+    # doubling the sequence doubles the workspace — mechanism-grounded ∝ S.
+    ws = eval_expr(FLASH_LSE_WS, DM)
+    assert ws == 64 * DM.B * DM.n_heads * DM.S
+    d2 = DimTable(H=16, F=32, n_heads=4, n_kv=2, head_dim=8, S=16, B=1, vocab=32, n_layers=3)
+    assert eval_expr(FLASH_LSE_WS, d2) == 2 * ws
+
+
+def test_dsv4_sparse_attn_carries_flash_workspace():
+    from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
+    for ratio in (4, 128):
+        ops = build_dsv4_hybrid_attn_ops(DM, ratio)
+        sp = next(op for op in ops if op.name == "sparse_attn")
+        assert sp.workspace == FLASH_LSE_WS
