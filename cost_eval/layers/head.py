@@ -109,7 +109,11 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     from .ffn import build_shared_expert_ops
 
     dims = to_dimtable(cfg)
-    ops = list(build_embedding_ops(cfg))          # 共享 embedding（:441）
+    # 共享 embedding（multi_token_prediction.py:379 `embedding(...)` 用主模型 embedding cell）
+    # → MTP embedding op **不携带 params**（vocab×H 权重与主 embedding 层 tie，已计一次，C2）。
+    ops = list(build_embedding_ops(cfg))
+    for op in ops:
+        op.params = []
 
     # ── MTP 专属投影：enorm / hnorm / cat / eh_proj（2H → H，:375-380）─────────────
     dec_in = TensorRef("decoder_input", ("S", "B", "H"), shard={0: "sp"})   # embedding 输出（roll 后）
@@ -140,6 +144,10 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         ffn_ops += build_shared_expert_ops(dims)
     ops += attn_ops + ffn_ops
 
-    # ── 共享 head + loss（final_layernorm 由 head 段的 log_softmax 前的 lm_head 承接）──
-    ops += build_head_and_loss_ops(cfg)
+    # ── 共享 head + loss（multi_token_prediction.py:393 `output_layer(hidden_states,
+    #    weight=output_weight)` 用主模型 output_layer + 其权重）→ MTP head op **不携带 params**
+    #    （H×vocab 权重与主 lm_head tie，已计一次，C2）；loss 段（logsoftmax/nll）保留。──
+    head_ops = list(build_head_and_loss_ops(cfg))
+    head_ops[0].params = []                        # lm_head 段首 op（MATMUL）tie 主 head
+    ops += head_ops
     return ops
