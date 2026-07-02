@@ -113,7 +113,7 @@ def main():
           + (f" ; real = {real} ; ratio = {pk/real:.4f}" if real else ""))
     print(f"--- breakdown (MiB) ---")
     for k in ("persistent", "act_live", "gather_buf", "grad_buf", "recomp_scratch",
-              "bwd_scratch", "swap_buf", "workspace", "framework"):
+              "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "framework"):
         print(f"  {k:16s} = {getattr(b, k)/MiB:9.1f}")
 
 

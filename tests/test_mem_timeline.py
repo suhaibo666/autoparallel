@@ -7,6 +7,7 @@ from cost_eval.specs import ParallelConfig, RecomputeSpec, SwapSpec, OptimizerSp
 from cost_eval.parallel_model import ParallelModel
 from cost_eval.shape_eval import ShapeEval
 from cost_eval.static_mem import StaticMem
+from cost_eval.structure_mem import estimate_structure_memory
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,45 @@ def test_oom_flag():
     r = MemTimeline().simulate(g, RecomputeSpec("None"), SwapSpec(), pm, persistent,
                                framework_reserve=0, max_device_memory=1)
     assert r[0].oom is True
+
+
+def _peak_layer_sm(g, peak_event):
+    lid = int(peak_event.split("@")[1])
+    ops = next(l for l in g.stages[0] if l.layer_id == lid).ops
+    return estimate_structure_memory(ops)
+
+
+def test_no_recompute_adds_bwd_working_set():
+    """§8.5②：无重算层反向叠加 `bwd_working_set`（= 该层 forward 峰值工作集的反向镜像，
+    激活梯度 dL/dact），扣掉已显式建模的 `bwd_scratch` 部分。transformer 为主的配置（toy 全
+    dense、无 loss 层）→ 峰值落在某 transformer 反向，bwd_working_set > 0 且入峰。"""
+    g, pm, persistent = _setup(pp=1)
+    r = MemTimeline().simulate(g, RecomputeSpec("None"), SwapSpec(), pm, persistent,
+                               framework_reserve=0, max_device_memory=10**12)
+    b = r[0].breakdown
+    assert r[0].peak_event.startswith("bwd")
+    assert b.bwd_working_set > 0                       # 无重算反向工作集入峰
+    sm = _peak_layer_sm(g, r[0].peak_event)
+    assert b.bwd_working_set == max(0, sm.forward_max_live - sm.bwd_scratch)
+    # 逐桶之和 == 峰值（新桶已并入 total，无遗漏/重复）
+    assert (b.persistent + b.act_live + b.gather_buf + b.grad_buf + b.recomp_scratch
+            + b.bwd_scratch + b.bwd_working_set + b.swap_buf + b.workspace
+            + b.framework) == r[0].peak_bytes
+
+
+def test_full_recompute_scratch_is_forward_max_live():
+    """§8.5②①②：重算层反向重物化 = 重跑 forward 的 **max-live**（非 saves 之和）。
+    `recomp_scratch = max(0, forward_max_live − checkpoint_input)`（层入口已 pin 进 act_live）。"""
+    g, pm, persistent = _setup(pp=1)
+    full = MemTimeline().simulate(g, RecomputeSpec("full", {0, 1, 2, 3}), SwapSpec(), pm,
+                                  persistent, framework_reserve=0, max_device_memory=10**12)
+    b = full[0].breakdown
+    assert full[0].peak_event.startswith("bwd")
+    assert b.recomp_scratch > 0                        # 峰值落在重算 transformer 层反向
+    sm = _peak_layer_sm(g, full[0].peak_event)
+    assert b.recomp_scratch == max(0, sm.forward_max_live - sm.checkpoint_input)
+    # forward_max_live ≠ activation_saves（守「取峰值工作集而非 saves 之和」的实质改动）
+    assert sm.forward_max_live != sm.activation_saves
 
 
 # ---------------------------------------------------------------------------

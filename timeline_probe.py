@@ -56,7 +56,7 @@ def maybe_png(samples, title, path):
     except Exception:
         return False
     buckets = ["persistent", "act_live", "gather_buf", "grad_buf",
-               "recomp_scratch", "bwd_scratch", "workspace", "framework"]
+               "recomp_scratch", "bwd_scratch", "bwd_working_set", "workspace", "framework"]
     xs = [s.idx for s in samples]
     stacks = [[getattr(s.breakdown, b) / MiB for s in samples] for b in buckets]
     fig, ax = plt.subplots(figsize=(11, 5))

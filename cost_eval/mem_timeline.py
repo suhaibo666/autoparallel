@@ -44,14 +44,16 @@ class Buckets:
     act_live: int = 0         # 当前存活的 saved activations
     gather_buf: int = 0       # FSDP all-gather 缓冲（当前层整层权重 + 预取下 depth 层双缓冲、reshard 后释）
     grad_buf: int = 0         # 参数梯度缓冲（BWD 一层的瞬时峰值）
-    recomp_scratch: int = 0   # full 重算时临时重建的 saves
-    bwd_scratch: int = 0      # 反向临时物化（如 loss probs fp32）
+    recomp_scratch: int = 0   # full 重算层反向重跑 forward 的 max-live（§8.5②，扣 checkpoint 输入）
+    bwd_scratch: int = 0      # 反向临时物化（如 loss probs fp32 / mHC sinkhorn grad）
+    bwd_working_set: int = 0  # 无重算层反向工作集（激活梯度 dL/dact，= forward_max_live − bwd_scratch，§8.5②）
     swap_buf: int = 0         # swap prefetch 缓冲（P0 简化：暂置 0）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
-                + self.recomp_scratch + self.bwd_scratch + self.swap_buf + self.workspace)
+                + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
+                + self.swap_buf + self.workspace)
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class MemBreakdown:
     grad_buf: int
     recomp_scratch: int
     bwd_scratch: int
+    bwd_working_set: int
     swap_buf: int
     workspace: int
     framework: int
@@ -221,7 +224,8 @@ class MemTimeline:
                 if record_timeline or is_peak:
                     bd = MemBreakdown(
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
-                        B.recomp_scratch, B.bwd_scratch, B.swap_buf, B.workspace,
+                        B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
+                        B.swap_buf, B.workspace,
                         framework_reserve,
                     )
                 if record_timeline:
@@ -267,19 +271,32 @@ class MemTimeline:
                         #     逆前向序：_fsdp_param_group.py:854-856；output_layer 首个反向
                         #     单元预取末 transformer 层）
                         #   + reduce-scatter 前 full 梯度(grad dtype)
-                        #   + (full 重算)重物化激活 + (op)反向临时物化(如 loss probs)
+                        #   + (full 重算)重物化激活 recomp_scratch / (无重算)反向工作集 bwd_working_set
+                        #   + (op)反向临时物化 bwd_scratch(如 loss probs)
                         #   共存，叠在 persistent + 其余 act_live 之上
                         B.gather_buf = sm.param_full_bytes + _prefetch_param_bytes(
                             bwd_order, idx, depth, sm_by_id)
                         B.grad_buf = sm.grad_full_bytes
-                        if recompute.is_full(lid):
-                            # 去双算：checkpoint 输入已在 act_live（fwd 时 pin），不再计入重物化
-                            # TODO(§8.5②): 严格应为该层 forward 的 max-live(mini-fwd 时间线)，非 saves 之和
-                            B.recomp_scratch = max(
-                                0, sm.activation_saves - sm.checkpoint_input)
                         B.bwd_scratch = sm.bwd_scratch
+                        if recompute.is_full(lid):
+                            # 重算层：反向重跑 forward，其重物化 = **该层 forward 的 max-live**
+                            # （mini-fwd 时间线峰值，§8.5②①②）扣掉已 pin 进 act_live 的 checkpoint
+                            # 输入。取代旧 `saves 之和 − checkpoint` 近似（saves 累加全层、非峰值；
+                            # 多中间量层 max-live 常 < Σsaves，旧式高估）。
+                            B.recomp_scratch = max(
+                                0, sm.forward_max_live - sm.checkpoint_input)
+                        else:
+                            # 无重算层：反向仍需再遍历 forward 求梯度，激活梯度 dL/dact 与激活同形、
+                            # 同样共存 → 反向工作集 ≈ 该层 forward_max_live（§8.5②）。其中已被显式建模
+                            # 的 op 级 fp32 反向物化（loss probs+grad_log_softmax / mHC sinkhorn grad）
+                            # 已在 bwd_scratch 计入 → 扣除避免双算。loss 层 bwd_scratch(满 vocab fp32
+                            # ×2) ≥ forward_max_live → 该项 = 0（不动已验证的 DSv3/loss 峰，无双算）；
+                            # transformer 层 bwd_scratch=0 → = forward_max_live（此前欠建的反向工作集）。
+                            B.bwd_working_set = max(
+                                0, sm.forward_max_live - sm.bwd_scratch)
                         rec(f"bwd@{lid}")
-                        B.gather_buf = B.grad_buf = B.recomp_scratch = B.bwd_scratch = 0
+                        B.gather_buf = B.grad_buf = B.recomp_scratch = 0
+                        B.bwd_scratch = B.bwd_working_set = 0
                         # 该层反向结束，释放其 pinned 激活
                         B.act_live -= pinned.pop((ev.mb, lid))
 

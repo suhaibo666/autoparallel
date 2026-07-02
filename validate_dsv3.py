@@ -99,7 +99,7 @@ def main():
     print(f"[峰值] 预测(含reserve) = {pk:8.1f} MiB ; 结构(剔reserve) = {struct:8.1f} MiB ; persistent={b.persistent/MiB:.0f}")
     print(f"--- 预测 breakdown (MiB) ---")
     for k in ("persistent", "act_live", "gather_buf", "grad_buf", "recomp_scratch",
-              "bwd_scratch", "swap_buf", "workspace", "framework"):
+              "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "framework"):
         print(f"  {k:16s} = {getattr(b, k)/MiB:9.1f}")
 
 

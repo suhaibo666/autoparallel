@@ -29,6 +29,12 @@ class StructureMemory:
     - `bwd_scratch`：该结构各 op 反向临时物化之和（如 loss probs/grad_log_softmax fp32）。
     - `workspace`：该结构各 op workspace 的最大值（FWD 逐层瞬时）。
     - `checkpoint_input`：full 重算时保留的层入口激活（首个有 saves 的 op 的首个 save）字节。
+    - `forward_max_live`：**该结构 forward 的峰值工作集**——mini-forward 时间线上同时存活激活
+      张量字节 + 该 op workspace 的最大值（设计 §8.5②）。反向再遍历 forward 求梯度，其工作集
+      ≈ 此峰值（激活梯度 dL/dact 与激活同形、同样共存）。**≠ `activation_saves`**：后者是整层
+      saved 张量去重之和（一个子集、跨全层累加），前者是单时刻峰值——二者无大小关系（多中间量
+      层常 `forward_max_live < activation_saves`，故不能用 `fml − saves` 当反向工作集，见
+      `mem_timeline`）。
     """
     persistent: int = 0
     activation_saves: int = 0
@@ -37,6 +43,7 @@ class StructureMemory:
     bwd_scratch: int = 0
     workspace: int = 0
     checkpoint_input: int = 0
+    forward_max_live: int = 0
 
 
 def _align_up(nbytes: int, block: int) -> int:
@@ -48,6 +55,42 @@ def _align_up(nbytes: int, block: int) -> int:
     if block <= 1:
         return nbytes
     return ((nbytes + block - 1) // block) * block
+
+
+def _forward_max_live(resolved_ops, blk: int) -> int:
+    """mini-forward 时间线求**峰值工作集**（设计 §8.5②）。
+
+    逐 op 顺序走一遍，维护"当前存活激活张量"集合：某 op 的 `output` 变为存活；某激活作为
+    input 被消费——它存活到**最后一次**被引用（作 input 或 output）的 op。峰值 =
+    `max_op(Σ 存活激活字节 + 该 op.workspace)`。
+
+    规则（与库内其它桶一致）：
+      - **仅激活**：`params`（is_weight 权重）不计——权重在 gather_buf/persistent 另算，反向
+        工作集是激活及其梯度。MATMUL 的权重同时出现在 `inputs` 与 `params`，按 `is_weight` 剔除。
+      - **按名去重**：同名张量（含 in-place 复用同一引用，如 rope 读写 qkv）只占一份。
+      - **逐张量块对齐**：与 `activation_saves` 同口径 `_align_up(numel·dtype, blk)`，可比。
+    活性区间取 `[首次出现 op 序, 末次出现 op 序]`：output 在其产出 op 诞生、input 在其消费 op
+    仍活；产而不被本结构消费的张量（如层输出 h2）在其产出 op 即计入（下一结构再接手）。
+    """
+    ops = list(resolved_ops)
+    if not ops:
+        return 0
+    byt: dict = {}          # name -> 对齐后字节（首次出现定，去重）
+    first: dict = {}        # name -> 首次出现 op 序
+    last: dict = {}         # name -> 末次出现 op 序
+    for i, op in enumerate(ops):
+        acts = [t for t in op.inputs if not t.is_weight]
+        acts.append(op.output)                      # output 恒为激活
+        for t in acts:
+            if t.name not in byt:
+                byt[t.name] = _align_up(t.local_numel * t.dtype_bytes, blk)
+                first[t.name] = i
+            last[t.name] = i
+    peak = 0
+    for i, op in enumerate(ops):
+        live = sum(b for n, b in byt.items() if first[n] <= i <= last[n])
+        peak = max(peak, live + op.workspace_bytes)
+    return peak
 
 
 def estimate_structure_memory(
@@ -107,6 +150,8 @@ def estimate_structure_memory(
             checkpoint_input = _align_up(s.local_numel * s.dtype_bytes, blk)
             break
 
+    forward_max_live = _forward_max_live(resolved_ops, blk)
+
     return StructureMemory(
         persistent=persistent,
         activation_saves=activation_saves,
@@ -115,4 +160,5 @@ def estimate_structure_memory(
         bwd_scratch=bwd_scratch,
         workspace=workspace,
         checkpoint_input=checkpoint_input,
+        forward_max_live=forward_max_live,
     )
