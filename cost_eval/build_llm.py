@@ -25,6 +25,27 @@ from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
 _DSV4_KEY_PREFIX = "dsv4hyb_r"
 
 
+def _check_implemented_dispatch(cfg: LLMConfig) -> None:
+    """对**改变 op 图**但当前只建了单一取值的分派字段，非实现取值即显式报错（I2）。
+
+    不静默按已实现取值继续（会产「貌似合理实则错误」的图）。仿 head.py:50（loss_type）。
+    """
+    if not cfg.gated_linear_unit:
+        raise NotImplementedError(
+            "gated_linear_unit=False（ungated FFN）暂未建 op 图：ffn.py 硬编码 2*F gated(SwiGLU)。")
+    if cfg.norm_placement != "pre":
+        raise NotImplementedError(
+            f"norm_placement={cfg.norm_placement!r} 暂未建 op 图（仅 'pre' 已实现："
+            "attn/ffn 段内嵌 pre-norm）。")
+    if cfg.normalization != "RMSNorm":
+        raise NotImplementedError(
+            f"normalization={cfg.normalization!r} 暂未建 op 图（仅 'RMSNorm' 已实现）。")
+    if cfg.position_embedding_type != "rope":
+        raise NotImplementedError(
+            f"position_embedding_type={cfg.position_embedding_type!r} 暂未建 op 图"
+            "（仅 'rope' 已实现；learned_absolute 需额外 pos 表、none 需去 rope op）。")
+
+
 def _is_moe_layer(cfg: LLMConfig, layer_idx: int) -> bool:
     """本层是否为 MoE FFN 层（否则 dense）。
 
@@ -147,6 +168,7 @@ def build_llm_spec(cfg: LLMConfig) -> ModelSpec:
     每层 pattern + embedding/lm_head（tie/loss 感知）。`build_llm_spec(deepseek_v3(N))` 须
     逐桶复现 `build_dsv3_spec(N)`（Task 1.3 硬门）。
     """
+    _check_implemented_dispatch(cfg)         # I2：未实现的结构分派项显式报错，不静默产错图
     dims = to_dimtable(cfg)
     pattern = gen_layer_pattern(cfg)
     # n_layers 必须 = len(layer_pattern)（stage 分配用，ParallelModel._layer_to_stage）。
