@@ -23,6 +23,10 @@ from cost_eval.build_llm import build_llm_spec
     ("normalization", "LayerNorm"),
     ("position_embedding_type", "learned_absolute"),
     ("position_embedding_type", "none"),
+    # Task 3：补齐此前 set-but-ignored 的 op-图相关字段（不再静默忽略）
+    ("add_bias_linear", True),      # linear bias 未建为 param
+    ("add_qkv_bias", True),         # QKV bias 未建为 param（Qwen）
+    ("qk_layernorm", True),         # Q/K RMSNorm 未建为 op（Qwen3 变体）
 ])
 def test_unimplemented_dispatch_raises(field, value):
     cfg = dataclasses.replace(llama(4), **{field: value})
@@ -30,7 +34,25 @@ def test_unimplemented_dispatch_raises(field, value):
         build_llm_spec(cfg)
 
 
+def _op_graph(spec):
+    """层名 → op 名序列（比较 op 图是否被某字段改变）。"""
+    return {k: [o.name for o in v.ops] for k, v in spec.layer_specs.items()}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("window_size", 128),
+    ("window_pattern", (0, 1, 1, 1)),
+])
+def test_swa_fields_are_memory_neutral_noops(field, value):
+    """window_size / window_pattern：flash-attn 下 SWA 对训练激活内存**中性**（设计 §7.4：
+    saves 仍是 Q/K/V/O+lse，[S,S] 分数从不物化）。故意**不 raise**，且**不改 op 图**——
+    与全注意力层逐 op 一致（区别于上面 fail-loud 的字段）。"""
+    base = llama(4)
+    swa = dataclasses.replace(base, **{field: value})
+    assert _op_graph(build_llm_spec(swa)) == _op_graph(build_llm_spec(base))
+
+
 def test_all_presets_still_build():
-    """所有现有 preset 用的都是已实现取值 → 正常建 spec。"""
+    """所有现有 preset 用的都是已实现取值 → 正常建 spec（含 qwen2 的 bias 已按 §7.4/Task3 归零）。"""
     for cfg in (deepseek_v3(4), deepseek_v4(4), llama(4), qwen2(4), mixtral(4)):
         assert build_llm_spec(cfg) is not None

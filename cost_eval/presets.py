@@ -192,17 +192,20 @@ def qwen2(
     head_dim: int | None = None,
     tie_word_embeddings: bool = True,
     qk_layernorm: bool = False,
-    add_qkv_bias: bool = True,
+    add_qkv_bias: bool = False,
 ) -> LLMConfig:
     """Qwen2 系（GQA + dense SwiGLU）预设，默认 = **Qwen2-1.5B**。
 
     默认超参：H=1536, 28 层, 12 头 / 2 KV 组（真 GQA），vocab=151936, ffn=8960,
-    head_dim=128, tie_word_embeddings=True（小模型 tie）。`add_qkv_bias=True`（Qwen QKV 带
-    偏置）；`qk_layernorm=True` 为 Qwen3 变体标记。
+    head_dim=128, tie_word_embeddings=True（小模型 tie）。
 
-    注：Tier-1 的 `build_gqa_attn_ops` op 图不随 `qk_layernorm`/`add_qkv_bias` 变化
-    （bias / q-k norm 的显存量级可忽略，未建独立 op）——这两个字段作为架构标记透传，
-    不改变内存 op 图。param ref 可选：本预设主要验证"能建能评估"。
+    **`add_qkv_bias` / `qk_layernorm` 默认 False（Task 3 决策 b）**：Qwen 架构上 QKV
+    投影确带偏置、Qwen3 在 Q/K 上加 RMSNorm，但二者的**显存量级可忽略且当前未建为
+    op/param**。为避免「设了却被静默忽略、产貌似合理实则偏差的图」，这两个字段现由
+    `build_llm.py:_check_implemented_dispatch` **fail-loud 守卫**：置 True 会抛
+    NotImplementedError（而非默默出一个略偏的数）。故本预设把它们归零（内存中性），
+    仅在此文档标注 Qwen 的真实架构；如日后要忠实建模，请在 attn builder 补 bias/q-k norm
+    op 后再放开。param ref 可选：本预设主要验证"能建能评估"。
     """
     return LLMConfig(
         num_layers=num_layers,

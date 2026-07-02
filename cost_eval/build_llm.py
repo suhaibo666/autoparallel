@@ -27,6 +27,11 @@ def _check_implemented_dispatch(cfg: LLMConfig) -> None:
     """对**改变 op 图**但当前只建了单一取值的分派字段，非实现取值即显式报错（I2）。
 
     不静默按已实现取值继续（会产「貌似合理实则错误」的图）。仿 head.py:50（loss_type）。
+
+    **例外——内存中性字段不 raise**：`window_size` / `window_pattern`（SWA 滑窗）在
+    flash-attn 下对训练激活内存中性（设计 §7.4：saves 仍 Q/K/V/O+lse，`[S,S]` 分数从不
+    物化 → SWA 层 op 图 ≡ 全注意力层），故**故意不报错**，仅作忠实表达模型（供 P1
+    时间/推理）；`build_llm_spec` 对其不改 op 图。
     """
     if not cfg.gated_linear_unit:
         raise NotImplementedError(
@@ -42,6 +47,20 @@ def _check_implemented_dispatch(cfg: LLMConfig) -> None:
         raise NotImplementedError(
             f"position_embedding_type={cfg.position_embedding_type!r} 暂未建 op 图"
             "（仅 'rope' 已实现；learned_absolute 需额外 pos 表、none 需去 rope op）。")
+    # ── Task 3：补齐此前 set-but-ignored 的 op-图相关字段（不再静默忽略，fail-loud）──────
+    if cfg.add_bias_linear:
+        raise NotImplementedError(
+            "add_bias_linear=True 暂未建 op 图：linear bias 未建为 param（量级可忽略但未建模）"
+            "——如需忠实计入请在各 MATMUL op 补 bias param，勿静默忽略。")
+    if cfg.add_qkv_bias:
+        raise NotImplementedError(
+            "add_qkv_bias=True 暂未建 op 图：QKV 投影 bias 未建为 param（Qwen 系）——内存可忽略"
+            "但未建模；preset 若仅想标注该架构，请用 add_qkv_bias=False + 注释（见 presets.qwen2）。")
+    if cfg.qk_layernorm:
+        raise NotImplementedError(
+            "qk_layernorm=True 暂未建 op 图：Q/K 上的 2 个 RMSNorm 未建为 op（Qwen3 变体）——"
+            "内存可忽略但未建模；如需忠实建模请在 attn builder 补 q/k norm op。")
+    # window_size / window_pattern：**故意不 raise**（见本函数 docstring「内存中性字段」）。
 
 
 def _is_moe_layer(cfg: LLMConfig, layer_idx: int) -> bool:
