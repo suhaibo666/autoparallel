@@ -72,6 +72,14 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     CMP_PROJ_OUT = f"{coff}*v_head_dim"                  # compressor.py:95 proj_out = coff*head_dim
     S_DIV_R = f"S//{compress_ratio}"                     # compressor.py:199 n_compressed
 
+    # 稀疏注意力 gather 的 KV 位置数 TOPK_DIM（sizes kv_gathered/attn_weights/topk_indices，
+    # csa.py:441-533 的 topk_idxs 末维；I3）：
+    #   - CSA(ratio 4)：DSA 索引器 top-k → dsa_indexer_topk（+window，window≪topk 忽略，as-is）。
+    #   - HCA(ratio 128)：**无 top-k gather**——稠密 attend 所有压缩位 window + S//ratio
+    #     （get_compress_topk_idxs n_compressed=S//ratio，csa.py:153-155/519；window_idxs :465/533）。
+    #     用 dsa_indexer_topk 会把 HCA 的 gather 激活放大 ~ratio/topk 倍（preset topk=1024 vs S/128=32）。
+    TOPK_DIM = "dsa_indexer_topk" if enable_indexer else f"csa_window_size + {S_DIV_R}"
+
     # ── 激活张量 ──────────────────────────────────────────────────────────────
     x           = TensorRef("x",            ("S", "B", "H"),        shard={0: "sp"})
     ln1         = TensorRef("ln1",          ("S", "B", "H"))
@@ -80,11 +88,11 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     q           = TensorRef("q",            ("S", "B", Q_OUT), shard={2: "tp"})  # :237 列并行
     kv          = TensorRef("kv",           ("S", "B", "v_head_dim"))     # :249 单共享头
     kv_a_out    = TensorRef("kv_a_out",     ("S", "B", "v_head_dim"))     # :250
-    # 稀疏注意力大头激活（csa.py，naive path）
-    kv_gathered = TensorRef("kv_gathered",  ("B", "S", "dsa_indexer_topk", "v_head_dim"))  # :208
-    attn_weights = TensorRef("attn_weights", ("B", "n_heads", "S", "dsa_indexer_topk"))    # :237
+    # 稀疏注意力大头激活（csa.py，naive path）；末维 = TOPK_DIM（CSA=top-k / HCA=window+S//ratio）
+    kv_gathered = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"))  # :208
+    attn_weights = TensorRef("attn_weights", ("B", "n_heads", "S", TOPK_DIM))    # :237
     core_out    = TensorRef("core_out",     ("S", "B", Q_OUT))           # :247 [sq,b,n,vd]
-    topk_indices = TensorRef("topk_indices", ("B", "S", "dsa_indexer_topk"), dtype_bytes=4)  # :241 int32
+    topk_indices = TensorRef("topk_indices", ("B", "S", TOPK_DIM), dtype_bytes=4)  # :241 int32
     compressed_kv = TensorRef("compressed_kv", (S_DIV_R, "B", "1", "v_head_dim"))  # :221
     o_group_out = TensorRef("o_group_out",  ("S", "B", O_GROUP_OUT))     # :285
     o           = TensorRef("o",            ("S", "B", "H"))             # :290

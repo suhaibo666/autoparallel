@@ -176,6 +176,34 @@ def test_ratio128_compressor_coff1_and_S_div_128():
     assert eval_expr(cmp.output.shape[0], DBIG) == 4096 // 128
 
 
+def _saved_numel(ops, name, d):
+    s = next(s for op in ops for s in op.saves if s.name == name)
+    numel = 1
+    for e in s.shape:
+        numel *= eval_expr(e, d)
+    return numel
+
+
+def test_ratio128_kv_gathered_uses_S_div_ratio_not_topk():
+    """HCA (ratio 128) 无 top-k gather：稠密 attend 压缩位 = window + S//ratio
+    （csa.py:153-155 n_compressed=S//ratio + :465/533 window_idxs），非 dsa_indexer_topk（I3）。"""
+    from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
+    ops = build_dsv4_hybrid_attn_ops(DBIG, 128)
+    expected_topk = DBIG.csa_window_size + DBIG.S // 128    # 128 + 32 = 160
+    assert _saved_numel(ops, "kv_gathered", DBIG) == DBIG.B * DBIG.S * expected_topk * DBIG.v_head_dim
+    # 绝不再按 DSA 索引器 top-k 定尺（HCA 无 gather；topk=2048 会 ~32× 过大）
+    assert _saved_numel(ops, "kv_gathered", DBIG) != DBIG.B * DBIG.S * DBIG.dsa_indexer_topk * DBIG.v_head_dim
+    # attn_weights 同 topk 维
+    assert _saved_numel(ops, "attn_weights", DBIG) == DBIG.B * DBIG.n_heads * DBIG.S * expected_topk
+
+
+def test_ratio4_kv_gathered_still_topk_unchanged():
+    """CSA (ratio 4) 保持 DSA top-k gather（dsa_indexer_topk），不受 HCA 修复影响。"""
+    from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
+    ops = build_dsv4_hybrid_attn_ops(DBIG, 4)
+    assert _saved_numel(ops, "kv_gathered", DBIG) == DBIG.B * DBIG.S * DBIG.dsa_indexer_topk * DBIG.v_head_dim
+
+
 # ---------------------------------------------------------------------------
 # ratio 0/1: MLA-base-like, no sparse additions
 # ---------------------------------------------------------------------------
