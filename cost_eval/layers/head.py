@@ -142,7 +142,22 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     ffn_ops = list(FFN_REGISTRY[ffn](dims))
     if ffn == "moe" and cfg.moe_shared_expert_num > 0:
         ffn_ops += build_shared_expert_ops(dims)
-    ops += attn_ops + ffn_ops
+    # mHC：MTP 的**内层 transformer_layer 同样跑在打包残差流上**（multi_token_prediction.py
+    # :381-399：`expand_hyper_connection_streams` → transformer_layer → `collapse_...`，
+    # `self.hc = config.enable_hyper_connections`）。故 mHC 开启时 MTP decoder 也要 ×n 包装
+    # （残差承载 ×n + 2 个 HC 模块），并前插 expand / 后接 collapse —— 与主干 decoder 同构（§9）。
+    # 此前漏建 → MTP 层激活欠算（其 saves 在主 loss 峰值仍存活，因 MTP 反向在 lm_head 之后）。
+    if cfg.residual_variant == "mhc" and cfg.num_residual_streams > 1:
+        from .residual import mhc_wrap, NH
+        mtp_streams = TensorRef("mtp_hc_streams", ("S", "B", NH), shard={0: "sp"})
+        eh = TensorRef("x", ("S", "B", "H"), shard={0: "sp"})              # eh_proj 输出
+        expand = OpSpec("mtp_hc_expand", OpType.ELEMENTWISE, [eh], mtp_streams, saves=[])
+        collapse_out = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
+        collapse = OpSpec("mtp_hc_collapse", OpType.ELEMENTWISE, [mtp_streams], collapse_out, saves=[])
+        wrapped = mhc_wrap(attn_ops + ffn_ops, cfg.num_residual_streams, dims)
+        ops += [expand] + wrapped + [collapse]
+    else:
+        ops += attn_ops + ffn_ops
 
     # ── 共享 head + loss（multi_token_prediction.py:393 `output_layer(hidden_states,
     #    weight=output_weight)` 用主模型 output_layer + 其权重）→ MTP head op **不携带 params**

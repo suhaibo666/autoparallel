@@ -104,8 +104,15 @@ def build_hyper_connection_ops(prefix: str, d: DimTable) -> list:
         # 2. mapping_proj（n*H → dim = 2n+n²）
         OpSpec(f"{prefix}_hc_mapping_proj", OpType.MATMUL, [hc_norm, proj_w], h_proj,
                params=[proj_w], saves=[]),
-        # 3. sinkhorn → h_res [S,B,n,n]（saved：output_cell 反向 h_res @ streams）
-        OpSpec(f"{prefix}_hc_sinkhorn", OpType.ELEMENTWISE, [h_proj], h_res, saves=[h_res]),
+        # 3. sinkhorn → h_res [S,B,n,n]（saved：output_cell 反向 h_res @ streams）。
+        #    **反向瞬态（bwd_scratch，公式，非常数）**：HyperConnectionOutputCell
+        #    （hyper_connection.py:87-112）前向 `new_streams = h_res @ x_streams + h_post*sublayer_out`
+        #    产 [s,b,n,H]；其反向物化 ×n 打包残差流梯度 `grad_x_streams [s,b,n*H]` +
+        #    重建 `res_part [s,b,n*H]`（`self.matmul(h_res, x_streams)`，:105），二者皆 compute
+        #    dtype(bf16=2B) → `bwd_scratch = 2 张量 × 2B × S·B·(n·H) = 4·S·B·n·H`。**∝ num_residual_streams**
+        #    （n=1 plain 时退化为普通 [S,B,H] 残差反向，四分之一）。仅在该 mHC 层反向事件计入。
+        OpSpec(f"{prefix}_hc_sinkhorn", OpType.ELEMENTWISE, [h_proj], h_res, saves=[h_res],
+               bwd_scratch="4*S*B*num_residual_streams*H"),
     ]
 
 
