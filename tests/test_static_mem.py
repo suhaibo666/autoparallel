@@ -1,4 +1,5 @@
-"""M5 static_mem 测试：守恒、退化（单卡=全局）、cpu_offload 归零。"""
+"""M5 static_mem 测试：守恒、退化（单卡=全局）、cpu_offload 归零、切分不整除报错。"""
+import pytest
 from cost_eval.model_spec import DimTable, ModelSpec
 from cost_eval.layers.dense import build_dense_decoder
 from cost_eval.specs import ParallelConfig, OptimizerSpec
@@ -46,3 +47,17 @@ def test_cpu_offload_zeroes_persistent():
     g = ShapeEval().resolve(_spec(), pm)
     out = StaticMem().compute(g, OptimizerSpec.adamw(), pm, cpu_offload=True)
     assert out[0] == 0
+
+
+def test_indivisible_fsdp_raises():
+    """切分不整除（权重 numel 不被 fsdp 整除）→ ValueError，而非静默 floor 低估（I1，OOM 安全）。
+
+    D 下 o_w=n_heads·head_dim·H=8×8=64、fc1_w=256 等不被 fsdp=3 整除。与 resolve_tensor
+    对 sharded 维不整除即 raise 的口径一致（shape_eval.py:59-63）。
+    """
+    Dsmall = DimTable(H=8, F=16, n_heads=2, n_kv=2, head_dim=4, S=4, B=1, vocab=10, n_layers=1)
+    spec = ModelSpec("t", Dsmall, ["dense"], {"dense": build_dense_decoder(Dsmall)})
+    pm = ParallelModel(ParallelConfig(dp_shard=3), n_layers=1, world_size=3)
+    g = ShapeEval().resolve(spec, pm)     # resolve 不会 raise（权重仅 tp=1 切）
+    with pytest.raises(ValueError):
+        StaticMem().compute(g, OptimizerSpec.adamw(), pm, cpu_offload=False)

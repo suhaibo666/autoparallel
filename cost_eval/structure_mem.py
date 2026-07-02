@@ -65,10 +65,19 @@ def estimate_structure_memory(
         for s in op.saves:
             saves[s.name] = s
 
-    persistent = sum(
-        (w.local_numel // (efsdp if w.is_expert else fsdp)) * opt_state_bytes
-        for w in params.values()
-    )
+    # 持久 = param+opt（按 fsdp/efsdp 切）。**切分不整除即报错，不静默 floor**（I1，OOM 安全）：
+    # 静默截断会低估每卡显存 → OOM 风险，且与 resolve_tensor 对 sharded 维不整除即 raise 的
+    # 口径不一致（shape_eval.py:59-63）。opt_state_bytes==0（mem_timeline 只取瞬态桶）时不查。
+    persistent = 0
+    if opt_state_bytes:
+        for w in params.values():
+            divisor = efsdp if w.is_expert else fsdp
+            if w.local_numel % divisor != 0:
+                raise ValueError(
+                    f"{w.name} local_numel={w.local_numel} 不被 "
+                    f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
+                    f"（切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
+            persistent += (w.local_numel // divisor) * opt_state_bytes
     activation_saves = sum(s.local_numel * s.dtype_bytes for s in saves.values())
     param_full_bytes = sum(w.local_numel * w.dtype_bytes for w in params.values())
     grad_full_bytes = sum(w.local_numel * grad_dtype_bytes for w in params.values())
