@@ -24,13 +24,11 @@ def num_distinct_communicators(pc) -> int:
     **不是干净的 ×200MB**；且这一切只影响 reserved、**不进 allocated 峰值**（ep=2 真机证实）。
     """
     n = 1  # hccl_world_group
-    if pc.dp_shard * pc.cp > 1:
+    if pc.dp_shard * pc.cp > 1:   # FSDP 组（dp_shard·cp）——已含 cp，勿再单列 cp（Task 8 去重）
         n += 1
     if pc.tp > 1:
         n += 1
     if pc.ep > 1:
-        n += 1
-    if pc.cp > 1:
         n += 1
     if pc.pp > 1:
         n += 1

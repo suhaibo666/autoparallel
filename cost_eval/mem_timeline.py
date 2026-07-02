@@ -40,9 +40,9 @@ def build_1f1b(stage: int, pp: int, m: int):
 @dataclass
 class Buckets:
     """7 桶内存状态（每桶均为字节数，瞬时值）。"""
-    persistent: int = 0       # param + grad + optimizer state（持久态）
+    persistent: int = 0       # param + optimizer state（持久态，剔 grad §8.4）
     act_live: int = 0         # 当前存活的 saved activations
-    gather_buf: int = 0       # FSDP all-gather 缓冲（P0 简化：暂置 0）
+    gather_buf: int = 0       # FSDP all-gather 缓冲（FWD/BWD 逐层设为整层权重、reshard 后释）
     grad_buf: int = 0         # 参数梯度缓冲（BWD 一层的瞬时峰值）
     recomp_scratch: int = 0   # full 重算时临时重建的 saves
     bwd_scratch: int = 0      # 反向临时物化（如 loss probs fp32）
@@ -138,7 +138,8 @@ class MemTimeline:
     """事件驱动峰值仿真器（M6）。
 
     P0 简化：
-    - gather_buf 暂置 0（FSDP 双缓冲预取在后续增量补）。
+    - gather_buf 在 FWD/BWD 逐层设为整层 full-unsharded 权重、reshard 后即释（FSDP 双缓冲预取
+      的双份重叠尚未建，属后续增量）。
     - swap 仅将被 swap 层的 saved 置 0（离开 act_live），swap_buf 暂置 0。
     """
 

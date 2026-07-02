@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
 
-# 每卡 token 数（balanced dispatch 假设 capacity_factor=1）
-# 注：ep 切分由 shard={0:"ep"} 在 resolve_tensor 中处理，此处用全量符号
-TLOCAL = "S*B*topk"
+# 每卡 token 数（balanced dispatch，design §7：T_local = S·B·topk·C/ep）。
+# capacity_factor=C 影响 dispatched token 数（内存相关）；ep 切分由 shard={0:"ep"} 在
+# resolve_tensor 中处理，此处用含 C 的全量符号。C=1.0（DSv3）时退化为 S·B·topk（不变）。
+TLOCAL = "S*B*topk*capacity_factor"
 
 
 def build_dense_ffn_ops(d: DimTable) -> list:

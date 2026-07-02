@@ -13,6 +13,11 @@ class ParallelModel:
             raise ValueError(
                 f"ep({pc.ep}) 必须整除 dp_shard*cp*tp={region}（专家在该区内分片）")
         self._efsdp = region // pc.ep
+        # 均匀切层要求每 stage 至少一层；pp>n_layers 会令 per=0 → ZeroDivisionError（Task 8）。
+        if pc.layers_per_stage is None and pc.pp > n_layers:
+            raise ValueError(
+                f"pp({pc.pp}) > n_layers({n_layers})：每 stage 至少需一层，无法均匀切层"
+                "（或显式给 layers_per_stage）")
 
     def degree(self, axis: str) -> int:
         if axis == "sp":
