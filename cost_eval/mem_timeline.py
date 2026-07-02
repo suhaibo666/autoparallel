@@ -47,7 +47,7 @@ class Buckets:
     recomp_scratch: int = 0   # full 重算层反向重跑 forward 的 max-live（§8.5②，扣 checkpoint 输入）
     bwd_scratch: int = 0      # 反向临时物化（如 loss probs fp32 / mHC sinkhorn grad）
     bwd_working_set: int = 0  # 无重算层反向工作集（激活梯度 dL/dact，= forward_max_live − bwd_scratch，§8.5②）
-    swap_buf: int = 0         # swap prefetch 缓冲（P0 简化：暂置 0）
+    swap_buf: int = 0         # 激活 swap H2D 预取缓冲（BWD：复原当前卸载层 saves + 反向序后 depth 层在飞预取窗，双缓冲）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
 
     def total(self) -> int:
@@ -156,6 +156,31 @@ def _prefetch_param_bytes(order: list, idx: int, depth: int, sm_by_id: dict) -> 
     return total
 
 
+def _prefetch_swap_bytes(order: list, idx: int, depth: int, offloaded: set, sm_by_id: dict) -> int:
+    """激活 swap 反向 H2D 预取窗（双缓冲）：反向执行序 `order` 中位置 idx 之后 `depth` 个单元里
+    **被卸载的层**（`offloaded` 集）的 activation_saves 之和——反向到当前层时，其后 depth 层的
+    激活正被预取回 HBM（在飞/已驻留），与当前层激活共存。
+
+    忠实 mindformers pynative `apply_swap`：预取对 `(layer_id, layer_id+prefetch)`
+    （`activation_checkpoint.py:807/:812`）经 `SwapManager().set_forward_prefetch_layer`
+    （`:814-815`）——处理"更后一层"(反向更早、id 更大)时触发"更前一层"的 H2D swap-in；反向到某层
+    时，其 swap-in 已在 `prefetch` 步前触发 → 驻留。故反向序里位置 idx 之后 `depth` 个单元 = 在飞
+    预取窗。depth 来自 `SwapSpec.default_prefetch`（`config.py:826` 默认 1，校验 ≥1；本库额外允许
+    depth=0 = 仅复原当前层、无预取窗）。
+
+    - `offloaded` = 实际卸载的层集（`swap.swaps(lid) and not recompute.is_full(lid)`，与 FWD
+      `saved=0` 条件一致）；非卸载层激活走 act_live/recomp_scratch，不进此窗（三态互斥，去双算）。
+    - 边界（idx+1.. 越界）→ 求和为 0（反向末端无更多可预取）。
+    - swap 关（`offloaded` 空）→ 求和 0（回归路径，逐字节复现旧行为）。
+    """
+    total = 0
+    for j in range(idx + 1, min(idx + 1 + depth, len(order))):
+        lid = order[j]
+        if lid in offloaded:
+            total += sm_by_id[lid].activation_saves
+    return total
+
+
 # ---------------------------------------------------------------------------
 # MemTimeline
 # ---------------------------------------------------------------------------
@@ -167,7 +192,11 @@ class MemTimeline:
     - gather_buf 在 FWD/BWD 逐层 = 当前层 full-unsharded 权重 + **预取下 depth 层双缓冲**
       （FSDP2 参数预取：`_prefetch_param_bytes`，depth 来自 ParallelConfig.prefetch_depth，
       默认 1；depth=0 复现旧单缓冲），reshard 后即释（reshard_after_forward=default）。
-    - swap 仅将被 swap 层的 saved 置 0（离开 act_live），swap_buf 暂置 0。
+    - 激活 swap（`SwapSpec`，忠实 mindformers pynative `apply_swap` / PyTorch `save_on_cpu`）：
+      FWD 被 swap 层 saves 卸载到 CPU（D2H）→ `saved=0`，前向→反向间隙不驻留 act_live；
+      BWD 反向前 H2D 取回 → `swap_buf` = 复原当前层 saves +（反向序后 depth 层的）在飞预取窗
+      （`_prefetch_swap_bytes`，depth 来自 `SwapSpec.default_prefetch`，与 FSDP 参数预取同构的
+      双缓冲）。swap 关（enable=False）→ swap_buf 恒 0，逐字节复现旧行为。
     """
 
     def simulate(self, g, recompute, swap, pm, static_persistent: dict,
@@ -198,6 +227,10 @@ class MemTimeline:
         # （survey：PyTorch _fsdp_param_group.py:854-856 / mindformers parallelize.py:245-273）。
         # depth=0 → 复现旧单缓冲（回归路径）。
         depth = getattr(pm.pc, "prefetch_depth", 1)
+        # 激活 swap 反向 H2D 预取深度（config 驱动，非魔法常数）：来自 SwapSpec.default_prefetch
+        # （survey：mindformers config.py:826 默认 1 = 双缓冲；activation_checkpoint.py:807/:814）。
+        # swap 关时 swaps() 恒 False → 下方 swap_buf 恒 0（与预取深度无关）。
+        swap_depth = getattr(swap, "default_prefetch", 1)
 
         for stage, layers in g.stages.items():
             layer_ids = [l.layer_id for l in layers]
@@ -208,6 +241,12 @@ class MemTimeline:
                     l.ops, grad_dtype_bytes=grad_dtype_bytes,
                     alloc_block_bytes=alloc_block_bytes)
                 for l in layers
+            }
+            # 实际卸载到 CPU 的层集（三态互斥：recompute 优先于 swap，与 FWD `saved=0` 分支同条件）。
+            # 这些层 saves 前向不驻留 act_live、反向经 swap_buf 复原（H2D 取回）。
+            offloaded = {
+                lid for lid in layer_ids
+                if swap.swaps(lid) and not recompute.is_full(lid)
             }
 
             B = Buckets(persistent=static_persistent.get(stage, 0))
@@ -278,6 +317,14 @@ class MemTimeline:
                             bwd_order, idx, depth, sm_by_id)
                         B.grad_buf = sm.grad_full_bytes
                         B.bwd_scratch = sm.bwd_scratch
+                        # 激活 swap（§8.1 swap_buf="从 CPU 预取回的激活"）：被卸载层反向前 H2D 取回，
+                        #   swap_buf = 复原当前层 saves（不在 act_live）+ 反向序后 swap_depth 层在飞预取窗
+                        #   （双缓冲，`_prefetch_swap_bytes`）。当前层复原量 = 前向从 act_live 扣掉的同一
+                        #   `activation_saves`（对称：卸载多少、取回多少），故被 swap 层反向激活仍驻留、不欠算。
+                        #   非卸载层此项 0 → swap 关逐字节复现旧行为。
+                        B.swap_buf = (
+                            (sm.activation_saves if lid in offloaded else 0)
+                            + _prefetch_swap_bytes(bwd_order, idx, swap_depth, offloaded, sm_by_id))
                         if recompute.is_full(lid):
                             # 重算层：反向重跑 forward，其重物化 = **该层 forward 的 max-live**
                             # （mini-fwd 时间线峰值，§8.5②①②）扣掉已 pin 进 act_live 的 checkpoint
@@ -296,7 +343,7 @@ class MemTimeline:
                                 0, sm.forward_max_live - sm.bwd_scratch)
                         rec(f"bwd@{lid}")
                         B.gather_buf = B.grad_buf = B.recomp_scratch = 0
-                        B.bwd_scratch = B.bwd_working_set = 0
+                        B.bwd_scratch = B.bwd_working_set = B.swap_buf = 0
                         # 该层反向结束，释放其 pinned 激活
                         B.act_live -= pinned.pop((ev.mb, lid))
 
