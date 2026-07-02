@@ -20,18 +20,19 @@ from cost_eval.model_spec import ModelSpec
 from cost_eval.specs import (
     ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec)
 from cost_eval.report import Evaluator
-from validate_dsv3 import build_dsv3_spec
+from validate_dsv3 import build_dsv3_spec, RESIDUAL_MiB
 
 MiB, GiB = 2 ** 20, 2 ** 30
 
 
 def _peak(spec, num_transformer_layers, ep=1):
     full = set(range(1, num_transformer_layers + 1))   # transformer layers only
+    # 默认 depth=1 预取双缓冲 + 拆解后的 RESIDUAL_MiB(=177−ΔP)
     ev = Evaluator(
         spec,
         ParallelConfig(dp_shard=2, tp=1, ep=ep, pp=1, cp=1, sequence_parallel=True),
         OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4),
-        HardwareSpec(max_device_memory=59 * GiB, framework_reserve=177 * MiB),
+        HardwareSpec(max_device_memory=59 * GiB, framework_reserve=RESIDUAL_MiB * MiB),
         RecomputeSpec(mode="full", full_layers=full),
         SwapSpec(),
     )

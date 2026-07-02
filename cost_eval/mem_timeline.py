@@ -42,7 +42,7 @@ class Buckets:
     """7 桶内存状态（每桶均为字节数，瞬时值）。"""
     persistent: int = 0       # param + optimizer state（持久态，剔 grad §8.4）
     act_live: int = 0         # 当前存活的 saved activations
-    gather_buf: int = 0       # FSDP all-gather 缓冲（FWD/BWD 逐层设为整层权重、reshard 后释）
+    gather_buf: int = 0       # FSDP all-gather 缓冲（当前层整层权重 + 预取下 depth 层双缓冲、reshard 后释）
     grad_buf: int = 0         # 参数梯度缓冲（BWD 一层的瞬时峰值）
     recomp_scratch: int = 0   # full 重算时临时重建的 saves
     bwd_scratch: int = 0      # 反向临时物化（如 loss probs fp32）
@@ -130,6 +130,29 @@ def _layer_workspace(layer) -> int:
     return estimate_structure_memory(layer.ops).workspace
 
 
+def _prefetch_param_bytes(order: list, idx: int, depth: int, sm_by_id: dict) -> int:
+    """FSDP2 参数预取双缓冲：执行序 `order` 中位置 idx 之后 `depth` 个单元的
+    full-unsharded 参数字节之和（compute dtype）——与当前层共存的预取缓冲。
+
+    忠实 PyTorch FSDP2 默认 **depth-1**（`_fsdp_param_group.py:854-856`
+    `_backward_prefetch` → `target = post_forward_order[curr_index - 1]`，恰回退 1
+    个单元；`:854` 的 `elif curr_index > 0` → 反向最后一个单元不预取。前向隐式
+    depth-1：`wait_for_unshard:486-495` + Note:61-70 当前 all-gather 输出保留至下一
+    copy-in）。mindformers pynative 显式同深度（`parallelize.py:245-273`
+    set_modules_to_{forward,backward}_prefetch，每层→相邻一层）。
+
+    - depth=1：恰取执行序下一个单元的 param_full；边界（末单元 idx+1 越界）→ 求和为
+      0（不预取）。
+    - depth=0：范围空 → 0 → 复现旧单缓冲（回归路径）。
+    - reshard_after_forward=default（非 root 用完即 reshard，`_fsdp_state.py:203-207`）
+      → 与当前层共存的仅这 depth 个预取单元，**不累积**。
+    """
+    total = 0
+    for j in range(idx + 1, min(idx + 1 + depth, len(order))):
+        total += sm_by_id[order[j]].param_full_bytes
+    return total
+
+
 # ---------------------------------------------------------------------------
 # MemTimeline
 # ---------------------------------------------------------------------------
@@ -137,9 +160,10 @@ def _layer_workspace(layer) -> int:
 class MemTimeline:
     """事件驱动峰值仿真器（M6）。
 
-    P0 简化：
-    - gather_buf 在 FWD/BWD 逐层设为整层 full-unsharded 权重、reshard 后即释（FSDP 双缓冲预取
-      的双份重叠尚未建，属后续增量）。
+    建模要点：
+    - gather_buf 在 FWD/BWD 逐层 = 当前层 full-unsharded 权重 + **预取下 depth 层双缓冲**
+      （FSDP2 参数预取：`_prefetch_param_bytes`，depth 来自 ParallelConfig.prefetch_depth，
+      默认 1；depth=0 复现旧单缓冲），reshard 后即释（reshard_after_forward=default）。
     - swap 仅将被 swap 层的 saved 置 0（离开 act_live），swap_buf 暂置 0。
     """
 
@@ -166,6 +190,10 @@ class MemTimeline:
         res: dict = {}
         pp = pm.degree("pp")
         m = pm.pc.num_microbatches
+        # FSDP2 参数预取深度（config 驱动，非魔法常数）：默认 1 = FSDP2 默认双缓冲
+        # （survey：PyTorch _fsdp_param_group.py:854-856 / mindformers parallelize.py:245-273）。
+        # depth=0 → 复现旧单缓冲（回归路径）。
+        depth = getattr(pm.pc, "prefetch_depth", 1)
 
         for stage, layers in g.stages.items():
             layer_ids = [l.layer_id for l in layers]
@@ -206,10 +234,12 @@ class MemTimeline:
 
             for ev in build_1f1b(stage, pp, m):
                 if ev.kind == "FWD":
-                    for lid in layer_ids:
+                    for idx, lid in enumerate(layer_ids):
                         sm = sm_by_id[lid]
-                        # 1. FSDP all-gather 整层参数(compute dtype) + workspace → 采样
-                        B.gather_buf = sm.param_full_bytes
+                        # 1. FSDP all-gather 整层参数(compute dtype) + 预取下 depth 层双缓冲
+                        #    （FSDP2 前向隐式 depth-1 overlap）+ workspace → 采样
+                        B.gather_buf = sm.param_full_bytes + _prefetch_param_bytes(
+                            layer_ids, idx, depth, sm_by_id)
                         B.workspace = sm.workspace
                         rec(f"fwd:{lid}")
                         B.workspace = 0
@@ -227,13 +257,18 @@ class MemTimeline:
                     rec("fwd_end")
 
                 else:  # BWD（逆序层）—— FSDP gather + full grad + recompute + bwd_scratch 共存
-                    for lid in reversed(layer_ids):
+                    bwd_order = list(reversed(layer_ids))
+                    for idx, lid in enumerate(bwd_order):
                         sm = sm_by_id[lid]
                         # 反向某层峰值 = 该层 FSDP 重新 gather 的整层参数(compute)
+                        #   + 预取反向下 depth 层的双缓冲（FSDP2 默认 depth-1 反向预取，
+                        #     逆前向序：_fsdp_param_group.py:854-856；output_layer 首个反向
+                        #     单元预取末 transformer 层）
                         #   + reduce-scatter 前 full 梯度(grad dtype)
                         #   + (full 重算)重物化激活 + (op)反向临时物化(如 loss probs)
                         #   共存，叠在 persistent + 其余 act_live 之上
-                        B.gather_buf = sm.param_full_bytes
+                        B.gather_buf = sm.param_full_bytes + _prefetch_param_bytes(
+                            bwd_order, idx, depth, sm_by_id)
                         B.grad_buf = sm.grad_full_bytes
                         if recompute.is_full(lid):
                             # 去双算：checkpoint 输入已在 act_live（fwd 时 pin），不再计入重物化

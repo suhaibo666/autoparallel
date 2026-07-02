@@ -24,7 +24,9 @@ GOLDEN_OPS = {
                 "e_swiglu", "e_fc2", "combine", "shared_fc1", "shared_swiglu", "shared_fc2"],
     "lm_head": ["lm_head", "logsoftmax", "nll"],
 }
-# ── 冻结 golden：N=4 峰值逐桶字节（framework_reserve=177 MiB、full 重算 1..4、FSDP dp_shard=2）─
+# ── 冻结 golden：N=4 峰值逐桶字节（framework_reserve=177 MiB、full 重算 1..4、FSDP dp_shard=2、
+#    **prefetch_depth=0**——旧单缓冲回归路径：depth=0 逐字节复现预取建模前的 breakdown，
+#    守卫「depth=0 复现旧行为」；默认 depth=1 的拆解路径另见 test_fsdp_prefetch.py）─
 GOLDEN_BREAKDOWN = {
     "persistent": 4015915008, "act_live": 3250585600, "gather_buf": 463339520,
     "grad_buf": 926679040, "recomp_scratch": 0, "bwd_scratch": 4236247040,
@@ -41,7 +43,8 @@ def _spec():
 def _eval(spec):
     ev = Evaluator(
         spec,
-        ParallelConfig(dp_shard=2, tp=1, ep=1, pp=1, cp=1, sequence_parallel=True),
+        ParallelConfig(dp_shard=2, tp=1, ep=1, pp=1, cp=1, sequence_parallel=True,
+                       prefetch_depth=0),   # 回归路径：复现预取建模前的旧单缓冲 breakdown
         OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4),
         HardwareSpec(max_device_memory=59 * GiB, framework_reserve=177 * MiB),
         RecomputeSpec(mode="full", full_layers=set(range(1, 5))),
