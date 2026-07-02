@@ -258,10 +258,12 @@ def test_resolve_no_error(ratio):
 
 def test_registry_dsv4_requires_ratio():
     from cost_eval.layers.registry import ATTN_REGISTRY
+    from cost_eval.layer_context import LayerContext
     assert "dsv4_hybrid" in ATTN_REGISTRY
-    # called without ratio -> clear NotImplementedError (assembler wiring is Task 2.4)
+    # uniform (dims, ctx) API: missing/invalid ctx -> clear NotImplementedError
     with pytest.raises(NotImplementedError):
         ATTN_REGISTRY["dsv4_hybrid"](DS)
-    # called with ratio -> real op list
-    ops = ATTN_REGISTRY["dsv4_hybrid"](DS, 4)
+    # ctx carries per-layer compress_ratio -> real op list (read structurally from ctx)
+    ctx = LayerContext(kind="decoder", attn_type="dsv4_hybrid", compress_ratio=4, ffn_type="moe")
+    ops = ATTN_REGISTRY["dsv4_hybrid"](DS, ctx)
     assert isinstance(ops, list) and "indexer" in _names(ops)

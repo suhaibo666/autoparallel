@@ -20,7 +20,6 @@ from .model_spec import DimTable, LayerSpec, ModelSpec
 from .layers.registry import ATTN_REGISTRY, FFN_REGISTRY
 from .layers.ffn import build_shared_expert_ops
 from .layers.head import build_embedding_ops, build_head_and_loss_ops, build_mtp_ops
-from .layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
 from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
 
 
@@ -114,17 +113,13 @@ def _use_mhc(cfg: LLMConfig) -> bool:
 def _build_decoder_body(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> list:
     """组装一个 decoder 层的 body op（attn 段 + ffn 段，未套 mHC）。
 
-    **结构化 dispatch**（读 `ctx` 字段，不解析字符串）：
-    - `ctx.attn_type == "dsv4_hybrid"` → `build_dsv4_hybrid_attn_ops(dims, ctx.compress_ratio)`
-      （按 per-layer 压缩比内部分支，§7.3）。
-    - 其它 → `ATTN_REGISTRY[ctx.attn_type](dims)`。
-    ffn 段：`FFN_REGISTRY[ctx.ffn_type](dims)`（+ `build_shared_expert_ops` 当 moe & 有 shared expert）。
+    **统一注册表 API**（结构化 dispatch，读 `ctx` 字段，不解析字符串）：
+    - attn 段：`ATTN_REGISTRY[ctx.attn_type](dims, ctx)`——`dsv4_hybrid` 从 `ctx.compress_ratio`
+      读 per-layer 压缩比内部分支（§7.3）；`gqa`/`mla` 忽略 ctx。
+    - ffn 段：`FFN_REGISTRY[ctx.ffn_type](dims, ctx)`（+ `build_shared_expert_ops` 当 moe & 有 shared expert）。
     """
-    if ctx.attn_type == "dsv4_hybrid":
-        attn_ops = list(build_dsv4_hybrid_attn_ops(dims, ctx.compress_ratio))
-    else:
-        attn_ops = list(ATTN_REGISTRY[ctx.attn_type](dims))
-    ffn_ops = list(FFN_REGISTRY[ctx.ffn_type](dims))
+    attn_ops = list(ATTN_REGISTRY[ctx.attn_type](dims, ctx))
+    ffn_ops = list(FFN_REGISTRY[ctx.ffn_type](dims, ctx))
     if ctx.ffn_type == "moe" and cfg.moe_shared_expert_num > 0:
         ffn_ops += build_shared_expert_ops(dims)
     return attn_ops + ffn_ops
