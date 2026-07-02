@@ -91,8 +91,18 @@ class StagePeak:
 # ---------------------------------------------------------------------------
 
 def _layer_saves_bytes(layer) -> int:
-    """该层所有 op 的 saves 张量总字节（全量保存时 pin 进 act_live）。"""
-    return sum(s.local_numel * s.dtype_bytes for op in layer.ops for s in op.saves)
+    """该层所有 op 的 saves 张量总字节（全量保存时 pin 进 act_live）。
+
+    **按张量名去重（设计 §2.1/§7.1「Σ去重」）**：同一物理张量被多个 op `save_for_backward`
+    只占一份显存，只能算一次。典型：`attn` 被 `flash`（saves=[qkv,attn,lse]）与 `o_proj`
+    （saves=[attn]）双 save（attention.py GQA :69/:73、MLA :149/:153）——去重前每层每 microbatch
+    多算约一个 attn 张量（C1）。
+    """
+    seen: dict = {}
+    for op in layer.ops:
+        for s in op.saves:
+            seen[s.name] = s.local_numel * s.dtype_bytes
+    return sum(seen.values())
 
 
 def _checkpoint_input_bytes(layer) -> int:
