@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from .structure_mem import estimate_structure_memory
+
 
 class StaticMem:
     """M5：计算每 stage 每卡的持久内存字节（param + grad + optimizer state）。"""
@@ -34,15 +36,14 @@ class StaticMem:
                 out[stage] = 0
                 continue
 
-            numel = 0
-            for layer in layers:
-                for op in layer.ops:
-                    for w in op.params:
-                        # w.local_numel 已由 M4 除过 tp（dense）或 ep（expert）
-                        # M5 再除对应的 FSDP 组
-                        divisor = efsdp if w.is_expert else fsdp
-                        numel += w.local_numel // divisor
-
-            out[stage] = numel * opt.state_bytes_per_param
+            # 逐结构（层）组装 StructureMemory.persistent（含 fsdp/efsdp 切 + opt 倍数、按名
+            # 去重），跨结构相加即该 stage 持久态。去重集中在 estimate_structure_memory 一处。
+            out[stage] = sum(
+                estimate_structure_memory(
+                    layer.ops, fsdp=fsdp, efsdp=efsdp,
+                    opt_state_bytes=opt.state_bytes_per_param,
+                ).persistent
+                for layer in layers
+            )
 
         return out

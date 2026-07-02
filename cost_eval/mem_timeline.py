@@ -2,6 +2,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
+from .structure_mem import estimate_structure_memory
+
 
 # ---------------------------------------------------------------------------
 # Task 11: Event + build_1f1b
@@ -90,49 +92,42 @@ class StagePeak:
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-def _layer_saves_bytes(layer) -> int:
-    """该层所有 op 的 saves 张量总字节（全量保存时 pin 进 act_live）。
+# 以下 `_layer_*` 均**组装** `estimate_structure_memory`（structure_mem.py）取对应桶，
+# 不再各自裸 walk raw ops——去重（saves/params 按名）与 rollup 逻辑集中在那一处。
 
-    **按张量名去重（设计 §2.1/§7.1「Σ去重」）**：同一物理张量被多个 op `save_for_backward`
-    只占一份显存，只能算一次。典型：`attn` 被 `flash`（saves=[qkv,attn,lse]）与 `o_proj`
-    （saves=[attn]）双 save（attention.py GQA :69/:73、MLA :149/:153）——去重前每层每 microbatch
-    多算约一个 attn 张量（C1）。
-    """
-    seen: dict = {}
-    for op in layer.ops:
-        for s in op.saves:
-            seen[s.name] = s.local_numel * s.dtype_bytes
-    return sum(seen.values())
+def _layer_saves_bytes(layer) -> int:
+    """该层 saves 去重后总字节（全量保存时 pin 进 act_live）。
+
+    去重语义（设计 §2.1/§7.1「Σ去重」）见 `estimate_structure_memory`：`attn` 被
+    `flash`（saves=[qkv,attn,lse]）与 `o_proj`（saves=[attn]）双 save（attention.py GQA
+    :69/:73、MLA :149/:153）只算一次（C1）。"""
+    return estimate_structure_memory(layer.ops).activation_saves
 
 
 def _checkpoint_input_bytes(layer) -> int:
-    """full 重算时仅保留层输入：取第一个有 saves 的 op 的首个 save。"""
-    for op in layer.ops:
-        if op.saves:
-            s = op.saves[0]
-            return s.local_numel * s.dtype_bytes
-    return 0
+    """full 重算时仅保留层输入：第一个有 saves 的 op 的首个 save。"""
+    return estimate_structure_memory(layer.ops).checkpoint_input
 
 
 def _layer_param_bytes(layer) -> int:
-    """该层 full-unsharded 参数（compute dtype）——FSDP all-gather 缓冲；
-    权重 local_numel 已含 tp/ep 切但未含 fsdp，故即 full-unsharded。"""
-    return sum(w.local_numel * w.dtype_bytes for op in layer.ops for w in op.params)
+    """该层 full-unsharded 参数（compute dtype）——FSDP all-gather 缓冲（按名去重）。"""
+    return estimate_structure_memory(layer.ops).param_full_bytes
 
 
 def _layer_grad_bytes(layer, grad_dtype_bytes: int) -> int:
-    """反向 reduce-scatter 前的 full-unsharded 梯度（按 grad dtype）。"""
-    return sum(w.local_numel * grad_dtype_bytes for op in layer.ops for w in op.params)
+    """反向 reduce-scatter 前的 full-unsharded 梯度（按 grad dtype，按名去重）。"""
+    return estimate_structure_memory(
+        layer.ops, grad_dtype_bytes=grad_dtype_bytes).grad_full_bytes
 
 
 def _layer_bwd_scratch(layer) -> int:
     """该层各 op 反向临时物化之和（如 loss probs fp32）。"""
-    return sum(getattr(op, "bwd_scratch_bytes", 0) for op in layer.ops)
+    return estimate_structure_memory(layer.ops).bwd_scratch
 
 
 def _layer_workspace(layer) -> int:
     """该层各 op workspace_bytes 的最大值（FWD 逐层临时占用）。"""
-    return max((op.workspace_bytes for op in layer.ops), default=0)
+    return estimate_structure_memory(layer.ops).workspace
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +169,12 @@ class MemTimeline:
         for stage, layers in g.stages.items():
             layer_ids = [l.layer_id for l in layers]
             by_id = {l.layer_id: l for l in layers}
+            # 每层的 StructureMemory rollup（模块化组装，单点去重）——预算一次，事件循环直取各桶。
+            sm_by_id = {
+                l.layer_id: estimate_structure_memory(
+                    l.ops, grad_dtype_bytes=grad_dtype_bytes)
+                for l in layers
+            }
 
             B = Buckets(persistent=static_persistent.get(stage, 0))
             peak: int = -1
@@ -205,20 +206,20 @@ class MemTimeline:
             for ev in build_1f1b(stage, pp, m):
                 if ev.kind == "FWD":
                     for lid in layer_ids:
-                        layer = by_id[lid]
+                        sm = sm_by_id[lid]
                         # 1. FSDP all-gather 整层参数(compute dtype) + workspace → 采样
-                        B.gather_buf = _layer_param_bytes(layer)
-                        B.workspace = _layer_workspace(layer)
+                        B.gather_buf = sm.param_full_bytes
+                        B.workspace = sm.workspace
                         rec(f"fwd:{lid}")
                         B.workspace = 0
                         B.gather_buf = 0   # reshard_after_forward(default)：用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
-                            saved = _checkpoint_input_bytes(layer)   # 仅保留层入口
+                            saved = sm.checkpoint_input               # 仅保留层入口
                         elif swap.swaps(lid):
                             saved = 0                                 # 全部卸载到 CPU
                         else:
-                            saved = _layer_saves_bytes(layer)        # 全量 saves
+                            saved = sm.activation_saves               # 全量 saves（去重）
                         pinned[(ev.mb, lid)] = saved
                         B.act_live += saved
                     # 所有层 pin 完毕 → 该 microbatch FWD 峰
@@ -226,19 +227,19 @@ class MemTimeline:
 
                 else:  # BWD（逆序层）—— FSDP gather + full grad + recompute + bwd_scratch 共存
                     for lid in reversed(layer_ids):
-                        layer = by_id[lid]
+                        sm = sm_by_id[lid]
                         # 反向某层峰值 = 该层 FSDP 重新 gather 的整层参数(compute)
                         #   + reduce-scatter 前 full 梯度(grad dtype)
                         #   + (full 重算)重物化激活 + (op)反向临时物化(如 loss probs)
                         #   共存，叠在 persistent + 其余 act_live 之上
-                        B.gather_buf = _layer_param_bytes(layer)
-                        B.grad_buf = _layer_grad_bytes(layer, grad_dtype_bytes)
+                        B.gather_buf = sm.param_full_bytes
+                        B.grad_buf = sm.grad_full_bytes
                         if recompute.is_full(lid):
                             # 去双算：checkpoint 输入已在 act_live（fwd 时 pin），不再计入重物化
                             # TODO(§8.5②): 严格应为该层 forward 的 max-live(mini-fwd 时间线)，非 saves 之和
                             B.recomp_scratch = max(
-                                0, _layer_saves_bytes(layer) - _checkpoint_input_bytes(layer))
-                        B.bwd_scratch = _layer_bwd_scratch(layer)
+                                0, sm.activation_saves - sm.checkpoint_input)
+                        B.bwd_scratch = sm.bwd_scratch
                         rec(f"bwd@{lid}")
                         B.gather_buf = B.grad_buf = B.recomp_scratch = B.bwd_scratch = 0
                         # 该层反向结束，释放其 pinned 激活
