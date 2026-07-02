@@ -1,5 +1,7 @@
 """Task 11 + 12 tests for M6 mem_timeline (build_1f1b + simulate)."""
-from cost_eval.mem_timeline import build_1f1b, Event, MemTimeline, _layer_saves_bytes
+from cost_eval.mem_timeline import (
+    build_1f1b, build_interleaved_1f1b, interleaved_warmup,
+    Event, MemTimeline, _layer_saves_bytes)
 from cost_eval.model_spec import DimTable, ModelSpec
 from cost_eval.layers.dense import build_dense_decoder
 from cost_eval.layers.mla import build_mla_dense_decoder
@@ -217,3 +219,124 @@ def test_mla_layer_dedups_attn_save_once():
     attn_bytes = attn.local_numel * attn.dtype_bytes
     assert attn_bytes > 0
     assert dedup == naive - attn_bytes
+
+
+# ---------------------------------------------------------------------------
+# Task [VPP]: 交错式 1F1B（interleaved-1F1B / 虚拟流水 VPP）—— 更深 warmup
+#
+# 锚定公式（Megatron `schedules.py:877-878`，默认
+# `microbatch_group_size_per_vp_stage = pp`，`model_parallel_config.py:519-520`）：
+#     num_warmup = (pp - rank - 1)*2 + (V - 1)*pp        （clamp 到本模型的 m）
+# 对照 plain-1F1B（`schedules.py:870`）：num_warmup = pp - rank - 1。
+# mindformers pynative 同构（round-robin chunk：`pipeline_parallel.py:257-258`；
+# V=1→plain、V>1→interleaved：`:275-276`/`:360-371`）。
+# ---------------------------------------------------------------------------
+
+def _leading_fwd(evs):
+    """事件序列开头连续 FWD 的个数（第一个 BWD 之前）。plain/interleaved 里
+    = warmup + 1（未被 m 截断时：warmup 个热身 FWD + steady 第一个 FWD）。"""
+    n = 0
+    for e in evs:
+        if e.kind == "FWD":
+            n += 1
+        else:
+            break
+    return n
+
+
+def test_interleaved_v1_byte_identical_to_1f1b():
+    """V=1 → 逐事件复现 plain build_1f1b（byte-identical 门；守卫 anchors/golden）。"""
+    for pp in (1, 2, 4):
+        for stage in range(pp):
+            for m in (1, 4, 8):
+                assert build_interleaved_1f1b(stage, pp, m, 1) == build_1f1b(stage, pp, m)
+
+
+def test_interleaved_warmup_formula_matches_megatron():
+    """warmup 计数命中 Megatron 交错式表达式（手算字面值，非自指）。"""
+    assert interleaved_warmup(0, 4, 16, 2) == 2 * 3 + 1 * 4      # 10
+    assert interleaved_warmup(1, 4, 16, 2) == 2 * 2 + 1 * 4      # 8
+    assert interleaved_warmup(3, 4, 16, 2) == 2 * 0 + 1 * 4      # 4（末 stage 仍热身）
+    assert interleaved_warmup(0, 4, 30, 3) == 2 * 3 + 2 * 4      # 14
+    assert interleaved_warmup(0, 2, 8, 2) == 2 * 1 + 1 * 2       # 4
+    # V=1 退回 plain-1F1B 的 warmup（**不是**交错式在 V=1 处的 2×(pp-1-stage)）
+    assert interleaved_warmup(0, 4, 16, 1) == min(4 - 1 - 0, 16)  # 3
+
+
+def test_interleaved_warmup_deeper_than_plain():
+    """任意 stage：交错式 warmup 严格深于 plain-1F1B（更多在飞 microbatch）。"""
+    for stage in range(4):
+        plain = min(4 - 1 - stage, 16)
+        assert interleaved_warmup(stage, 4, 16, 2) > plain
+
+
+def test_interleaved_warmup_monotonic_in_v():
+    """warmup 计数随 V 单调增（V 越多 → warmup 越深）。m 足够大避免截断。"""
+    prev = interleaved_warmup(0, 4, 100, 1)
+    for v in (2, 3, 4, 5):
+        w = interleaved_warmup(0, 4, 100, v)
+        assert w > prev
+        prev = w
+
+
+def test_interleaved_warmup_clamped_to_m():
+    """raw 2*3+3*4=18 > m=8 → 截断到 m=8；事件计数仍平衡（m F / m B）。"""
+    assert interleaved_warmup(0, 4, 8, 4) == 8
+    evs = build_interleaved_1f1b(0, 4, 8, 4)
+    assert sum(e.kind == "FWD" for e in evs) == 8
+    assert sum(e.kind == "BWD" for e in evs) == 8
+
+
+def test_interleaved_event_counts_balanced():
+    """V>1：总 FWD == m、总 BWD == m（pinned 全 pop，无泄漏）。"""
+    evs = build_interleaved_1f1b(0, 4, 16, 2)
+    assert sum(e.kind == "FWD" for e in evs) == 16
+    assert sum(e.kind == "BWD" for e in evs) == 16
+
+
+def test_interleaved_leading_fwd_is_warmup_plus_one():
+    """把 warmup 公式与事件序列扣起来：未截断时开头 FWD 连跑 = warmup + 1。"""
+    w = interleaved_warmup(0, 4, 16, 2)          # 10 < 16
+    assert _leading_fwd(build_interleaved_1f1b(0, 4, 16, 2)) == w + 1
+
+
+# ── simulate 接线：V 来自 ParallelConfig.interleave ─────────────────────────
+
+def _sim_interleave(pp, m, v, stage=0, recompute=None):
+    spec = ModelSpec("toy", D, ["dense"] * 4, {"dense": build_dense_decoder(D)})
+    pm = ParallelModel(ParallelConfig(pp=pp, num_microbatches=m, interleave=v),
+                       n_layers=4, world_size=pp)
+    g = ShapeEval().resolve(spec, pm)
+    persistent = StaticMem().compute(g, OptimizerSpec.adamw(), pm, False)
+    rc = recompute or RecomputeSpec("None")
+    return MemTimeline().simulate(g, rc, SwapSpec(), pm, persistent,
+                                  framework_reserve=0, max_device_memory=10 ** 12)[stage]
+
+
+def test_interleave1_simulate_reproduces_default():
+    """simulate 接线 interleave=1 与「不设该字段（默认 1）」逐字节一致（回归门）。"""
+    a = _sim_interleave(4, 8, 1, stage=0)
+    spec = ModelSpec("toy", D, ["dense"] * 4, {"dense": build_dense_decoder(D)})
+    pm = ParallelModel(ParallelConfig(pp=4, num_microbatches=8), n_layers=4, world_size=4)
+    g = ShapeEval().resolve(spec, pm)
+    persistent = StaticMem().compute(g, OptimizerSpec.adamw(), pm, False)
+    b = MemTimeline().simulate(g, RecomputeSpec("None"), SwapSpec(), pm, persistent,
+                               framework_reserve=0, max_device_memory=10 ** 12)[0]
+    assert a.peak_bytes == b.peak_bytes
+    assert a.breakdown == b.breakdown
+
+
+def test_interleave_deeper_warmup_raises_peak_stage0():
+    """warmup-受限的 stage 0：V=2 比 plain 更深 warmup → act_live/peak 更高。"""
+    p1 = _sim_interleave(4, 20, 1)
+    p2 = _sim_interleave(4, 20, 2)
+    assert p2.breakdown.act_live > p1.breakdown.act_live
+    assert p2.peak_bytes > p1.peak_bytes
+
+
+def test_interleave_peak_monotonic_in_v_stage0():
+    """peak 随 V 单调不减（更深 warmup → 更多在飞 microbatch 的 act_live）。"""
+    peaks = [_sim_interleave(4, 20, v).peak_bytes for v in (1, 2, 4)]
+    assert peaks[0] <= peaks[1] <= peaks[2]
+    acts = [_sim_interleave(4, 20, v).breakdown.act_live for v in (1, 2, 4)]
+    assert acts[0] <= acts[1] <= acts[2]

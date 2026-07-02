@@ -6,7 +6,7 @@ from .structure_mem import estimate_structure_memory, estimate_select_memory
 
 
 # ---------------------------------------------------------------------------
-# Task 11: Event + build_1f1b
+# Task 11: Event + build_1f1b（+ Task[VPP]: 交错式 1F1B / 虚拟流水 warmup）
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -16,12 +16,12 @@ class Event:
     layer: int = -1
 
 
-def build_1f1b(stage: int, pp: int, m: int):
-    """返回 (FWD/BWD, microbatch) 事件序列（层粒度在 simulate 内展开）。
+def _1f1b_from_warmup(warmup: int, m: int):
+    """给定 warmup（先行前向数）构造 1F1B 事件序列：warmup 个 FWD 先行，然后
+    steady 段 F/B 交替直到 m 个前向发完，最后 cooldown 段把剩余 BWD 收尾。
 
-    warmup=min(pp-1-stage, m) 个前向先行，然后 1F1B 交替，最后 cooldown BWD。
-    """
-    warmup = min(pp - 1 - stage, m)
+    plain 与 interleaved 仅 **warmup 深度** 不同 → 共用此段（DRY，且保证 V=1
+    与旧 build_1f1b 逐事件一致）。"""
     evs = [Event("FWD", i) for i in range(warmup)]
     fwd_i, bwd_i = warmup, 0
     while bwd_i < m:
@@ -31,6 +31,72 @@ def build_1f1b(stage: int, pp: int, m: int):
         evs.append(Event("BWD", bwd_i))
         bwd_i += 1
     return evs
+
+
+def build_1f1b(stage: int, pp: int, m: int):
+    """plain 1F1B（forward_backward_pipelining_without_interleaving）事件序列。
+
+    warmup = min(pp-1-stage, m) 个前向先行（Megatron `schedules.py:870`
+    `num_warmup = pp - rank - 1`，clamp 到 total=m，`:889-890`），然后 1F1B
+    交替，最后 cooldown BWD。层粒度在 simulate 内展开。"""
+    return _1f1b_from_warmup(min(pp - 1 - stage, m), m)
+
+
+def interleaved_warmup(stage: int, pp: int, m: int, v: int) -> int:
+    """交错式 1F1B（VPP / 虚拟流水）某 stage 的 warmup（先行前向）微批数。
+
+    锚定 **Megatron** `forward_backward_pipelining_with_interleaving` 的
+    `num_warmup_microbatches`（`schedules.py:877-878`）：
+
+        num_warmup = (pp - rank - 1) * 2 + (num_model_chunks - 1)
+                     * microbatch_group_size_per_vp_stage
+
+    默认 `microbatch_group_size_per_vp_stage = pipeline_model_parallel_size = pp`
+    （深度优先调度，`model_parallel_config.py:519-520`），故本库取
+
+        warmup = (pp - stage - 1) * 2 + (v - 1) * pp
+
+    其中 v = num_model_chunks（虚拟流水级数 / interleave 数），stage = PP rank。
+    再 clamp 到本模型的可用微批数 m（Megatron 在虚拟粒度 clamp 到 m*v，
+    `schedules.py:862/889-890`；本库事件为**物理微批粒度**——一个 FWD 事件 pin 整
+    个物理 stage 的全部层，见 build_interleaved_1f1b 文档——故 clamp 到 m）。
+
+    **V=1 不走此式**：交错式在 v=1 处给出 2*(pp-1-stage)，是 plain 的 2 倍；Megatron
+    在 v=1 时根本走 `virtual_pipeline_parallel_size is None` 的 plain 分支
+    （`schedules.py:868-870`），mindformers pynative 亦要求 v>1 才 interleaved
+    （`pipeline_parallel.py:275-276`/`:360-371`）。故 v<=1 由 build_interleaved_1f1b
+    直接委托 plain build_1f1b。此函数按定义对 v<=1 返回 plain warmup（min(pp-1-stage, m)）。
+    """
+    if v <= 1:
+        return min(pp - 1 - stage, m)
+    raw = (pp - stage - 1) * 2 + (v - 1) * pp
+    return min(raw, m)
+
+
+def build_interleaved_1f1b(stage: int, pp: int, m: int, v: int):
+    """交错式 1F1B（interleaved-1F1B / VPP）事件序列 —— **更深的 warmup**。
+
+    与 plain build_1f1b 唯一区别是 warmup 深度（interleaved_warmup）：V 个虚拟模型
+    块交错各自的微批 → 首个反向前有更多在飞微批 → warmup 更深 → simulate 的 FWD 循环
+    里 `pinned` 同时驻留更多微批激活 → 每 stage 激活峰更高（本次建模的内存效应）。
+
+    **V=1 → 逐事件复现 build_1f1b**（byte-identical；本库现有配置全部 v=1，anchors/
+    golden 不动）。
+
+    ── 层→(stage,chunk) 与内存幅度的忠实性说明（faithful-but-minimal，见 CLAUDE.md）──
+    真实 VPP 下每个物理 stage 拥有 **V 个非连续 chunk**（round-robin：物理 rank 拥有虚拟
+    stage {chunk*pp + rank}，Megatron 及 mindformers `pipeline_parallel.py:257-258`；层按
+    虚拟 stage 均分，`:188-195`），每个在飞虚拟微批只 pin **一个 chunk（L/V 层）**，净激活
+    膨胀比 ≈ 1 + (pp-1)/(pp*V)（在 V=2 处最大，随 V 增大回落）。本模型走**最小侵入**路径：
+    沿用既有「一个 FWD 事件 pin 整个物理 stage 的全部层」的 pinned 循环，仅把 warmup 加深到
+    Megatron 交错式公式 → 内存效应表现为「pinned 同时驻留 warmup+1 个 **整 stage** 微批激活」。
+    这是对真实 VPP 峰值的**保守上界**（每微批按整 stage 而非 L/V 计，偏高约 V 倍），换取零侵入
+    与 V=1 逐字节回归；把 per-chunk（×1/V）细化列为文档化后续项。warmup 深度本身严格取自 Megatron
+    源码，V 越大 warmup 越深、峰值单调不减，方向与真实一致。
+    """
+    if v <= 1:
+        return build_1f1b(stage, pp, m)
+    return _1f1b_from_warmup(interleaved_warmup(stage, pp, m, v), m)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +289,10 @@ class MemTimeline:
         res: dict = {}
         pp = pm.degree("pp")
         m = pm.pc.num_microbatches
+        # 虚拟流水（VPP）级数 V：来自 ParallelConfig.interleave（默认 1 = plain 1F1B，
+        # build_interleaved_1f1b 对 v<=1 逐事件复现 build_1f1b → anchors/golden 不动）。
+        # V>1 → 交错式更深 warmup（Megatron `schedules.py:877-878`），更多在飞微批激活。
+        v = getattr(pm.pc, "interleave", 1)
         # FSDP2 参数预取深度（config 驱动，非魔法常数）：默认 1 = FSDP2 默认双缓冲
         # （survey：PyTorch _fsdp_param_group.py:854-856 / mindformers parallelize.py:245-273）。
         # depth=0 → 复现旧单缓冲（回归路径）。
@@ -290,7 +360,7 @@ class MemTimeline:
             # (mb, layer_id) -> saved bytes currently pinned in act_live
             pinned: dict = {}
 
-            for ev in build_1f1b(stage, pp, m):
+            for ev in build_interleaved_1f1b(stage, pp, m, v):
                 if ev.kind == "FWD":
                     for idx, lid in enumerate(layer_ids):
                         sm = sm_by_id[lid]
