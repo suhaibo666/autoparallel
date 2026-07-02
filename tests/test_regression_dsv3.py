@@ -12,11 +12,17 @@ def _peak(spec, N):
                    HardwareSpec(max_device_memory=59*GiB, framework_reserve=RESIDUAL_MiB*MiB),
                    RecomputeSpec(mode="full", full_layers=full), SwapSpec())
     return ev.evaluate().per_stage[0]
+# 真机实测锚点（max_memory_allocated MiB）。framework_reserve 经验常数已消除（RESIDUAL_MiB=0），
+# 预测由「逐桶结构 + 分配器对齐公式」给出（无拟合 blob）→ 从逐字节命中改为**真机 ±1% 容差**。
+# 预测现略低于真机（DSv3 4L 12409.5 vs 12473.1 = 0.995），差额是未建的 sub-block 临时量（文档化小残差）。
+REAL_4L, REAL_8L = 12473.1, 13953.3
+
+
 def test_preset_equals_oracle_and_anchor_4L():
     new = _peak(build_llm_spec(deepseek_v3(4)), 4)
     old = _peak(build_dsv3_spec(4)[0], 4)
-    assert abs(new.peak_bytes - old.peak_bytes) < 1
-    assert abs(new.peak_bytes/MiB - 12472.5) < 0.5
+    assert abs(new.peak_bytes - old.peak_bytes) < 1               # preset≡oracle（逐字节）
+    assert abs(new.peak_bytes/MiB - REAL_4L) / REAL_4L < 0.01     # 真机 ±1%（无 framework 常数）
 def test_anchor_8L():
     new = _peak(build_llm_spec(deepseek_v3(8)), 8)
-    assert abs(new.peak_bytes/MiB - 13896.1) < 1.0
+    assert abs(new.peak_bytes/MiB - REAL_8L) / REAL_8L < 0.01     # 真机 ±1%

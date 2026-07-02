@@ -20,19 +20,16 @@ GiB = 2 ** 30
 import os
 # 真机实测 (peak_alloc_MiB, resident_MiB) by (层数, ep)
 MEASURED = {(4, 1): (12473.1, 3862.0), (8, 1): (13953.3, None), (4, 2): (12474.1, None)}
-# framework_reserve(allocated) = residual（**不含 HCCL**，ep=2 修正 §8.6）。
-# 原 2197 里 ~2020 MiB 是 loss 反向漏建的 grad_log_softmax(fp32 满 vocab)，现已显式建进
-# nll.bwd_scratch（probs + grad 共 2×4·S·B·vocab，loss.py:80-82）。
-#
-# **FSDP2 参数预取拆解（2026-07-02）**：又从 177 里拆出 **ΔP ≈ 113.969 MiB** —— 这是峰值
-# 时刻 bwd@5(lm_head) 反向预取的下一 transformer 层(layer4, mla_moe) 的 full-unsharded
-# 参数双缓冲（compute dtype），此前隐匿在这个经验常数里，现已由公式显式建进 gather_buf
-# （mem_timeline._prefetch_param_bytes，忠实 FSDP2 默认 depth-1：PyTorch
-# _fsdp_param_group.py:854-856 / mindformers parallelize.py:245-273）。这是纯**再归属**：
-# depth=1 + 63 与 depth=0 + 177 的总峰值逐字节相等（tests/test_fsdp_prefetch.py
-# ::test_dsv3_prefetch_is_exact_reattribution_of_reserve）。残余 63 = flash workspace +
-# MoE all-to-all staging + 分配器块对齐取整。HCCL 在 reserved 池不计入 allocated 峰值。
-RESIDUAL_MiB = 63     # = 177 − ΔP(≈114)：ΔP 已移入 gather_buf 预取双缓冲公式
+# framework_reserve **生产默认 = 0**（经验常数已彻底消除，2026-07-02）。原 2197→177→63 的逐项归属：
+#   - ~2020 MiB：loss 反向 grad_log_softmax(fp32 满 vocab) → 已建进 nll.bwd_scratch（loss.py:80-82）。
+#   - ~114 MiB（ΔP）：FSDP2 反向预取下一层双缓冲 → 已建进 gather_buf（_prefetch_param_bytes，depth-1）。
+#   - flash workspace（∝S·n_heads）→ flash op workspace（FLASH_LSE_WS，T2；off loss 峰）。
+#   - MoE all-to-all staging（∝dispatched_tokens·H）→ dispatch/combine workspace（MOE_STAGING_WS，T3；off 峰）。
+#   - 分配器块对齐 → structure_mem 逐张量 roundup 到 alloc_block_bytes=512（平台属性，T4；DSv3 已对齐→0）。
+# 残余 ~63 MiB（DSv3 4L，0.5%）= 未建的 sub-block 临时量（rope cos/sin 表 / norm rstd / cast 临时），
+# 属**已文档化的已知小残差**，不再拟合成常数 → RESIDUAL_MiB=0，DSv3 4L 预测 12409.5（真机 12473.1，0.995）。
+# HCCL 在 reserved 池不计入 allocated 峰值。审计旧行为：depth=0 + framework_reserve=177（见 test_dsv3_golden）。
+RESIDUAL_MiB = 0      # 经验常数已消除；机理项按公式散落 op 图（见 cost_eval/framework.py docstring）
 
 
 def build_embedding(d):

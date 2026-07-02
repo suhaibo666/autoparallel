@@ -39,6 +39,17 @@ class StructureMemory:
     checkpoint_input: int = 0
 
 
+def _align_up(nbytes: int, block: int) -> int:
+    """分配器块对齐上取整：把一次分配的字节数按内存池块粒度上取整（平台属性，非拟合）。
+
+    MindSpore 设备内存池 `DynamicMemPoolBestFit` 对每次分配按 `kDynamicMemAlignSize`(=512B)
+    对齐；`max_memory_allocated`（分配峰值）因此 = Σ 各张量按块上取整的字节。block<=1 → 不取整
+    （回归/直调路径逐字节复现旧行为）。"""
+    if block <= 1:
+        return nbytes
+    return ((nbytes + block - 1) // block) * block
+
+
 def estimate_structure_memory(
     resolved_ops,
     *,
@@ -46,6 +57,7 @@ def estimate_structure_memory(
     efsdp: int = 1,
     opt_state_bytes: int = 0,
     grad_dtype_bytes: int = 4,
+    alloc_block_bytes: int = 1,
 ) -> StructureMemory:
     """把一段属于同一结构的 ResolvedOp 汇总成 `StructureMemory`（按名去重）。
 
@@ -55,7 +67,11 @@ def estimate_structure_memory(
     fsdp / efsdp    : int  — 持久 param 的 FSDP 分母（专家用 efsdp，其余用 fsdp）。
     opt_state_bytes : int  — 持久 = param+opt 的每元素字节倍数（AdamW fp32=12/bf16=14）；0=不算持久。
     grad_dtype_bytes: int  — 反向瞬态 grad 的 dtype 字节。
+    alloc_block_bytes: int — 设备内存池分配对齐块（平台属性，`HardwareSpec.alloc_block_bytes`，
+        默认 512）。**逐张量**按此上取整——分配峰值(max_memory_allocated)的分配器碎片公式，
+        取代经验 framework_reserve 常数。默认 1（无取整）供直调/回归逐字节复现旧值。
     """
+    blk = alloc_block_bytes
     # ── 按名去重：params / saves（结构内同名 = 同一物理张量，只算一次）──────────────
     params: dict = {}
     saves: dict = {}
@@ -77,10 +93,10 @@ def estimate_structure_memory(
                     f"{w.name} local_numel={w.local_numel} 不被 "
                     f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
                     f"（切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
-            persistent += (w.local_numel // divisor) * opt_state_bytes
-    activation_saves = sum(s.local_numel * s.dtype_bytes for s in saves.values())
-    param_full_bytes = sum(w.local_numel * w.dtype_bytes for w in params.values())
-    grad_full_bytes = sum(w.local_numel * grad_dtype_bytes for w in params.values())
+            persistent += _align_up((w.local_numel // divisor) * opt_state_bytes, blk)
+    activation_saves = sum(_align_up(s.local_numel * s.dtype_bytes, blk) for s in saves.values())
+    param_full_bytes = sum(_align_up(w.local_numel * w.dtype_bytes, blk) for w in params.values())
+    grad_full_bytes = sum(_align_up(w.local_numel * grad_dtype_bytes, blk) for w in params.values())
     bwd_scratch = sum(getattr(op, "bwd_scratch_bytes", 0) for op in resolved_ops)
     workspace = max((op.workspace_bytes for op in resolved_ops), default=0)
 
@@ -88,7 +104,7 @@ def estimate_structure_memory(
     for op in resolved_ops:
         if op.saves:
             s = op.saves[0]
-            checkpoint_input = s.local_numel * s.dtype_bytes
+            checkpoint_input = _align_up(s.local_numel * s.dtype_bytes, blk)
             break
 
     return StructureMemory(

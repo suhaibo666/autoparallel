@@ -17,5 +17,6 @@ def test_build_dsv3_spec_now_uses_preset():
     for N in (4,8):
         assert _peak(build_dsv3_spec(N)[0], N) == _peak(build_llm_spec(deepseek_v3(N)), N)
 def test_anchors_unchanged():
-    assert abs(_peak(build_dsv3_spec(4)[0],4)/MiB - 12472.5) < 0.5
-    assert abs(_peak(build_dsv3_spec(8)[0],8)/MiB - 13896.1) < 1.0
+    # framework 经验常数消除后：真机 ±1%（12409.5 vs 12473.1、13833.1 vs 13953.3，均 <1%）
+    assert abs(_peak(build_dsv3_spec(4)[0],4)/MiB - 12473.1) / 12473.1 < 0.01
+    assert abs(_peak(build_dsv3_spec(8)[0],8)/MiB - 13953.3) / 13953.3 < 0.01

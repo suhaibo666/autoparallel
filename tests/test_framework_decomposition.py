@@ -172,3 +172,73 @@ def test_moe_staging_scales_with_dispatched_tokens():
     d2 = DimTable(H=16, F=32, n_heads=4, n_kv=2, head_dim=8, S=8, B=1, vocab=32,
                   n_layers=3, n_experts=4, topk=4, moe_F=32)
     assert eval_expr(MOE_STAGING_WS, d2) == 2 * ws
+
+
+# ===========================================================================
+# T4 — framework_reserve → documented allocator block-rounding FORMULA (no blob)
+# ===========================================================================
+# The old `framework_reserve` (calibrated 2197→177→63 MiB) is decomposed: FSDP
+# prefetch → gather_buf; flash-ws → flash workspace; MoE-staging → dispatch/combine
+# workspace. What physically remains in the ALLOCATED peak is per-allocation pool
+# alignment — a documented HW property, NOT a fit. MindSpore DynamicMemPool aligns
+# each allocation to `kDynamicMemAlignSize` (512B). framework_reserve is now 0 by
+# default (the mechanism pieces live in the op graph); the calibrated arg is kept
+# only as an AUDIT/regression knob (reproduces the old lumped behaviour).
+
+def test_hardware_alloc_block_bytes_documented_default():
+    from cost_eval.specs import HardwareSpec
+    hw = HardwareSpec(max_device_memory=1)
+    # MindSpore DynamicMemPoolBestFit kDynamicMemAlignSize (platform property, not a fit).
+    assert hw.alloc_block_bytes == 512
+
+
+def test_framework_reserve_default_zero_no_fitted_blob():
+    from cost_eval.framework import framework_reserve
+    from cost_eval.specs import ParallelConfig
+    # No hand-set MiB residual: default framework_reserve is exactly 0.
+    assert framework_reserve(ParallelConfig()) == 0
+
+
+def test_framework_reserve_calibrated_arg_is_audit_regression_path():
+    """Explicit calibrated reserve is still returned verbatim (auditable old behaviour)."""
+    from cost_eval.framework import framework_reserve
+    from cost_eval.specs import ParallelConfig
+    assert framework_reserve(ParallelConfig(), 177 * 2 ** 20) == 177 * 2 ** 20
+
+
+def test_structure_mem_rounds_each_tensor_up_to_alloc_block():
+    """Allocator FORMULA: each live tensor's bytes rounded up to the pool block."""
+    from cost_eval.model_spec import OpSpec, OpType, TensorRef
+    from cost_eval.shape_eval import ShapeEval
+    from cost_eval.structure_mem import estimate_structure_memory
+    from cost_eval.parallel_model import ParallelModel
+    from cost_eval.specs import ParallelConfig
+    from cost_eval.model_spec import ModelSpec, LayerSpec, DimTable as DT
+    # one save of 100 bytes (odd) → rounds up to 512 with a 512B block.
+    d = DT(H=100, F=1, n_heads=1, n_kv=1, head_dim=1, S=1, B=1, vocab=1, n_layers=1, dtype_bytes=1)
+    x = TensorRef("x", ("S", "B", "H"))
+    op = OpSpec("op", OpType.NORM, [x], TensorRef("y", ("S", "B", "H")), saves=[x])
+    spec = ModelSpec("m", d, ["l"], {"l": LayerSpec([op])})
+    g = ShapeEval().resolve(spec, ParallelModel(ParallelConfig(), 1, 1))
+    ops = g.stages[0][0].ops
+    assert estimate_structure_memory(ops).activation_saves == 100                 # block=1 → no rounding
+    assert estimate_structure_memory(ops, alloc_block_bytes=512).activation_saves == 512
+
+
+def test_dsv3_tensors_already_block_aligned_so_reserve_is_zero():
+    """DSv3's modeled tensors are 512-aligned → the allocator formula adds 0; the
+    old 63 MiB was over-attribution, not real allocated block fragmentation."""
+    from cost_eval.presets import deepseek_v3
+    from cost_eval.build_llm import build_llm_spec
+    from cost_eval.structure_mem import estimate_structure_memory
+    from cost_eval.shape_eval import ShapeEval
+    from cost_eval.parallel_model import ParallelModel
+    from cost_eval.specs import ParallelConfig
+    spec = build_llm_spec(deepseek_v3(4))
+    pm = ParallelModel(ParallelConfig(dp_shard=2, sequence_parallel=True), spec.dims.n_layers, 2)
+    g = ShapeEval().resolve(spec, pm)
+    for layer in g.stages[0]:
+        base = estimate_structure_memory(layer.ops, grad_dtype_bytes=4)
+        rounded = estimate_structure_memory(layer.ops, grad_dtype_bytes=4, alloc_block_bytes=512)
+        assert base.activation_saves == rounded.activation_saves
+        assert base.param_full_bytes == rounded.param_full_bytes

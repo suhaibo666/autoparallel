@@ -42,14 +42,19 @@ class Evaluator:
                  * self.pc.tp * self.pc.pp)
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
         g = ShapeEval().resolve(self.spec, pm)
-        persistent = StaticMem().compute(g, self.opt, pm, self.pc.cpu_offload)
-        # framework_reserve 按配置分解：HCCL(200MB×组数) + hw.framework_reserve(残余标定项)
+        # 分配器块对齐（平台属性 HardwareSpec.alloc_block_bytes，默认 512）：逐张量 roundup —
+        # 「分配器碎片」项的公式化落地（framework_reserve「块对齐取整」分量，取代经验常数）。
+        block = getattr(self.hw, "alloc_block_bytes", 1)
+        persistent = StaticMem().compute(g, self.opt, pm, self.pc.cpu_offload, alloc_block_bytes=block)
+        # framework_reserve 现默认 0（生产）：框架瞬态已按机理拆进 op 图（FSDP 预取→gather_buf、
+        # flash-ws→flash workspace、MoE staging→dispatch/combine workspace）+ 分配器对齐→上面的
+        # 逐张量 roundup。hw.framework_reserve 仅审计/回归旋钮（显式给值复现旧经验常数，如 golden 177）。
         fr = framework_reserve(self.pc, self.hw.framework_reserve)
         peaks = MemTimeline().simulate(
             g, self.recompute, self.swap, pm, persistent,
             fr, self.hw.max_device_memory,
             grad_dtype_bytes=getattr(self.opt, "grad_dtype_bytes", 4),
-            record_timeline=record_timeline)
+            record_timeline=record_timeline, alloc_block_bytes=block)
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         return PeakMemoryReport(per_stage, tightest, any(p.oom for p in per_stage))

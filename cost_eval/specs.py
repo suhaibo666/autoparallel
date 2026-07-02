@@ -38,7 +38,16 @@ class OptimizerSpec:
 @dataclass
 class HardwareSpec:
     max_device_memory: int                   # bytes（来自 ContextConfig.max_device_memory）
-    framework_reserve: int = 0               # O_framework 标定常数
+    # framework_reserve：**审计/回归旋钮**（默认 0，非生产项）。生产路径下框架瞬态已按机理
+    # 拆进 op 图（FSDP 预取→gather_buf、flash-ws→flash workspace、MoE staging→dispatch/combine
+    # workspace，见 framework.py）；此项仅在显式给值时复现旧「经验兜底常数」以供审计（如 golden
+    # 的 177 MiB）。**不是拟合的物理量**。
+    framework_reserve: int = 0
+    # alloc_block_bytes：**平台属性**（不是拟合值）——MindSpore 设备内存池 `DynamicMemPoolBestFit`
+    # 对每次分配按 `kMemAlignSize`(=512B, `kDynamicMemAlignSize`) 对齐。分配峰值(max_memory_allocated)
+    # 里每个张量按此块粒度上取整 → 少量对齐碎片。这是 framework_reserve「分配器块对齐」项的**公式化**
+    # 落地（structure_mem 逐张量 roundup），取代经验常数。默认 512（可按硬件覆盖）。
+    alloc_block_bytes: int = 512
 
 
 @dataclass

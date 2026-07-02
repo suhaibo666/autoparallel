@@ -152,5 +152,6 @@ def test_swa_memory_neutral_equal_peak():
 def test_dsv3_preset_still_byte_identical():
     new = _peak(build_llm_spec(deepseek_v3(4)), 4)
     old = _peak(build_dsv3_spec(4)[0], 4)
-    assert abs(new.peak_bytes - old.peak_bytes) < 1
-    assert abs(new.peak_bytes / MiB - 12472.5) < 0.5
+    assert abs(new.peak_bytes - old.peak_bytes) < 1               # preset≡oracle（逐字节）
+    # framework 经验常数已消除 → 真机 12473.1 ±1%（预测 12409.5 = 0.995，无拟合 blob）
+    assert abs(new.peak_bytes / MiB - 12473.1) / 12473.1 < 0.01

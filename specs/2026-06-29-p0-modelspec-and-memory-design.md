@@ -315,6 +315,20 @@ fp32 AdamW 训练后常驻 = param(4)+m(4)+v(4) = **12 B/param**（不是 16）�
 **关键认知**：原 2197 的"framework_reserve"并非真·框架开销，其 92% 是漏建的 loss 反向激活——`framework_reserve` 是**记账兜底位**，
 不是物理实体；把可建模项逐一建出来后它应持续收窄（理想 →仅分配器碎片）。
 
+> **§8.6.1 收尾：`framework_reserve` → 0（经验常数彻底消除，2026-07-02）**
+>
+> 承接上面"应持续收窄"，本次把残余 63 MiB 逐项**按机理拆进 op 图的公式**，`framework_reserve` 生产默认 = **0**（无拟合 MiB blob）。逐项归属（每项**只在其算子活跃的事件计入**——全局常数会在 loss 峰值也错误叠加 flash-ws 等，而那里没有 attention 在跑）：
+>
+> | 原 framework_reserve 分量 | 现落地（公式，file:line） | 缩放律 | 落在哪个事件 |
+> |---|---|---|---|
+> | FSDP2 参数预取双缓冲（~114 MiB） | `gather_buf`（`mem_timeline._prefetch_param_bytes`，depth-1） | ∝ 下层 param_full | 峰值层 gather |
+> | flash-attention workspace | flash op `workspace` = `attention.FLASH_LSE_WS="64·B·n_heads·S"`（`flash_attention.py:136-196` softmax_max/sum [B,n_heads,S,8] fp32） | **∝ S·n_heads** | attention 前向 |
+> | MoE all-to-all staging | dispatch/combine op `workspace` = `ffn.MOE_STAGING_WS="2·S·B·topk·C·H"`（`experts.py:103-173` permute/unpermute） | **∝ dispatched_tokens·H** | MoE 前向 |
+> | mHC/MTP 反向瞬态 | mHC sinkhorn `bwd_scratch=4·S·B·n·H`（`hyper_connection.py:87-112`）+ MTP mHC 包装（`multi_token_prediction.py:381-399`） | ∝ n·H | mHC/MTP 层反向 |
+> | 分配器块对齐碎片 | `structure_mem` 逐张量 roundup 到 `HardwareSpec.alloc_block_bytes`（=512B，MindSpore `DynamicMemPoolBestFit.kDynamicMemAlignSize`，**平台属性非拟合**） | ∝ 张量数 | 全事件 |
+>
+> DSv3 各建模张量本已 512 对齐 → 分配器项为 **0**。残余 ~63 MiB（DSv3 4L，**0.5%**）= 未建的 sub-block 临时量（rope cos/sin 表 / norm rstd / cast 临时张量），属**已文档化的已知小残差**，不再拟合。锚点漂移：DSv3 4L 12472.5→**12409.5**（真机 12473.1，0.995，±1% 内）；8L 13896.1→**13833.1**（真机 13953.3，0.991）。**审计旧行为**：`HardwareSpec(framework_reserve=177·MiB)` + `prefetch_depth=0` 逐字节复现拆解前 breakdown（`test_dsv3_golden`）。
+
 ### 8.7 真机验证现状（DeepSeek-V3，2026-06-30，3 个数据点）
 
 | 配置 | 静态 persistent | 峰值预测 | 真机 alloc | ratio |

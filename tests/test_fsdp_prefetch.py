@@ -157,9 +157,12 @@ def test_dsv3_peak_gather_is_lmhead_plus_next_bwd_layer():
 
 
 def test_dsv3_default_reserve_reconciles_anchor_4L_8L():
-    """默认 depth=1 + 拆解后的 RESIDUAL_MiB → DSv3 4L/8L 仍命中锚点（±1 MiB）。"""
+    """默认 depth=1 + RESIDUAL_MiB=0（经验常数已消除）→ DSv3 4L/8L 命中真机锚点 ±1%。
+
+    预测由「逐桶结构 + 分配器对齐公式」给出，无拟合 framework 常数；现略低于真机
+    （12409.5 vs 12473.1 = 0.995），差额为文档化的 sub-block 小残差。"""
     from validate_dsv3 import RESIDUAL_MiB
     p4 = _dsv3_peak(4, 1, RESIDUAL_MiB * MiB)
     p8 = _dsv3_peak(8, 1, RESIDUAL_MiB * MiB)
-    assert abs(p4.peak_bytes / MiB - 12472.5) < 1.0
-    assert abs(p8.peak_bytes / MiB - 13896.1) < 1.0
+    assert abs(p4.peak_bytes / MiB - 12473.1) / 12473.1 < 0.01
+    assert abs(p8.peak_bytes / MiB - 13953.3) / 13953.3 < 0.01

@@ -169,7 +169,8 @@ class MemTimeline:
 
     def simulate(self, g, recompute, swap, pm, static_persistent: dict,
                  framework_reserve: int, max_device_memory: int,
-                 grad_dtype_bytes: int = 4, record_timeline: bool = False) -> dict:
+                 grad_dtype_bytes: int = 4, record_timeline: bool = False,
+                 alloc_block_bytes: int = 1) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -201,7 +202,8 @@ class MemTimeline:
             # 每层的 StructureMemory rollup（模块化组装，单点去重）——预算一次，事件循环直取各桶。
             sm_by_id = {
                 l.layer_id: estimate_structure_memory(
-                    l.ops, grad_dtype_bytes=grad_dtype_bytes)
+                    l.ops, grad_dtype_bytes=grad_dtype_bytes,
+                    alloc_block_bytes=alloc_block_bytes)
                 for l in layers
             }
 

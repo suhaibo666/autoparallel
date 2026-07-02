@@ -17,7 +17,7 @@ from .structure_mem import estimate_structure_memory
 class StaticMem:
     """M5：计算每 stage 每卡的持久内存字节（param + grad + optimizer state）。"""
 
-    def compute(self, g, opt, pm, cpu_offload: bool) -> dict:
+    def compute(self, g, opt, pm, cpu_offload: bool, alloc_block_bytes: int = 1) -> dict:
         """返回 {stage: bytes} 字典。
 
         参数
@@ -26,6 +26,7 @@ class StaticMem:
         opt          : OptimizerSpec  — 含 state_bytes_per_param（如 AdamW=16）。
         pm           : ParallelModel  — 提供 fsdp_degree() / efsdp_degree()。
         cpu_offload  : bool           — True 则该 stage 持久态全部卸载 CPU，返回 0。
+        alloc_block_bytes : int       — 设备内存池分配对齐块（平台属性，默认 1=不取整）。
         """
         fsdp = pm.fsdp_degree()
         efsdp = pm.efsdp_degree()
@@ -42,6 +43,7 @@ class StaticMem:
                 estimate_structure_memory(
                     layer.ops, fsdp=fsdp, efsdp=efsdp,
                     opt_state_bytes=opt.state_bytes_per_param,
+                    alloc_block_bytes=alloc_block_bytes,
                 ).persistent
                 for layer in layers
             )

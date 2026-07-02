@@ -280,3 +280,23 @@ config：`loss_type`、`chunk_loss_num`。
 - **仍待验证**：融合 mHC（容器 vendor OPP 无 `aclnnMhcPreSinkhorn` kernel，本次 mHC 走 unfused，内存与 fused 等价——主导是 ×n 残差、sinkhorn n×n 可忽略）；带重算路径（此 MS 版本 dsv4 全重算触发 `recompute() context_fn` bug，待修）。
 - mHC 的 `act_live ×n` 仍未真机验证（此 align 配置未开 mHC/MTP）。
 - 精确 CSA-vs-HCA overlap 差异在实施期按源码落 op。
+
+### 14.1 framework_reserve 消除 + mHC/MTP 反向瞬态（2026-07-02）
+
+把最后一个经验常数 `framework_reserve` 逐项拆成**逐 op 机理公式**（详见 `2026-06-29-...design.md` §8.6.1）：预取→`gather_buf`、flash-ws→flash `workspace`（∝S·n_heads）、MoE staging→dispatch/combine `workspace`（∝dispatched_tokens·H）、分配器对齐→`structure_mem` 逐张量 roundup（`alloc_block_bytes=512`，平台属性）。`framework_reserve` 生产默认 **0**（无拟合 blob；审计旧值走显式 `HardwareSpec(framework_reserve=…)`）。
+
+**mHC/MTP 反向瞬态（T1）**：
+- mHC `sinkhorn` op 加 `bwd_scratch=4·S·B·n·H`——`HyperConnectionOutputCell`（`hyper_connection.py:87-112`）反向物化的 ×n 打包残差流梯度 `grad_x_streams`+重建 `res_part`（compute dtype），仅在该 mHC 层反向事件计入。
+- **MTP decoder 现按 `residual_variant=mhc` ×n 包装**（前插 `mtp_hc_expand`/后接 `mtp_hc_collapse`）——忠实 `multi_token_prediction.py:381-399`（MTP 内层 `transformer_layer` 跑在打包残差流上，`self.hc=config.enable_hyper_connections`）。此前漏建 → MTP 层激活欠算（其 saves 在主 loss 峰值仍存活，MTP 反向在 lm_head 之后）。
+
+**锚点复核（真机 dsv4 align，seq2048/heads64/v512/无重算/FSDP-2，`validate_dsv4align.py`）**：
+
+| 配置 | 真机(fused) | 评估器(消除常数后) | ratio | 峰值算子 |
+|---|---|---|---|---|
+| base（无 mHC/MTP） | 15415.5 | 14490.5 | **0.940**（UNDER 6%） | bwd@lm_head(loss) |
+| +mHC(×4)+MTP | 21153.1 | 18529.2 | **0.876**（UNDER 12%） | bwd@lm_head(loss) |
+
+**未能完全和解的残差 + 机理假设**（不 fudge，按规则报告）：
+1. **base −925 MiB**：峰值firmly在 loss 反向（较次高事件 fwd_end 高 ~3700 MiB），故 flash-ws/MoE-staging（off-peak）与预取都不上峰。差额疑为 **①无重算反向工作集欠建**（§8.5②：反向逐 op 重物化非 saved 中间量，act_live=Σsaves 低估真实反向峰）+ **②dsv4 fused/unfused 激活图口径**（评估器 sparse_attn 仍 save naive-path 的 kv_gathered 1024 MiB，而 fused 走 scratch 不物化——两处误差部分抵消）。均属 dsv4 激活图/反向工作集范畴，非 framework_reserve/反向瞬态范畴。
+2. **+mHC+MTP 额外 −1700 MiB**：base 缺口 + **主 loss 与 MTP loss 的 `grad_logits`（各 ~2020 MiB fp32 满 vocab）在共享 output head 处并存**（dual-gradient）之嫌——评估器把主 loss（bwd@lm_head）与 MTP loss（bwd@mtp）建成时序两事件、互不并存；真机因共享 head 权重梯度累加可能同时物化两份，+~2020 MiB 恰使 20549→接近 21153。该并存与 pynative 反向调度相关、无法从源码干净确证，故列为假设不强建（避免 fudge）。
+3. 起点差异：本次实测 mHC+MTP 基线 0.87（非任务所述 0.932），疑评估器状态/config 细节差异；按实测基线报告。
