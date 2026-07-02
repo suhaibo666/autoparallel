@@ -56,7 +56,8 @@ def test_deepseek_v4_builds_modelspec_and_evaluates():
 
 def test_layer_pattern_encodes_compress_ratios():
     cfg = deepseek_v4(4)
-    pattern = gen_layer_pattern(cfg)
+    # gen_layer_pattern 返回 list[LayerContext]；其派生字符串标签仍编码 per-layer ratio。
+    pattern = [c.name for c in gen_layer_pattern(cfg)]
     assert pattern[0] == "embedding"
     assert pattern[-1] == "lm_head"
     # each transformer layer key encodes its ratio from csa_compress_ratios

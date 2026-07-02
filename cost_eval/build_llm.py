@@ -3,9 +3,10 @@
 一个 config 驱动的 `build_llm_spec(LLMConfig)` 取代"每模型手写一个 build_*_spec"。
 本文件 Phase 1（Tier-1）提供：
 
-- `gen_layer_pattern(cfg)`：把 `LLMConfig` 展开成层序列
-  `["embedding"] + per-layer {attn}_{dense|moe} + ["mtp"]*mtp_num_layers + ["lm_head"]`。
-- `build_llm_spec(cfg)`：按 pattern 为每种唯一层 key 组装一份 `LayerSpec`，返回 `ModelSpec`。
+- `gen_layer_pattern(cfg)`：把 `LLMConfig` 展开成 **`list[LayerContext]`**（结构化逐层身份），
+  序列 = `[embedding] + per-layer decoder ctx + [mtp]*mtp_num_layers + [lm_head]`。
+- `build_llm_spec(cfg)`：以 `LayerContext`（hashable）为键去重相同层、组装 `LayerSpec`，再用
+  `ctx.name` 作 ModelSpec 的字符串层名（输出标签，绝不反解析），返回 `ModelSpec`。
 
 **铁律**：decoder body 由现有命名 op-builder 直接拼接（attn 段已内嵌 ln1/residual，
 ffn 段已内嵌 ln2/residual），**不另加 norm op**——否则将偏离 `build_mla_dense_decoder`/
@@ -13,6 +14,7 @@ ffn 段已内嵌 ln2/residual），**不另加 norm op**——否则将偏离 `b
 """
 from __future__ import annotations
 
+from .layer_context import LayerContext
 from .llm_config import LLMConfig, to_dimtable
 from .model_spec import DimTable, LayerSpec, ModelSpec
 from .layers.registry import ATTN_REGISTRY, FFN_REGISTRY
@@ -20,9 +22,6 @@ from .layers.ffn import build_shared_expert_ops
 from .layers.head import build_embedding_ops, build_head_and_loss_ops, build_mtp_ops
 from .layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
 from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
-
-# dsv4_hybrid 层 key 前缀：`dsv4hyb_r{ratio}_{dense|moe}` 编码 per-layer compress_ratio。
-_DSV4_KEY_PREFIX = "dsv4hyb_r"
 
 
 def _check_implemented_dispatch(cfg: LLMConfig) -> None:
@@ -79,25 +78,31 @@ def _compress_ratio(cfg: LLMConfig, layer_idx: int) -> int:
 
 
 def gen_layer_pattern(cfg: LLMConfig) -> list:
-    """展开层序列（设计 §5 步骤 2）。
+    """展开层序列为 **`list[LayerContext]`**（设计 §5 步骤 2）。
 
-    `["embedding"]` + 每个 transformer 层一个 decoder key + `["mtp"] * mtp_num_layers`
-    + `["lm_head"]`。decoder key：
-      - 一般 attn：`f"{attn_type}_{dense|moe}"`；
-      - `dsv4_hybrid`：`f"dsv4hyb_r{ratio}_{dense|moe}"`，`ratio=csa_compress_ratios[layer]`
-        （§5：层 key 需编码 per-layer compress_ratio，`_build_layer_ops` 据此内部分支）。
-    ffn（dense/moe）由 `_is_moe_layer` 决定。
+    `[embedding]` + 每个 transformer 层一个 decoder ctx + `[mtp] * mtp_num_layers`
+    + `[lm_head]`。每个 decoder ctx 结构化携带 `attn_type`/`compress_ratio`/`ffn_type`/
+    `residual_variant`（不再编码进字符串再反解析）：
+      - `ffn_type`（dense/moe）由 `_is_moe_layer` 决定；
+      - `compress_ratio` 仅 `dsv4_hybrid` 取 `csa_compress_ratios[layer]`，其它注意力为 None
+        （`_build_decoder_body` 据 ctx 字段结构化分支，§7.3）。
+
+    返回 `LayerContext` 列表；其确定性字符串标签（`ctx.name`）在 `build_llm_spec` 里作为
+    ModelSpec 的 `layer_pattern`/`layer_specs` 键（输出标签，绝不反解析）。
     """
-    pattern = ["embedding"]
+    pattern = [LayerContext(kind="embedding")]
     for layer_idx in range(cfg.num_layers):
         ffn = "moe" if _is_moe_layer(cfg, layer_idx) else "dense"
-        if cfg.attn_type == "dsv4_hybrid":
-            ratio = _compress_ratio(cfg, layer_idx)
-            pattern.append(f"{_DSV4_KEY_PREFIX}{ratio}_{ffn}")
-        else:
-            pattern.append(f"{cfg.attn_type}_{ffn}")
-    pattern += ["mtp"] * cfg.mtp_num_layers
-    pattern.append("lm_head")
+        ratio = _compress_ratio(cfg, layer_idx) if cfg.attn_type == "dsv4_hybrid" else None
+        pattern.append(LayerContext(
+            kind="decoder",
+            attn_type=cfg.attn_type,
+            compress_ratio=ratio,
+            ffn_type=ffn,
+            residual_variant=cfg.residual_variant,
+        ))
+    pattern += [LayerContext(kind="mtp")] * cfg.mtp_num_layers
+    pattern.append(LayerContext(kind="lm_head"))
     return pattern
 
 
@@ -106,53 +111,51 @@ def _use_mhc(cfg: LLMConfig) -> bool:
     return cfg.residual_variant == "mhc" and cfg.num_residual_streams > 1
 
 
-def _build_decoder_body(key: str, cfg: LLMConfig, dims: DimTable) -> list:
+def _build_decoder_body(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> list:
     """组装一个 decoder 层的 body op（attn 段 + ffn 段，未套 mHC）。
 
-    - `dsv4hyb_r{ratio}_{ffn}` → `build_dsv4_hybrid_attn_ops(dims, ratio)`（按 ratio 内部分支，§7.3）。
-    - 其它 `{attn}_{ffn}` → `ATTN_REGISTRY[attn](dims)`。
-    ffn 段：`FFN_REGISTRY[ffn](dims)`（+ `build_shared_expert_ops` 当 moe & 有 shared expert）。
+    **结构化 dispatch**（读 `ctx` 字段，不解析字符串）：
+    - `ctx.attn_type == "dsv4_hybrid"` → `build_dsv4_hybrid_attn_ops(dims, ctx.compress_ratio)`
+      （按 per-layer 压缩比内部分支，§7.3）。
+    - 其它 → `ATTN_REGISTRY[ctx.attn_type](dims)`。
+    ffn 段：`FFN_REGISTRY[ctx.ffn_type](dims)`（+ `build_shared_expert_ops` 当 moe & 有 shared expert）。
     """
-    if key.startswith(_DSV4_KEY_PREFIX):
-        # key = f"dsv4hyb_r{ratio}_{ffn}"：先剥 ffn 后缀，再从前缀解析 ratio。
-        prefix, ffn = key.rsplit("_", 1)                    # prefix = f"dsv4hyb_r{ratio}"
-        ratio = int(prefix[len(_DSV4_KEY_PREFIX):])
-        attn_ops = list(build_dsv4_hybrid_attn_ops(dims, ratio))
+    if ctx.attn_type == "dsv4_hybrid":
+        attn_ops = list(build_dsv4_hybrid_attn_ops(dims, ctx.compress_ratio))
     else:
-        attn, ffn = key.rsplit("_", 1)
-        attn_ops = list(ATTN_REGISTRY[attn](dims))
-    ffn_ops = list(FFN_REGISTRY[ffn](dims))
-    if ffn == "moe" and cfg.moe_shared_expert_num > 0:
+        attn_ops = list(ATTN_REGISTRY[ctx.attn_type](dims))
+    ffn_ops = list(FFN_REGISTRY[ctx.ffn_type](dims))
+    if ctx.ffn_type == "moe" and cfg.moe_shared_expert_num > 0:
         ffn_ops += build_shared_expert_ops(dims)
     return attn_ops + ffn_ops
 
 
-def _build_layer_ops(key: str, cfg: LLMConfig, dims: DimTable) -> list:
-    """为一种层 key 组装 op 列表（设计 §5 步骤 3）。
+def _build_layer_ops(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> list:
+    """为一个 `LayerContext` 组装 op 列表（设计 §5 步骤 3，dispatch on `ctx.kind`）。
 
-    - `"embedding"` → embedding op（+ mHC 时追加 `hc_expand`：`[S,B,H]→[S,B,n·H]`，§9 stack entry）。
-    - `"lm_head"` → head+loss op（+ mHC 时前插 `hc_collapse`：`[S,B,n·H]→[S,B,H]`，§9 stack exit）。
-    - `"mtp"` → `build_mtp_ops(cfg)`（embedding + 1 decoder 层 + 共享 head，§10）。
-    - decoder key → `_build_decoder_body`；`residual_variant=="mhc"` 时整体套 `mhc_wrap`
+    - `kind=="embedding"` → embedding op（+ mHC 时追加 `hc_expand`：`[S,B,H]→[S,B,n·H]`，§9 stack entry）。
+    - `kind=="lm_head"` → head+loss op（+ mHC 时前插 `hc_collapse`：`[S,B,n·H]→[S,B,H]`，§9 stack exit）。
+    - `kind=="mtp"` → `build_mtp_ops(cfg)`（embedding + 1 decoder 层 + 共享 head，§10）。
+    - `kind=="decoder"` → `_build_decoder_body`；`residual_variant=="mhc"` 时整体套 `mhc_wrap`
       （每层前插 attn_hc/ffn_hc + 残差承载张量 ×n，§9）。
 
     **不另加 norm op**：attn 段已内嵌 ln1/residual，ffn 段已内嵌 ln2/residual —— plain 路径下
     直接拼接即与 `build_mla_dense_decoder`/`build_mla_moe_decoder` 逐字段一致（1.3 硬门）。
     """
-    if key == "embedding":
+    if ctx.kind == "embedding":
         ops = build_embedding_ops(cfg)
         if _use_mhc(cfg):
             ops = list(ops) + [build_hc_expand_op(dims)]
         return ops
-    if key == "lm_head":
+    if ctx.kind == "lm_head":
         ops = build_head_and_loss_ops(cfg)
         if _use_mhc(cfg):
             ops = [build_hc_collapse_op(dims)] + list(ops)
         return ops
-    if key == "mtp":
+    if ctx.kind == "mtp":
         return build_mtp_ops(cfg)
 
-    body = _build_decoder_body(key, cfg, dims)
+    body = _build_decoder_body(ctx, cfg, dims)
     if _use_mhc(cfg):
         body = mhc_wrap(body, cfg.num_residual_streams, dims)
     return body
@@ -170,14 +173,18 @@ def build_llm_spec(cfg: LLMConfig) -> ModelSpec:
     """
     _check_implemented_dispatch(cfg)         # I2：未实现的结构分派项显式报错，不静默产错图
     dims = to_dimtable(cfg)
-    pattern = gen_layer_pattern(cfg)
+    pattern = gen_layer_pattern(cfg)           # list[LayerContext]
     # n_layers 必须 = len(layer_pattern)（stage 分配用，ParallelModel._layer_to_stage）。
     # to_dimtable 只算 num_layers+2（embedding+head），未含 MTP 层；此处按实际 pattern 长度校正。
     # mtp_num_layers==0（如 DSv3）时 len(pattern)==num_layers+2 → 无变化，逐字节不变（1.3 硬门）。
     dims.n_layers = len(pattern)
-    layer_specs = {
-        key: LayerSpec(_build_layer_ops(key, cfg, dims))
-        for key in dict.fromkeys(pattern)          # 唯一 key，保序去重
-    }
+    # 直接用 **LayerContext 本身**（hashable）去重相同层，再把其 `ctx.name` 作为 ModelSpec
+    # 的字符串键（输出标签）——构造/分派全程走结构化 ctx，绝不反解析字符串。
+    specs_by_ctx = {}
+    for ctx in pattern:                        # 保序：dict 记首次出现
+        if ctx not in specs_by_ctx:
+            specs_by_ctx[ctx] = LayerSpec(_build_layer_ops(ctx, cfg, dims))
+    layer_pattern = [ctx.name for ctx in pattern]
+    layer_specs = {ctx.name: spec for ctx, spec in specs_by_ctx.items()}
     name = f"llm-{cfg.attn_type}-{cfg.num_layers}L"
-    return ModelSpec(name, dims, pattern, layer_specs)
+    return ModelSpec(name, dims, layer_pattern, layer_specs)

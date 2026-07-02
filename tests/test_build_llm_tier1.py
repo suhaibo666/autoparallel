@@ -38,7 +38,8 @@ def test_returns_modelspec_with_matching_pattern():
     cfg = _dsv3_like_cfg(3)
     spec = build_llm_spec(cfg)
     assert isinstance(spec, ModelSpec)
-    assert spec.layer_pattern == gen_layer_pattern(cfg)
+    # gen_layer_pattern 现返回 list[LayerContext]；ModelSpec 用其派生的 ctx.name 字符串键。
+    assert spec.layer_pattern == [c.name for c in gen_layer_pattern(cfg)]
     assert spec.layer_pattern == ["embedding", "mla_dense", "mla_moe", "mla_moe", "lm_head"]
     # DimTable 与 validate_dsv3.build_dsv3_spec(3) 结构一致
     assert spec.dims.n_layers == 5 and spec.dims.n_experts == 8 and spec.dims.n_shared == 1
