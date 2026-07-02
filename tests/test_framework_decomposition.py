@@ -135,3 +135,40 @@ def test_dsv4_sparse_attn_carries_flash_workspace():
         ops = build_dsv4_hybrid_attn_ops(DM, ratio)
         sp = next(op for op in ops if op.name == "sparse_attn")
         assert sp.workspace == FLASH_LSE_WS
+
+
+# ===========================================================================
+# T3 — MoE all-to-all staging buffers (∝ dispatched_tokens · H)
+# ===========================================================================
+# Source: experts.py:103-146 GroupedMLP.permute — tokens are sorted by expert into
+#   `routed_input` [S·B·topk, H] (the send/permute staging buffer BEFORE the ep
+#   all-to-all); experts.py:149-173 unpermute scatters back (combine staging).
+# The received post-a2a tokens (`disp`, [TLOCAL,H]{ep}) are already a save; the
+# missing piece is the permute/scatter STAGING (compute dtype), transient during
+# dispatch/combine → workspace on those ops. dispatched_tokens = S·B·topk·capacity.
+
+MOE_STAGING_WS = "2*S*B*topk*capacity_factor*H"
+
+DMOE = DimTable(
+    H=16, F=32, n_heads=4, n_kv=2, head_dim=8, S=8, B=1, vocab=32, n_layers=3,
+    n_experts=4, topk=2, moe_F=32, moe_shared_F=32,
+)
+
+
+def test_moe_dispatch_and_combine_carry_a2a_staging_workspace():
+    from cost_eval.layers.ffn import build_moe_ffn_ops
+    ops = build_moe_ffn_ops(DMOE)
+    disp = next(op for op in ops if op.name == "dispatch")
+    comb = next(op for op in ops if op.name == "combine")
+    assert disp.workspace == MOE_STAGING_WS
+    assert comb.workspace == MOE_STAGING_WS
+
+
+def test_moe_staging_scales_with_dispatched_tokens():
+    # send+recv permute buffer (bf16 2B): 2 · S·B·topk·capacity · H.
+    ws = eval_expr(MOE_STAGING_WS, DMOE)
+    assert ws == 2 * DMOE.S * DMOE.B * DMOE.topk * DMOE.H     # capacity_factor=1.0
+    # doubling topk doubles the staging (∝ dispatched tokens).
+    d2 = DimTable(H=16, F=32, n_heads=4, n_kv=2, head_dim=8, S=8, B=1, vocab=32,
+                  n_layers=3, n_experts=4, topk=4, moe_F=32)
+    assert eval_expr(MOE_STAGING_WS, d2) == 2 * ws

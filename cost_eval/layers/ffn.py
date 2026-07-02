@@ -19,6 +19,15 @@ from ..model_spec import DimTable, OpSpec, OpType, TensorRef
 # resolve_tensor 中处理，此处用含 C 的全量符号。C=1.0（DSv3）时退化为 S·B·topk（不变）。
 TLOCAL = "S*B*topk*capacity_factor"
 
+# MoE all-to-all **staging 缓冲**（∝ dispatched_tokens·H —— 从 framework_reserve 拆出）。
+# 源：experts.py:103-146 `GroupedMLP.permute` 把 token 按专家排序进 `routed_input`
+# `[S·B·topk, H]`——ep all-to-all **之前**的发送/置换 staging 缓冲（各卡对自己 S·B 个 token
+# 展开 topk 份，**不按 ep 切**，故用全量 S·B·topk）；experts.py:149-173 `unpermute` 反向散射
+# （combine staging）。收端 post-a2a token（`disp [TLOCAL,H]{ep}`）已建为 save；此处补的是
+# **置换 staging**（compute dtype bf16=2B），dispatch/combine 期瞬时活着 → 建为该 op 的
+# workspace（前向逐层临时，非全局常数、非 loss 峰）。= 2×S·B·topk·C·H bytes。
+MOE_STAGING_WS = "2*S*B*topk*capacity_factor*H"
+
 
 def build_dense_ffn_ops(d: DimTable) -> list:
     """构造 dense SwiGLU MLP FFN 段的 op 列表（5 个 OpSpec）。
@@ -104,8 +113,9 @@ def build_moe_ffn_ops(d: DimTable) -> list:
         OpSpec("router",   OpType.MOE_ROUTER, [hin],       logits,
                saves=[logits]),
         # 2. Dispatch（all-to-all；把 token 路由到各 expert rank）
+        #    workspace = 置换发送 staging 缓冲（experts.py permute → routed_input [S·B·topk,H]）
         OpSpec("dispatch", OpType.DISPATCH,   [hin],       disp,
-               saves=[disp]),
+               saves=[disp], workspace=MOE_STAGING_WS),
         # 3. 专家 fc1（grouped GEMM，按 ep 切分的专家矩阵）
         OpSpec("e_fc1",    OpType.MOE_GEMM,   [disp, w1], g,
                params=[w1], saves=[disp]),
@@ -116,8 +126,9 @@ def build_moe_ffn_ops(d: DimTable) -> list:
         OpSpec("e_fc2",    OpType.MOE_GEMM,   [act, w2],  eo,
                params=[w2], saves=[act]),
         # 6. Combine（all-to-all；把 expert 输出还原到 token 序列）
+        #    workspace = 反向散射 staging 缓冲（experts.py unpermute，:149-173）
         OpSpec("combine",  OpType.COMBINE,    [eo],        comb,
-               saves=[comb]),
+               saves=[comb], workspace=MOE_STAGING_WS),
     ]
 
 
