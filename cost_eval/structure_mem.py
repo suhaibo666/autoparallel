@@ -162,3 +162,86 @@ def estimate_structure_memory(
         checkpoint_input=checkpoint_input,
         forward_max_live=forward_max_live,
     )
+
+
+# ---------------------------------------------------------------------------
+# 选择性重算（selective recompute）——按 op 划分的内存分解
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SelectMemory:
+    """一层在**选择性重算**下的三个内存桶（字节，已对齐/去重）。
+
+    选择性重算把一层的 op 分成「选中（重算）」与「非选中（保存）」两部分：选中 op 的 saves
+    前向不常驻、反向重物化；非选中 op 的 saves 照常常驻。据此：
+
+    - ``act_live_pinned``：前向常驻激活 = **非选中 op 的 saves**（去重）∪ **层入口
+      checkpoint_input**（重算边界，始终保留）。丢掉的正是「只被选中 op 保存」的那些张量。
+    - ``recomp_scratch``：反向重物化选中段 = `forward_max_live(选中 op) −
+      checkpoint_input(选中段边界)`——与 full 重算同构（full 扣层入口），只是**范围收窄到选中
+      op**。选中段边界（选中 op 的首个 save）视作已由前驱非选中 op / 层入口提供（对模块粒度选择
+      精确；更细粒度选择时该边界可能实际未 pin → 略偏乐观，见下 flag）。
+    - ``bwd_working_set``：非选中段反向工作集 = `forward_max_live(非选中 op) −
+      bwd_scratch(非选中)`——与无重算路径同构，只是**范围收窄到非选中 op**。
+
+    两端退化**逐字节复现**既有公式（这是 None/full 不变、且 select-all==full /
+    select-none==None 的机理根因）：
+      - 全选（选中=全部 op）：非选中=∅ → act_live_pinned=checkpoint_input、
+        recomp=forward_max_live(全)−checkpoint_input、bwd_working_set=0 == **full**。
+      - 全不选（选中=∅）：act_live_pinned=activation_saves、recomp=0、
+        bwd_working_set=forward_max_live(全)−bwd_scratch == **None**。
+
+    > flag（简化）：mindformers 选择粒度是**模块/cell**（如 `self_attention`、`feed_forward`），
+    > 其边界即层/模块入口（已 pin），故 `− checkpoint_input(选中段)` 精确。若选更细的单个 op
+    > （如仅 `flash`），其输入边界未必已 pin，此项会略微高估「已提供」→ recomp 略偏小；本库如实
+    > 按公式计（不引入拟合项），并在此标注该偏差方向。
+    """
+    act_live_pinned: int = 0
+    recomp_scratch: int = 0
+    bwd_working_set: int = 0
+
+
+def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int = 1) -> SelectMemory:
+    """按 `is_selected(op) -> bool` 把一层 op 划分为选中/非选中，算选择性重算三桶。
+
+    复用 `estimate_structure_memory` 的 rollup / 去重 / `forward_max_live` 机理（不另写一份）：
+    对选中子集、非选中子集各调一次，再按 §SelectMemory 组装。`alloc_block_bytes` 与主路径同口径
+    传导（逐张量块对齐）。
+
+    参数
+    ----
+    resolved_ops     : Iterable[ResolvedOp]  — 整层（或整结构）的 op。
+    is_selected      : callable(op) -> bool  — 该 op 是否选中重算（选中→saves 丢弃、反向重物化）。
+    alloc_block_bytes: int                    — 设备内存池分配对齐块（平台属性），默认 1（不取整）。
+    """
+    ops = list(resolved_ops)
+    blk = alloc_block_bytes
+    selected = [op for op in ops if is_selected(op)]
+    nonselected = [op for op in ops if not is_selected(op)]
+
+    sm_sel = estimate_structure_memory(selected, alloc_block_bytes=blk)
+    sm_non = estimate_structure_memory(nonselected, alloc_block_bytes=blk)
+
+    # 层入口 checkpoint_input（重算边界，始终保留）：整层第一个有 saves 的 op 的首个 save。
+    ci_name = None
+    ci_bytes = 0
+    for op in ops:
+        if op.saves:
+            ci_name = op.saves[0].name
+            ci_bytes = _align_up(op.saves[0].local_numel * op.saves[0].dtype_bytes, blk)
+            break
+
+    # act_live_pinned = 非选中 saves（去重）∪ {ci}。ci 若已在非选中 saves 里则不重复加（按名去重）。
+    nonsel_save_names = {s.name for op in nonselected for s in op.saves}
+    act_live_pinned = sm_non.activation_saves + (ci_bytes if ci_name not in nonsel_save_names else 0)
+
+    # recomp = 选中段 forward_max_live − 选中段边界（与 full 同构，范围收窄到选中 op）。
+    recomp_scratch = max(0, sm_sel.forward_max_live - sm_sel.checkpoint_input)
+    # bwd_working_set = 非选中段 forward_max_live − 非选中 bwd_scratch（与无重算同构，范围收窄）。
+    bwd_working_set = max(0, sm_non.forward_max_live - sm_non.bwd_scratch)
+
+    return SelectMemory(
+        act_live_pinned=act_live_pinned,
+        recomp_scratch=recomp_scratch,
+        bwd_working_set=bwd_working_set,
+    )

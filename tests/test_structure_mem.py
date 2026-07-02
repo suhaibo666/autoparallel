@@ -7,11 +7,14 @@
 from cost_eval.model_spec import DimTable, ModelSpec, LayerSpec, OpSpec, OpType, TensorRef
 from cost_eval.layers.attention import build_gqa_attn_ops
 from cost_eval.layers.ffn import build_dense_ffn_ops, build_moe_ffn_ops
+from cost_eval.layers.dense import build_dense_decoder
 from cost_eval.layers.mla import build_mla_dense_decoder
 from cost_eval.specs import ParallelConfig
 from cost_eval.parallel_model import ParallelModel
 from cost_eval.shape_eval import ShapeEval
-from cost_eval.structure_mem import estimate_structure_memory, StructureMemory
+from cost_eval.structure_mem import (
+    estimate_structure_memory, StructureMemory,
+    estimate_select_memory, SelectMemory)
 
 D = DimTable(H=64, F=128, n_heads=4, n_kv=4, head_dim=16, S=128, B=1, vocab=100,
              n_layers=1, n_experts=8, topk=2, moe_F=128)
@@ -130,3 +133,86 @@ def test_compose_equals_whole_layer():
     assert sa.persistent + sf.persistent == sw.persistent
     assert sa.bwd_scratch + sf.bwd_scratch == sw.bwd_scratch
     assert max(sa.workspace, sf.workspace) == sw.workspace
+
+
+# ---------------------------------------------------------------------------
+# Task [SELECTIVE] — 选择性重算的按结构分解（estimate_select_memory）
+#
+# 选择性重算把「哪些 op 的 saves 被丢弃、反向重算」建成对 op 集的划分：
+#   - act_live_pinned  = 非选中 op 的 saves（去重）+ 层入口 checkpoint_input（重算边界，始终保留）
+#   - recomp_scratch   = forward_max_live(选中 op) − checkpoint_input(选中段边界)  ——反向重物化选中段
+#   - bwd_working_set   = forward_max_live(非选中 op) − bwd_scratch(非选中)          ——非选中段反向工作集
+# 两端退化必须**逐字节复现** None/full 既有公式（这是 None/full 不变的机理保证）。
+# ---------------------------------------------------------------------------
+
+def _dense_ops():
+    ops, _ = _resolve(build_dense_decoder(D).ops)
+    return ops
+
+
+def test_select_all_reproduces_full():
+    """全选（predicate 恒 True）逐字段复现 full 重算：act_live=checkpoint_input、
+    recomp=fml−ci、bwd_working_set=0（→ select-all == full 的机理根因）。"""
+    ops = _dense_ops()
+    sm = estimate_structure_memory(ops)
+    sel = estimate_select_memory(ops, lambda op: True)
+    assert isinstance(sel, SelectMemory)
+    assert sel.act_live_pinned == sm.checkpoint_input
+    assert sel.recomp_scratch == max(0, sm.forward_max_live - sm.checkpoint_input)
+    assert sel.bwd_working_set == 0
+
+
+def test_select_none_reproduces_no_recompute():
+    """全不选（predicate 恒 False）逐字段复现无重算：act_live=activation_saves、
+    recomp=0、bwd_working_set=fml−bwd_scratch（→ select-none == None 的机理根因）。"""
+    ops = _dense_ops()
+    sm = estimate_structure_memory(ops)
+    sel = estimate_select_memory(ops, lambda op: False)
+    assert sel.act_live_pinned == sm.activation_saves
+    assert sel.recomp_scratch == 0
+    assert sel.bwd_working_set == max(0, sm.forward_max_live - sm.bwd_scratch)
+
+
+def test_select_core_attn_scoped_to_selected_ops():
+    """选中 core-attn（flash op，Megatron 默认）：各桶按选中/非选中划分精确成立，
+    且 act_live 严格介于 full(checkpoint_input) 与 None(activation_saves) 之间。"""
+    ops = _dense_ops()
+    sm = estimate_structure_memory(ops)
+    is_sel = lambda op: op.name == "flash"
+    selected = [op for op in ops if is_sel(op)]
+    nonsel = [op for op in ops if not is_sel(op)]
+    sm_sel = estimate_structure_memory(selected)
+    sm_non = estimate_structure_memory(nonsel)
+    sel = estimate_select_memory(ops, is_sel)
+    # recomp 作用于选中 op 的 forward_max_live（扣其段边界，与 full 同构）
+    assert sel.recomp_scratch == max(0, sm_sel.forward_max_live - sm_sel.checkpoint_input)
+    assert sel.recomp_scratch > 0
+    # 非选中 op 的反向工作集
+    assert sel.bwd_working_set == max(0, sm_non.forward_max_live - sm_non.bwd_scratch)
+    # act_live 丢掉 flash 独占的 saves（qkv/lse），保留 ci 与共享的 attn（o_proj 也 save）
+    assert sm.checkpoint_input < sel.act_live_pinned < sm.activation_saves
+
+
+def test_select_attention_module_drops_all_attn_saves_but_boundary():
+    """选中整个 attention 模块（前 6 op，忠实 mindformers self_attention 模块粒度）：
+    act_live 恰丢掉 attention 段 saves 减去层入口边界（= activation_saves(attn) − checkpoint_input）。"""
+    ops = _dense_ops()
+    sm = estimate_structure_memory(ops)
+    attn_ops = ops[:6]
+    sm_attn = estimate_structure_memory(attn_ops)
+    # 前 6 op = attention 段
+    is_sel = lambda op: op.name in {"ln1", "qkv", "rope", "flash", "o_proj", "add1"}
+    sel = estimate_select_memory(ops, is_sel)
+    dropped = sm.activation_saves - sel.act_live_pinned
+    assert dropped == sm_attn.activation_saves - sm_attn.checkpoint_input
+    # recomp = attention 段 forward_max_live − 段边界（= 层入口 x，已 pin）
+    assert sel.recomp_scratch == max(0, sm_attn.forward_max_live - sm_attn.checkpoint_input)
+
+
+def test_select_respects_alloc_block_alignment():
+    """alloc_block_bytes 传导：select 各桶与 estimate_structure_memory 同口径对齐。"""
+    ops = _dense_ops()
+    sm = estimate_structure_memory(ops, alloc_block_bytes=512)
+    sel = estimate_select_memory(ops, lambda op: True, alloc_block_bytes=512)
+    assert sel.act_live_pinned == sm.checkpoint_input
+    assert sel.recomp_scratch == max(0, sm.forward_max_live - sm.checkpoint_input)

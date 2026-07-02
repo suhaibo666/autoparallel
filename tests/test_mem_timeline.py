@@ -107,6 +107,75 @@ def test_full_recompute_scratch_is_forward_max_live():
 
 
 # ---------------------------------------------------------------------------
+# Task [SELECTIVE]: 选择性重算（mode=select，按 op/模块）
+# ---------------------------------------------------------------------------
+
+def _sim(recompute):
+    g, pm, persistent = _setup(pp=1)
+    return MemTimeline().simulate(
+        g, recompute, SwapSpec(), pm, persistent,
+        framework_reserve=0, max_device_memory=10**12)[0]
+
+
+def test_none_full_byte_identical_anchor():
+    """None/full 峰值字节锚点（守卫本次改动不动既有两态；toy dense 4 层）。"""
+    none = _sim(RecomputeSpec("None"))
+    full = _sim(RecomputeSpec("full", {0, 1, 2, 3}))
+    assert none.peak_bytes == 3641344
+    assert full.peak_bytes == 2768896
+
+
+def test_select_core_attn_peak_between_none_and_full():
+    """选中 core-attn（flash，Megatron 默认）：峰值严格介于无重算与全重算之间，
+    act_live 较无重算下降，recomp_scratch 入峰 > 0，峰仍落反向。"""
+    none = _sim(RecomputeSpec("None"))
+    full = _sim(RecomputeSpec("full", {0, 1, 2, 3}))
+    sel = _sim(RecomputeSpec("select", select_ops={lid: {"flash"} for lid in range(4)}))
+    assert full.peak_bytes < sel.peak_bytes < none.peak_bytes
+    assert sel.breakdown.act_live < none.breakdown.act_live
+    assert sel.breakdown.recomp_scratch > 0
+    assert sel.peak_event.startswith("bwd")
+
+
+def test_select_monotonic_more_ops_lower_peak():
+    """重算的 op 越多，激活峰越低（内存↔重算旋钮）：
+    None ≥ select(flash) ≥ select(整个 attention 模块) ≥ full，严格单调。"""
+    none = _sim(RecomputeSpec("None"))
+    full = _sim(RecomputeSpec("full", {0, 1, 2, 3}))
+    flash_only = _sim(RecomputeSpec(
+        "select", select_ops={lid: {"flash"} for lid in range(4)}))
+    attn_mod = _sim(RecomputeSpec(
+        "select",
+        select_ops={lid: {"ln1", "qkv", "rope", "flash", "o_proj", "add1"}
+                    for lid in range(4)}))
+    assert (none.peak_bytes > flash_only.peak_bytes
+            > attn_mod.peak_bytes > full.peak_bytes)
+
+
+def test_select_all_ops_equals_full():
+    """select 全部 op == full 重算（两条路径一致）：峰值与逐桶 breakdown 皆相等。"""
+    g, pm, persistent = _setup(pp=1)
+    all_names = {op.name for op in g.stages[0][0].ops}
+    mt = MemTimeline()
+    full = mt.simulate(g, RecomputeSpec("full", {0, 1, 2, 3}), SwapSpec(), pm,
+                       persistent, framework_reserve=0, max_device_memory=10**12)[0]
+    sel_all = mt.simulate(
+        g, RecomputeSpec("select", select_ops={lid: set(all_names) for lid in range(4)}),
+        SwapSpec(), pm, persistent, framework_reserve=0, max_device_memory=10**12)[0]
+    assert sel_all.peak_bytes == full.peak_bytes
+    assert sel_all.breakdown.act_live == full.breakdown.act_live
+    assert sel_all.breakdown.recomp_scratch == full.breakdown.recomp_scratch
+    assert sel_all.breakdown.bwd_working_set == full.breakdown.bwd_working_set
+
+
+def test_select_none_selectors_equals_no_recompute():
+    """select 但选择器命中空（或未配该层）→ 逐字节复现无重算峰值。"""
+    none = _sim(RecomputeSpec("None"))
+    sel_empty = _sim(RecomputeSpec("select", select_ops={0: set()}))
+    assert sel_empty.peak_bytes == none.peak_bytes
+
+
+# ---------------------------------------------------------------------------
 # Task 1 [C1]: 激活 saves 按张量名去重（attn 被 flash + o_proj 双 save）
 # ---------------------------------------------------------------------------
 

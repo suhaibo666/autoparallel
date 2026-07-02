@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from .structure_mem import estimate_structure_memory
+from .structure_mem import estimate_structure_memory, estimate_select_memory
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +242,24 @@ class MemTimeline:
                     alloc_block_bytes=alloc_block_bytes)
                 for l in layers
             }
+            # 选择性重算：每层按选择器（op 名/类型子串）把 op 划分为选中/非选中，预算三桶
+            # （act_live_pinned / recomp_scratch / bwd_working_set，复用 forward_max_live 机理，
+            # 单点去重）。仅对 is_select 的层预算；full/None 层走既有路径（字节级不变）。
+            select_mem_by_id = {
+                l.layer_id: estimate_select_memory(
+                    l.ops,
+                    (lambda op, _lid=l.layer_id: recompute.op_matches(
+                        _lid, op.name, getattr(op.type, "value", op.type))),
+                    alloc_block_bytes=alloc_block_bytes)
+                for l in layers if recompute.is_select(l.layer_id)
+            }
             # 实际卸载到 CPU 的层集（三态互斥：recompute 优先于 swap，与 FWD `saved=0` 分支同条件）。
-            # 这些层 saves 前向不驻留 act_live、反向经 swap_buf 复原（H2D 取回）。
+            # 这些层 saves 前向不驻留 act_live、反向经 swap_buf 复原（H2D 取回）。full 与 select
+            # 均属「重算态」，不进卸载集。
             offloaded = {
                 lid for lid in layer_ids
-                if swap.swaps(lid) and not recompute.is_full(lid)
+                if swap.swaps(lid)
+                and not recompute.is_full(lid) and not recompute.is_select(lid)
             }
 
             B = Buckets(persistent=static_persistent.get(stage, 0))
@@ -292,6 +305,10 @@ class MemTimeline:
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
                             saved = sm.checkpoint_input               # 仅保留层入口
+                        elif recompute.is_select(lid):
+                            # 选择性重算：非选中 op 的 saves（去重）+ 层入口边界常驻；
+                            # 选中 op 的 saves 丢弃（反向重物化）。介于 full 与全量之间。
+                            saved = select_mem_by_id[lid].act_live_pinned
                         elif swap.swaps(lid):
                             saved = 0                                 # 全部卸载到 CPU
                         else:
@@ -332,6 +349,14 @@ class MemTimeline:
                             # 多中间量层 max-live 常 < Σsaves，旧式高估）。
                             B.recomp_scratch = max(
                                 0, sm.forward_max_live - sm.checkpoint_input)
+                        elif recompute.is_select(lid):
+                            # 选择性重算：选中 op 反向重物化（recomp_scratch，= 选中段 forward_max_live
+                            # 扣段边界）与非选中 op 反向工作集（bwd_working_set，= 非选中段
+                            # forward_max_live 扣 bwd_scratch）共存。全选→复现 full（recomp=fml−ci、
+                            # bwd_ws=0）；全不选→复现无重算（recomp=0、bwd_ws=fml−bwd_scratch）。
+                            smem = select_mem_by_id[lid]
+                            B.recomp_scratch = smem.recomp_scratch
+                            B.bwd_working_set = smem.bwd_working_set
                         else:
                             # 无重算层：反向仍需再遍历 forward 求梯度，激活梯度 dL/dact 与激活同形、
                             # 同样共存 → 反向工作集 ≈ 该层 forward_max_live（§8.5②）。其中已被显式建模
