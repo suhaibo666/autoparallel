@@ -177,22 +177,39 @@ linear_qkv（GQA：KV 用 `num_query_groups`）→ rope → flash_attn → linea
 linear_q(_a/_b + q_a_ln) + linear_kv(_a/_b + kv_a_ln) + rope + flash_attn + linear_proj。维度：`q_lora_rank/kv_lora_rank/qk_rope/qk_nope/v_head_dim`。DeepSeek-V3 已真机验证（P0 §8.7）。
 
 ### 7.3 `dsv4_hybrid`（DSA·CSA·HCA，**新建**，源：`pynative/.../experimental_attention_variant/`）
-MLA base 之上，**每层按 `compress_ratio` 分支**（`deepseek_v4_hybrid_attention.py:70`）：
+`DSv4HybridSelfAttention` 是**所有层共用的顶层注意力模块**（`deepseek_v4_hybrid_attention.py:70`），
+**每层按 `compress_ratio` 只切换内层稀疏路径**——Q 低秩(down→norm→up→**per-head fp32 norm**)、
+单共享 KV、RoPE、**分组输出** 这套顶层结构对**所有 ratio（含滑窗 0/1）都一样**：
 
-| compress_ratio | 模式 | 分支结构 | rope |
+| compress_ratio | 模式 | 内层稀疏路径 | rope |
 |---|---|---|---|
-| 0/1 | 滑窗 | 只 sliding-window（`window_size`）稀疏注意力 | 标准 rope |
+| 0/1 | 滑窗 | 只 sliding-window（`window_size`）稠密注意力（**顶层结构仍是 DSv4-own**，非退化 MLA） | 标准 rope |
 | 4 | **CSA** | 压缩器(overlap, coff=2) + **DSA 索引器** top-k + 稀疏注意力 | YaRN(`csa_compress_rotary_base`) |
 | 128 | **HCA** | 压缩器(non-overlap, coff=1) + dense 压缩位 | YaRN |
 
-**新增 op（在 MLA base 上）**：
-- **索引器**（`indexer.py`，仅 CSA）：`linear_wq_b`(q_lora→n_idx·d_idx)、`linear_weights_proj`(H→n_idx)、压缩器出 k_index；**`index_scores [B,S,S] fp32`（O(S²)，内存大头，可重算不 save）**、`topk_indices [B,S,topk] int32`。
-- **压缩器**（`compressor.py`）：`linear_wkv`/`linear_wgate`(H→coff·vd)、`ape`(fp32) → gated pooling → `compressed_kv [S/r, B, 1, vd]`；pooling 中间量 `[S/r, r·coff, B, d]`。
-- **稀疏注意力**（`csa.py`）：gather → **`kv_gathered [B,S,topk,vd]`（O(S·topk)，内存大头）**、`scores/attn_weights [B,h,S,topk]`。
-- **分组输出**：`linear_o_group_proj`(o_groups×o_lora) + `linear_proj`。
+> [!contradiction] **2026-07-03 修订（真机 Profiler 定位 925 MiB 欠计，OOM 安全向）**
+> 旧设计说"ratio 0/1 == MLA base、内存中性"（复用 `build_mla_attn_ops`）。**真机否证**：
+> DSv4 顶层对**所有 ratio** 都物化两个 fp32 大头（256 MiB/层 @ 对齐配置），MLA base 没有 →
+> ratio 0/1 **不再退化复用 MLA**，全 ratio 走 DSv4-own op 图（`build_dsv4_hybrid_attn_ops` 顶层）：
+>   1. **per-head Query RMSNorm** `q_hnorm_fp32 [S,B,n_heads·v_head_dim] fp32`（`:239-245`
+>      `q = rms_norm(cast(q, fp32), γ)`）；bf16 输入 `q` 也 saved（rms_norm 反向，128 MiB/层）。
+>   2. **分组输出 bmm 的 fp32 输入** `cg_fp32 [S,B,n_heads·v_head_dim] fp32`（`:277-283`
+>      `bmm(cast(cg, fp32), cast(wo, fp32))`）。
+> 参数侧连带影响：3 个 ratio-0 注意力块从 MLA 权重切到 DSv4-own 权重（各 +~26.18M，
+> DSv4(4) 全局 +78.9M，**非幻影**；见 `tests/test_param_conservation.py`）。
 
-**内存大头**（评估器须建）：`index_scores` O(S²)、`kv_gathered`/`attn_weights` O(S·topk)、`compressed_kv` O(S/r)。config：`csa_compress_ratios/csa_window_size/dsa_indexer_{n_heads,head_dim,topk}/o_groups/o_lora_rank`。
-> 实现细节（CSA overlap vs HCA non-overlap 的精确 op 差异）在实施期按 `compressor.py:43` RFC §3.4.2.2 落到 op；本设计先定"一个 `build_dsv4_hybrid_attn_ops(d, ratio)` 按 ratio 内部分支 + 上述内存大头"。
+**新增 op（顶层 DSv4-own 之上，按 ratio）**：
+- **索引器**（`indexer.py`，仅 CSA）：`linear_wq_b`(q_lora→n_idx·d_idx)、`linear_weights_proj`(H→n_idx)、压缩器出 k_index；**`index_scores [B,S,S] fp32`（O(S²)，可重算不 save，建为 `bwd_scratch`）**、`topk_indices [B,S,topk] int32`。
+- **压缩器**（`compressor.py`）：`linear_wkv`/`linear_wgate`(H→coff·vd)、`ape`(fp32) → gated pooling → `compressed_kv [S/r, B, 1, vd]`。
+- **稀疏注意力**（`csa.py`）：gather → `kv_gathered [B,S,topk,vd]`、`attn_weights [B,h,S,topk]`。
+- **分组输出**：`linear_o_group_proj`(o_groups×o_lora，产 `cg_fp32`) + `linear_proj`。
+
+**融合 vs 非融合（`dsa_fused`，生产默认 True）**：`kv_gathered`/`attn_weights` 是 **unfused 小算子路径**
+（`csa.py:187` `unfused_compressed_sparse_attn`）才物化的中间量；**fused kernel** `npu_sparse_attn_shared_kv`
+走 scratch **不物化**（真机 15415 profile 查无此张量）。故 `dsa_fused=True` 时 `sparse_attn` **不 save**
+它们（否则幻影多算 ~1312 MiB）；`False` 才 save。此前评估器无论 fused 都 save，是 §12 line 300 记的欠/过计双误差之一，本次一并修。
+
+**内存大头**（评估器须建）：`q_hnorm_fp32`/`cg_fp32` 各 O(S·B·n_heads·vd) fp32（顶层，全 ratio）；`index_scores` O(S²)（CSA，bwd_scratch）；`kv_gathered`/`attn_weights` O(S·topk)（**仅 unfused**）；`compressed_kv` O(S/r)。config：`csa_compress_ratios/csa_window_size/dsa_indexer_{n_heads,head_dim,topk}/o_groups/o_lora_rank/dsa_fused`。
 
 ### 7.4 SWA 滑窗注意力（Mistral/Qwen/Gemma-2）——对训练峰值**内存中性**
 `mha/gqa/mla` 加 `window_size` 即 SWA。**关键：flash-attention 下 SWA 不改训练激活内存**——
@@ -201,6 +218,9 @@ saves 仍是 Q/K/V/O `[S,B,H]` + logsumexp `[S,n_heads]`，`[S,S]` 分数矩阵�
 故 **SWA 层 op 图 ≡ 全注意力层 op 图**；`window_size`/`window_pattern` 仅作**忠实表达模型** + 供 P1 时间/推理用，
 `build_llm_spec` 对其**不改 op 图**（Gemma-2 的 SWA/全交错也因此不影响每层内存结构）。
 > 若将来要建 flash-workspace 随 window 的缩放（现为常数），需 window-varying 真机点标定（类比 P0 §8.7）；属 Tier-2。
+> **注意**：本节的"SWA 内存中性 / op 图 ≡ 全注意力"只适用于 **`mha/gqa/mla` 通用滑窗**（Mistral/Qwen/Gemma-2）。
+> **`dsv4_hybrid` 的 ratio-0/1 滑窗不适用**——它走 DSv4-own 顶层（per-head fp32 Q-norm + 分组输出 fp32），
+> 比全注意力多两个 fp32 大头，详见 §7.3 的 2026-07-03 修订。
 
 ---
 
@@ -298,5 +318,39 @@ config：`loss_type`、`chunk_loss_num`。
 
 **未能完全和解的残差 + 机理假设**（不 fudge，按规则报告）：
 1. **base −925 MiB**：峰值firmly在 loss 反向（较次高事件 fwd_end 高 ~3700 MiB），故 flash-ws/MoE-staging（off-peak）与预取都不上峰。差额疑为 **①无重算反向工作集欠建**（§8.5②：反向逐 op 重物化非 saved 中间量，act_live=Σsaves 低估真实反向峰）+ **②dsv4 fused/unfused 激活图口径**（评估器 sparse_attn 仍 save naive-path 的 kv_gathered 1024 MiB，而 fused 走 scratch 不物化——两处误差部分抵消）。均属 dsv4 激活图/反向工作集范畴，非 framework_reserve/反向瞬态范畴。
+   > [!update] **②已在 §14.2（2026-07-03）修复**：sparse_attn 按 `dsa_fused` 门控——fused 不再 save kv_gathered/attn_weights，同时补了此前漏建的 per-head fp32 Q-norm + 分组输出 fp32。**副作用**：修 ② 拆散了「①欠建 × ②过计」的相互抵消，base 从 0.940 略降至 0.930（②过计原在**掩盖** ① 欠建）。①（无重算反向工作集）为**残余真因**，见 §14.2。
 2. **+mHC+MTP 额外 −1700 MiB**：base 缺口 + **主 loss 与 MTP loss 的 `grad_logits`（各 ~2020 MiB fp32 满 vocab）在共享 output head 处并存**（dual-gradient）之嫌——评估器把主 loss（bwd@lm_head）与 MTP loss（bwd@mtp）建成时序两事件、互不并存；真机因共享 head 权重梯度累加可能同时物化两份，+~2020 MiB 恰使 20549→接近 21153。该并存与 pynative 反向调度相关、无法从源码干净确证，故列为假设不强建（避免 fudge）。
 3. 起点差异：本次实测 mHC+MTP 基线 0.87（非任务所述 0.932），疑评估器状态/config 细节差异；按实测基线报告。
+
+### 14.2 dsv4 顶层 fp32 大头 + fused 门控（2026-07-03，真机定位 925 MiB 欠计）
+
+**动机**：§14.1 base −925 MiB 的诊断 ②（dsv4 激活图口径）落地修复。真机 Profiler（fused 15415）
+逐算子核对 DSv4HybridSelfAttention 顶层，定位**两处 fp32 大头此前漏建/错 dtype** + **一处 fused 幻影过计**：
+
+| 项 | 源码 | 张量 | 此前 | 现 |
+|---|---|---|---|---|
+| per-head Q RMSNorm | `deepseek_v4_hybrid_attention.py:239-245` | `q_hnorm_fp32 [S,B,n·vd] fp32` | ratio 0/1 退化 MLA 无此 op | 全 ratio 顶层 save（256 MiB/层@align） |
+| 分组输出 bmm 输入 | `:277-283` | `cg_fp32 [S,B,n·vd] fp32` | bf16（错 dtype） | fp32 save（256 MiB/层@align） |
+| 稀疏中间量 | `csa.py:187/208/237` | `kv_gathered/attn_weights` | 无论 fused 都 save（幻影 ~1312 MiB） | `dsa_fused` 门控：fused 不 save |
+
+**实现**（`layers/dsv4_hybrid.py` 全 ratio 自建 op 图，删 `if ratio in (0,1): return build_mla_attn_ops`）：
+`q_hnorm` op `saves=[q]`（bf16 输入供 rms_norm 反向）、下游 attention `saves=[q_hnorm]`（fp32，QK 反向）；
+`o_group_proj` `saves=[cg_fp32]`；`sparse_saves = [q_hnorm, core_out] if fused else [q_hnorm, kv_gathered, attn_weights, core_out]`。
+新增 `DimTable.dsa_fused`/`LLMConfig.dsa_fused`（默认 True=生产）。参数守恒连带更新（见 §7.3 修订、`tests/test_param_conservation.py` golden 1,200,440,848→1,279,344,144，+78.9M 非幻影）。
+
+**本地验证**：全 233 测试绿；DSv3 双锚点**逐字节不变**（12409.5 / 13833.1，纯公式 framework=0）；
+param 守恒分解确认 delta 全落 3 个 ratio-0 注意力块、emb/lm_head 不变（无 vocab 幻影）。
+
+**真机效果（上一会话实测，fused align 同配置，anchor 15415.5，待本机复验）**：
+
+| 配置 | 真机(fused) | 评估器(修复后) | ratio | vs §14.1(修前) |
+|---|---|---|---|---|
+| base（无 mHC/MTP） | 15415.5 | ~14336 | **0.930** | 0.940 → **0.930**（略降） |
+| +mHC(×4)+MTP | 21153.1 | ~18450 | **0.872** | 0.876 → 0.872 |
+
+**诚实结论（不 fudge）**：本次修复**结构正确**（fp32 大头是真物化、fused 不物化稀疏中间量是真的），
+但 base ratio **0.940→0.930 反而更欠**——因为修 ②（去 1312 幻影）**拆散了原本掩盖 ① 的相互抵消**：
+此前 `②过计 kv_gathered ≈ ①欠建反向工作集`，两者抵消才凑出 0.940。去掉幻影后，**① 无重算反向
+工作集欠建（§8.5②）暴露为残余真因**。**当前 0.930 仍 UNDER（OOM 不安全向）**——达真·OOM-safe 需
+把 ① 按机理建全（无重算路径下反向逐 op 重物化非-saved 中间量的峰值工作集），**而非**保留 ② 幻影凑数。
+→ **下一步**：①的 `bwd_working_set`（§8.5②）在 dsv4 无重算配置下的口径核对 + 真机复验（需服务器会话）。

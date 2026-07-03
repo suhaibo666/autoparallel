@@ -11,28 +11,37 @@ mindformers `pynative/.../experimental_attention_variant/` 源码：
 
 | compress_ratio | 模式 | 分支结构 |
 |---|---|---|
-| 0 / 1 | 滑窗 | 只 sliding-window 稀疏注意力 → 内存等价 MLA base（§7.4 内存中性），
-|       |      | 直接复用 `build_mla_attn_ops`。|
-| 4     | CSA  | MLA base + **indexer**（index_scores O(S²)）+ 压缩器(overlap, coff=2)
-|       |      | + 稀疏注意力（kv_gathered O(S·topk)）+ 分组输出。|
-| 128   | HCA  | MLA base + 压缩器(non-overlap, coff=1) + dense 压缩位（无 top-k indexer）
-|       |      | + 稀疏注意力 + 分组输出。|
+| 0 / 1 | 滑窗 | 只 sliding-window 稠密注意力（**仍走 DSv4 顶层**：per-head fp32 Q-norm + 分组输出）。|
+| 4     | CSA  | +**indexer**（index_scores O(S²)）+ 压缩器(overlap, coff=2) + 稀疏注意力 + 分组输出。|
+| 128   | HCA  | + 压缩器(non-overlap, coff=1) + dense 压缩位（无 top-k indexer）+ 稀疏注意力 + 分组输出。|
+
+**关键修正（2026-07-03，真机 Profiler 定位 925 MiB 欠计）**：DSv4HybridSelfAttention 顶层
+**对所有 ratio（含 0/1）**都物化两个 fp32 张量到 loss 峰值，此前评估器漏建/错 dtype：
+  1. **per-head Query RMSNorm** —— `deepseek_v4_hybrid_attention.py:239-245`
+     `q = rms_norm(cast(q, fp32), q_rms_gamma)` → fp32 `q[S,B,n_heads*q_head_dim]`（真机 256 MiB/层）。
+  2. **分组输出 bmm 的 fp32 输入** —— `:277-283` `bmm(cast(cg, fp32), cast(wo, fp32))`
+     → fp32 `cg[S,B,n_heads*v_head_dim]`（真机 256 MiB/层）。
+  ⇒ 故 ratio 0/1 **不再**退化复用 `build_mla_attn_ops`，DSv4 全 ratio 自建 op 图。
+
+**融合 vs 非融合（`d.dsa_fused`，生产默认 True）**：`kv_gathered`/`attn_weights` 是 **unfused
+小算子路径**（`csa.py:187` `unfused_compressed_sparse_attn`）才物化的中间量；**fused kernel**
+`npu_sparse_attn_shared_kv` 走 scratch **不物化**（真机 15415 里查无此张量）。故 fused 时
+sparse_attn **不 save** 它们（否则幻影多算 ~1312 MiB）。
 
 **内存大头**（评估器建模的重点）：
-  - `index_scores [B,S,S] fp32` → O(S²)，建为 indexer op 的 `bwd_scratch="4*B*S*S"`
-    （`indexer.py:227-236`，「可重算不 save」→ bwd 期临时物化，fp32=4B）。
-  - `kv_gathered [B,S,topk,v_head_dim]` → O(S·topk)，建为 sparse_attn 的 saves
-    （`csa.py:208`）。
-  - `attn_weights [B,n_heads,S,topk]` → O(S·topk)，sparse_attn saves（`csa.py:237`）。
-  - `compressed_kv [S//ratio, B, 1, v_head_dim]`（`compressor.py:221` unsqueeze 后）。
+  - `q_hnorm_fp32 [S,B,n_heads*v_head_dim] fp32`（per-head Q-norm，256 MiB/层，:239-245）。
+  - `cg_fp32 [S,B,n_heads*v_head_dim] fp32`（分组输出 fp32 输入，256 MiB/层，:277-283）。
+  - `index_scores [B,S,S] fp32` → O(S²)，indexer op 的 `bwd_scratch="4*B*S*S"`（indexer.py:227-236）。
+  - `kv_gathered [B,S,topk,v_head_dim]` / `attn_weights [B,n_heads,S,topk]` —— **仅 unfused** save（csa.py:208/237）。
+  - `compressed_kv [S//ratio, B, 1, v_head_dim]`（compressor.py:221）。
 
-新增符号维（`DimTable` 字段，默认 0）：`dsa_indexer_n_heads/dsa_indexer_head_dim/
-dsa_indexer_topk/o_groups/o_lora_rank/csa_window_size`。
+符号维（`DimTable` 字段）：`dsa_indexer_n_heads/dsa_indexer_head_dim/dsa_indexer_topk/
+o_groups/o_lora_rank/csa_window_size`；`dsa_fused: bool`（融合开关，默认 True）。
 """
 from __future__ import annotations
 
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
-from .attention import build_mla_attn_ops, FLASH_LSE_WS
+from .attention import FLASH_LSE_WS
 
 __all__ = ["build_dsv4_hybrid_attn_ops"]
 
@@ -54,122 +63,97 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     参数
     ----
     d : DimTable
-        需含 MLA dims + dsv4 dims（dsa_indexer_* / o_groups / o_lora_rank）。
+        需含 MLA dims + dsv4 dims（dsa_indexer_* / o_groups / o_lora_rank）+ `dsa_fused`。
     compress_ratio : int
         本层压缩比：0/1=滑窗、4=CSA、128=HCA。
 
     返回的最后一个 op 输出为 ``h1``（shard={0:'sp'}），可与 FFN 尾拼接。
     """
-    # ── ratio 0/1：滑窗分支 == MLA base（内存中性，§7.4）──────────────────────
-    # DSv4HybridSelfAttention 顶层结构不变，但 core_attention 退化为纯滑窗稠密注意力，
-    # flash 下 saves 仍是 Q/K/V/O + lse（[S,S] 分数从不物化），故内存等价 MLA base。
-    if compress_ratio in (0, 1):
-        return build_mla_attn_ops(d)
-
-    # ratio ∈ {4, 128}：CSA / HCA
-    coff = 2 if compress_ratio == 4 else 1               # compressor.py:89-90 overlap→coff=2
-    enable_indexer = compress_ratio == 4                 # csa.py:324 仅 ratio==4 启 indexer
-    CMP_PROJ_OUT = f"{coff}*v_head_dim"                  # compressor.py:95 proj_out = coff*head_dim
-    S_DIV_R = f"S//{compress_ratio}"                     # compressor.py:199 n_compressed
-
-    # 稀疏注意力 gather 的 KV 位置数 TOPK_DIM（sizes kv_gathered/attn_weights/topk_indices，
-    # csa.py:441-533 的 topk_idxs 末维；I3）：
-    #   - CSA(ratio 4)：DSA 索引器 top-k → dsa_indexer_topk（+window，window≪topk 忽略，as-is）。
-    #   - HCA(ratio 128)：**无 top-k gather**——稠密 attend 所有压缩位 window + S//ratio
-    #     （get_compress_topk_idxs n_compressed=S//ratio，csa.py:153-155/519；window_idxs :465/533）。
-    #     用 dsa_indexer_topk 会把 HCA 的 gather 激活放大 ~ratio/topk 倍（preset topk=1024 vs S/128=32）。
+    fused = getattr(d, "dsa_fused", True)          # 融合 DSA kernel（生产默认）：稀疏中间量不物化
+    sparse = compress_ratio not in (0, 1)          # 4=CSA / 128=HCA 走稀疏；0/1 滑窗
+    coff = 2 if compress_ratio == 4 else 1         # compressor.py:89-90 overlap→coff=2
+    enable_indexer = compress_ratio == 4           # csa.py:324 仅 ratio==4 启 indexer
+    CMP_PROJ_OUT = f"{coff}*v_head_dim"            # compressor.py:95 proj_out = coff*head_dim
+    S_DIV_R = f"S//{compress_ratio}" if sparse else "S"   # compressor.py:199 n_compressed
+    # 稀疏注意力 gather 的 KV 位置数（I3）：CSA→top-k；HCA→稠密 window+S//ratio（无 top-k）。
     TOPK_DIM = "dsa_indexer_topk" if enable_indexer else f"csa_window_size + {S_DIV_R}"
 
     # ── 激活张量 ──────────────────────────────────────────────────────────────
-    x           = TensorRef("x",            ("S", "B", "H"),        shard={0: "sp"})
-    ln1         = TensorRef("ln1",          ("S", "B", "H"))
-    q_compressed = TensorRef("q_compressed", ("S", "B", "q_lora_rank"))   # :234
-    q_a_out     = TensorRef("q_a_out",      ("S", "B", "q_lora_rank"))    # :235
-    q           = TensorRef("q",            ("S", "B", Q_OUT), shard={2: "tp"})  # :237 列并行
-    kv          = TensorRef("kv",           ("S", "B", "v_head_dim"))     # :249 单共享头
-    kv_a_out    = TensorRef("kv_a_out",     ("S", "B", "v_head_dim"))     # :250
-    # 稀疏注意力大头激活（csa.py，naive path）；末维 = TOPK_DIM（CSA=top-k / HCA=window+S//ratio）
-    kv_gathered = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"))  # :208
-    attn_weights = TensorRef("attn_weights", ("B", "n_heads", "S", TOPK_DIM))    # :237
-    core_out    = TensorRef("core_out",     ("S", "B", Q_OUT))           # :247 [sq,b,n,vd]
-    topk_indices = TensorRef("topk_indices", ("B", "S", TOPK_DIM), dtype_bytes=4)  # :241 int32
-    compressed_kv = TensorRef("compressed_kv", (S_DIV_R, "B", "1", "v_head_dim"))  # :221
-    o_group_out = TensorRef("o_group_out",  ("S", "B", O_GROUP_OUT))     # :285
-    o           = TensorRef("o",            ("S", "B", "H"))             # :290
-    h1          = TensorRef("h1",           ("S", "B", "H"), shard={0: "sp"})
+    x            = TensorRef("x",            ("S", "B", "H"),         shard={0: "sp"})
+    ln1          = TensorRef("ln1",          ("S", "B", "H"))
+    q_compressed = TensorRef("q_compressed", ("S", "B", "q_lora_rank"))          # :234
+    q_a_out      = TensorRef("q_a_out",      ("S", "B", "q_lora_rank"))          # :235
+    q            = TensorRef("q",            ("S", "B", Q_OUT), shard={2: "tp"})  # :237 列并行(bf16)
+    # per-head Q RMSNorm 输出 fp32（:239-245）—— 真机 256 MiB/层，此前漏建
+    q_hnorm      = TensorRef("q_hnorm_fp32", ("S", "B", Q_OUT), shard={2: "tp"}, dtype_bytes=4)
+    kv           = TensorRef("kv",           ("S", "B", "v_head_dim"))           # :249 单共享头
+    kv_a_out     = TensorRef("kv_a_out",     ("S", "B", "v_head_dim"))           # :250
+    core_out     = TensorRef("core_out",     ("S", "B", Q_OUT))                  # :247 [sq,b,n,vd]
+    # 分组输出 bmm 的 fp32 输入 cg（:277-283 cast(cg, fp32)）—— 真机 256 MiB/层，此前错 bf16
+    cg_fp32      = TensorRef("cg_fp32",      ("S", "B", Q_OUT), dtype_bytes=4)
+    o_group_out  = TensorRef("o_group_out",  ("S", "B", O_GROUP_OUT))            # :285
+    o            = TensorRef("o",            ("S", "B", "H"))                    # :290
+    h1           = TensorRef("h1",           ("S", "B", "H"), shard={0: "sp"})
 
-    # ── 权重张量（is_weight=True）─────────────────────────────────────────────
-    wq_down = TensorRef("wq_down", ("H", "q_lora_rank"),  is_weight=True)                     # :93-101
-    wq_up   = TensorRef("wq_up",   ("q_lora_rank", Q_OUT), shard={1: "tp"}, is_weight=True)    # :110-118 列并行
-    wkv     = TensorRef("wkv",     ("H", "v_head_dim"),    is_weight=True)                     # :120-128
-    # 索引器权重（indexer.py）
-    idx_wq_b  = TensorRef("idx_wq_b",  ("q_lora_rank", IDX_QB_OUT),          is_weight=True)   # indexer.py:109-117
-    idx_wproj = TensorRef("idx_wproj", ("H", "dsa_indexer_n_heads"),         is_weight=True)   # indexer.py:126-134
-    # 压缩器权重（compressor.py）；ape 为 fp32 可学习参数
-    cmp_wkv   = TensorRef("cmp_wkv",   ("H", CMP_PROJ_OUT),                  is_weight=True)    # compressor.py:97-105
-    cmp_wgate = TensorRef("cmp_wgate", ("H", CMP_PROJ_OUT),                  is_weight=True)    # compressor.py:107-115
-    cmp_ape   = TensorRef("cmp_ape",   (str(compress_ratio), CMP_PROJ_OUT),  is_weight=True, dtype_bytes=4)  # compressor.py:117-120 fp32
-    # 稀疏注意力 attn_sink（每头 fp32，csa.py:305）
-    attn_sink = TensorRef("attn_sink", ("n_heads",), is_weight=True, dtype_bytes=4)            # csa.py:304-308
-    # 分组输出权重
-    wo_group = TensorRef("wo_group", (O_GROUP_OUT, O_CHUNK), is_weight=True)                   # :140-143 linear_o_group_proj
+    # ── 基础权重（所有 ratio 共有）─────────────────────────────────────────────
+    wq_down  = TensorRef("wq_down",  ("H", "q_lora_rank"),   is_weight=True)                    # :93-101
+    wq_up    = TensorRef("wq_up",    ("q_lora_rank", Q_OUT), shard={1: "tp"}, is_weight=True)   # :110-118 列并行
+    wkv      = TensorRef("wkv",      ("H", "v_head_dim"),    is_weight=True)                    # :120-128
+    wo_group = TensorRef("wo_group", (O_GROUP_OUT, O_CHUNK), is_weight=True)                    # :140-143 linear_o_group_proj
     o_w      = TensorRef("o_w",      (O_GROUP_OUT, "H"),     is_weight=True)                    # :145-153 linear_proj
 
-    # ── base：Q 低秩 down→norm→up + 单头 KV down→norm + RoPE ─────────────────
+    # ── base：Q 低秩 down→norm→up→**per-head fp32 norm** + 单头 KV down→norm + RoPE ──
     ops = [
-        # 1. Pre-norm
-        OpSpec("ln1",           OpType.NORM,   [x],             ln1, saves=[x]),
-        # 2. linear_q_down_proj（H → q_lora_rank，:234）
-        OpSpec("linear_q_down", OpType.MATMUL, [ln1, wq_down],  q_compressed,
+        OpSpec("ln1",           OpType.NORM,   [x],              ln1, saves=[x]),                 # 1 Pre-norm
+        OpSpec("linear_q_down", OpType.MATMUL, [ln1, wq_down],   q_compressed,                   # 2 :234
                params=[wq_down], saves=[ln1]),
-        # 3. q_layernorm（q_lora_rank 维，:235）
-        OpSpec("q_a_norm",      OpType.NORM,   [q_compressed],  q_a_out, saves=[q_compressed]),
-        # 4. linear_q_up_proj（q_lora → n_heads*v_head_dim，:237）
-        OpSpec("linear_q_up",   OpType.MATMUL, [q_a_out, wq_up], q,
+        OpSpec("q_a_norm",      OpType.NORM,   [q_compressed],   q_a_out, saves=[q_compressed]), # 3 :235
+        OpSpec("linear_q_up",   OpType.MATMUL, [q_a_out, wq_up], q,                              # 4 :237
                params=[wq_up], saves=[q_a_out]),
-        # 5. linear_kv_proj（H → v_head_dim，单共享头，:249）
-        OpSpec("linear_kv",     OpType.MATMUL, [ln1, wkv],      kv,
-               params=[wkv], saves=[ln1]),
-        # 6. kv_layernorm（v_head_dim 维，:250）
-        OpSpec("kv_a_norm",     OpType.NORM,   [kv],            kv_a_out, saves=[kv]),
-        # 7. Main Q/K pe-lane RoPE（:256-261，in-place，复用 q 引用）
-        OpSpec("rope",          OpType.ROPE,   [q],             q, saves=[]),
+        # 5 per-head Query RMSNorm（:239-245）：rms_norm 反向需 bf16 输入 q（128 MiB/层，saved）；
+        #   fp32 输出 q_hnorm 由下游 attention save（QK 反向需 Q，256 MiB/层）——两者共存至 loss 峰值。
+        OpSpec("q_hnorm",       OpType.NORM,   [q],              q_hnorm, saves=[q]),
+        OpSpec("linear_kv",     OpType.MATMUL, [ln1, wkv],       kv, params=[wkv], saves=[ln1]), # 6 :249
+        OpSpec("kv_a_norm",     OpType.NORM,   [kv],             kv_a_out, saves=[kv]),          # 7 :250
+        OpSpec("rope",          OpType.ROPE,   [q_hnorm],        q_hnorm, saves=[]),             # 8 :256-261 in-place
     ]
 
-    # ── indexer（仅 CSA ratio==4）：产 index_scores O(S²) + topk_indices ─────────
-    if enable_indexer:
-        # inputs：x(ln1) 供 linear_weights_proj，qr(q_a_out) 供 linear_wq_b（indexer.py:151-197）。
-        # index_scores [B,S,S] fp32 建为 bwd_scratch（可重算不 save，indexer.py:227-236）。
-        ops.append(
-            OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
-                   params=[idx_wq_b, idx_wproj], saves=[topk_indices],
-                   bwd_scratch="4*B*S*S")
-        )
+    # ── core attention ────────────────────────────────────────────────────────
+    if sparse:
+        compressed_kv = TensorRef("compressed_kv", (S_DIV_R, "B", "1", "v_head_dim"))            # :221
+        kv_gathered   = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"))            # csa.py:208
+        attn_weights  = TensorRef("attn_weights", ("B", "n_heads", "S", TOPK_DIM))               # csa.py:237
+        topk_indices  = TensorRef("topk_indices", ("B", "S", TOPK_DIM), dtype_bytes=4)           # :241 int32
+        idx_wq_b  = TensorRef("idx_wq_b",  ("q_lora_rank", IDX_QB_OUT),         is_weight=True)   # indexer.py:109-117
+        idx_wproj = TensorRef("idx_wproj", ("H", "dsa_indexer_n_heads"),        is_weight=True)   # indexer.py:126-134
+        cmp_wkv   = TensorRef("cmp_wkv",   ("H", CMP_PROJ_OUT),                 is_weight=True)    # compressor.py:97-105
+        cmp_wgate = TensorRef("cmp_wgate", ("H", CMP_PROJ_OUT),                 is_weight=True)    # compressor.py:107-115
+        cmp_ape   = TensorRef("cmp_ape",   (str(compress_ratio), CMP_PROJ_OUT), is_weight=True, dtype_bytes=4)  # :117-120 fp32
+        attn_sink = TensorRef("attn_sink", ("n_heads",), is_weight=True, dtype_bytes=4)          # csa.py:304-308
+        # indexer（仅 CSA ratio==4）：index_scores [B,S,S] fp32 建为 bwd_scratch（可重算不 save，indexer.py:227-236）
+        if enable_indexer:
+            ops.append(OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
+                              params=[idx_wq_b, idx_wproj], saves=[topk_indices], bwd_scratch="4*B*S*S"))
+        # compressor：门控池化 → compressed_kv [S//ratio,B,1,vd]（compressor.py）
+        ops.append(OpSpec("compressor", OpType.MATMUL, [ln1], compressed_kv,
+                          params=[cmp_wkv, cmp_wgate, cmp_ape], saves=[compressed_kv]))
+        # sparse attention：save Q(=q_hnorm fp32)+O(core_out)；fused kernel 不物化 kv_gathered/
+        # attn_weights（走 scratch）；unfused 才 save 它们。
+        sparse_saves = ([q_hnorm, core_out] if fused
+                        else [q_hnorm, kv_gathered, attn_weights, core_out])
+        ops.append(OpSpec("sparse_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out, compressed_kv], core_out,
+                          params=[attn_sink], saves=sparse_saves, workspace=FLASH_LSE_WS))
+    else:
+        # 滑窗（ratio 0/1）：纯 flash（sliding-window），saves Q(=q_hnorm)/O(core_out)+lse（[S,S] 从不物化，§7.4）
+        ops.append(OpSpec("core_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out], core_out,
+                          saves=[q_hnorm, core_out], workspace=FLASH_LSE_WS))
 
-    # ── compressor：门控池化 → compressed_kv [S//ratio,B,1,vd]（compressor.py）─────
-    ops.append(
-        OpSpec("compressor", OpType.MATMUL, [ln1], compressed_kv,
-               params=[cmp_wkv, cmp_wgate, cmp_ape], saves=[compressed_kv])
-    )
-
-    # ── sparse attention：gather kv_gathered O(S·topk) + attn（csa.py naive path）──
-    # flash workspace = softmax LSE 机理公式（∝ S·n_heads，同标准 flash，见 FLASH_LSE_WS）：
-    # 稀疏 attention 底层仍是 FlashAttentionScore（csa.py:279-284 softmax_max/sum），故同工作集。
-    ops.append(
-        OpSpec("sparse_attn", OpType.FLASH_ATTN, [q, kv_a_out, compressed_kv], core_out,
-               params=[attn_sink], saves=[kv_gathered, attn_weights, core_out],
-               workspace=FLASH_LSE_WS)
-    )
-
-    # ── 分组输出：linear_o_group_proj（bmm）→ linear_proj → 残差 ─────────────────
+    # ── 分组输出：linear_o_group_proj（bmm，fp32 cg save）→ linear_proj → 残差 ────
     ops += [
-        # grouped wo_a（:274-287）
+        # grouped wo_a：bmm 对 core_out cast fp32（cg_fp32 saved，:274-287）—— 真机 256 MiB/层
         OpSpec("o_group_proj", OpType.MATMUL, [core_out, wo_group], o_group_out,
-               params=[wo_group], saves=[core_out]),
-        # linear_proj（o_groups*o_lora → H，:290）
-        OpSpec("o_proj",       OpType.MATMUL, [o_group_out, o_w], o,
-               params=[o_w], saves=[o_group_out]),
-        # Residual add（输出 h1，reshard 回 SP）
-        OpSpec("add1",         OpType.ELEMENTWISE, [o], h1, saves=[]),
+               params=[wo_group], saves=[cg_fp32]),
+        OpSpec("o_proj",       OpType.MATMUL, [o_group_out, o_w], o, params=[o_w], saves=[o_group_out]),  # :290
+        OpSpec("add1",         OpType.ELEMENTWISE, [o], h1, saves=[]),           # 残差 → h1（reshard SP）
     ]
     return ops

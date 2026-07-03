@@ -47,6 +47,7 @@ class LLMConfig:
     dsa_indexer_topk: int = 0
     o_groups: int = 0                       # 分组输出投影
     o_lora_rank: int = 0
+    dsa_fused: bool = True                   # 融合 DSA kernel（生产默认）：稀疏中间量不物化（§真机）
 
     # ---- ② FFN / MoE ----
     ffn_hidden_size: int | None = None      # 默认 4*H
@@ -134,6 +135,7 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         o_groups=cfg.o_groups,
         o_lora_rank=cfg.o_lora_rank,
         csa_window_size=cfg.csa_window_size,
+        dsa_fused=cfg.dsa_fused,
         moe_shared_F=cfg.moe_shared_ffn_hidden_size,
         capacity_factor=cfg.moe_capacity_factor,
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。

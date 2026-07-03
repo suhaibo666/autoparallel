@@ -43,12 +43,20 @@ def test_dsv3_param_conservation():
 
 
 def test_dsv4_param_conservation_no_phantom():
-    """DSv4(4) 冻结 golden（tie 后无幻影 vocab·H；逐层：emb 231.670M + r0_dense 27.081M
-      + r4_moe 199.458M + r128_moe 186.096M + r0_moe 159.201M + mtp 165.265M
-      + lm_head 231.670M = 1,200,440,848）。
-    若 C2 复发（MTP untie）会再 +2·vocab·H≈463M → ~1,663M，超 ±2% → 本测试挂（守住 C2）。
+    """DSv4(4) 冻结 golden（tie 后无幻影 vocab·H；逐层：emb 231.670M + r0_dense 53.262M
+      + r4_moe 199.458M + r128_moe 186.096M + r0_moe 185.383M + mtp 191.805M
+      + lm_head 231.670M = 1,279,344,144）。
+    若 C2 复发（MTP untie）会再 +2·vocab·H≈463M → ~1,742M，超 ±2% → 本测试挂（守住 C2）。
+
+    2026-07-03 修订：ref 1,200,440,848 → 1,279,344,144（+78.9M）。**非幻影**——三个
+    **ratio-0 注意力块**（r0_dense/r0_moe/mtp）从 MLA-base 权重切到 DSv4-own 权重
+    （各 +~26.18M）：真机 Profiler 定位 DSv4HybridSelfAttention 对**所有 ratio**（含滑窗
+    0/1）都用同一顶层模块（per-head fp32 Q-norm + 单共享 KV + 分组输出），滑窗只是其中一个
+    分支、非独立 MLA 模块。故 ratio-0 不再退化复用 build_mla_attn_ops。
+    佐证无幻影：emb + lm_head 两项 **逐字节不变**（各 231.670M）；r4_moe/r128_moe
+    （本就 DSv4-own）不变。delta 全部落在 3 个 r0 注意力块，无 vocab·H 混入。
     """
-    ref = 1_200_440_848
+    ref = 1_279_344_144
     n = _global_param_count(build_llm_spec(deepseek_v4(4)))
     assert _rel_err(n, ref) < 0.02, f"DSv4(4) params={n:,} vs ref {ref:,} err={_rel_err(n, ref):.4%}"
     # 直接守卫：vocab 权重只应计两次（emb + lm_head），不得混入 MTP 幻影。

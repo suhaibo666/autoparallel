@@ -78,10 +78,14 @@ def test_dsv4_registry_reads_ratio_from_ctx():
     assert n4 == _names(build_dsv4_hybrid_attn_ops(D, 4))
 
 
-def test_dsv4_registry_ratio_zero_is_mla_base():
-    # ratio 0/1 → 滑窗 == MLA base（§7.4 内存中性）
+def test_dsv4_registry_ratio_zero_is_dsv4_own_not_mla():
+    # ratio 0/1 → 滑窗仍走 DSv4 顶层（per-head fp32 Q-norm + 分组输出），**不再** == MLA base
+    # （真机定位：MLA 不含 q_hnorm/cg_fp32 两个 256MiB fp32 大头，§7.4 修订）。
     n0 = _names(ATTN_REGISTRY["dsv4_hybrid"](D, _dec("dsv4_hybrid", "moe", 0)))
-    assert n0 == _names(build_mla_attn_ops(D))
+    assert "q_hnorm" in n0 and "o_group_proj" in n0   # DSv4 顶层特征
+    assert "indexer" not in n0 and "compressor" not in n0 and "sparse_attn" not in n0  # 滑窗无稀疏
+    assert n0 != _names(build_mla_attn_ops(D))
+    assert n0 == _names(build_dsv4_hybrid_attn_ops(D, 0))   # 等价底层 (dims, ratio) builder
 
 
 def test_dsv4_registry_without_ratio_raises_clearly():

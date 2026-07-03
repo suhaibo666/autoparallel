@@ -11,6 +11,8 @@ Source (mindformers, faithful):
   experimental_attention_variant/{deepseek_v4_hybrid_attention,indexer,compressor,csa}.py
 Design: specs/2026-07-01-unified-llm-modelspec-design.md §7.3 / §7.2 / §4.
 """
+from dataclasses import replace
+
 import pytest
 
 from cost_eval.model_spec import DimTable, OpType, ModelSpec, LayerSpec
@@ -35,6 +37,11 @@ DBIG = DimTable(
     dsa_indexer_n_heads=4, dsa_indexer_head_dim=128, dsa_indexer_topk=2048,
     o_groups=8, o_lora_rank=256, csa_window_size=128,
 )
+
+# unfused 路径（dsa_fused=False）：小算子 unfused_compressed_sparse_attn 才物化
+# kv_gathered/attn_weights（csa.py:187）；融合 kernel 走 scratch 不物化（生产默认）。
+DS_UNFUSED = replace(DS, dsa_fused=False)
+DBIG_UNFUSED = replace(DBIG, dsa_fused=False)
 
 
 def _names(ops):
@@ -108,9 +115,9 @@ def test_ratio4_index_scores_bwd_scratch_is_S2():
 
 
 def test_ratio4_kv_gathered_saved_is_S_times_topk():
-    """Sparse attention saves kv_gathered [B,S,topk,v_head_dim] -> O(S*topk)."""
+    """UNFUSED sparse attention saves kv_gathered [B,S,topk,v_head_dim] -> O(S*topk)."""
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
-    ops = build_dsv4_hybrid_attn_ops(DS, 4)
+    ops = build_dsv4_hybrid_attn_ops(DS_UNFUSED, 4)
     kvg = next(s for op in ops for s in op.saves if s.name == "kv_gathered")
     numel = 1
     for e in kvg.shape:
@@ -120,7 +127,7 @@ def test_ratio4_kv_gathered_saved_is_S_times_topk():
 
 def test_ratio4_attn_weights_saved_is_S_times_topk():
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
-    ops = build_dsv4_hybrid_attn_ops(DS, 4)
+    ops = build_dsv4_hybrid_attn_ops(DS_UNFUSED, 4)   # unfused：才物化 attn_weights
     aw = next(s for op in ops for s in op.saves if s.name == "attn_weights")
     numel = 1
     for e in aw.shape:
@@ -188,7 +195,7 @@ def test_ratio128_kv_gathered_uses_S_div_ratio_not_topk():
     """HCA (ratio 128) 无 top-k gather：稠密 attend 压缩位 = window + S//ratio
     （csa.py:153-155 n_compressed=S//ratio + :465/533 window_idxs），非 dsa_indexer_topk（I3）。"""
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
-    ops = build_dsv4_hybrid_attn_ops(DBIG, 128)
+    ops = build_dsv4_hybrid_attn_ops(DBIG_UNFUSED, 128)   # unfused：才物化 kv_gathered
     expected_topk = DBIG.csa_window_size + DBIG.S // 128    # 128 + 32 = 160
     assert _saved_numel(ops, "kv_gathered", DBIG) == DBIG.B * DBIG.S * expected_topk * DBIG.v_head_dim
     # 绝不再按 DSA 索引器 top-k 定尺（HCA 无 gather；topk=2048 会 ~32× 过大）
@@ -198,9 +205,9 @@ def test_ratio128_kv_gathered_uses_S_div_ratio_not_topk():
 
 
 def test_ratio4_kv_gathered_still_topk_unchanged():
-    """CSA (ratio 4) 保持 DSA top-k gather（dsa_indexer_topk），不受 HCA 修复影响。"""
+    """CSA (ratio 4) UNFUSED 保持 DSA top-k gather（dsa_indexer_topk），不受 HCA 修复影响。"""
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
-    ops = build_dsv4_hybrid_attn_ops(DBIG, 4)
+    ops = build_dsv4_hybrid_attn_ops(DBIG_UNFUSED, 4)
     assert _saved_numel(ops, "kv_gathered", DBIG) == DBIG.B * DBIG.S * DBIG.dsa_indexer_topk * DBIG.v_head_dim
 
 
@@ -208,17 +215,21 @@ def test_ratio4_kv_gathered_still_topk_unchanged():
 # ratio 0/1: MLA-base-like, no sparse additions
 # ---------------------------------------------------------------------------
 
-def test_ratio0_is_mla_base_no_sparse():
+def test_ratio0_is_dsv4_own_graph_not_mla():
+    """ratio 0/1（滑窗）也走 DSv4 顶层（per-head fp32 Q-norm + 分组输出），
+    **不再**退化复用 build_mla_attn_ops（真机 Profiler 定位：MLA 不含这两个 fp32 大头）。"""
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
     from cost_eval.layers.attention import build_mla_attn_ops
     ops = build_dsv4_hybrid_attn_ops(DS, 0)
     names = _names(ops)
-    assert "indexer" not in names
-    assert "compressor" not in names
-    assert "sparse_attn" not in names
+    assert "indexer" not in names           # 无 O(S²) 索引器
+    assert "compressor" not in names        # 无压缩器
+    assert "sparse_attn" not in names        # 滑窗走 core_attn 纯 flash
+    assert "core_attn" in names
     assert all(op.bwd_scratch != "4*B*S*S" for op in ops)
-    # reuse MLA base structure verbatim
-    assert names == _names(build_mla_attn_ops(DS))
+    # DSv4 顶层 fp32 大头 + 分组输出，MLA base 没有 → 不再逐字复用
+    assert "q_hnorm" in names and "o_group_proj" in names
+    assert names != _names(build_mla_attn_ops(DS))
 
 
 def test_ratio1_same_as_ratio0():
@@ -232,9 +243,36 @@ def test_ratio1_same_as_ratio0():
 
 def test_op_counts_per_branch():
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
-    assert len(build_dsv4_hybrid_attn_ops(DS, 0)) == 10     # MLA base
-    assert len(build_dsv4_hybrid_attn_ops(DS, 128)) == 12   # base7 + compressor + sparse + o_group + o_proj + add1
-    assert len(build_dsv4_hybrid_attn_ops(DS, 4)) == 13     # + indexer
+    # base8 = ln1,q_down,q_a_norm,q_up,q_hnorm,kv,kv_a_norm,rope；尾 3 = o_group_proj,o_proj,add1
+    assert len(build_dsv4_hybrid_attn_ops(DS, 0)) == 12     # base8 + core_attn + 尾3
+    assert len(build_dsv4_hybrid_attn_ops(DS, 128)) == 13   # base8 + compressor + sparse_attn + 尾3
+    assert len(build_dsv4_hybrid_attn_ops(DS, 4)) == 14     # + indexer
+
+
+def test_fused_drops_kv_gathered_and_attn_weights():
+    """融合 kernel（dsa_fused=True，生产默认）：kv_gathered/attn_weights 走 scratch 不物化
+    （真机 15415 profile 查无此张量）——故 sparse_attn 不 save 它们。"""
+    from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
+    fused = build_dsv4_hybrid_attn_ops(DS, 4)            # DS 默认 dsa_fused=True
+    saved = {s.name for op in fused for s in op.saves}
+    assert "kv_gathered" not in saved and "attn_weights" not in saved
+    # unfused 才有
+    unf = {s.name for op in build_dsv4_hybrid_attn_ops(DS_UNFUSED, 4) for s in op.saves}
+    assert "kv_gathered" in unf and "attn_weights" in unf
+
+
+def test_per_head_q_rmsnorm_and_grouped_output_fp32_saves():
+    """真机 Profiler 定位的两个 fp32 大头（256 MiB/层 @ align 配置）：
+    per-head Q RMSNorm 输出 q_hnorm_fp32（:239-245）+ 分组输出 fp32 输入 cg_fp32（:277-283）。"""
+    from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
+    for ratio in (0, 4, 128):                            # 所有 ratio 都有（顶层 wrapper 统一）
+        ops = build_dsv4_hybrid_attn_ops(DBIG, ratio)
+        saved = {s.name: s for op in ops for s in op.saves}
+        assert "q_hnorm_fp32" in saved and saved["q_hnorm_fp32"].dtype_bytes == 4
+        assert "cg_fp32" in saved and saved["cg_fp32"].dtype_bytes == 4
+        # 尺寸 = n_heads*v_head_dim（fp32），且 q(bf16 输入)也 saved（rms_norm 反向）
+        assert _saved_numel(ops, "q_hnorm_fp32", DBIG) == DBIG.S * DBIG.B * DBIG.n_heads * DBIG.v_head_dim
+        assert "q" in saved and saved["q"].dtype_bytes is None   # bf16（走 DimTable.dtype_bytes）
 
 
 # ---------------------------------------------------------------------------
