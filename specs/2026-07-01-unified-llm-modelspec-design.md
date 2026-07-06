@@ -370,6 +370,9 @@ param 守恒分解确认 delta 全落 3 个 ratio-0 注意力块、emb/lm_head �
   - `253`：异构 allocator/kernel 尾。
   **更正**：原稿「96=½·wq_up + AdamW elementwise」**错**——½·wq_up 与 `[2048,12288]` numel 巧合同 25.16M elem；
   `Muls/Div/Square` 的 96MiB 行是**另外的 AdamW 瞬态、不在峰值 live**。`qk_layernorm`(8 MiB bf16)**已建模**（`validate_dsv4align.py:41` 省略正确）。
-→ **下一步（待用户定夺，"消除经验常数"原则 vs OOM 安全冲突）**：残差既无 config 公式可算，只能
-   **(A)** DSv4-scoped **实测** working-set 项（~384 融合 kernel fp32，标注 kernel-internal，同已接受的 DSv3 平台常数法）；
-   **(B)** A + 折入 441.9/尾 → ~1.0；**(C)** 显式 OOM margin 旋钮；**(D)** 诚实记录、维持 0.930。
+→ **决策（2026-07-06，用户定夺）：选 (D) 诚实记录、维持 0.930，不加任何常数。** 理由：残差既无
+   config 公式可算（融合 kernel 内部量 + 共享 head 瞬态），加**实测**项会破坏"零经验常数、纯公式可算"
+   铁律；而这是**源码级已定位**的已知项（非未知 blob）。故 op 图保持纯公式（framework=0），dsv4-fused
+   预测维持 **0.9300（UNDER ~7%）**，**OOM 评估由用户用时自留 ≥8% 裕度**。`validate_dsv4align.py`
+   输出已印该 caveat。备选 (A)/(B)（DSv4-scoped 实测 working-set 项 → ~0.955/~1.0）与 (C)（显式 OOM
+   margin 旋钮）已记录在案，若未来 OOM 安全需求高于"零常数"洁癖可回取。

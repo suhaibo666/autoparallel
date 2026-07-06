@@ -45,9 +45,11 @@
    numel 巧合同为 25.16M elem，误导了参数形状猜测。`Muls/Div/Square` 的 96MiB 行是**另外的 AdamW 瞬态、不在峰值 live**。
    `qk_layernorm`(q_layernorm 6 + kv_layernorm 2 = 8 MiB bf16)**已建模**，非欠计。
 4. **仍 UNDER 7%（OOM-不安全向）**，且残差**非**干净的漏建 saved 激活——是**融合 kernel 内部量 + 共享 head 瞬态**，
-   **无 config 公式可算**。→ 达 OOM-safe 只能：**(A)** 加 DSv4-scoped 的**实测** working-set 项（~384 融合
-   kernel fp32，标注 kernel-internal，与已接受的 DSv3 平台常数同法）；**(B)** A + 折入 441.9/尾 → ~1.0；
-   **(C)** 显式 OOM margin 旋钮；**(D)** 诚实记录、维持 0.930。**均需用户定夺**（"消除经验常数"原则 vs OOM 安全冲突）。
+   **无 config 公式可算**。
+   **决策（2026-07-06，用户定夺）：选 (D) 诚实记录、维持 0.930，不加常数。** op 图保持纯公式（framework=0），
+   dsv4-fused 预测 = **0.9300（UNDER ~7%）**，残差**源码级已定位**，**OOM 评估由用户用时自留 ≥8% 裕度**
+   （`validate_dsv4align.py` 输出已印 caveat）。备选（记录在案，OOM 需求升级可回取）：**(A)** DSv4-scoped 实测
+   working-set 项 ~384 → ~0.955；**(B)** A + 441.9/尾 → ~1.0；**(C)** 显式 OOM margin 旋钮。
 
 ## 产物
 `operator_memory.csv`（12012 行）、`memory_record.csv`（48003 行）、`memory_summary_rank0.txt`。

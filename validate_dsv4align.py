@@ -111,6 +111,12 @@ def main():
     print(f"=== DSv4-align {N}L seq={SEQ} mHC={MHC} MTP={MTP} (no-recompute, FSDP-2) ===")
     print(f"[peak] pred = {pk:8.1f} MiB @ {p.peak_event}"
           + (f" ; real = {real} ; ratio = {pk/real:.4f}" if real else ""))
+    # 已知残差（源码级已定位，2026-07-06 用户定夺维持纯公式、不加常数；设计 §14.2 / DIAGNOSIS.md）：
+    # dsv4-fused 结构性 UNDER ~7%——融合 kernel 内部 fp32 [S,12288]×层 + ½·vocab·H lm_head 反向瞬态 +
+    # allocator 尾，无 config 公式可算。**OOM 评估请对本预测自留 ≥8% 裕度**（否则会把会 OOM 的配置判为可放下）。
+    if real and pk < real:
+        print(f"[caveat] dsv4-fused 已知 UNDER {(1 - pk/real) * 100:.1f}%（融合 kernel 内部量，源码级已定位）"
+              f" → OOM 评估请自留 ≥8% 裕度；详见 specs §14.2 / analysis/realmachine/dsv4_fused/DIAGNOSIS.md")
     print(f"--- breakdown (MiB) ---")
     for k in ("persistent", "act_live", "gather_buf", "grad_buf", "recomp_scratch",
               "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "framework"):
