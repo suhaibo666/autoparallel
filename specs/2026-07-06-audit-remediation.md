@@ -283,3 +283,129 @@ DSv3 无 select 层 → `estimate_select_memory` **根本不在 DSv3 路径上**
 `pytest` 全绿。改动仅落 `structure_mem.estimate_select_memory` + 新增 `_pinned_input_boundary` helper；更新
 `tests/test_structure_mem.py::test_select_core_attn_scoped_to_selected_ops`（该断言原编码旧低估
 `fml−checkpoint_input`，改为修正值 `fml`（边界未 pin 不减），附 D-3 注释）+ 新增单 op 自估足迹用例。
+
+### D-7：mindformers 配置文件 → 评估器配置对象 转换器
+
+**审计发现**：评估器完全**对象驱动**——`LLMConfig`（`llm_config.py`）+ `ParallelConfig`/`RecomputeSpec`/
+`SwapSpec`/`OptimizerSpec`/`HardwareSpec`（`specs.py`）+ 预设工厂（`presets.py`），`cost_eval/` 内 **0 处**
+`yaml`/`json.load`（`grep -rn "yaml\|json.load" cost_eval` 无命中）。故目标 7「按配置文件灵活仿真」只在
+**对象层**达成：拿到一份真实 mindformers 训练 yaml 的用户必须**手工翻译**成上述对象。三处手写翻译
+（`validate_dsv3.py`/`validate_dsv4align.py:dsv4_align_config()`/`presets.py`）就是这份手工映射被反复做的证据。
+
+**决策（用户原话「构建 mindformers 的配置文件转换器」）**：新增 `cost_eval/configs/from_mindformers.py`，
+把 mindformers **pynative 训练 yaml** 映射到评估器配置对象。**核心保持纯**（只吃 dict，`cost_eval` 核不新增
+硬 yaml 依赖）；薄 path-loader 内**惰性** `import yaml`。字段映射**逐字复现**上述三处已核验手写映射
+（它们是 verified source of truth），并以「喂回锚点 config → 得到与 `dsv4_align_config()`/`deepseek_v3()`
+**逐字段相等**的 `LLMConfig` → 同一评估峰值」作为保真判据。
+
+**模块 API**：
+
+| 符号 | 签名 | 说明 |
+|------|------|------|
+| `EvaluatorConfigBundle` | dataclass(`llm, parallel, recompute, swap, optimizer, hardware`) | 打包 6 个评估器对象 |
+| `from_mindformers_dict(mf: dict)` | `dict → EvaluatorConfigBundle` | **纯核**（不 import yaml），全部映射逻辑在此 |
+| `load_mindformers_yaml(path)` | `path → EvaluatorConfigBundle` | 薄壳：**函数内**惰性 `import yaml` + `safe_load` + 调纯核 |
+
+**`model.*` → `LLMConfig` 字段映射**（定位符 = `prep_dsv4align.py:NN`（记作 P4:NN）+ `validate_dsv4align.py:
+dsv4_align_config()`（记作 V4:NN）+ `presets.py:deepseek_v3()`（记作 D3:NN））：
+
+| mindformers `model.*` | LLMConfig 字段 | 规则 / 定位 |
+|---|---|---|
+| `hidden_size` | `hidden_size` | 直通（P4:72；V4:43） |
+| `num_hidden_layers` | `num_layers` | 直通（P4:74） |
+| `num_attention_heads` | `num_attention_heads` | 直通（P4:77；V4:44） |
+| `num_key_value_heads` | `num_query_groups` | 缺省：MLA 系→`1`（V4:45 `num_query_groups=1`）/ 否则→`num_attention_heads`；DSv3 显式 `8`（D3:34） |
+| `vocab_size` | `vocab_size` | 直通（P4:70；V4:46） |
+| `seq_length` | `seq_length` | 直通（P4:71；V4:47） |
+| `intermediate_size` | `ffn_hidden_size` | 直通（P4:73；V4:66 `ffn_hidden_size=3072`） |
+| `multi_latent_attention` + `experimental_attention_variant` | `attn_type` | 见下「attn_type 推断」（P4:81/98；V4:50） |
+| `kv_lora_rank`/`q_lora_rank`/`qk_rope_head_dim`/`qk_nope_head_dim`/`v_head_dim` | 同名直通 | P4:83-87；V4:51-55 |
+| （MLA 派生）`qk_nope_head_dim + qk_rope_head_dim` | `head_dim` | **仅 `attn_type="mla"`** 设为 nope+rope（DSv3=128+64=192，D3:38）；`dsv4_hybrid`/GQA **留 None**（V4 未设 head_dim；MLA 下 `head_dim` 对 op 图**惰性**，`attention.py:29-35` 只用 nope/rope/v/lora dims） |
+| `csa_compress_ratios` | `csa_compress_ratios` | `list→tuple`（P4:101；V4:57 `_cycle_ratios`） |
+| `csa_window_size` | `csa_window_size`（+ `dsv4_hybrid` 时 `window_size`） | P4:102；V4:58/64 |
+| `dsa_indexer_n_heads`/`dsa_indexer_head_dim`/`dsa_indexer_topk` | 同名直通 | P4:105-107；V4:59-62 |
+| `o_groups`/`o_lora_rank` | 同名直通 | P4:110-111；V4:63/64 |
+| `apply_dsa_kernel_fusion` | `dsa_fused` | `bool()`；与 `force_unfused_dsa`（P4:100）互反，不一致则 fail-loud。**FUSED 生产**=True（V4 默认 `dsa_fused=True`，对齐真机 FUSED 锚点 15415.5） |
+| `gated_linear_unit` | `gated_linear_unit` | 直通（P4:128；D-6） |
+| `moe_intermediate_size` | `moe_ffn_hidden_size` | 直通（P4:129；V4:69） |
+| `n_routed_experts` | `num_moe_experts` | 直通（P4:130；V4:67） |
+| `num_experts_per_tok` | `moe_router_topk` | 直通（P4:130；V4:68） |
+| `n_shared_experts` | `moe_shared_expert_num` | 直通（P4:131；V4:70） |
+| `moe_shared_expert_intermediate_size` | `moe_shared_ffn_hidden_size` | 直通（P4:131；V4:71） |
+| `first_k_dense_replace` | `first_k_dense_replace` | 直通（P4:130；V4:73） |
+| `enable_hyper_connections` / `hc_mult` | `residual_variant` / `num_residual_streams` | True→`"mhc"` + `num_residual_streams=hc_mult`；False→`"plain"`+`1`（P4:113-114；V4:75-76） |
+| `num_nextn_predict_layers` | `mtp_num_layers` | 直通（P4:121；V4:78） |
+| `add_bias_linear` | `add_bias_linear` | 直通（False=默认；True→build_llm fail-loud）（P4:79） |
+| `compute_dtype` | `compute_dtype_bytes` | `bfloat16/float16→2`，`float32→4`（P4:92；V4:80=2） |
+| `params_dtype` | `embedding_params_dtype_bytes` + OptimizerSpec | `float32→4`（=默认）；同时定 `params_fp32`（见下）（P4:91） |
+| `position_embedding_type` | `position_embedding_type` | rope 族（`rope/yarn/llama3/dynamic/linear`）→`"rope"`（内存等价）；其它→原样透传（build_llm fail-loud）（P4:124=`yarn`） |
+| `tie_word_embeddings` | `tie_word_embeddings` | 缺省 False（两锚点均独立 lm_head） |
+| `moe_capacity_factor`（缺省） | `moe_capacity_factor` | 无 mf 字段 → 默认 `1.0`（V4:72） |
+
+**attn_type 推断规则**（源：`multi_latent_attention`/`experimental_attention_variant` 如何表达，P4:81/98；
+落到 V4:50 `dsv4_hybrid`、D3:39 `mla`）：
+
+1. `multi_latent_attention=True` **且** `experimental_attention_variant="dsv4_hybrid"` → `attn_type="dsv4_hybrid"`。
+2. `multi_latent_attention=True`（无 dsv4 变体）→ `attn_type="mla"`。
+3. 否则：给了 `num_key_value_heads < num_attention_heads` → `"gqa"`（`num_query_groups=num_key_value_heads`）；
+   相等/未给 → `"mha"`（对称，`num_query_groups=num_attention_heads`）。
+4. `experimental_attention_variant` 为其它非空值（非 dsv4_hybrid）→ **fail-loud**（未建 op 图）。
+
+**ffn/moe 推断**：`n_routed_experts>0` → 该模型有 MoE 层，逐层 dense/moe 由 `first_k_dense_replace`
+（前 K 层 dense）决定（`build_llm._is_moe_layer` 既有语义）；`n_routed_experts` 缺省/0 → 纯 dense。
+`gated_linear_unit` 决定 fc1 是否 2×（D-6）。
+
+**非 `model` 段映射**：
+
+| mindformers | 评估器对象 | 规则 / 定位 |
+|---|---|---|
+| `parallelism.tensor_parallel`/`expert_parallel`/`context_parallel`/`pipeline_parallel` | `ParallelConfig.tp`/`ep`/`cp`/`pp` | 直通（P4:56-57） |
+| `parallelism.sequence_parallel` | `ParallelConfig.sequence_parallel` | 直通（P4:58） |
+| `parallelism.data_parallel_shard` | `ParallelConfig.dp_shard` | `>0` 直取；`<=0`（auto）→ `global_batch // (local_batch·num_microbatches)`（P4:55；FSDP-only，`dp_replicate=1`）→ 锚点 `2//1=2` |
+| `parallelism.pipeline_parallel_microbatch_size` | `ParallelConfig.num_microbatches` | `pp>1` 取该值、否则 `1`（对齐 `validate_dsv3.main` 的 `mbs=PP if PP>1 else 1`）（P4:57） |
+| `parallelism.{offset, num_layer_list}` | `ParallelConfig.layers_per_stage` | **D-8 衔接**：per-stage decoder 层数 → 加 embedding@stage0 + (mtp+head)@末 stage（和==`num_layers+mtp+2`）；缺省 None（均匀切） |
+| `recompute.mode` + `full_recompute_layer` | `RecomputeSpec.mode`/`full_layers` | 无 recompute 段→`"None"`；`mode="full"`+`["0-K"]`（0-indexed decoder）→ `full_layers={i+1}`（评估器 layer 0=embedding，故 **+1 偏移**）（P4:60；V4:97） |
+| `optimizer.type` + `params_dtype` | `OptimizerSpec` | `type→AdamW`；`params_dtype=float32→params_fp32=True`（`state_bytes=12`）；`grad_dtype_bytes=4`（默认 fp32 grad）（P4:52/91；V4:92） |
+| `context.max_device_memory` | `HardwareSpec.max_device_memory` | `"54GB"→54·2³⁰`（P4:49；不影响峰值，只判 OOM）；`framework_reserve=0`、`alloc_block_bytes=512` 用默认 |
+| （无 swap/offload 段） | `SwapSpec()` | 默认 disabled（swap/offload 映射未实现，见「限制」） |
+
+**fail-loud 策略**（与 `build_llm._check_implemented_dispatch` 一致——不静默产错图）：
+- **`model` 段严格白名单**：每个 key 必须落在「已映射集」∪「已知内存中性忽略集」，否则
+  `raise NotImplementedError`（列出未识别 key）。这保证「改变 op 图但未映射」的新结构字段**必炸**。
+- **值守卫**：`use_flash_attention=False`（会物化 `[S,S]` 分数、改 op 图）→ fail-loud；
+  `experimental_attention_variant` 非 `dsv4_hybrid` 的非空值 → fail-loud；`apply_dsa_kernel_fusion`
+  与 `force_unfused_dsa` 不互反 → fail-loud。
+- **透传守卫**：`add_bias_linear=True`/`add_qkv_bias=True`/`qk_layernorm=True`（若不在忽略集）/
+  `normalization≠RMSNorm`/`norm_placement≠pre`/`position_embedding_type` 非 rope 族 → 映射到
+  `LLMConfig` 后由 `build_llm` 原生 fail-loud（DRY，不在转换器重复）。
+- **非 `model` 段**（`parallelism`/`recompute`/`training`/`optimizer`/`context`/`checkpoint`/`lr_scheduler`/
+  `train_dataset`）：只读已知 key、忽略其余（这些只改训练循环/IO，不改 op 图）。
+
+**已知「内存中性」忽略集（`model.*`）= 刻意复现手写映射的省略**（每项均**不改内存 op 图**；`qk_layernorm`
+的省略直接照抄 `dsv4_align_config()` docstring「qk_layernorm/add_bias omitted（memory-negligible; would
+fail-loud in build_llm）」）：`model_type`/`architectures`/`max_position_embeddings`/`hidden_act`/`rms_norm_eps`/
+`mla_qkv_concat`/`qk_layernorm`/`attention_dropout`/`hidden_dropout`/`layernorm_compute_dtype`/
+`softmax_compute_dtype`/`rotary_dtype`/`initializer_range`/`csa_compress_rotary_base`/`csa_dense_mode`/
+`dsa_indexer_loss_coeff`/`dsa_indexer_use_sparse_loss`/`hc_sinkhorn_iters`/`hc_eps`/`use_fused_mhc`/
+`mtp_loss_scaling_factor`/`scaling_factor`/`beta_fast`/`beta_slow`/`mscale`/`mscale_all_dim`/`rope_theta`/
+`router_dense_type`/`routed_scaling_factor`/`moe_token_dispatcher_type`/`moe_grouped_gemm`/
+`moe_router_load_balancing_type`/`moe_aux_loss_coeff`/`scoring_func`/`norm_topk_prob`/`moe_token_drop_policy`/
+`moe_router_enable_expert_bias`/`moe_router_bias_update_rate`/`use_pad_tokens`/`topk_group`/`n_group`/
+`force_unfused_dsa`（作 `apply_dsa_kernel_fusion` 的互反校验用，不单独映射）。**新增未在此集也未映射的
+`model` key → fail-loud**（不静默吞）。
+
+**round-trip 保真论证**：
+- **DSv4-align**：喂 `prep_dsv4align.py`（`N=4, SEQ=2048, MHC=0, MTP=0, FUSED=1`）生成的 dict → 转换器产
+  `LLMConfig` 与 `dsv4_align_config(4)` **逐字段相等**（上表全部 40+ 字段核对，`qk_layernorm:True` 落忽略集→
+  默认 False、`params_dtype:float32→4`=默认、`apply_dsa_kernel_fusion:True→dsa_fused=True`、`num_query_groups`
+  缺省→1、`head_dim` dsv4_hybrid→None、`position_embedding_type:yarn→rope`）→ 同一 bundle（dp_shard=2/
+  no-recompute/54GB）→ **峰值 14336.5**。
+- **DSv3**：喂重构的 DSv3 mindformers dict（`multi_latent_attention:True` 无 dsv4 变体、`num_key_value_heads:8`、
+  MLA dims 128/64/192、`n_routed_experts:8`/`num_experts_per_tok:4`、`recompute.mode:full`+`["0-3"]`、`59GB`）→
+  转换器产 `LLMConfig` 与 `deepseek_v3(4)` 逐字段相等（`head_dim=128+64=192`、`num_query_groups=8`、
+  `attn_type="mla"`）→ 同一 bundle（dp_shard=2/full-recompute {1,2,3,4}/59GB）→ **峰值 12409.5**。
+- 若 round-trip **不能**复现锚点 `LLMConfig`/峰值 → **停并报差异**（静默偏离 verified 手写映射比没有转换器更糟）。
+
+**DSv3 硬门（本模块对 eval core 零改动）**：新增 `cost_eval/configs/`（转换器）+ `tests/test_from_mindformers.py`，
+**不碰** `cost_eval` 核任何评估路径 → `validate_dsv3.py` 恒 `12409.5`、`pytest` 全绿必然成立（仍显式跑核验）。
+纯核 `from_mindformers_dict` 不 `import yaml`；仅 `load_mindformers_yaml` 内惰性导入 → `cost_eval` 核无新硬依赖。
