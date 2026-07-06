@@ -140,5 +140,6 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         capacity_factor=cfg.moe_capacity_factor,
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
         num_residual_streams=cfg.num_residual_streams,
+        gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
         dtype_bytes=cfg.compute_dtype_bytes,
     )

@@ -3,7 +3,6 @@
 以下 LLMConfig 字段会改变 op 图，但当前实现只建了其中一个取值；其它取值若被 preset 设置
 会**静默忽略**、产出「貌似合理实则错误」的图。仿 head.py:50（loss_type 未知即 NotImplementedError）
 在装配点显式报错：
-  - gated_linear_unit=False（ffn 硬编码 2*F gated）
   - norm_placement != "pre"
   - normalization != "RMSNorm"
   - position_embedding_type != "rope"
@@ -17,7 +16,8 @@ from cost_eval.build_llm import build_llm_spec
 
 
 @pytest.mark.parametrize("field,value", [
-    ("gated_linear_unit", False),
+    # gated_linear_unit=False 现已建 op 图（D-6，ffn 按 d.gated_linear_unit 分派）→ 不再 raise，
+    # 覆盖迁至 test_ungated_ffn.py。
     ("norm_placement", "post"),
     ("norm_placement", "sandwich"),
     ("normalization", "LayerNorm"),

@@ -40,27 +40,32 @@ def build_dense_ffn_ops(d: DimTable) -> list:
     d : DimTable
         模型架构超参（H/F/S/B …）。
     """
+    # gated（SwiGLU）：fc1 输出 2F（gate+up）→ swiglu → F；ungated（D-6）：fc1 输出 F → gelu → F。
+    gated = getattr(d, "gated_linear_unit", True)
+    fc1_out = "2*F" if gated else "F"       # fc1 输出维（gate+up 合并 vs 纯 up）
+    act_name = "swiglu" if gated else "gelu"
+
     # ── 激活张量 ───────────────────────────────────────────────────────────────
     h1     = TensorRef("h1",   ("S", "B", "H"),          shard={0: "sp"})
     ln2    = TensorRef("ln2",  ("S", "B", "H"))
-    g      = TensorRef("g",    ("S", "B", "2*F"),        shard={2: "tp"})
+    g      = TensorRef("g",    ("S", "B", fc1_out),      shard={2: "tp"})
     act    = TensorRef("act",  ("S", "B", "F"),          shard={2: "tp"})
     o2     = TensorRef("o2",   ("S", "B", "H"),          partial="tp")
     h2     = TensorRef("h2",   ("S", "B", "H"),          shard={0: "sp"})
 
     # ── 权重张量（is_weight=True，标注 tp 切分）──────────────────────────────
-    fc1_w  = TensorRef("fc1_w", ("H", "2*F"), shard={1: "tp"}, is_weight=True)
-    fc2_w  = TensorRef("fc2_w", ("F",  "H"),  shard={0: "tp"}, is_weight=True)
+    fc1_w  = TensorRef("fc1_w", ("H", fc1_out), shard={1: "tp"}, is_weight=True)
+    fc2_w  = TensorRef("fc2_w", ("F",  "H"),    shard={0: "tp"}, is_weight=True)
 
     return [
         # 7. Pre-FFN norm
         OpSpec("ln2",    OpType.NORM,        [h1],         ln2,
                saves=[h1]),
-        # 8. FFN gate 投影（SwiGLU 第一段，输出 2F）
+        # 8. FFN 上投影（gated→2F gate+up；ungated→F）
         OpSpec("fc1",    OpType.MATMUL,      [ln2, fc1_w], g,
                params=[fc1_w], saves=[ln2]),
-        # 9. SwiGLU 激活
-        OpSpec("swiglu", OpType.ELEMENTWISE, [g],          act,
+        # 9. 激活（gated=SwiGLU 2F→F；ungated=gelu F→F）
+        OpSpec(act_name, OpType.ELEMENTWISE, [g],          act,
                saves=[g]),
         # 10. FFN down 投影（行并行）
         OpSpec("fc2",    OpType.MATMUL,      [act, fc2_w], o2,
@@ -87,6 +92,11 @@ def build_moe_ffn_ops(d: DimTable) -> list:
     d : DimTable
         需包含 n_experts / topk / moe_F 字段。
     """
+    # gated（SwiGLU）：专家 fc1 输出 2·moe_F；ungated（D-6）：moe_F。
+    gated = getattr(d, "gated_linear_unit", True)
+    e_fc1_out = "2*moe_F" if gated else "moe_F"
+    e_act_name = "e_swiglu" if gated else "e_gelu"
+
     # ── MoE FFN 激活张量 ────────────────────────────────────────────────────
     # add1 输出（h1）作为 router 与 dispatch 的输入
     hin  = TensorRef("h1",    ("S", "B", "H"),                  shard={0: "sp"})
@@ -94,9 +104,9 @@ def build_moe_ffn_ops(d: DimTable) -> list:
     logits = TensorRef("logits", ("S", "B", "n_experts"))
     # dispatch 后 token 按 ep 分片（all-to-all）
     disp = TensorRef("disp",  (TLOCAL, "H"),                    shard={0: "ep"})
-    # 专家 fc1 输出（SwiGLU gate+up 合并，2·moe_F）
-    g    = TensorRef("e_g",   (TLOCAL, "2*moe_F"),              shard={0: "ep"})
-    # SwiGLU 后激活（moe_F 维）
+    # 专家 fc1 输出（gated=2·moe_F gate+up；ungated=moe_F）
+    g    = TensorRef("e_g",   (TLOCAL, e_fc1_out),              shard={0: "ep"})
+    # 激活后（moe_F 维）
     act  = TensorRef("e_act", (TLOCAL, "moe_F"),                shard={0: "ep"})
     # 专家 fc2 输出（H 维，仍按 ep 分片）
     eo   = TensorRef("e_o",   (TLOCAL, "H"),                    shard={0: "ep"})
@@ -105,7 +115,7 @@ def build_moe_ffn_ops(d: DimTable) -> list:
 
     # ── 专家权重（纯 EP：dim 0 按 ep 轴切分，不含 tp）─────────────────────
     # shape 用全量维度（n_experts），shard={0:"ep"} 在 resolve_tensor 中做整除
-    w1 = TensorRef("e_w1", ("n_experts", "H",     "2*moe_F"), shard={0: "ep"}, is_weight=True)
+    w1 = TensorRef("e_w1", ("n_experts", "H",     e_fc1_out), shard={0: "ep"}, is_weight=True)
     w2 = TensorRef("e_w2", ("n_experts", "moe_F", "H"),       shard={0: "ep"}, is_weight=True)
 
     return [
@@ -119,8 +129,8 @@ def build_moe_ffn_ops(d: DimTable) -> list:
         # 3. 专家 fc1（grouped GEMM，按 ep 切分的专家矩阵）
         OpSpec("e_fc1",    OpType.MOE_GEMM,   [disp, w1], g,
                params=[w1], saves=[disp]),
-        # 4. SwiGLU 激活
-        OpSpec("e_swiglu", OpType.ELEMENTWISE, [g],        act,
+        # 4. 激活（gated=SwiGLU；ungated=gelu）
+        OpSpec(e_act_name, OpType.ELEMENTWISE, [g],        act,
                saves=[g]),
         # 5. 专家 fc2（grouped GEMM）
         OpSpec("e_fc2",    OpType.MOE_GEMM,   [act, w2],  eo,
@@ -144,22 +154,27 @@ def build_shared_expert_ops(d: DimTable) -> list:
     d : DimTable
         需包含 moe_shared_F 字段。
     """
+    # gated（SwiGLU）：2·moe_shared_F；ungated（D-6）：moe_shared_F。
+    gated = getattr(d, "gated_linear_unit", True)
+    sh_fc1_out = "2*moe_shared_F" if gated else "moe_shared_F"
+    sh_act_name = "shared_swiglu" if gated else "shared_gelu"
+
     # ── Shared expert 激活 / 权重 ─────────────────────────────────────────
     hin_sh     = TensorRef("h1",     ("S", "B", "H"),            shard={0: "sp"})
-    sh_g       = TensorRef("sh_g",   ("S", "B", "2*moe_shared_F"), shard={2: "tp"})
+    sh_g       = TensorRef("sh_g",   ("S", "B", sh_fc1_out),     shard={2: "tp"})
     sh_act     = TensorRef("sh_act", ("S", "B", "moe_shared_F"),  shard={2: "tp"})
     sh_o       = TensorRef("sh_o",   ("S", "B", "H"),             partial="tp")
-    sh_fc1_w   = TensorRef("sh_w1",  ("H",            "2*moe_shared_F"),
+    sh_fc1_w   = TensorRef("sh_w1",  ("H",            sh_fc1_out),
                             shard={1: "tp"}, is_weight=True)
     sh_fc2_w   = TensorRef("sh_w2",  ("moe_shared_F", "H"),
                             shard={0: "tp"}, is_weight=True)
 
     return [
-        # shared fc1（列并行：H → 2*moe_shared_F）
+        # shared fc1（列并行：H → gated 2*moe_shared_F / ungated moe_shared_F）
         OpSpec("shared_fc1",    OpType.MATMUL,      [hin_sh, sh_fc1_w], sh_g,
                params=[sh_fc1_w], saves=[hin_sh]),
-        # shared SwiGLU
-        OpSpec("shared_swiglu", OpType.ELEMENTWISE, [sh_g],             sh_act,
+        # shared 激活（gated=SwiGLU；ungated=gelu）
+        OpSpec(sh_act_name,     OpType.ELEMENTWISE, [sh_g],             sh_act,
                saves=[sh_g]),
         # shared fc2（行并行：moe_shared_F → H，partial=tp）
         OpSpec("shared_fc2",    OpType.MATMUL,      [sh_act, sh_fc2_w], sh_o,

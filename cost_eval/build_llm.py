@@ -33,9 +33,8 @@ def _check_implemented_dispatch(cfg: LLMConfig) -> None:
     物化 → SWA 层 op 图 ≡ 全注意力层），故**故意不报错**，仅作忠实表达模型（供 P1
     时间/推理）；`build_llm_spec` 对其不改 op 图。
     """
-    if not cfg.gated_linear_unit:
-        raise NotImplementedError(
-            "gated_linear_unit=False（ungated FFN）暂未建 op 图：ffn.py 硬编码 2*F gated(SwiGLU)。")
+    # gated_linear_unit=False（ungated MLP）：D-6 已建 op 图（ffn.py 按 d.gated_linear_unit 分派，
+    # fc1 输出 F 而非 2F）→ 不再 raise。
     if cfg.norm_placement != "pre":
         raise NotImplementedError(
             f"norm_placement={cfg.norm_placement!r} 暂未建 op 图（仅 'pre' 已实现："

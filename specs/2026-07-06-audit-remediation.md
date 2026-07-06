@@ -178,3 +178,23 @@ for ev in build_interleaved_1f1b(stage,pp,m,v)]`，`build_interleaved_1f1b(·,v<
 恒 = 整个 `layer_ids`（同一列表对象）→ 事件序列、pin 集合、`_prefetch_*` 全逐字节等价旧循环。DSv3（`pp=1,
 v=1`，`interleave` 默认 1）与所有现有 anchors/golden/preset 均 `v=1` → **不进 v>1 分支** → `12409.5` 恒定、
 `pytest` 全绿。v>1 是本次唯一改动路径，对 v=1 是**精确 no-op**。
+
+### D-6：ungated MLP（`gated_linear_unit=False`）—— 构建 op 图
+
+**审计发现**：`build_llm._check_implemented_dispatch`（`build_llm.py:36-38`）对 `gated_linear_unit=False`
+**fail-loud raise**——ffn.py 硬编码 `2*F`（SwiGLU gate+up），不支持 ungated MLP（GPT-2/OPT 式 fc1→F→gelu→fc2）。
+
+**忠实模型**：gated（SwiGLU）fc1 输出 **2·F**（gate+up 合并），swiglu 取 gate⊙up→F；ungated（plain MLP）
+fc1 输出 **F**，纯 gelu/relu→F。二者 op 数相同（ln2→fc1→act→fc2→add2），**唯 fc1 输出维 2F↔F、fc1_w
+[H,2F]↔[H,F]、激活 swiglu↔gelu** 不同。同理 MoE 专家（`2*moe_F↔moe_F`）与 shared expert
+（`2*moe_shared_F↔moe_shared_F`）。
+
+**整改**（`model_spec.py`/`llm_config.py`/`ffn.py`/`build_llm.py`）：
+- `DimTable` 加 `gated_linear_unit: bool = True`；`to_dimtable` 透传 `cfg.gated_linear_unit`。
+- `build_dense_ffn_ops`/`build_moe_ffn_ops`/`build_shared_expert_ops` 按 `d.gated_linear_unit` 分派 fc1
+  输出维（`2*F`/`F` 等）+ 激活名（swiglu/gelu）。
+- 删 `build_llm.py` 对 `gated_linear_unit=False` 的 raise。
+
+**DSv3 复核**：默认 `gated_linear_unit=True`（DSv3/全 preset 皆 SwiGLU）→ 走原 2F 分支、`12409.5` 逐字节
+不变。新增 `tests/test_ungated_ffn.py`（6 例：dense/moe/shared 的 F↔2F + fc1_w 减半 + build_llm 不再 raise）；
+`test_unimplemented_dispatch.py` 移除 gated_linear_unit 用例（已实现）。

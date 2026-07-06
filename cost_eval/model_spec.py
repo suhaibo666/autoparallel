@@ -39,6 +39,9 @@ class DimTable:
     # mHC residual streams (设计 §9)：hidden 打包为 n 条残差流 [S,B,n*H]。
     # 默认 1 → 完全惰性（plain 残差，n*H==H），不影响任何现有 spec。
     num_residual_streams: int = 1
+    # gated_linear_unit（SwiGLU）：True→fc1 输出 2·F（gate+up）；False→ungated MLP，fc1 输出 F
+    # （plain gelu/relu，D-6）。默认 True（现有全部 spec 走 SwiGLU，故 DSv3/preset 不变）。
+    gated_linear_unit: bool = True
     dtype_bytes: int = 2
 
     def as_dict(self) -> dict:
