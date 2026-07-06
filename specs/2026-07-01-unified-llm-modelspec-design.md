@@ -361,8 +361,15 @@ param 守恒分解确认 delta 全落 3 个 ratio-0 注意力块、emb/lm_head �
   128 类(q+core_out)×4=1024。**修复把该建的都建对了**。
 - **子代理"漏建 CE buffer"假设证伪**：真机 loss 区恰 3 个 fp32 vocab（评估器已建 3）；且 DSv3 同 loss、
   seq 翻倍残差仅 ~64，若 CE 欠建会翻倍——残差是 **dsv4 专属**。
-- **残差 1079 定性**：未建的 `96×4`（=½·wq_up fp32/层）+ `441.9`（=½·emb/head fp32）是**参数形状**瞬态，
-  算子名 `Muls/Div/Square/Sqrt/Addcmul/RmsNorm` = **RMSNorm 反向 + AdamW** elementwise 原语 →
-  **① 反向/优化器工作集尾**（§8.5②）在峰值处与激活共存，`act_live=Σsaves` 不计。**非**漏建 saved 激活。
-→ **下一步（待用户定夺）**：显式建"参数形状反向/优化器瞬态工作集"（§8.5② 扩到峰值事件）达 OOM-safe，
-   或设显式 OOM 安全 margin（非结构 fudge 常数）。
+- **残差 1079 定性（2026-07-06 二次取证，子代理 monkeypatch `ops.rms_norm` 全覆盖 + 融合 op 探针）**：
+  **非**干净的漏建 saved 激活。分解——
+  - `384 = 96×4`：**融合 DSA kernel 内部 fp32 `[2048,12288]`**（前向分配、held 过峰值）。实测无任何
+    `ops.rms_norm` 输出 96 MiB；它是 `npu_sparse_attn_shared_kv` AscendC 内部保留量，`save_for_backward`
+    列表全 bf16/小量。12288/tok=64×192 **非 config 维** → **无符号 shape、只能测**。
+  - `441.9 = ½·vocab·H fp32`：lm_head 反向 `View` 瞬态，在**共享 `head.py`**（DSv3 同 head 却无等价瞬态 → 归属不确定，建此处会动 DSv3 峰值）。
+  - `253`：异构 allocator/kernel 尾。
+  **更正**：原稿「96=½·wq_up + AdamW elementwise」**错**——½·wq_up 与 `[2048,12288]` numel 巧合同 25.16M elem；
+  `Muls/Div/Square` 的 96MiB 行是**另外的 AdamW 瞬态、不在峰值 live**。`qk_layernorm`(8 MiB bf16)**已建模**（`validate_dsv4align.py:41` 省略正确）。
+→ **下一步（待用户定夺，"消除经验常数"原则 vs OOM 安全冲突）**：残差既无 config 公式可算，只能
+   **(A)** DSv4-scoped **实测** working-set 项（~384 融合 kernel fp32，标注 kernel-internal，同已接受的 DSv3 平台常数法）；
+   **(B)** A + 折入 441.9/尾 → ~1.0；**(C)** 显式 OOM margin 旋钮；**(D)** 诚实记录、维持 0.930。
