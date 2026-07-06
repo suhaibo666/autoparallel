@@ -198,3 +198,23 @@ fc1 输出 **F**，纯 gelu/relu→F。二者 op 数相同（ln2→fc1→act→f
 **DSv3 复核**：默认 `gated_linear_unit=True`（DSv3/全 preset 皆 SwiGLU）→ 走原 2F 分支、`12409.5` 逐字节
 不变。新增 `tests/test_ungated_ffn.py`（6 例：dense/moe/shared 的 F↔2F + fc1_w 减半 + build_llm 不再 raise）；
 `test_unimplemented_dispatch.py` 移除 gated_linear_unit 用例（已实现）。
+
+### D-2：HCCL 通信缓冲接入报告（按通信域数，reserved 口径）
+
+**审计发现**：`framework.hccl_reserved_buffer(pc)`（`framework.py:57`，= `200MB × num_distinct_communicators`）
+**有模型但从未被 `Evaluator.evaluate` 调用**（`report.py:52` 只算 `framework_reserve`=0）→ 目标 4「涵盖 HCCL」
+在报告层面未落地：`evaluate()` 返回里 HCCL=0。
+
+**忠实模型**：HCCL 每个**不同子通信器**（world + 各启用并行域：FSDP=dp_shard·cp / tp / ep / pp / dp_replicate）
+在 **reserved 池**预留一份 `hcclBufferSize=200MB`（CANN 9.0 真机日志，平台属性）。**不进 allocated 峰值**
+（ep=2 真机实证：加 EP 组 allocated 不变、reserved 涨）。设备 HBM 真实约束是 **reserved ≈ allocated_peak
++ HCCL (+ 池碎片)**。
+
+**整改**（`report.py`）：`Evaluator.evaluate` 调 `hccl_reserved_buffer(pc)`，surfaced 为
+`PeakMemoryReport.hccl_reserved_bytes`（world-level 同值）；加 `reserved_estimate_bytes(stage) = 该 stage
+allocated 峰值 + HCCL` 供 reserved 口径 OOM 余量核查。**不改** `peak_bytes`/`oom`（仍 allocated 口径，真机验证）
+——HCCL 只作独立字段，故 allocated 峰值不变。
+
+**DSv3 复核**：`peak_bytes` 逐字节不变 `12409.5`（HCCL 是新增独立字段，不进 allocated）；`hccl_reserved_bytes`
+= world(1)+FSDP(dp_shard=2>1) = 2×200MB（DSv3 dp_shard=2）。新增 `tests/test_hccl_reserved.py`（5 例：
+world-only / tp / fsdp 缩放 + 不进 allocated + reserved 估计）。

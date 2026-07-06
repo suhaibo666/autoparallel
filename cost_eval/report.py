@@ -10,15 +10,27 @@ from .parallel_model import ParallelModel
 from .shape_eval import ShapeEval
 from .static_mem import StaticMem
 from .mem_timeline import MemTimeline, StagePeak
-from .framework import framework_reserve
+from .framework import framework_reserve, hccl_reserved_buffer
 
 
 @dataclass(frozen=True)
 class PeakMemoryReport:
-    """各 PP stage 峰值显存报告。"""
+    """各 PP stage 峰值显存报告。
+
+    `peak_bytes`/`oom` 是 **allocated 峰值**（max_memory_allocated，OOM 主判据，真机验证）。
+    `hccl_reserved_bytes`（D-2）是 **reserved 池**的 HCCL 通信缓冲估计（按通信域数，`framework.
+    hccl_reserved_buffer`）——**不进 allocated 峰值**（ep=2 真机证实），但计入 `reserved 估计`：
+    `reserved ≈ allocated_peak + hccl_reserved (+ 池碎片)`。设备 HBM 的真实约束是 reserved，
+    故给出 `reserved_estimate_bytes(stage)` 供 reserved 口径的 OOM 余量核查。
+    """
     per_stage: list        # list[StagePeak]，按 stage 升序
     tightest_stage: int    # peak_bytes 最大的 stage
-    oom: bool              # 任意 stage OOM
+    oom: bool              # 任意 stage OOM（allocated 口径）
+    hccl_reserved_bytes: int = 0   # D-2：HCCL 通信缓冲（reserved 池，按通信域数；world-level 同值）
+
+    def reserved_estimate_bytes(self, stage: int) -> int:
+        """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲（reserved 口径上界）。"""
+        return self.per_stage[stage].peak_bytes + self.hccl_reserved_bytes
 
 
 class Evaluator:
@@ -57,4 +69,7 @@ class Evaluator:
             record_timeline=record_timeline, alloc_block_bytes=block)
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
-        return PeakMemoryReport(per_stage, tightest, any(p.oom for p in per_stage))
+        # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。
+        hccl = hccl_reserved_buffer(self.pc)
+        return PeakMemoryReport(per_stage, tightest,
+                                any(p.oom for p in per_stage), hccl_reserved_bytes=hccl)
