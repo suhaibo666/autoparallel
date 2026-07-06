@@ -409,3 +409,22 @@ fail-loud in build_llm）」）：`model_type`/`architectures`/`max_position_emb
 **DSv3 硬门（本模块对 eval core 零改动）**：新增 `cost_eval/configs/`（转换器）+ `tests/test_from_mindformers.py`，
 **不碰** `cost_eval` 核任何评估路径 → `validate_dsv3.py` 恒 `12409.5`、`pytest` 全绿必然成立（仍显式跑核验）。
 纯核 `from_mindformers_dict` 不 `import yaml`；仅 `load_mindformers_yaml` 内惰性导入 → `cost_eval` 核无新硬依赖。
+
+## 5. 整改完成状态（2026-07-06）
+
+7 项决策全部落地（D-5/D-9 按定夺维持现状），逐项 docs-first + DSv3 硬门 + 独立 commit：
+
+| # | 状态 | commit | 关键效果 |
+|---|---|---|---|
+| D-1 cp 切激活 | ✅ | `28229e4` | 激活 S_eff=S/cp（含 flash-ws/loss/index）；cp=1 no-op |
+| D-8 显式 stage 层数 | ✅ | `2d66940` | `layers_per_stage` 首选 + 三重校验，不静默错映射 |
+| D-4 VPP 按 chunk | ✅ | `2ac2e4b` | 去 ~V× 过估，按实际 chunk 层数累加；v=1 == 1F1B |
+| D-6 ungated FFN | ✅ | `7a2594c` | `gated_linear_unit=False` 建 op 图（fc1 不 2×） |
+| D-2 HCCL 接入 | ✅ | `30febaa` | 按通信域数 surfaced 到报告（reserved 口径） |
+| D-3 细粒度选重 per-op | ✅ | `73dab0a` | 单 op 自估自身足迹（`_pinned_input_boundary`），修低估 |
+| D-7 配置转换器 | ✅ | `4cc33dc` | mindformers yaml → 评估器配置对象；round-trip 两锚点精确 |
+| D-5 / D-9 | 维持 | — | DSv4-fused 7% caveat / DSv3 ~0.5% sub-block 残差 |
+
+**不变量守住**：DSv3 锚点全程逐字节 `12409.5`；DSv4-align `14336.5`（0.930，D-5 caveat）；
+`pytest` `233 → 288`（+55 例，全绿）。7 目标：审计时 5✅2⚠️ → 整改后 cp/HCCL/配置文件/VPP/
+细粒度选重/ungated/显式 stage 全部补齐。
