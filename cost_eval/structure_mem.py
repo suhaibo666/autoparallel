@@ -177,10 +177,14 @@ class SelectMemory:
 
     - ``act_live_pinned``：前向常驻激活 = **非选中 op 的 saves**（去重）∪ **层入口
       checkpoint_input**（重算边界，始终保留）。丢掉的正是「只被选中 op 保存」的那些张量。
-    - ``recomp_scratch``：反向重物化选中段 = `forward_max_live(选中 op) −
-      checkpoint_input(选中段边界)`——与 full 重算同构（full 扣层入口），只是**范围收窄到选中
-      op**。选中段边界（选中 op 的首个 save）视作已由前驱非选中 op / 层入口提供（对模块粒度选择
-      精确；更细粒度选择时该边界可能实际未 pin → 略偏乐观，见下 flag）。
+    - ``recomp_scratch``：反向重物化选中 op = `forward_max_live(选中 op) −
+      _pinned_input_boundary(选中 op)`——**每个选中 op 自估自身**足迹（D-3）。选择性重算把每个选中
+      op / 模块**各自**包成一个 checkpoint region（反向逐个、独立重跑），故层的重算工作集峰 =
+      `forward_max_live(选中集)`（连续选中岛内共存取峰、跨岛取 max），**再扣其中确实已 pin 的进入
+      边界输入**（已在 act_live 计过，避免双算）——**而非**无条件扣「选中段首个 save」。旧式无条件
+      扣 `checkpoint_input(选中段)`，隐含「段边界已由前驱 pin」，对**模块/cell 粒度**精确、但对
+      **细粒度单 op**（如仅 `flash`，其输入边界未必 pin）会把并未常驻的输入当「已提供」减掉 →
+      **低估**（OOM 不安全）。D-3 改为**按实际 pin 的进入边界扣**，修正低估、两端仍退化不变。
     - ``bwd_working_set``：非选中段反向工作集 = `forward_max_live(非选中 op) −
       bwd_scratch(非选中)`——与无重算路径同构，只是**范围收窄到非选中 op**。
 
@@ -191,14 +195,45 @@ class SelectMemory:
       - 全不选（选中=∅）：act_live_pinned=activation_saves、recomp=0、
         bwd_working_set=forward_max_live(全)−bwd_scratch == **None**。
 
-    > flag（简化）：mindformers 选择粒度是**模块/cell**（如 `self_attention`、`feed_forward`），
-    > 其边界即层/模块入口（已 pin），故 `− checkpoint_input(选中段)` 精确。若选更细的单个 op
-    > （如仅 `flash`），其输入边界未必已 pin，此项会略微高估「已提供」→ recomp 略偏小；本库如实
-    > 按公式计（不引入拟合项），并在此标注该偏差方向。
+    > D-3（已修正）：mindformers 选择粒度可细到**单个 op**（`config.py:759-796` `select_module`/
+    > `exclude_op`；`activation_checkpoint.py` 对每个命中 op/模块**各自**包 checkpoint）。旧式
+    > `− checkpoint_input(选中段)` 只在**模块/cell 粒度**（边界=层/模块入口，已 pin）精确；对细粒度
+    > 单 op（如仅 `flash`，输入边界未必 pin）会**低估** recomp（OOM 不安全）。现按用户定夺「细粒度选
+    > 重根据单个 op 自己去估计自己」——`recomp = forward_max_live(选中集) − _pinned_input_boundary`，
+    > 只扣**实际已 pin** 的进入边界输入。模块/全选粒度边界=层入口已 pin → 逐字节复现旧值；单 op 边界
+    > 未 pin → 不扣 → 按该 op 自身完整重算足迹计，不再低估。
     """
     act_live_pinned: int = 0
     recomp_scratch: int = 0
     bwd_working_set: int = 0
+
+
+def _pinned_input_boundary(selected, pinned_names, blk: int) -> int:
+    """选中集**进入边界里已 pin 的输入**字节之和（按名去重、逐张量块对齐）。D-3 的核心。
+
+    进入边界 = 被选中 op 消费、但**不由任何选中 op 产出**的非权重输入（段外产出或层入口）——须
+    常驻才能起算选中 op 的重算。其中**已 pin**（名字 ∈ ``pinned_names`` = 非选中 saves ∪ {层
+    checkpoint_input}）的部分，其字节已计入 act_live，故从 recomp 扣掉避免双算；**未 pin** 的
+    （细粒度单 op 的输入边界——唯一 saver 是它自己且已随选中丢弃）**保留**在 recomp（该 op 须自付
+    其输入的重物化）。这取代旧式无条件扣「选中段首个 save」的乐观假设（对模块粒度精确、对单 op
+    低估 → OOM 不安全，见 §SelectMemory D-3）。
+
+    两端退化保证 byte-identical：
+      - 全选 / 模块粒度：进入边界 = 层入口 `x`（= `ci`，已 pin）→ 扣 `x` 字节 = 旧
+        `checkpoint_input`，故 `recomp = forward_max_live − x` 逐字节复现 full。
+      - 全不选：selected=∅ → 无输入可迭代 → 返回 0（recomp 另经 `forward_max_live(∅)=0` 归零）。
+    """
+    produced = {op.output.name for op in selected}   # 段内产出 → 现算，已在 forward_max_live 计
+    seen: set = set()
+    total = 0
+    for op in selected:
+        for t in op.inputs:
+            if t.is_weight or t.name in produced or t.name in seen:
+                continue
+            seen.add(t.name)
+            if t.name in pinned_names:               # 进入边界且已 pin → 扣（已在 act_live）
+                total += _align_up(t.local_numel * t.dtype_bytes, blk)
+    return total
 
 
 def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int = 1) -> SelectMemory:
@@ -235,8 +270,13 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
     nonsel_save_names = {s.name for op in nonselected for s in op.saves}
     act_live_pinned = sm_non.activation_saves + (ci_bytes if ci_name not in nonsel_save_names else 0)
 
-    # recomp = 选中段 forward_max_live − 选中段边界（与 full 同构，范围收窄到选中 op）。
-    recomp_scratch = max(0, sm_sel.forward_max_live - sm_sel.checkpoint_input)
+    # D-3：recomp = 选中集 forward_max_live − **进入边界里实际已 pin 的输入**（每 op 自估自身足迹），
+    # 不再无条件扣「选中段首个 save」（旧式对细粒度单 op 低估→OOM 不安全；见 §SelectMemory D-3）。
+    # pinned = 非选中 saves ∪ {层 ci}（ci 恒常驻）。模块/全选粒度边界=层入口(=ci)已 pin → 逐字节复现
+    # 旧公式；单 op 边界未 pin → 不扣 → 按 forward_max_live([op]) 全额计。
+    pinned_names = nonsel_save_names | ({ci_name} if ci_name is not None else set())
+    recomp_scratch = max(
+        0, sm_sel.forward_max_live - _pinned_input_boundary(selected, pinned_names, blk))
     # bwd_working_set = 非选中段 forward_max_live − 非选中 bwd_scratch（与无重算同构，范围收窄）。
     bwd_working_set = max(0, sm_non.forward_max_live - sm_non.bwd_scratch)
 

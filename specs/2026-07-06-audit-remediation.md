@@ -218,3 +218,68 @@ allocated 峰值 + HCCL` 供 reserved 口径 OOM 余量核查。**不改** `peak
 **DSv3 复核**：`peak_bytes` 逐字节不变 `12409.5`（HCCL 是新增独立字段，不进 allocated）；`hccl_reserved_bytes`
 = world(1)+FSDP(dp_shard=2>1) = 2×200MB（DSv3 dp_shard=2）。新增 `tests/test_hccl_reserved.py`（5 例：
 world-only / tp / fsdp 缩放 + 不进 allocated + reserved 估计）。
+
+### D-3：细粒度选择性重算 —— 每个选中 op **自估自身**重算足迹（单 op 不再低估）
+
+**审计发现（已核）**：`estimate_select_memory`（`structure_mem.py:239`）把选中段的反向重物化算成
+`recomp_scratch = max(0, sm_sel.forward_max_live − sm_sel.checkpoint_input)`——**无条件**扣掉选中段
+「首个 save」(`sm_sel.checkpoint_input`)，其隐含假设是「该段入口边界已被前驱非选中 op / 层入口 pin 进
+act_live，故不重复计」。代码自己已 flag 该假设的适用边界（`structure_mem.py:194-197`）：mindformers 选择
+粒度是**模块 / cell**（`self_attention`、`feed_forward`），其边界恰是层 / 模块入口（已 pin），扣段边界精确；
+但若选**更细的单个 op**（如仅 `flash`），该 op 的输入边界**未必已 pin** → 无条件扣段边界会把一份**并未
+常驻**的输入当成「已提供」减掉 → `recomp` 被**低估**（OOM **不**安全方向）。**只在模块 / cell 粒度精确**。
+
+**用户定夺（原话）**：「细粒度的选重还是应该根据单个 op 自己去估计自己来看」——细粒度选择性重算应
+**由每个选中 op 各自、独立地估计自己的重算成本**，而不是共享一个「段边界已 pin」的假设。
+
+**忠实模型（每 op 自估）**。选择性重算在反向时**逐个**重跑选中 op / region 以复现其输出供求梯度；
+框架把每个选中的 op / 模块**各自**包进一个 checkpoint region（各自 save 自己的输入、丢弃内部激活、反向
+时独立重物化）。故重算单个 op 的显存 = **它自己的重算足迹** = 该 op 此刻活着的输入 + 输出 + workspace
+（= 对该单 op 求 `forward_max_live([op])`，即 inputs+output+workspace）。选中 op 在反向**不同时刻**被
+各自重算（backward 顺着层逆序走，任一时刻只有一个 region 在重算）→ 层的重算工作集峰 = **各 region 峰
+的沿时间线复用**（`forward_max_live(选中集)` 天然给出：**连续选中岛内**共存取峰、**跨岛**取 max），
+再减去**其中确实已 pin 的进入边界输入**（已在 act_live 计过，避免双算）——**而非**无条件减「段首 save」。
+
+- **进入边界**（须常驻才能起算的输入）= 被选中 op 消费、但**不由任何选中 op 产出**的非权重输入（段外
+  产出或层入口）。其中**已 pin**（∈ 非选中 saves ∪ {层 checkpoint_input}）→ 减；**未 pin**（细粒度单 op
+  的输入，唯一 saver 是它自己且已随选中丢弃）→ **保留**在 recomp（该 op 须自付其输入的重物化）。
+- 与**旧式的区别**：旧式减 `sm_sel.checkpoint_input`（选中段**首个 save**，且**无条件**假设已 pin）；
+  新式减 `_pinned_input_boundary`（选中段**进入边界输入**中**实际已 pin** 的部分）。两者在模块 / 全选
+  粒度**逐字节相等**（边界 = 层入口 `x`，既是段首 save 又是 `ci`、确已 pin → 都减 `x` 字节）；只在
+  细粒度单 op（边界未 pin）**分叉**：旧减、新不减 → 新 `recomp` 更大（**修正低估**，OOM 安全方向）。
+
+**源码定位（selective remat = 逐 region 独立重跑，各持自身输入）**：
+- mindformers `RecomputeConfig.select_module` / `exclude_op`（`config.py:759-796`）：按**模块路径** /
+  **算子名子串**选一组 op；`activation_checkpoint.py` 的 `_clean_and_parse_config`（`:478-518`）反转成
+  `{layer_id: [module_names]}`，并对**每个命中的 op / 模块各自**包 checkpoint 包装（`:534-540`
+  `needle in op_name` 命中即独立包裹）→ 每个被包的 region **各自** save 输入、反向各自重跑，彼此**不**
+  共享一个「整层已 pin」的边界。本库 op 图是扁平叶子模块，故「模块」= 一组 op，用子串命中匹配。
+- Megatron `recompute_granularity="selective"` + `recompute_modules`（`transformer_config.py:526-534,559`，
+  默认 `core_attn`）：selective 把**每个**被选 region（默认 core-attn）用 `tensor_parallel/random.py`
+  的 `checkpoint(fn, ...)` 包住——`checkpoint` **只 save 该 region 的输入**、反向用保存的输入**重跑该
+  region**（内部激活是重算期瞬态），每个 region 独立。这正是「每 op 自估自身、其输入是自己的 checkpoint
+  边界」的语义来源。
+
+**两端退化（byte-identical，load-bearing）**。`_pinned_input_boundary` 在两个极端与旧式逐字节相等，故
+`select-all == full`、`select-none == None` 不变：
+- **全选**（选中 = 全部 op）：非选中 = ∅ → 进入边界 = 层入口 `x`（唯一段外输入），`x` = `ci`、已 pin →
+  减 `x` 字节 = `sm.checkpoint_input`；`forward_max_live(全) − x` **==** `full` 路径的
+  `sm.forward_max_live − sm.checkpoint_input`（`mem_timeline.py:507-508`）。`bwd_working_set=0`、
+  `act_live=ci` 均不动。
+- **全不选**（选中 = ∅）：`selected=∅` → `forward_max_live(∅)=0` → `recomp=0`；`act_live=activation_saves`、
+  `bwd_working_set=forward_max_live(全)−bwd_scratch` == `None` 路径，不动。
+- **模块粒度**（选中 = 整个 attention 段）：进入边界 = 层入口 `x`（已 pin）→ 减 `x`，与旧
+  `sm_attn.forward_max_live − sm_attn.checkpoint_input` 逐字节相等（既有测试不变）。
+
+**单 op 修正（数值）**。toy dense 层（`H=64,S=128,B=1,n_kv=4,head_dim=16`，bf16，blk 不影响均 512 整除）
+选 `{flash}`：`forward_max_live([flash]) = qkv(49152)+attn(16384)+ws(32768) = 98304`；flash 的输入边界
+`qkv` 的唯一 saver 是 flash 自己（已随选中丢弃）、`qkv ∉ {非选中 saves ∪ ci=x}` → **未 pin** → 不减。
+**旧** `recomp = 98304 − sm_sel.checkpoint_input(=qkv 49152) = 49152`（低估）；**新** `recomp = 98304 − 0
+= 98304`（+49152，= 被错减的 qkv 边界）。方向：新 ≥ 旧，修正 OOM 不安全的低估。
+
+**DSv3 复核（本项对 DSv3 完全 no-op）**：DSv3 走 `RecomputeSpec(mode="full", ...)`（`validate_dsv3.py:91`），
+**不是** `select` → `mem_timeline.py:392-399` 仅对 `recompute.is_select(lid)` 的层建 `select_mem_by_id`，
+DSv3 无 select 层 → `estimate_select_memory` **根本不在 DSv3 路径上**。故 `peak_bytes` 逐字节不变 `12409.5`、
+`pytest` 全绿。改动仅落 `structure_mem.estimate_select_memory` + 新增 `_pinned_input_boundary` helper；更新
+`tests/test_structure_mem.py::test_select_core_attn_scoped_to_selected_ops`（该断言原编码旧低估
+`fml−checkpoint_input`，改为修正值 `fml`（边界未 pin 不减），附 D-3 注释）+ 新增单 op 自估足迹用例。

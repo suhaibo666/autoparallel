@@ -184,9 +184,14 @@ def test_select_core_attn_scoped_to_selected_ops():
     sm_sel = estimate_structure_memory(selected)
     sm_non = estimate_structure_memory(nonsel)
     sel = estimate_select_memory(ops, is_sel)
-    # recomp 作用于选中 op 的 forward_max_live（扣其段边界，与 full 同构）
-    assert sel.recomp_scratch == max(0, sm_sel.forward_max_live - sm_sel.checkpoint_input)
-    assert sel.recomp_scratch > 0
+    # D-3（golden 修正）：单 op(flash) 选择——每 op **自估自身**足迹。flash 的输入边界 qkv 唯一 saver
+    # 是 flash 自己（已随选中丢弃），qkv ∉ {非选中 saves ∪ ci=x} → **未 pin** → 不能像模块粒度那样
+    # 扣段边界。故 recomp = 该 op 完整重算足迹 forward_max_live([flash]) = qkv(49152)+attn(16384)
+    # +ws(32768) = 98304，**不减** qkv。旧式无条件扣 sm_sel.checkpoint_input(=qkv) → recomp=49152 低估
+    # （OOM 不安全）；此断言原编码该旧低估值，改为修正值。
+    old_undercount = max(0, sm_sel.forward_max_live - sm_sel.checkpoint_input)   # 旧低估 = 49152
+    assert sel.recomp_scratch == sm_sel.forward_max_live == 98304                # 修正：不减未 pin 边界
+    assert sel.recomp_scratch > old_undercount                                  # D-3：不再低估(98304>49152)
     # 非选中 op 的反向工作集
     assert sel.bwd_working_set == max(0, sm_non.forward_max_live - sm_non.bwd_scratch)
     # act_live 丢掉 flash 独占的 saves（qkv/lse），保留 ci 与共享的 attn（o_proj 也 save）
@@ -216,3 +221,71 @@ def test_select_respects_alloc_block_alignment():
     sel = estimate_select_memory(ops, lambda op: True, alloc_block_bytes=512)
     assert sel.act_live_pinned == sm.checkpoint_input
     assert sel.recomp_scratch == max(0, sm.forward_max_live - sm.checkpoint_input)
+
+
+# ---------------------------------------------------------------------------
+# D-3：细粒度选择性重算——每个选中 op 自估自身足迹（单 op 不再低估）
+#
+# 受控 4-op 合成层，精确控制「选中 op 的输入边界是否被非选中 op pin」两个分支：
+#   a: [X,W]->P  saves=[X]        （X=层入口）
+#   b: [P,W]->Q  saves=[P]
+#   mid: [Q]->R  saves=[Q,R] ws=1000
+#   c: [R,W]->Y  saves=[R]
+# 张量字节(dtype=4, blk=1)：X=512，P=Q=R=Y=32768，mid workspace=1000。
+# ---------------------------------------------------------------------------
+
+def _synthetic_boundary_ops():
+    X = TensorRef("X", ("S", "B"),      dtype_bytes=4)                     # 512
+    W = TensorRef("W", ("H", "H"),      is_weight=True, dtype_bytes=4)     # 权重，不计
+    P = TensorRef("P", ("S", "B", "H"), dtype_bytes=4)                     # 32768
+    Q = TensorRef("Q", ("S", "B", "H"), dtype_bytes=4)                     # 32768
+    R = TensorRef("R", ("S", "B", "H"), dtype_bytes=4)                     # 32768
+    Y = TensorRef("Y", ("S", "B", "H"), dtype_bytes=4)                     # 32768
+    ops, _ = _resolve([
+        OpSpec("a",   OpType.MATMUL,      [X, W], P, params=[W], saves=[X]),
+        OpSpec("b",   OpType.MATMUL,      [P, W], Q, params=[W], saves=[P]),
+        OpSpec("mid", OpType.ELEMENTWISE, [Q],    R, saves=[Q, R], workspace="1000"),
+        OpSpec("c",   OpType.MATMUL,      [R, W], Y, params=[W], saves=[R]),
+    ])
+    return ops
+
+
+def test_select_single_op_unpinned_boundary_no_undercount():
+    """D-3：选中单个 interior op(mid)，其输入边界 Q 唯一 saver 是 mid 自己（已丢弃）→ **未 pin**
+    → recomp = 该 op 完整重算足迹 forward_max_live([mid])，**不减** Q。严格 > 旧式无条件扣段边界值。"""
+    ops = _synthetic_boundary_ops()
+    sel = estimate_select_memory(ops, lambda op: op.name == "mid")
+    sm_sel = estimate_structure_memory([op for op in ops if op.name == "mid"])
+    # forward_max_live([mid]) = Q(32768) + R(32768) + ws(1000) = 66536
+    assert sm_sel.forward_max_live == 66536
+    assert sm_sel.checkpoint_input == 32768                 # mid.saves[0] = Q（旧式会错减这一份）
+    old_undercount = max(0, sm_sel.forward_max_live - sm_sel.checkpoint_input)   # 旧低估 = 33768
+    assert sel.recomp_scratch == 66536                      # 修正：边界 Q 未 pin → 不减
+    assert sel.recomp_scratch == old_undercount + 32768     # 恰好补回被错减的 Q
+    assert sel.recomp_scratch > old_undercount              # D-3 方向：不再低估（OOM 安全）
+
+
+def test_select_single_op_pinned_boundary_still_subtracts():
+    """D-3 对称面：选中单个 op(c)，其输入边界 R 被**非选中** op mid save → **已 pin** → 仍如实扣 R
+    （已在 act_live，不双算）。证明修正只在「边界确未 pin」时生效，pin 时行为不变。"""
+    ops = _synthetic_boundary_ops()
+    sel = estimate_select_memory(ops, lambda op: op.name == "c")
+    sm_sel = estimate_structure_memory([op for op in ops if op.name == "c"])
+    # forward_max_live([c]) = R(32768) + Y(32768) = 65536；R 由非选中 mid save → pin → 扣
+    assert sm_sel.forward_max_live == 65536
+    assert sel.recomp_scratch == 65536 - 32768              # = 32768（扣掉已 pin 的边界 R）
+
+
+def test_select_extremes_byte_identical_on_synthetic_layer():
+    """合成层上两端退化仍 byte-identical：select-all == full、select-none == None（守卫 D-3
+    改动不破坏机理根因，独立于 dense builder）。"""
+    ops = _synthetic_boundary_ops()
+    sm = estimate_structure_memory(ops)
+    all_sel = estimate_select_memory(ops, lambda op: True)
+    assert all_sel.recomp_scratch == max(0, sm.forward_max_live - sm.checkpoint_input)  # == full
+    assert all_sel.act_live_pinned == sm.checkpoint_input
+    assert all_sel.bwd_working_set == 0
+    none_sel = estimate_select_memory(ops, lambda op: False)
+    assert none_sel.recomp_scratch == 0                                                # == None
+    assert none_sel.act_live_pinned == sm.activation_saves
+    assert none_sel.bwd_working_set == max(0, sm.forward_max_live - sm.bwd_scratch)
