@@ -353,4 +353,16 @@ param 守恒分解确认 delta 全落 3 个 ratio-0 注意力块、emb/lm_head �
 此前 `②过计 kv_gathered ≈ ①欠建反向工作集`，两者抵消才凑出 0.940。去掉幻影后，**① 无重算反向
 工作集欠建（§8.5②）暴露为残余真因**。**当前 0.930 仍 UNDER（OOM 不安全向）**——达真·OOM-safe 需
 把 ① 按机理建全（无重算路径下反向逐 op 重物化非-saved 中间量的峰值工作集），**而非**保留 ② 幻影凑数。
-→ **下一步**：①的 `bwd_working_set`（§8.5②）在 dsv4 无重算配置下的口径核对 + 真机复验（需服务器会话）。
+
+**真机复验（2026-07-06，子代理跑 `ascend116`/`shb.ms.2.9` cards 2,3，见 `analysis/realmachine/dsv4_fused/DIAGNOSIS.md`）**：
+- **锚点逐字节复现 15415.5（0.0% 漂移）**，fused 确认（峰值算子 `ScatterAddExt`，同 DSv3 签名）。修复未破坏真机测量。
+- **峰值时刻 live-set 重构**（`operator_memory.csv`，alloc≤T_peak<release）证：评估器**所有大结构 buffer
+  逐类精确吻合**——fp32 vocab×3=3030、bf16 logits 505、FSDP 满梯度 883.8、dsv4 256 类(q_hnorm+cg)×4=2048、
+  128 类(q+core_out)×4=1024。**修复把该建的都建对了**。
+- **子代理"漏建 CE buffer"假设证伪**：真机 loss 区恰 3 个 fp32 vocab（评估器已建 3）；且 DSv3 同 loss、
+  seq 翻倍残差仅 ~64，若 CE 欠建会翻倍——残差是 **dsv4 专属**。
+- **残差 1079 定性**：未建的 `96×4`（=½·wq_up fp32/层）+ `441.9`（=½·emb/head fp32）是**参数形状**瞬态，
+  算子名 `Muls/Div/Square/Sqrt/Addcmul/RmsNorm` = **RMSNorm 反向 + AdamW** elementwise 原语 →
+  **① 反向/优化器工作集尾**（§8.5②）在峰值处与激活共存，`act_live=Σsaves` 不计。**非**漏建 saved 激活。
+→ **下一步（待用户定夺）**：显式建"参数形状反向/优化器瞬态工作集"（§8.5② 扩到峰值事件）达 OOM-safe，
+   或设显式 OOM 安全 margin（非结构 fudge 常数）。

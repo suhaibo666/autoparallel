@@ -1,0 +1,58 @@
+DeepSeek-V4 dsv4_hybrid FUSED mode — real-machine memory validation
+Machine: ascend116 (910B3), container shb.ms.2.9, cards ASCEND_RT_VISIBLE_DEVICES=2,3
+Config: 4 layers, seq=2048, compress_ratios=[0,4,128,0], mtp=0, mhc=0, fused=True
+Date: 2026-07-06
+
+=== STEP 3 (CLEAN, authoritative anchor) — msrun 2-card, run_ds3_memprobe.py ===
+3 steps completed cleanly. Losses: step1=11.875927  step2=11.789841  step3=11.692684
+step1 per_step_time=60433ms (fused kernel compile), step2=605ms, step3=600ms
+
+[MEMPROBE] rank=0 peak_alloc_MiB=15415.5 peak_reserved_MiB=16092.0 framework_reserve_MiB=676.5
+[MEMPROBE] rank=1 peak_alloc_MiB=15415.5 peak_reserved_MiB=16096.0 framework_reserve_MiB=680.5
+
+rank0 ms.runtime.memory_summary():
+|=============================================|
+|               Memory summary                |
+|=============================================|
+| Metric               | Data                 |
+|---------------------------------------------|
+| Reserved memory      |  16092 MB            |
+| Allocated memory     |   5676 MB            |   (current at summary time, post-train)
+| Idle memory          |  10412 MB            |
+| Eager free memory    | 100242 MB            |
+| Max reserved memory  |  16092 MB            |
+| Max allocated memory |  15415 MB            |
+|=============================================|
+
+FUSED engaged: YES. Evidence: force_unfused_dsa=false; LITilingData/lightning_indexer
+fused tiling loaded; peak_alloc 15415.5 in fused range 15000-15600; no 'unavailable' /
+'cannot open shared object' / Traceback / unfused-fallback in worker logs.
+Reconfirms prior 15415.5 anchor EXACTLY (0.0% drift). Evaluator predicts 14336.5 -> gap 1079.0 MiB.
+
+=== STEP 4 (PROFILER) — msrun 2-card, run_ds3_memtimeline.py, profile_memory=True ===
+Both ranks: analyse done. peak_alloc reconfirmed 15415.5 MiB
+(reserved 16096/16104 with ~370MB profiler overhead).
+memory_record.csv MindSpore component global max Total Allocated(MB) = 15785.438
+(= 15415.5 + ~370 profiler overhead).
+
+Peak operator (max 'Allocation Total Allocated(MB)' in operator_memory.csv):
+  ScatterAddExt = 15415.47 MB  (the op live at the exact peak; = cross-entropy loss backward)
+  its own tensor at that row = 16393.5 KB = 16.0 MiB (small; it is the alloc that tips to peak;
+  pre-alloc total was 15399.46 MB)
+
+Biggest live tensors (deduped, Size_KB | MiB | Name | inferred shape/dtype):
+  1034240.5 | 1010.0 | SubExt/ScatterAddExt/Reshape/Neg/MaxDim/Log/ExpandDimsView | [2048,129280] fp32 logits (CE loss fwd+bwd, softmax_compute_dtype=fp32). MANY live at once: Reshape x6, SubExt/ScatterAddExt/Neg/MaxDim/Log/ExpandDimsView x3 each.
+   966403.0 | 943.8 | GatherDGradV2 | gather-backward (dtype not cleanly inferable)
+   904960.5 | 883.8 | GatherDGradV2/Empty/ResizeStorage/TransposeExtView | [129280,1792] fp32 = vocab embedding-weight grad
+   551937.0 | 539.0 | MatMulExt
+   544770.0 | 532.0 | MatMulExt
+   517120.5 | 505.0 | ZerosLikeExt/MatMulExt | [2048,129280] bf16 logits (compute_dtype=bf16, lm_head matmul output)
+   474112.5 | 463.0 | Reshape
+   452482.5 | 441.9 | TransposeExtView
+   452480.5 | 441.9 | View/Sub/Square/Sqrt
+
+RESIDUAL LOCUS (1079.0 MiB predicted->real gap): dominated by the fp32 cross-entropy
+materialization. The lm_head emits bf16 logits [2048,129280]=505 MiB, which is upcast to
+fp32 [2048,129280]=1010.0 MiB for the loss; the unfused softmax/log-softmax/NLL fwd+bwd
+then holds SEVERAL 1010 MiB fp32 buffers live simultaneously. A single un-modeled fp32
+logits/CE buffer (1010.0 MiB) accounts for essentially the entire 1079 MiB gap.
