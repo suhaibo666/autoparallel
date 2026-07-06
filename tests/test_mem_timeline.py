@@ -302,15 +302,21 @@ def test_interleaved_leading_fwd_is_warmup_plus_one():
 
 # ── simulate 接线：V 来自 ParallelConfig.interleave ─────────────────────────
 
-def _sim_interleave(pp, m, v, stage=0, recompute=None):
-    spec = ModelSpec("toy", D, ["dense"] * 4, {"dense": build_dense_decoder(D)})
+def _sim_interleave(pp, m, v, stage=0, recompute=None, n_layers=4, record_timeline=False):
+    spec = ModelSpec("toy", D, ["dense"] * n_layers, {"dense": build_dense_decoder(D)})
     pm = ParallelModel(ParallelConfig(pp=pp, num_microbatches=m, interleave=v),
-                       n_layers=4, world_size=pp)
+                       n_layers=n_layers, world_size=pp)
     g = ShapeEval().resolve(spec, pm)
     persistent = StaticMem().compute(g, OptimizerSpec.adamw(), pm, False)
     rc = recompute or RecomputeSpec("None")
     return MemTimeline().simulate(g, rc, SwapSpec(), pm, persistent,
-                                  framework_reserve=0, max_device_memory=10 ** 12)[stage]
+                                  framework_reserve=0, max_device_memory=10 ** 12,
+                                  record_timeline=record_timeline)[stage]
+
+
+def _max_act_live(sp):
+    """时间线上 act_live 的最大值（record_timeline=True 时可用）。"""
+    return max(t.breakdown.act_live for t in sp.timeline)
 
 
 def test_interleave1_simulate_reproduces_default():
@@ -327,16 +333,22 @@ def test_interleave1_simulate_reproduces_default():
 
 
 def test_interleave_deeper_warmup_raises_peak_stage0():
-    """warmup-受限的 stage 0：V=2 比 plain 更深 warmup → act_live/peak 更高。"""
-    p1 = _sim_interleave(4, 20, 1)
-    p2 = _sim_interleave(4, 20, 2)
-    assert p2.breakdown.act_live > p1.breakdown.act_live
+    """warmup-受限的 stage 0：V=2 比 plain 更深 warmup → act_live/peak 更高，但（D-4 后）**远低于
+    ~V× 过估**。物理配置 pp=2、8 层（L=4/stage ≥ v，可真切 chunk；旧 4 层/pp=4 是 L=1 退化配置）。"""
+    p1 = _sim_interleave(2, 20, 1, n_layers=8, record_timeline=True)
+    p2 = _sim_interleave(2, 20, 2, n_layers=8, record_timeline=True)
+    assert _max_act_live(p2) > _max_act_live(p1)          # 交错更深 warmup → 更吃激活（10·s > 8·s）
     assert p2.peak_bytes > p1.peak_bytes
+    assert _max_act_live(p2) < 2 * _max_act_live(p1)      # D-4：< V×plain（~V× 过估已消）
 
 
-def test_interleave_peak_monotonic_in_v_stage0():
-    """peak 随 V 单调不减（更深 warmup → 更多在飞 microbatch 的 act_live）。"""
-    peaks = [_sim_interleave(4, 20, v).peak_bytes for v in (1, 2, 4)]
-    assert peaks[0] <= peaks[1] <= peaks[2]
-    acts = [_sim_interleave(4, 20, v).breakdown.act_live for v in (1, 2, 4)]
-    assert acts[0] <= acts[1] <= acts[2]
+def test_interleave_peak_bulges_at_v2_stage0():
+    """D-4 修正：VPP 峰值随 V **非单调**——膨胀比 ≈ 1+(pp-1)/(pp·V) 在 **V=2 处最大、随 V 回落**
+    （旧 simulate「单调增」是 ~V× 过估的副产物）。物理 pp=2、8 层（L=4/stage）：max act_live（层单位）
+    v1=(1+1)·4=8 → v2=(4+1)·2=10 → v4=(8+1)·1=9 → v2 > v4 > v1；peak_bytes 同签名。"""
+    pk = {v: _sim_interleave(2, 20, v, n_layers=8).peak_bytes for v in (1, 2, 4)}
+    assert pk[2] > pk[4] > pk[1]                          # bulge at v2（非单调增）
+    ac = {v: _max_act_live(_sim_interleave(2, 20, v, n_layers=8, record_timeline=True))
+          for v in (1, 2, 4)}
+    assert ac[2] > ac[4] > ac[1]                          # act_live 同签名（10 > 9 > 8 层单位）
+    assert ac[2] < 2 * ac[1] and ac[4] < 4 * ac[1]        # 每个 v>1 均 < V×plain

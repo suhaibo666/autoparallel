@@ -120,3 +120,61 @@ scratch 侧用 floordiv 安全（合法配置下 `S%cp==0` 时 S 与 S² 均整�
 （`validate_dsv3.py:84`）走 `cp=1`，`degree("cp")=1` → **两处分支完全不进入**，`resolve_tensor` /
 `ShapeEval.resolve` 逐字节复现旧行为 → DSv3 4L 恒 `12409.5`、`pytest` 全绿。cp 是本次唯一新增的激活
 分母，且只在 `>1` 时生效，故对全部现有 cp=1 配置（anchors/golden/preset）是**精确 no-op**。
+
+### D-4：VPP（交错式 1F1B, v>1）激活峰值 —— 从 ~V× 过估改为**按 chunk 忠实累加**
+
+**审计发现（已核，`mem_timeline.py:86-95`/`:363-387` 旧行为）**：交错式 1F1B（VPP，`interleave = v > 1`）
+的 simulate 走**物理微批粒度**——沿用 plain-1F1B 的事件循环，每个 FWD 事件把**整个物理 stage 的全部 L 层**
+（遍历全 `layer_ids`）pin 进 `act_live`（`:365-387`），却又把 warmup 加深到交错式深度
+（`build_interleaved_1f1b` / `interleaved_warmup`）。于是峰值 ≈ `(warmup+1) 个在飞微批 × L 层`，而**真实
+VPP 每个在飞（虚拟）步只驻留一个 chunk（L/V 层）**——旧式每微批高估 **V 倍**（旧 docstring 自述「偏高约
+V 倍」，列为文档化后续项）。`v=1` 时该式退回 plain-1F1B、逐字节一致（`:97-99`），**唯 v>1 过估**。
+
+**忠实模型（Megatron 交错式，按 chunk 累加）**。VPP 下每个物理 device（PP rank）持 **V 个 model chunk**，
+每 chunk **L/V 层**（L = 该物理 stage 层数；全模型总层数 = `pp·L`，**不是** `pp·V·L`）。用户 2026-07-06
+定夺原话：「vpp 应该按照 vpp 的理论公式估计 micro size，整个激活按照实际的层数（**所有的 chunk 层数之和**）
+来估计」。落成两条，均**逐行锚定 Megatron `pipeline_parallel/schedules.py`**：
+
+1. **micro 数 = VPP 理论 warmup 公式（虚拟步 = chunk-forward 粒度）**。取 `get_pp_rank_microbatches`
+   （`schedules.py:877-878`）：
+   $$\text{warmup} = (pp - \text{rank} - 1)\cdot 2 + (V-1)\cdot G,\qquad G=\texttt{microbatch\_group\_size\_per\_vp\_stage}$$
+   默认 `G = pp`（深度优先，`model_parallel_config.py:519-520`），**clamp 到 `total = m·V`**（虚拟微批总数，
+   `:889-890`）——注意是 `m·V` 不是 `m`：warmup 计的是**虚拟步（chunk-forward）**，本库旧 `interleaved_warmup`
+   clamp 到 `m` 是物理粒度口径，虚拟路径须用 `m·V`。
+2. **整体激活 = 实际层数（Σ chunk 层数）忠实累加，每步只驻留一个 chunk**。交错式的 (microbatch, chunk)
+   下发顺序逐行 port 自 Megatron `get_schedule_table`（`:902-929`，deep-first：每组连跑 `G` 个微批的同一
+   chunk 再切下一 chunk，末组把剩余微批一次排完）+ `convert_schedule_table_to_order`（`:932-955`：前 warmup
+   步纯 FWD，随后 steady 逐 `(FWD_i, BWD_{i-warmup})` 交替，末尾 warmup 个 BWD 收尾；forward/backward 同表
+   FIFO → 每 `(mb,chunk)` 前向一次、反向一次）。每个**虚拟 FWD 步 pin 一个 chunk（L/V 层）**、其对应 BWD 步
+   释放该 chunk。峰值（warmup 结束、第一个 BWD 前的最深处，`warmup+1` 个在飞虚拟步）：
+   $$\text{peak act\_live} = \sum_{c=0}^{V-1} n_c \cdot (\text{chunk }c\text{ 的 saves}),\qquad \sum_c n_c = \text{warmup}+1$$
+   其中 $n_c$ = 峰时 chunk $c$ 的在飞微批数（**热身期早 chunk 在飞更多** → 分布非均匀）。层均匀时
+   $= (\text{warmup}+1)\cdot(L/V)\cdot s$（= 旧物理峰 ÷V，V× 过估恰好消去）；层非均匀时（embedding 归首
+   chunk、loss 归末 chunk）按各 chunk **实际** saves 加权 → **非「盲目 ÷V」**，loss 层巨大的 `bwd_scratch`
+   仍落在其所在单一 chunk。**关键不变式**：`Σ_c len(chunk_c) == L`（所有 chunk 层数之和 = 实际 device 层数），
+   任一微批走过全 V chunk 最多 pin **L 层**，**绝不 `V·L`**。
+
+**per-chunk 分布（已手算+脚本双验）**。`pp=2, v=2, m≥4, stage0`：`warmup=(2-0-1)·2+(2-1)·2=4`，峰 `5` 个
+在飞虚拟步，分布 `chunk0=3 / chunk1=2`（deep-first 表 `[(0,0)(1,0)(0,1)(1,1)(2,0)(3,0)(2,1)(3,1)]` 前
+5 个前向）→ `peak = 5·(L/2)·s`。对照：v=1（plain）`warmup=1`、峰 `2` 微批 × L 层 = `2L·s`；旧物理过估
+v=2 = `5 微批 × L 层 = 5L·s`（= 忠实值的 **V=2 倍**）。故忠实峰 `5·(L/2)=2.5L·s` 落在 plain(`2L`) 与
+旧 V×(`5L`) 之间 —— **方向（>plain，交错确实更吃激活）与幅度（<V×，过估消去）同时修正**。
+
+**峰值随 V 非单调（bulge at V=2）**。忠实模型下净激活膨胀比 ≈ `1 + (pp-1)/(pp·V)`（旧 docstring 已述），
+**V=2 处最大、随 V 增大回落**：`pp=2, L=4, stage0` 的峰 act_live（层单位）= v1:`8` → v2:`(4+1)·2=10` →
+v4:`(8+1)·1=9`，故 `v2 > v4 > v1`（旧 simulate 是单调增，属过估的副产物）。整改后原
+`test_interleave_peak_monotonic_in_v_stage0`（断言单调增）改写为 `bulge at v2 + 界定 <V×`。
+
+**实现**（`mem_timeline.py`，`v>1` 专属分支，`v<=1` 走原路径）：
+- 新增 `get_schedule_table` / `interleaved_virtual_order` / `chunk_layer_ids` 三个纯函数（前两者逐行 port
+  Megatron，后者均衡切层且带 `Σ==L` 不变式）。
+- simulate 事件循环改为遍历统一的 `steps = [(kind, mb, ev_layers)]`：`v>1` → `ev_layers = chunk`（一个虚拟步
+  一个 chunk）；`v<=1` → `ev_layers = layer_ids`（整 stage，逐字节复现 `build_interleaved_1f1b`）。逐层 pin/
+  gather/workspace/BWD 桶**机体一字未改**，仅把作用域从「全 stage」收窄到「当前步的 chunk」，`pinned` 仍以
+  `(mb, lid)` 为键（chunk 互斥 → 无碰撞、无泄漏）。
+
+**v=1 == plain-1F1B + DSv3 no-op（硬门论证）**。simulate 对 `v<=1` 直接用 `[(ev.kind, ev.mb, layer_ids)
+for ev in build_interleaved_1f1b(stage,pp,m,v)]`，`build_interleaved_1f1b(·,v<=1)` 委托 `build_1f1b`，`ev_layers`
+恒 = 整个 `layer_ids`（同一列表对象）→ 事件序列、pin 集合、`_prefetch_*` 全逐字节等价旧循环。DSv3（`pp=1,
+v=1`，`interleave` 默认 1）与所有现有 anchors/golden/preset 均 `v=1` → **不进 v>1 分支** → `12409.5` 恒定、
+`pytest` 全绿。v>1 是本次唯一改动路径，对 v=1 是**精确 no-op**。
