@@ -41,3 +41,62 @@
 ## 4. 各项整改机制（子代理填充，source-faithful）
 
 <!-- D-8 / D-1 / D-4 / D-3 / D-2 / D-6 / D-7 各起一节，含 mindformers/Megatron 源码定位 + 公式 + DSv3 复核 -->
+
+### D-1：context-parallel（cp）必须切激活（activations ÷cp）
+
+**审计发现（已核）**：`cp` 目前**只切参数**（折进 `fsdp_degree = dp_shard*cp`，`static_mem.py:8`/
+`parallel_model.py:32`），**不切任何激活**——全库 `'cp'` 作 shard key 出现 **0 次**（`grep -rn "'cp'"
+cost_eval/layers` 无命中；所有 TensorRef 的 `shard` 只用 `tp`/`ep`/`sp`）。故 `cp>1` 时每卡激活、
+flash workspace、loss/index bwd_scratch 全部 **over-count ×cp**。
+
+**忠实模型（S_effective = S / cp）**。cp 是**全局域的序列并行**（ring / context attention）：整条序列
+沿 token 维切成 cp 份，每 rank 只拥有 **S/cp 个 token（query）**；key/context 经 ring P2P 轮转，每个
+query 仍见**完整上下文**（用户 2026-07-06 定夺原话：「cp 是全局域的序列切分，整体的激活值都会切分为
+原有的 1/cp」）。这正是本库设计文档早已写下、但**只设计未落地**的意图：
+
+- `specs/2026-06-23-pynative-cost-evaluator-design.md:147` —— 「**CP `context_parallel`｜激活 seq 维
+  cp**｜colossal=ring P2P / ulysses=all-to-all」。
+- 同文件 `:102` —— 「`{0:"cp"}` = seq 切 cp」（TensorRef.shard 的既定语义，只是没有一个张量真的带上它）。
+- `specs/2026-06-29-core-modules-m4-m5-m6-internals.md:80` —— 「**cp 整除 seq** → 非法配置即报」
+  （整除校验口径，本次照此 raise）。
+- 参数侧不动：同 `:151` 「FSDP `data_parallel_shard`：param+grad+opt 存储 /(dp_shard·cp)」——参数的
+  cp 折进 `fsdp_degree`（`static_mem.py:8`）**已实现且正确**，本次**只碰激活**，不双算。
+
+**SP × CP 组合**（两个正交的序列并行域，degree 相乘）：
+- **SP 标注的激活**（`shard={0:'sp'}`，`sequence_parallel` 时 → S/tp）：叠加 cp → **S/(tp·cp)**。
+- **非 SP 激活**（attention 内部全序列，如 MLA `qb_out`/`kvb_out`、GQA `qkv`）：→ **S/cp**。
+- **权重无 S**（已逐一核验：embedding `[vocab,H]`、head `[H,vocab]`、attn `qkv_w[H,·]`/`o_w[·,H]`、
+  MLA `qb_w/kvb_w`、ffn `fc1_w/fc2_w`、专家 `e_w1/e_w2`、dsv4 `wq_*/wkv/wo_*/idx_*/cmp_*`、mHC
+  `rms_w/proj_w` —— 无一含符号 `S`）→ 天然不受 S→S/cp 影响，参数分片仍走既有 `fsdp_degree`。
+
+**index_scores（S²）在 CP 下的取舍（关键决策）**。dsv4 DSA 索引器把 `index_scores [B,S,S] fp32`
+物化为 `bwd_scratch="4*B*S*S"`（`dsv4_hybrid.py:136`，源 `indexer.py:227-236`）。它是 `[B, S_query,
+S_key]` 的打分矩阵。CP 下 **query 维切分、key 维保持全量**（每 rank 的 S/cp 个 query 对完整 S 个 key
+打分，key 经 ring 轮转补齐）→ 每卡 `[B, S/cp, S]` = **`4*B*S*S / cp` = S²/cp（去掉一个 S 因子，一次
+cp）**，**不是** S²/cp²。理由：ring/context attention 只切 query（token）维；被 attend 的 key/context
+维不切。这与用户「整体激活 ÷cp（一次）」以及设计「seq 维 cp（单维）」完全一致。同理 dsv4 稀疏 gather
+张量 `kv_gathered [B,S,TOPK,vd]` / `attn_weights [B,n_heads,S,TOPK]` 只切 query 维 `S`，**不切**
+`TOPK`（= window + S//ratio，每 query 见的上下文位置数，ring 补齐后仍全量）。
+
+**统一机制 = 「切 query/token 维一次」**，落在两处：
+1. **张量**（`shape_eval.resolve_tensor`）：非权重张量，切**首个引用符号 `S` 的维**（token/query 维）
+   ÷cp；其余含 S 的维（仅 `TOPK_DIM` 这类上下文维）保持全量（故用 `break` 只切第一维）。含 S 的
+   token 维覆盖：`[S,B,·]`（dim0）、MoE `disp/e_* [TLOCAL=S·B·topk·C, ·]`（dim0，dispatched token
+   ∝S）、dsv4 `compressed_kv [S//ratio,·]`（dim0，压缩 token ∝S）、`kv_gathered/attn_weights/
+   topk_indices` 的 query 维（首个 `S`）。
+2. **workspace / bwd_scratch 字符串**（`shape_eval.ShapeEval.resolve`）：含符号 `S` 的表达式，求值后
+   **整体 ÷cp 一次**。单 S 项 → S/cp（`FLASH_LSE_WS=64·B·n_heads·S`、loss `8·S·B·vocab`、MoE
+   `MOE_STAGING_WS=2·S·B·topk·C·H`、mHC `4·S·B·n·H`）；双 S 的 index_scores `4·B·S·S` → S²/cp（去一
+   个 S 因子 = query 切分，与张量口径一致）。全库 workspace/bwd_scratch **全部含 S**（已核），故「除
+   一次」对每一项都恰为「去掉 query 那一个 S 因子」。
+
+**整除**（与 `shape_eval.py:60-62` 同口径 raise，OOM 安全，不静默 floor）：张量侧对被切的 token 维值
+做 `% cp != 0 → raise`（SP 张量先 ÷sp 再查 `(S/tp)%cp`，等价于 `(tp·cp)|S`；非 SP 查 `S%cp`）。因每个
+带 S-workspace 的 op 必有含 S 的激活输入/输出（flash 有 `qkv`、nll 有 `logsm`、indexer 有 `ln1`…），
+`resolve_tensor` 会**先**在这些张量上 raise → 非法 `S%cp≠0` 配置在算 workspace 前已被拒；故 workspace/
+scratch 侧用 floordiv 安全（合法配置下 `S%cp==0` 时 S 与 S² 均整除，逐字节精确）。
+
+**DSv3 = cp=1 无操作（硬门论证）**。两处改动均 `if cp > 1:` 守卫，`cp = pm.degree("cp")`；DSv3 anchor
+（`validate_dsv3.py:84`）走 `cp=1`，`degree("cp")=1` → **两处分支完全不进入**，`resolve_tensor` /
+`ShapeEval.resolve` 逐字节复现旧行为 → DSv3 4L 恒 `12409.5`、`pytest` 全绿。cp 是本次唯一新增的激活
+分母，且只在 `>1` 时生效，故对全部现有 cp=1 配置（anchors/golden/preset）是**精确 no-op**。

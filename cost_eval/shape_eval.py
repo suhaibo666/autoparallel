@@ -39,6 +39,21 @@ def eval_expr(expr: str, dims: DimTable) -> int:
     return int(_ev(tree))
 
 
+def _refs_symbol(expr: str, sym: str) -> bool:
+    """符号维/字符串表达式是否**引用**符号 `sym`（作为标识符 Name，而非裸子串匹配）。
+
+    用于 context-parallel 识别「序列（token/query）维」：某维/某 workspace 表达式引用 `S` 即随
+    序列长度缩放，CP 下应 ÷cp。走 AST Name 判定 → `"S//4"`/`"S*B*topk*capacity_factor"` 命中，
+    `"kv_lora_rank"`/`"n_heads"`（含小写 s 但无 Name `S`）不误伤。非法/空表达式 → False。"""
+    if not expr:
+        return False
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return False
+    return any(isinstance(n, ast.Name) and n.id == sym for n in ast.walk(tree))
+
+
 # ---------------------------------------------------------------------------
 # Task 5 — ResolvedTensor + resolve_tensor
 # ---------------------------------------------------------------------------
@@ -61,6 +76,21 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
             raise ValueError(
                 f"{t.name} dim{dim_idx}={sizes[dim_idx]} 不被 {axis}={deg} 整除")
         sizes[dim_idx] //= deg
+    # ── context-parallel（cp）：全局序列切分——每个**非权重激活**的 token/query 维 ÷cp（D-1）──
+    # cp 是独立于 sp 的全局序列并行域（ring/context attention）：切 query（token）维，key/context
+    # 维保持全量（每 rank 的 S/cp 个 query 仍见完整上下文）。故只切**首个引用符号 S 的维**（token
+    # 维），其余含 S 的维（仅 dsv4 `TOPK_DIM`=window+S//ratio 这类上下文位置维）不切 → `break`。
+    # 与 SP 组合：SP 张量已在上面 ÷sp（=tp），此处再 ÷cp → S/(tp·cp)；非 SP → S/cp。权重无 S
+    # （已核）→ is_weight 跳过；参数分片仍走 fsdp_degree=dp_shard·cp（static_mem.py:8），不双算。
+    cp = pm.degree("cp")
+    if cp > 1 and not t.is_weight:
+        for dim_idx, e in enumerate(t.shape):
+            if _refs_symbol(e, "S"):
+                if sizes[dim_idx] % cp != 0:
+                    raise ValueError(
+                        f"{t.name} 序列维 dim{dim_idx}={sizes[dim_idx]} 不被 cp={cp} 整除")
+                sizes[dim_idx] //= cp
+                break
     numel = prod(sizes) if sizes else 1
     dtype_bytes = t.dtype_bytes if t.dtype_bytes is not None else dims.dtype_bytes
     return ResolvedTensor(t.name, numel, dtype_bytes, t.is_weight, t.has_ep())
@@ -171,6 +201,17 @@ class ShapeEval:
                 r_sav = tuple(resolve_tensor(t, spec.dims, pm) for t in op.saves)
                 ws = eval_expr(op.workspace, spec.dims) if op.workspace else 0
                 bws = eval_expr(op.bwd_scratch, spec.dims) if op.bwd_scratch else 0
+                # context-parallel（cp）：含符号 S 的 workspace/bwd_scratch 也 ÷cp 一次（D-1）——
+                # flash-ws(∝S)/loss(∝S)/MoE-staging(∝S)/mHC(∝S) → S/cp；index_scores `4·B·S·S`
+                # → S²/cp（去掉 query 那个 S 因子，与张量口径一致：切 query 维、key 维保持全量）。
+                # 每个带 S-workspace 的 op 必有含 S 的激活张量（flash 有 qkv、nll 有 logsm…），
+                # 故非法 S%cp≠0 已在上面 resolve_tensor 先 raise → 此处合法配置下整除，floordiv 安全。
+                cp = pm.degree("cp")
+                if cp > 1:
+                    if _refs_symbol(op.workspace, "S"):
+                        ws //= cp
+                    if _refs_symbol(op.bwd_scratch, "S"):
+                        bws //= cp
                 comms = []
                 for t in op.inputs:
                     src = produced.get(t.name)
