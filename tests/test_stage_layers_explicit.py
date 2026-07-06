@@ -1,0 +1,46 @@
+"""D-8：PP 每 stage 层数**显式配置**（忠实 mindformers `offset`/`num_layer_list`）+ 校验。
+
+评估器首选 `ParallelConfig.layers_per_stage`（每 stage 层数列表，含 embedding+head 两伪层、
+和==n_layers），不自行推测；缺省才退化均匀切。本测试锁 __init__ 校验 + 映射正确。
+"""
+import pytest
+
+from cost_eval.specs import ParallelConfig
+from cost_eval.parallel_model import ParallelModel
+
+
+def test_explicit_layers_per_stage_uneven_mapping():
+    # n_layers=8（含 emb+head），pp=3，显式非均匀切 [3,3,2]
+    pc = ParallelConfig(pp=3, layers_per_stage=[3, 3, 2])
+    pm = ParallelModel(pc, n_layers=8, world_size=3)
+    assert pm.stage_layers(0) == [0, 1, 2]
+    assert pm.stage_layers(1) == [3, 4, 5]
+    assert pm.stage_layers(2) == [6, 7]
+    assert [pm.stage_of(l) for l in range(8)] == [0, 0, 0, 1, 1, 1, 2, 2]
+
+
+def test_explicit_len_must_equal_pp():
+    with pytest.raises(ValueError, match="长度"):
+        ParallelModel(ParallelConfig(pp=4, layers_per_stage=[3, 3, 2]), n_layers=8, world_size=4)
+
+
+def test_explicit_sum_must_equal_n_layers():
+    with pytest.raises(ValueError, match="之和"):
+        ParallelModel(ParallelConfig(pp=3, layers_per_stage=[3, 3, 3]), n_layers=8, world_size=3)
+
+
+def test_explicit_each_stage_positive():
+    with pytest.raises(ValueError, match=">0"):
+        ParallelModel(ParallelConfig(pp=3, layers_per_stage=[4, 4, 0]), n_layers=8, world_size=3)
+
+
+def test_none_falls_back_to_uniform_split():
+    # None → 均匀切：8 层 pp=2 → per=4 → [0,0,0,0,1,1,1,1]
+    pm = ParallelModel(ParallelConfig(pp=2, layers_per_stage=None), n_layers=8, world_size=2)
+    assert [pm.stage_of(l) for l in range(8)] == [0, 0, 0, 0, 1, 1, 1, 1]
+
+
+def test_uniform_split_remainder_on_last_stage():
+    # 非整除 7 层 pp=2 → per=3 → 末 stage 拿 remainder（审计 D-8 记录的行为；显式配可规避）
+    pm = ParallelModel(ParallelConfig(pp=2, layers_per_stage=None), n_layers=7, world_size=2)
+    assert [pm.stage_of(l) for l in range(7)] == [0, 0, 0, 1, 1, 1, 1]

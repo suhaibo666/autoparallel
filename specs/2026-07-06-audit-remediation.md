@@ -42,6 +42,26 @@
 
 <!-- D-8 / D-1 / D-4 / D-3 / D-2 / D-6 / D-7 各起一节，含 mindformers/Megatron 源码定位 + 公式 + DSv3 复核 -->
 
+### D-8：PP 每 stage 层数显式配置（不自行推测）
+
+**审计发现**：`ParallelConfig.layers_per_stage`（显式每 stage 层数）已支持并被 `parallel_model.py:45-49`
+读取，但**无校验**——错长度/错和的列表会静默产生错误映射；缺省的均匀切 `per=n_layers//pp`
+（`:50-51`）把非整除 remainder 全堆**末 stage**，可能错判 tightest stage。
+
+**决策（用户）**：忠实 mindformers 流水线设计——**直接配置每 stage 多少层，不自行推测**：显式让用户
+配、或从用户配置读。mindformers 用 `offset`/`num_layer_list` 指定各 stage 的层数偏移；本库 `layers_per_stage`
+是其等价低层接口（每 stage 层数列表，**含 embedding + head 两个伪层**，故和 == `n_layers` = num_layers+2）。
+
+**整改**（`parallel_model.py.__init__` + `specs.py`）：
+- 显式 `layers_per_stage` 升为**首选路径**，`__init__` 加三重校验：`len == pp`、`sum == n_layers`、
+  每项 `> 0`，任一不满足即 `raise ValueError`（不静默）。
+- 均匀切保留为**缺省 fallback**（`layers_per_stage=None`），文档标注 pp>1 非整除时建议显式配。
+- 高层 mindformers 语义（decoder 层→stage + emb 归 stage0 / head 归末 stage）由 D-7 配置转换器映射到此列表。
+
+**DSv3 复核**：DSv3 走 `pp=1, layers_per_stage=None` → 不进显式分支、均匀切 `per=n_layers` 全归 stage0
+（与旧一致）→ `12409.5` 逐字节不变、`pytest` 全绿。新增 `tests/test_stage_layers_explicit.py`（6 例：
+非均匀映射 + 三重校验 raise + None 均匀 + remainder 归末）。
+
 ### D-1：context-parallel（cp）必须切激活（activations ÷cp）
 
 **审计发现（已核）**：`cp` 目前**只切参数**（折进 `fsdp_degree = dp_shard*cp`，`static_mem.py:8`/

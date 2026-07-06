@@ -17,7 +17,9 @@ class ParallelConfig:
     cpu_offload: bool = False
     microbatch: int = 1
     interleave: int = 1
-    layers_per_stage: Optional[list] = None  # None=均匀切
+    # PP 每 stage 层数（含 embedding+head 两伪层，和==n_layers）：**首选显式配置**（忠实
+    # mindformers `offset`/`num_layer_list`，D-8），不自行推测；None=退化均匀切（remainder 归末 stage）。
+    layers_per_stage: Optional[list] = None
     prefetch_depth: int = 1
     num_microbatches: int = 1                # m = global_batch/(dp*microbatch)，由 adapter 算好
 
