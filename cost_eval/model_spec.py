@@ -42,6 +42,10 @@ class DimTable:
     # gated_linear_unit（SwiGLU）：True→fc1 输出 2·F（gate+up）；False→ungated MLP，fc1 输出 F
     # （plain gelu/relu，D-6）。默认 True（现有全部 spec 走 SwiGLU，故 DSv3/preset 不变）。
     gated_linear_unit: bool = True
+    # 交叉熵是否融合 kernel（①，真机 profiler）：False=unfused pynative log_softmax+NLL op 链
+    #   （无重算下 ~8 满 vocab fp32 中间量共存，fat）；True=fused kernel（精简 ~3，如 DSv4 生产）。
+    #   默认 False（pynative 常态）。仅在**无重算 + unfused** 下 loss bwd_scratch fat（mem_timeline ①）。
+    cross_entropy_fused: bool = False
     dtype_bytes: int = 2
 
     def as_dict(self) -> dict:

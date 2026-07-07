@@ -482,3 +482,35 @@ fail-loud in build_llm）」）：`model_type`/`architectures`/`max_position_emb
 **不变量守住**：DSv3 锚点全程逐字节 `12409.5`；DSv4-align `14336.5`（0.930，D-5 caveat）；
 `pytest` `233 → 288`（+55 例，全绿）。7 目标：审计时 5✅2⚠️ → 整改后 cp/HCCL/配置文件/VPP/
 细粒度选重/ungated/显式 stage 全部补齐。
+
+## 6. D-10：无重算下 loss/优化器两大欠计（真机 profiler，pp=2 8L 无重算 DSv3）
+
+pp>1 强制无重算（此栈 pp+重算不支持），真机 profiler（`analysis/realmachine/pp2_norecomp/`）
+证 stage0/stage1 两处系统性欠计（估计器 stage0 7861 vs 真机 10246、stage1 15143 vs 45655）：
+
+**① unfused 交叉熵链（stage1 主导）**。无重算下 loss 反向峰同时挂 **~8 份满 `[S,B,vocab]` fp32**
+中间量（profiler op-names：Log/Copy/Neg/ScatterAddExt/ZerosLikeExt/Muls = `log_softmax+NLL` op 链，
+各 2020/4040 MiB），估计器只建 **3 份**（logsm saved + probs+grad）。公式 `P_loss ≈ k_ce·S·B·vocab·4`，
+`k_ce≈8`（profiler）。**门控**：仅 **无重算(`mode=None`) + unfused CE(`cross_entropy_fused=False`)**
+才 fat——full/select 重算下真机只 ~3 份共存（峰在链尾、早期已释，cp2 profiler 4L 见证）；fused CE
+（DSv4 生产）恒精简。落地 `mem_timeline`：loss 层（`nll` op 认定）bwd_scratch `8·S·B·vocab`(2份)→
+`×(k_ce−1)/2`(7份)。`DimTable/LLMConfig.cross_entropy_fused`（默认 False；DSv4=True）经 report 透传。
+
+**② optimizer-step 瞬态（stage0 主导，系统性）**。stage0 无 loss，峰在 **AdamW 更新 embedding
+`[vocab,H]`**：profiler **7× 883.8 MiB fp32**（=vocab·H·4；GatherDGradV2 grad + Muls/Sub/sqrt/m̂/update）。
+估计器只建持久 param+m+v，漏 step 瞬态。公式 `P_optstep ≈ persistent + k_opt·max_weight_numel·4`，
+`k_opt=6`（pp=2 stage0 标定 10246，与 AdamW 更新 op 链吻合）。落地 `mem_timeline`：每 stage 反向后加
+`optstep` 事件（与激活桶互斥，step 在反向后激活已释）；权重取 resolved `local_numel`（已按 fsdp 切）。
+**这也是 DSv4-fused D-5 残差里 441.9/883.8「参数形状瞬态」的真身**（但 DSv4 峰在 loss 反向、opt-step
+不上峰，故 DSv4 0.930 不动）。
+
+**验证**：pp=2 8L 无重算（B=2）stage0 **7861→10311**（real 10246，1.006 @optstep）、stage1
+**15143→43659**（real 45655，0.956）；DSv3 4L full 重算 **12409.5 逐字节不变**（①非无重算不触发、
+②opt-step 6481<loss 12473 不上峰）；DSv4-align **0.930 不变**（fused CE）。`pytest` 293 绿；新增
+`tests/test_ce_optstep.py`（4 例）。**诚实**：`k_ce/k_opt` 是 profiler 标定计数（同平台常数档，非 op 图
+纯导出——共存数受 allocator/microbatch 影响，见 D-5）；stage1 余 4% 是小张量尾。**B**：pp 下
+per-device 批 = global_batch/dp（dp=1 时 =global），估计器需按配置设 B（真机 profiler 见 B=2 满 vocab）。
+
+**pp>2 真机受限**：pp=4/8 撞 mindformers 中间-stage MLA bug（`AddExt [1792] vs [1792,1536]`，
+decoder-only 中间 stage），此栈跑不了 → pp>2 每-stage 只出估计器预测、未真机核对（同 SP+MoE/
+TP+MoE/PP+重算，本 build 多维并行对 DSv3 的第 4 条限制）。

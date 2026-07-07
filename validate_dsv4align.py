@@ -77,6 +77,7 @@ def dsv4_align_config(num_layers=4, mhc=0, mtp=0, seq=2048):
         # MTP
         mtp_num_layers=mtp,
         loss_type="logsoftmax_nll",
+        cross_entropy_fused=True,       # DSv4 生产用融合 CE kernel（精简 ~3 buffer）→ ① 不 fat（0.930 不动）
         compute_dtype_bytes=2,
     )
 

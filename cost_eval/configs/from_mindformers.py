@@ -311,6 +311,8 @@ def _build_llm_config(model: dict) -> LLMConfig:
             o_groups=int(model.get("o_groups", 0)),
             o_lora_rank=int(model.get("o_lora_rank", 0)),
             dsa_fused=_dsa_fused(model),
+            # ①：DSv4 融合生产路径用融合 CE kernel（精简）→ 无重算下不 fat（对齐 dsv4_align_config）。
+            cross_entropy_fused=_dsa_fused(model),
         )
     return LLMConfig(**kwargs)
 

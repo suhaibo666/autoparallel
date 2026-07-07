@@ -70,6 +70,7 @@ class LLMConfig:
     # ---- 装配：embedding / head / loss ----
     tie_word_embeddings: bool = False       # tie→无独立 lm_head 权重
     loss_type: str = "logsoftmax_nll"       # logsoftmax_nll | chunked | vocab_parallel_ce
+    cross_entropy_fused: bool = False        # ①：融合 CE kernel（DSv4=True lean）/ unfused pynative（False，无重算下 fat）
     chunk_loss_num: int = 0                 # >1：分块 CE，降 loss 区峰值
     embedding_params_dtype_bytes: int = 4   # embedding/输出 fp32
 
@@ -141,5 +142,6 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
         num_residual_streams=cfg.num_residual_streams,
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
+        cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
         dtype_bytes=cfg.compute_dtype_bytes,
     )

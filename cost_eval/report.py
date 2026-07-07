@@ -66,7 +66,8 @@ class Evaluator:
             g, self.recompute, self.swap, pm, persistent,
             fr, self.hw.max_device_memory,
             grad_dtype_bytes=getattr(self.opt, "grad_dtype_bytes", 4),
-            record_timeline=record_timeline, alloc_block_bytes=block)
+            record_timeline=record_timeline, alloc_block_bytes=block,
+            cross_entropy_fused=getattr(self.spec.dims, "cross_entropy_fused", False))
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。

@@ -344,7 +344,7 @@ class MemTimeline:
     def simulate(self, g, recompute, swap, pm, static_persistent: dict,
                  framework_reserve: int, max_device_memory: int,
                  grad_dtype_bytes: int = 4, record_timeline: bool = False,
-                 alloc_block_bytes: int = 1) -> dict:
+                 alloc_block_bytes: int = 1, cross_entropy_fused: bool = False) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -407,6 +407,16 @@ class MemTimeline:
                 if swap.swaps(lid)
                 and not recompute.is_full(lid) and not recompute.is_select(lid)
             }
+
+            # ① unfused 交叉熵链（真机 profiler，pp=2 8L 无重算 stage1）：**无重算**下 loss 层反向峰
+            #   同时挂着 ~8 份满 vocab fp32 中间量（log_softmax+NLL op 链：cast/sub/exp/log/Neg/
+            #   ScatterAdd/ZerosLike/probs），而估计器只建 3 份（logsm saved + probs+grad）。**全/选择
+            #   重算**下真机只 ~3 份共存（峰在链尾、早期中间量已释，cp2 profiler 4L 见证）→ 仅无重算 fat。
+            #   loss 层由 `nll` op 认定（唯一满 vocab bwd_scratch）。**fused CE（DSv4 生产）精简、不 fat**
+            #   → `cross_entropy_fused` 时 loss_lids 空（DSv4-align 0.930 不动）。
+            loss_lids = (set() if cross_entropy_fused else
+                         {l.layer_id for l in layers
+                          if any(getattr(op, "name", "") == "nll" for op in l.ops)})
 
             B = Buckets(persistent=static_persistent.get(stage, 0))
             peak: int = -1
@@ -493,6 +503,12 @@ class MemTimeline:
                             bwd_order, idx, depth, sm_by_id)
                         B.grad_buf = sm.grad_full_bytes
                         B.bwd_scratch = sm.bwd_scratch
+                        # ① 无重算下 loss 层：unfused CE 链 fat。现 bwd_scratch=8·S·B·vocab=2 份
+                        #   （probs+grad）；真机 k_ce≈8 份共存 → 补到 k_ce-1=7 份（logsm 1 份在 act_live）。
+                        #   仅 mode=='None'（无重算）+ loss 层，故 full/select 重算与所有现有锚点不动。
+                        if recompute.mode == "None" and lid in loss_lids and sm.bwd_scratch > 0:
+                            K_CE = 8
+                            B.bwd_scratch = sm.bwd_scratch // 2 * (K_CE - 1)
                         # 激活 swap（§8.1 swap_buf="从 CPU 预取回的激活"）：被卸载层反向前 H2D 取回，
                         #   swap_buf = 复原当前层 saves（不在 act_live）+ 反向序后 swap_depth 层在飞预取窗
                         #   （双缓冲，`_prefetch_swap_bytes`）。当前层复原量 = 前向从 act_live 扣掉的同一
