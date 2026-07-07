@@ -511,6 +511,10 @@ pp>1 强制无重算（此栈 pp+重算不支持），真机 profiler（`analysi
 纯导出——共存数受 allocator/microbatch 影响，见 D-5）；stage1 余 4% 是小张量尾。**B**：pp 下
 per-device 批 = global_batch/dp（dp=1 时 =global），估计器需按配置设 B（真机 profiler 见 B=2 满 vocab）。
 
-**pp>2 真机受限**：pp=4/8 撞 mindformers 中间-stage MLA bug（`AddExt [1792] vs [1792,1536]`，
-decoder-only 中间 stage），此栈跑不了 → pp>2 每-stage 只出估计器预测、未真机核对（同 SP+MoE/
-TP+MoE/PP+重算，本 build 多维并行对 DSv3 的第 4 条限制）。
+**pp>2 真机受限（2026-07-07 深挖更正）**：pp=4/8 崩在 **pynative pipeline+优化器**——完整调用栈显示
+不在 MLA 前向,而在 **AdamW step**（`adamw.py:43 addcmul`）:decoder-only **中间 stage** 把一个 **1D
+layernorm 权重的状态 `[H]=[1792]`** 和一个 **2D 投影权重的梯度 `[H,·]`** 配错。**非 MLA 特有**:MLA 撞
+`[1792]vs[1792,1536]`(=[H,rq])、**GQA 撞 `[1792]vs[1792,1792]`(=[H,H])**（关 `multi_latent_attention`
+后仍崩）;dp=1/2 均复现;mHC/MTP 关。pp=2 无中间 stage 故能跑（唯一真机点）。⇒ pp>2 每-stage 只出估计器
+预测、无法真机核对。这是本 build 多维并行对 DSv3 的第 **5** 条栈限制（SP+MoE / TP+MoE / PP+重算 /
+pp>2-middle-stage-optimizer / 已列）。**完整显存公式参考见 `2026-07-07-memory-model-reference.md`**。
