@@ -223,11 +223,27 @@ DSv3 8L 无重算 pp=2(`B=2, S=4096, V=129280, H=1792`):
 其它已验锚点:DSv3 4L 全重算 **12409.5**(真机 12473,0.995)、DSv4-fused **0.930**、
 cp=2 colossal/ulysses **0.996**、DSv3 8L/ep=2 泛化 0.99+。
 
+**选择性重算(D-3,真机 2026-07-07,DSv3 8L dp=2)**——`recompute:{mode:select,select_module:{M:[0-7]}}`:
+
+| select_module | 真机 | 估计器 | ratio |
+|---|---|---|---|
+| both(≈full,退化端) | 13953 | 13833 | **0.991** ✅ |
+| `self_attention` | 18828 | 15361 | **0.816** ⚠️ |
+| `feed_forward` | 19967 | 14554 | **0.729** ⚠️ |
+
+**退化端(both==full)精确**,但**部分选择系统性欠预测 ~18-27%(OOM-不安全)**。根因非 D-3 机制,
+而是**保留模块(尤其 MoE)的无重算激活 + 反向工作集**在 loss 峰值处欠计——**同 §D-10 ①/D-5 一族**
+(profiler:峰值 live 里 14×112 MiB + 大量 FFN/MoE 小张量尾未建全)。详见
+`analysis/realmachine/select_attn/DIAGNOSIS.md`。
+
 ## 15. 诚实边界 + 已知栈限制
 
 - `k_ce/k_opt` 是 profiler 标定计数(共存数受 allocator/microbatch 影响,同平台常数档,非 op 图纯导出)。
 - 未建模的小残差:DSv4-fused 7%(融合 kernel 内部量,D-5)、DSv3 ~0.5% sub-block 尾(rope cos/sin、norm rstd、cast 临时)。
-- 未真机核对:cp>1(除 pp=2 外)、VPP、pp>2 每-stage。
+- 未真机核对:cp>1(除 pp=2 外)、VPP、pp>2 每-stage、swap。
+- **选择性重算部分选择欠预测 ~18-27%(D-3,真机已验)**:退化端(==full)精确,但保留 MoE 模块的
+  无重算激活/反向工作集在 loss 峰值欠计(同 §D-10 ①/D-5 一族)——**待统一处理**(MoE §8.5② 分支
+  按真机校准,或 select/no-recompute 配置设显式 margin)。
 - **此 mindformers build 多维并行栈限制**(真机实测):① SP+MoE 不支持;② TP+MoE(Detach layout bug);
   ③ PP+重算互斥;④ **pp>2 崩在 pynative pipeline+优化器对 decoder-only 中间 stage 的 param/state
   配对(1D layernorm 权重 `[H]` 与 2D 投影权重 `[H,·]` 配错)**——MLA(`[H,rq]`)与 GQA(`[H,H]`)、

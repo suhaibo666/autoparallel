@@ -229,6 +229,25 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 msrun --worker_num=2 ... run_ds3_memprobe.py --con
 分解：**mHC(×4) 仅 +688**（×n 残差流在峰值前已释放）；**MTP +6777 是过预测主因**——评估器 `build_mtp_ops` 把 MTP 的 embedding/head 建成 untied，而 DSv4 MTP 应 **tie**（多算 ~2.8GB 幻影参数）。→ 待修 MTP tie。
 - 融合 mHC kernel（`aclnnMhcPreSinkhorn`）容器 vendor OPP **没有** → mHC 走 unfused（内存与 fused 等价）。`FUSED_MHC=1` 可强开（需该 kernel）。弃用 `prep_ds4_sim.py`。
 
+## 8. 多轴/重算 真机验证配方（env 驱动 `run_axis.sh`/`run_prof.sh` + `patch_parallelism.py`，2026-07-07）
+
+`$REF` 下已沉淀 3 个 env 驱动脚本（`run_axis.sh`=prep+patch+msrun+MEMPROBE、`run_prof.sh`=+Profiler、
+`patch_parallelism.py`=改 `ds3_sim.yaml` 的并行/重算块）。跑法：
+```bash
+ssh 192.168.9.116 "docker exec shb.ms.2.9 bash -lc 'TAG=<t> LAYERS=8 DP=<n|-1> TP=<> CP=<> PP=<> SP=<0|1> \
+  GBS=<global_batch> NORECOMP=<0|1> SELECT=<module:0-7> CPM=<colossal|ulysses> LPS=<a,b,..> \
+  PORT=<uniq> CARDS=<i,j> W=<workers> bash $REF/run_axis.sh'"
+ssh ... "grep -h MEMPROBE $REF/log_<t>/worker_*.log"
+```
+**选择性重算**（D-3，`SELECT=self_attention:0-7` / `feed_forward:0-7` → `mode:select`+`select_module`）
+**已验证可跑**：DSv3 8L dp=2 → self_attention **18828**、feed_forward **19967**、both≈full **13953**。
+估计器退化端(both==full)精确 0.991，但**部分选择欠预测**（0.816/0.729，保留 MoE 无重算激活尾欠计，
+见 `analysis/realmachine/select_attn/DIAGNOSIS.md`、参考页 §14）。
+
+**本 build 多维并行栈限制（真机实测，勿浪费卡重试）**：① SP+MoE 不支持；② TP+MoE（Detach layout bug）；
+③ PP+重算互斥（用 `NORECOMP=1`）；④ **pp>2 崩**在 pynative AdamW 对 decoder-only 中间 stage 的
+param/state 配对（MLA `[H,rq]`、GQA `[H,H]` 同崩，非注意力特有）。故 tp/pp>2 对 DSv3 跑不了。
+
 ## 关联
 - 评估器：`cost_eval/`（本仓库），预测侧。
 - 设计：`specs/2026-06-29-p0-modelspec-and-memory-design.md` §10 验证阶梯、`specs/2026-06-23-...-design.md` §3 精度预期（η 标定缝）。
