@@ -550,11 +550,16 @@ class MemTimeline:
             # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
             #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥。AdamW 逐参数更新，峰在
             #   **最大单权重**：其 fp32 [weight] 临时（grad/grad-reduce/Square(g²)/sqrt(v̂)/m̂/update）
-            #   共 k_opt≈6 份（DSv3 8L pp=2 stage0 标定 10246；与 AdamW 更新 op 链数吻合）。权重取
-            #   resolved local_numel（已按 fsdp 切）→ dp_shard 大时该项小、不上峰（DSv3 4L 锚点不动）。
+            #   共 k_opt≈6 份（DSv3 8L pp=2 stage0 标定 10246；与 AdamW 更新 op 链数吻合）。
+            #   ★权重须按 FSDP 切（optim_grads_params：AdamW step 只跑本 rank 的 1/fsdp 分片）——
+            #   dense÷fsdp、expert÷efsdp（与 static_mem.persistent 同口径，resolve 只切了 tp/ep）。
+            #   cpu_offload 时优化器 step 在 CPU、无设备瞬态 → 该项 0。
             K_OPT = 6
-            max_w = max((w.local_numel for l in layers for op in l.ops for w in op.params),
-                        default=0)
+            fsdp_d, efsdp_d = pm.fsdp_degree(), pm.efsdp_degree()
+            max_w = 0 if pm.pc.cpu_offload else max(
+                (w.local_numel // (efsdp_d if getattr(w, "is_expert", False) else fsdp_d)
+                 for l in layers for op in l.ops for w in op.params),
+                default=0)
             if max_w > 0:
                 B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
                 B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
