@@ -56,15 +56,16 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
 
     # 对照 loss.py：logits(bf16) → cast fp32 → log_softmax(fp32,saved) → NLL；反向物化 probs(fp32)
     #
-    # ── D-1 修正（2026-07-07，真机确认）：loss/head 区全为 full-S，cp 下**不** ÷cp（cp_shard=False）──
-    # 各 cp 算法在 LM head 前把 hidden all-gather 回 full-S（head+loss 跑在完整序列上）；真机 cp=2 峰
-    # 实测 logsm/probs/grad_log_softmax 均满 vocab full-S（各 2020 MiB），旧「整体 ÷cp」错半 → 欠估
-    # ~29%。`loss` 输出亦标 cp_shard=False → 作为 nll op 的 full-S 信号，使其 bwd_scratch
-    # （8·S·B·vocab）在 ShapeEval.resolve 保持 full-S。此 builder 由主 lm_head 与 MTP 头共享 → 一处覆盖。
-    x = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"}, cp_shard=False)   # head 输入=all-gather 回 full-S
-    logits = TensorRef("logits_lm", ("S", "B", "vocab"), shard=dict(vshard), cp_shard=False)  # bf16, saved
-    logsm = TensorRef("logsm", ("S", "B", "vocab"), shard=dict(vshard), dtype_bytes=4, cp_shard=False)  # fp32, saved
-    loss = TensorRef("loss", ("B",), cp_shard=False)   # nll 输出：full-S 信号（其 bwd_scratch 不 ÷cp）
+    # ── D-1 再修正（2026-07-07，cp2-none profiler 定位 Bug A）：loss/head 区在 cp 下**是 ÷cp**（序列并行）──
+    # 之前误判「full-S」：把 cp=2 profiler 的 2020 MiB buffer 误读成 [B=1, full-S]，实为 **[B=2, S/cp=2048]**
+    # （full-S·B=1 与 S/cp·B=2 数值都 2020，混淆了 B 与 cp）；cp=2 full 之所以「0.996」是估计器 B=1·full-S
+    # 与真机 B=2·S/cp 数值抵消**蒙对**。真机（`analysis/realmachine/cp2_none/`）证 loss buffer=[S/cp,B,V]
+    # → loss/head 区随 cp ÷cp（**不**在 head 前 all-gather）。故这些张量恢复默认 `cp_shard=True`（÷cp），
+    # nll 的 bwd_scratch 亦随 op.output.cp_shard=True 在 ShapeEval.resolve ÷cp。主 lm_head 与 MTP 头共享。
+    x = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})   # head 输入随 cp ÷cp（S/(sp·cp)）
+    logits = TensorRef("logits_lm", ("S", "B", "vocab"), shard=dict(vshard))  # bf16, saved, ÷cp
+    logsm = TensorRef("logsm", ("S", "B", "vocab"), shard=dict(vshard), dtype_bytes=4)  # fp32, saved, ÷cp
+    loss = TensorRef("loss", ("B",))   # nll 输出
 
     if cfg.tie_word_embeddings:
         # 复用 embedding 权重：不新增 head_w 参数（vocab×H 只在 embedding 计一次）
@@ -77,8 +78,8 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
     # NLL 反向：默认/chunked 用 bwd_scratch（满 vocab 瞬态物化）；vocab_parallel 用 sharded probs save。
     if cfg.loss_type == "vocab_parallel_ce":
         # ctx.exp_vals [N,V_local]（loss.py:120）→ softmax 分子，∝1/tp；建为 sharded save。
-        # loss/head 区 full-S（cp_shard=False，D-1 修正）：vocab 按 tp 切，但序列维不 ÷cp。
-        probs = TensorRef("probs", ("S", "B", "vocab"), shard={2: "tp"}, dtype_bytes=4, cp_shard=False)
+        # loss/head 区随 cp ÷cp（Bug A 修正）：vocab 按 tp 切，序列维亦 ÷cp。
+        probs = TensorRef("probs", ("S", "B", "vocab"), shard={2: "tp"}, dtype_bytes=4)
         nll_op = OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss,
                         saves=[logsm, probs], bwd_scratch=None)
     else:

@@ -503,11 +503,13 @@ class MemTimeline:
                             bwd_order, idx, depth, sm_by_id)
                         B.grad_buf = sm.grad_full_bytes
                         B.bwd_scratch = sm.bwd_scratch
-                        # ① 无重算下 loss 层：unfused CE 链 fat。现 bwd_scratch=8·S·B·vocab=2 份
-                        #   （probs+grad）；真机 k_ce≈8 份共存 → 补到 k_ce-1=7 份（logsm 1 份在 act_live）。
-                        #   仅 mode=='None'（无重算）+ loss 层，故 full/select 重算与所有现有锚点不动。
+                        # ① 无重算下 loss 层：unfused CE 链共存 k_ce 份满 vocab fp32。现 bwd_scratch
+                        #   =8·S·B·vocab=2 份（probs+grad）→ 改到 k_ce-1 份（logsm 1 份在 act_live）。
+                        #   **k_ce 与制度相关（真机 profiler）**：流水线末 stage（pp>1，有 loss）CE 链保留更多
+                        #   中间量 → k_ce≈8（pp2-stage1 实测）；单 stage（pp=1）CE 链释放快 → k_ce≈3
+                        #   （cp2-none/select 实测仅 3 份共存）。仅 mode=='None' + loss 层，full/select 不动。
                         if recompute.mode == "None" and lid in loss_lids and sm.bwd_scratch > 0:
-                            K_CE = 8
+                            K_CE = 8 if pp > 1 else 4
                             B.bwd_scratch = sm.bwd_scratch // 2 * (K_CE - 1)
                         # 激活 swap（§8.1 swap_buf="从 CPU 预取回的激活"）：被卸载层反向前 H2D 取回，
                         #   swap_buf = 复原当前层 saves（不在 act_live）+ 反向序后 swap_depth 层在飞预取窗

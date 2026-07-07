@@ -50,12 +50,14 @@ tightest = argmax_s P_s ;  OOM = (max_s P_s > HBM)
 **并行分母(切分因子)**:`dp`(dp_shard)、`cp`、`tp`、`ep`、`pp`;`sp = tp`(开 SP 时,否则 1);
 `fsdp = dp·cp`;`efsdp = (dp·cp·tp)/ep`。
 
-**激活序列分母** `σS`:
+**激活序列分母** `σS`（2026-07-07 Bug A 修正：loss/head 区**也 ÷cp**）:
 ```
-σS = sp·cp   (SP 标注的 body 激活)
-   = cp      (非 SP 的 body 激活,如 attention 内部)
-   = 1       (loss/head 区 ；colossal CP 的 KV 维)
+σS = sp·cp   (SP 标注的激活:body + loss/head 的 h_final)
+   = cp      (非 SP 激活:attention 内部、logits/logsm/probs 等 loss/head 区)
+   = 1       (colossal CP 的 KV 维 all-gather)
 ```
+> loss/head 区**随 cp ÷cp**（真机 cp2-none profiler:loss buffer=[S/cp,B,V]）。此前 D-1 误判 full-S
+> （把 [B=2,S/cp] 误读成 [B=1,full-S]，数值都 2020）→ cp 下过预测 loss 区,已修（见 §7、§15）。
 
 **标定常数**:`k_ce=8`、`k_opt=6`、`blk=512`、`hccl=200MB`(出处见 §12)。
 
@@ -133,12 +135,14 @@ grad_buf        = (N_a + N_f)/tp · bg             （当前层满梯度,reduce-
 a_loss = S·B·V·bc            ← logits(bf16, saved)
        + 4·S·B·V             ← log_softmax(fp32, saved)
 
-bwd_scratch_loss = 4·S·B·V·(k_ce − 1)   若【无重算 且 unfused CE】   (k_ce=8 → 7 份满 vocab fp32)
-                 = 8·S·B·V              否则（fused / 重算,精简 = probs+grad 2 份）
+bwd_scratch_loss = 4·(S/σS)·B·V·(k_ce − 1)   若【无重算 且 unfused CE】
+                 = 8·(S/σS)·B·V              否则（fused / 重算,精简 = probs+grad 2 份）
 ```
-- 门控 `cross_entropy_fused`(DSv4 融合=True 恒精简);真机 profiler:无重算下 `log_softmax+NLL` op 链
-  ~8 份满 vocab fp32 共存(Log/Copy/Neg/ScatterAdd/ZerosLike…)。
-- **loss/head 区 `σS=1`**——不随 cp/sp 切(真机 head 前 all-gather hidden 回全长,D-1)。
+- 门控 `cross_entropy_fused`(DSv4 融合=True 恒精简);loss 区随 cp ÷σS（Bug A）。
+- **k_ce 与制度相关**(真机 profiler 实测共存份数):**流水线末 stage(pp>1)→k_ce=8**（pp2-stage1 见
+  8~10 份满 vocab fp32）;**单 stage(pp=1)→k_ce=4**（cp2-none/select 仅 3~4 份共存）。CE 链共存数
+  受 pipeline 调度影响,故按制度分（非单点常数）。
+- **loss/head 区随 cp ÷cp**（Bug A 修正,真机 cp2-none profiler:loss buffer=[S/cp,B,V]）。
 
 ## 8. optimizer-step 事件(②)
 
@@ -157,7 +161,7 @@ P_optstep = persistent + k_opt · max_w( numel_w / fsdp ) · 4        (k_opt=6)
 pp: 不切张量,切「层」→ stage 子集
 ```
 **cp 按算法(D-1)**:`ulysses/ring/hybrid` body 全 ÷cp;`colossal` body ÷cp 但 **KV all-gather 到全 S(σS=1)**;
-**所有算法 loss/head 区都全 S**。由 `context_parallel_method` 门控。
+**loss/head 区随 cp ÷cp**（Bug A 修正,2026-07-07——非「全 S」）。由 `context_parallel_method` 门控。
 
 ## 10. HCCL(reserved 口径,D-2)
 
@@ -182,7 +186,7 @@ N_comm = 1(world) + 1[dp·cp>1] + 1[tp>1] + 1[ep>1] + 1[pp>1] + 1[dp_replicate>1
 | 块对齐 `blk` | 512B | MindSpore `kDynamicMemAlignSize` |
 | flash LSE 系数 | 64 (=2×8×4) | CANN `FlashAttentionScore` softmax_max/sum `[B,nh,S,8]` fp32 |
 | AdamW 持久 `so` | 14 / 12 B/参 | bf16 2 + master 4 + m 4 + v 4 ／ fp32 4+4+4 |
-| `k_ce` | 8 | profiler(pp=2 stage1 无重算,满 vocab fp32 共存数) |
+| `k_ce` | 8(pp>1) / 4(pp=1) | profiler:流水线末 stage vs 单 stage 的满 vocab fp32 共存份数（制度相关） |
 | `k_opt` | 6 | profiler(pp=2 stage0,AdamW 更新 op 链) |
 | HCCL/组 | 200MB | 真机日志 hcclBufferSize(CANN 9.0),reserved 池 |
 
@@ -220,8 +224,20 @@ DSv3 8L 无重算 pp=2(`B=2, S=4096, V=129280, H=1792`):
 - **stage1 loss-bwd** = persistent + Σ层 + a_loss + `4·S·B·V·7`(①) ≈ **43.7 GB**(真机 45.7,**0.956**)。
 - **stage0** = persistent + `6·(V·H/1)·4`(=6×883.8 MiB,②) ≈ **10.3 GB**(真机 10.25,**1.006**)。
 
-其它已验锚点:DSv3 4L 全重算 **12409.5**(真机 12473,0.995)、DSv4-fused **0.930**、
-cp=2 colossal/ulysses **0.996**、DSv3 8L/ep=2 泛化 0.99+。
+**cp × 重算 真机验证矩阵(2026-07-07,Bug A + k_ce 制度化后)**:
+
+| 锚点 | 真机 | 估计器 | ratio |
+|---|---|---|---|
+| DSv3 4L 全重算 | 12473 | 12409.5 | 0.995 |
+| cp2 colossal/ulysses full(B=2) | 12433/12441 | 12409.5 | **0.998** |
+| pp2-stage0(优化器 step) | 10246 | 10311 | 1.006 |
+| pp2-stage1(loss,k_ce=8) | 45655 | 43659 | 0.956 |
+| **cp2-none(loss,k_ce=4)** | 20119 | 18326 | **0.911**（修前 2.17× 过预测） |
+| select self_attention | 18828 | 15361 | 0.816 ⚠️ |
+| DSv4-fused | 15415 | 14336 | 0.930 ⚠️ |
+
+**Bug A(loss ÷cp)+ k_ce 制度化把 cp 从 2.17× 过预测拉回 0.91**（真机机理正确）。cp2 full 的 0.998 现是
+**真的对齐**（此前 0.996 是 B=1·full-S 与 B=2·S/cp 数值抵消蒙对,见 §7）。**select/DSv4 仍欠预测**（见 §15）。
 
 **选择性重算(D-3,真机 2026-07-07,DSv3 8L dp=2)**——`recompute:{mode:select,select_module:{M:[0-7]}}`:
 
@@ -241,9 +257,13 @@ cp=2 colossal/ulysses **0.996**、DSv3 8L/ep=2 泛化 0.99+。
 - `k_ce/k_opt` 是 profiler 标定计数(共存数受 allocator/microbatch 影响,同平台常数档,非 op 图纯导出)。
 - 未建模的小残差:DSv4-fused 7%(融合 kernel 内部量,D-5)、DSv3 ~0.5% sub-block 尾(rope cos/sin、norm rstd、cast 临时)。
 - 未真机核对:cp>1(除 pp=2 外)、VPP、pp>2 每-stage、swap。
-- **选择性重算部分选择欠预测 ~18-27%(D-3,真机已验)**:退化端(==full)精确,但保留 MoE 模块的
-  无重算激活/反向工作集在 loss 峰值欠计(同 §D-10 ①/D-5 一族)——**待统一处理**(MoE §8.5② 分支
-  按真机校准,或 select/no-recompute 配置设显式 margin)。
+- **保留-MoE loss-峰值欠预测（select 0.816 / DSv4 0.930,OOM-不安全,尝试修未果）**:2026-07-07 试按机理
+  补「MoE grouped-GEMM 反向再物化」(ep-中间量足迹)到 act_live——**失败**:该项对所有事件生效,把
+  **无-loss stage 的逐层反向事件过度抬高**（pp2-stage0 10311→12082 过预测),而只在 loss-峰值需要。
+  即 kept-MoE 欠计**仅在 loss-backward 事件**（多层 saves 与 loss 区共存那一刻），单一 act_live 项无法
+  只补该事件而不误伤逐层反向。**已回退**。根因确认是「保留 MoE-FFN 前向 saves 在 loss 峰被简化 op 图
+  漏建（真机 grouped-GEMM 的 permute/capacity-pad/cast 中间量）」,需**按事件定向**的 MoE 模型或显式
+  margin,当前机理未及 → 保留为已知残差。cp 侧的欠计经查**非** kept-MoE 而是 Bug A/k_ce(已修)。
 - **此 mindformers build 多维并行栈限制**(真机实测):① SP+MoE 不支持;② TP+MoE(Detach layout bug);
   ③ PP+重算互斥;④ **pp>2 崩在 pynative pipeline+优化器对 decoder-only 中间 stage 的 param/state
   配对(1D layernorm 权重 `[H]` 与 2D 投影权重 `[H,·]` 配错)**——MLA(`[H,rq]`)与 GQA(`[H,H]`)、
