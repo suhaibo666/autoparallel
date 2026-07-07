@@ -48,6 +48,9 @@ def build_gqa_attn_ops(d: DimTable) -> list:
         模型架构超参（H/n_heads/n_kv/head_dim/S/B …）。
     """
     # ── 激活张量 ───────────────────────────────────────────────────────────────
+    # 注：`qkv` 是 Q/K/V **融合**张量（末维 (n_heads+2·n_kv)·d_h），KV 分量不可无损分割 → **不**标
+    # cp_kv（D-1 修正）。故 colossal 下 fused-qkv 的 KV 分量仍随 body ÷cp（小幅欠模 colossal 的 KV
+    # all-gather buffer）；全重算下该量 off loss 峰、本栈跑不了 cp+无重算故未真机验证——已 caveat。
     x      = TensorRef("x",    ("S", "B", "H"),        shard={0: "sp"})
     ln1    = TensorRef("ln1",  ("S", "B", "H"))
     qkv    = TensorRef("qkv",  ("S", "B", QKV),        shard={2: "tp"})
@@ -107,14 +110,16 @@ def build_mla_attn_ops(d: DimTable) -> list:
     ln1_out  = TensorRef("ln1",      ("S", "B", "H"))
     # linear_qkv 输出（列并行，末维 ÷ tp）
     qkv_out  = TensorRef("qkv_out",  ("S", "B", QKV_PROJ), shard={2: "tp"})
-    # q_a 和 kv_a 切片（split 隐含，建模为无 shard 的新张量）
+    # q_a 和 kv_a 切片（split 隐含，建模为无 shard 的新张量）。
+    # KV 侧激活（kv_a_in/kv_a_out/kvb_out）标 cp_kv=True（D-1 修正）：colossal 下 KV all-gather
+    # 到 full-S（不 ÷cp）；ulysses/ring/hybrid 仍随 body ÷cp。DSv3 走 cp=1 → 恒不生效，逐字节不变。
     q_a_in   = TensorRef("q_a_in",   ("S", "B", "q_lora_rank"))
-    kv_a_in  = TensorRef("kv_a_in",  ("S", "B", "kv_lora_rank"))
+    kv_a_in  = TensorRef("kv_a_in",  ("S", "B", "kv_lora_rank"), cp_kv=True)
     q_a_out  = TensorRef("q_a_out",  ("S", "B", "q_lora_rank"))
-    kv_a_out = TensorRef("kv_a_out", ("S", "B", "kv_lora_rank"))
+    kv_a_out = TensorRef("kv_a_out", ("S", "B", "kv_lora_rank"), cp_kv=True)
     # linear_qb / linear_kvb 输出
     qb_out   = TensorRef("qb_out",   ("S", "B", QB_OUT),   shard={2: "tp"})
-    kvb_out  = TensorRef("kvb_out",  ("S", "B", KVB_OUT),  shard={2: "tp"})
+    kvb_out  = TensorRef("kvb_out",  ("S", "B", KVB_OUT),  shard={2: "tp"}, cp_kv=True)
     # flash_attn 输出 + lse
     attn_out = TensorRef("attn",     ("S", "B", ATTN_OUT), shard={2: "tp"})
     lse      = TensorRef("lse",      ("S", "B", "n_heads"), shard={2: "tp"})

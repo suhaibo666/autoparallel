@@ -69,6 +69,12 @@
 cost_eval/layers` 无命中；所有 TensorRef 的 `shard` 只用 `tp`/`ep`/`sp`）。故 `cp>1` 时每卡激活、
 flash workspace、loss/index bwd_scratch 全部 **over-count ×cp**。
 
+> [!deprecated] 已被 2026-07-07 真机 + 算子级 Profiler **部分推翻**，修正见本节末「#### D-1 修正
+> （2026-07-07）」。要点：**loss/head 区对所有 cp 算法都是 full-S（不 ÷cp）**——旧「整体 ÷cp（含
+> loss/head）」错半了满 vocab 的 loss 张量，cp=2 峰值**欠估 ~29%**（旧 8839 vs 真机 12433）；且
+> body ÷cp 与否**依赖 `context_parallel_method`**（colossal 额外 all-gather KV 到 full-S）。以下
+> 2026-07-06 段落保留原始决策记录（body ÷cp 对 ulysses/ring/hybrid 仍成立、对 loss/head 被推翻）。
+
 **忠实模型（S_effective = S / cp）**。cp 是**全局域的序列并行**（ring / context attention）：整条序列
 沿 token 维切成 cp 份，每 rank 只拥有 **S/cp 个 token（query）**；key/context 经 ring P2P 轮转，每个
 query 仍见**完整上下文**（用户 2026-07-06 定夺原话：「cp 是全局域的序列切分，整体的激活值都会切分为
@@ -120,6 +126,54 @@ scratch 侧用 floordiv 安全（合法配置下 `S%cp==0` 时 S 与 S² 均整�
 （`validate_dsv3.py:84`）走 `cp=1`，`degree("cp")=1` → **两处分支完全不进入**，`resolve_tensor` /
 `ShapeEval.resolve` 逐字节复现旧行为 → DSv3 4L 恒 `12409.5`、`pytest` 全绿。cp 是本次唯一新增的激活
 分母，且只在 `>1` 时生效，故对全部现有 cp=1 配置（anchors/golden/preset）是**精确 no-op**。
+
+#### D-1 修正（2026-07-07，真机 + 算子级 Profiler 确认）：loss/head 区 full-S + 按 cp 算法分派
+
+真机 cp=2 实测 + 算子级 Profiler（`analysis/realmachine/cp2_colossal/operator_memory.csv`，
+DSv3 4L、seq=4096、vocab=129280、full-recompute、`context_parallel_method=colossal`）**推翻**了上面
+「整体激活 ÷cp（含 loss/head）」的口径，给出两条修正：
+
+**Correction A（已真机验证，最高优先）——loss/head 区对所有 cp 算法都是 full-S（不 ÷cp）。**
+- 证据：cp=2 峰值 **`Allocated=12433.2 MiB`**，落在 **loss 反向（`ScatterAddExt`/loss backward）**。
+  此刻 vocab 三张量均为 **full-S fp32 满 vocab，各 2020 MiB**：`log_softmax`(saved) + `probs`
+  (=exp(-logsm)) + `grad_log_softmax`(scatter_add 出的梯度)。`4·S·B·vocab=4·4096·129280=2020 MiB`，
+  三份共 **6060 MiB 全为 full-S**——**不是** S/cp（S/cp 仅 1010 MiB/份）。Profiler 里 `ScatterAddExt`/
+  `Log`/`Neg`/`SubExt`/`MaxDim` 五个 loss 反向算子全部实测 2020.0 MiB，逐一坐实 full-S。
+- 机理：mindformers 各 cp 算法在 **LM head 前把 hidden all-gather 回 full-S**（head+loss 跑在完整
+  序列上），故 `h_final`/`logits_lm`/`logsm`/`probs`/`loss` 及 nll 反向 `grad_log_softmax`
+  （`bwd_scratch=8·S·B·vocab`，含 chunked `8·S·B·vocab//k`）**全为 full-S、所有 cp 算法一致**。
+  旧「整体 ÷cp」把它们错半 → cp=2 峰值 **欠估 ~29%（OOM 不安全）**：旧模型报 8839，真机 12433。
+- **注**：`embedding` 输出 `emb_out` 与所有 **decoder 层激活**仍 ÷cp（是 S/cp）——**只有 head/loss 区**
+  full-S。二者边界 = LM head 前的 all-gather。
+
+**Correction B（源码忠实，colossal-KV 分支暂未真机验证）——body ÷cp 依 `context_parallel_method`。**
+核于 mindformers `pynative/distributed/{context_parallel,style}.py`：
+
+| method | body 激活 | attention KV | loss/head |
+|---|---|---|---|
+| `ulysses`（`style.py:170,198`：all-to-all，seq-shard→head-shard） | ÷cp | ÷cp（随 body） | **full-S** |
+| `ring`（Q,K,V 全切 + ring-pass 分块） | ÷cp | ÷cp | **full-S** |
+| `hybrid`（ring×ulysses 组合） | ÷cp | ÷cp | **full-S** |
+| `colossal`（`style.py:168,188`：`ulysses_degree=1`，all-gather KV 到 full-S） | ÷cp | **full-S（额外 full-S KV buffer）** | **full-S** |
+
+**落地机制（2026-07-07）：**
+- `ParallelConfig.context_parallel_method: str = "colossal"`（默认对齐 mindformers DSv3 yaml），
+  `__post_init__` 校验 ∈ {colossal, ulysses, ring, hybrid}（fail-loud，仿 head.py:50 的 loss_type）。
+- `TensorRef.cp_shard: bool = True`（False=full-S 不 ÷cp）；`TensorRef.cp_kv: bool = False`
+  （True=colossal 下 all-gather 到 full-S、其余 method 仍 ÷cp）。
+- **A**（`layers/head.py`）：`h_final`/`logits_lm`/`logsm`/`loss`/`probs`(vocab_parallel 支) 标
+  `cp_shard=False`。`resolve_tensor` 仅当 `t.cp_shard` 才 ÷cp；`ShapeEval.resolve` 仅当
+  `op.output.cp_shard` 才对 workspace/bwd_scratch ÷cp（nll 输出 `loss` cp_shard=False → 其
+  `bwd_scratch=8·S·B·vocab` 保持 full-S）。MTP 头经共享 builder `build_head_and_loss_ops` 自动覆盖。
+- **B**（`layers/{attention,mla,dsv4_hybrid}.py`）：KV 侧激活标 `cp_kv=True`（MLA
+  `kv_a_in`/`kv_a_out`/`kvb_out`；dsv4 `kv`/`kv_a_out`/`compressed_kv`/`kv_gathered`）；
+  `resolve_tensor` 在 `method=="colossal"` 下对 `cp_kv` 张量跳过 ÷cp（其余 method 仍 ÷cp，随 body）。
+  GQA 的 `qkv` 是 Q/K/V **融合**张量、KV 分量不可无损分割 → **不单独标**（colossal 下 fused-qkv 仍按
+  body ÷cp，属小幅欠模；全重算下该 KV 量 off-peak、且本栈跑不了 cp+无重算故未真机验证——已 caveat）。
+- **验证**：DSv3 走 cp=1 → 两处 cp 分支 `if cp>1` 不进入 → 逐字节复现旧行为 → DSv3 4L 恒 `12409.5`。
+  cp=2 4L full-recompute 预测 **8839 → 12381.5**（Δ = Δlogsm 1010 + Δlogits 505 + Δbwd_scratch 2020
+  + Δh_final 7 ≈ +3542）；colossal==ulysses（KV all-gather 在全重算层、off loss 峰）→ ratio 0.996 vs
+  真机 colossal 12433 / ulysses 12441（≈ dp=2 的 12474）。
 
 ### D-4：VPP（交错式 1F1B, v>1）激活峰值 —— 从 ~V× 过估改为**按 chunk 忠实累加**
 
@@ -416,7 +470,7 @@ fail-loud in build_llm）」）：`model_type`/`architectures`/`max_position_emb
 
 | # | 状态 | commit | 关键效果 |
 |---|---|---|---|
-| D-1 cp 切激活 | ✅ | `28229e4` | 激活 S_eff=S/cp（含 flash-ws/loss/index）；cp=1 no-op |
+| D-1 cp 切激活 | ✅（→ 2026-07-07 修正） | `28229e4` | 激活 S_eff=S/cp（含 flash-ws/loss/index）；cp=1 no-op。**修正**：loss/head 区 full-S（真机 12433，见 §D-1 修正）+ 按 `context_parallel_method` 分派（colossal KV all-gather） |
 | D-8 显式 stage 层数 | ✅ | `2d66940` | `layers_per_stage` 首选 + 三重校验，不静默错映射 |
 | D-4 VPP 按 chunk | ✅ | `2ac2e4b` | 去 ~V× 过估，按实际 chunk 层数累加；v=1 == 1F1B |
 | D-6 ungated FFN | ✅ | `7a2594c` | `gated_linear_unit=False` 建 op 图（fc1 不 2×） |

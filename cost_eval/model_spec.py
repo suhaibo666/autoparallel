@@ -57,6 +57,14 @@ class TensorRef:
     is_weight: bool = False
     partial: Optional[str] = None      # 该张量在此轴上是未规约部分和
     dtype_bytes: Optional[int] = None  # 覆盖 DimTable.dtype_bytes（如 fp32 loss 张量=4）
+    # ── context-parallel（cp）切分标注（D-1 修正 2026-07-07，真机确认）───────────────────
+    # cp_shard=False：该激活为**全序列 full-S**，cp 下**不** ÷cp（loss/head 区——head 前 hidden
+    #   all-gather 回 full-S，对**所有** cp 算法一致；真机 cp=2 峰实测满 vocab logsm/probs/grad
+    #   各 2020 MiB full-S）。默认 True = 随序列切分（emb_out + 所有 decoder 层激活 = S/cp）。
+    # cp_kv=True：该张量为 attention **KV 侧**激活；`colossal`（ulysses_degree=1）下 KV all-gather
+    #   到 **full-S**（不 ÷cp），其余 cp 算法（ulysses/ring/hybrid）仍随 body ÷cp。默认 False。
+    cp_shard: bool = True
+    cp_kv: bool = False
 
     def has_ep(self) -> bool:
         return "ep" in self.shard.values()

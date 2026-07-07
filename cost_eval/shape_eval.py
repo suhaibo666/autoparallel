@@ -82,8 +82,17 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
     # 维），其余含 S 的维（仅 dsv4 `TOPK_DIM`=window+S//ratio 这类上下文位置维）不切 → `break`。
     # 与 SP 组合：SP 张量已在上面 ÷sp（=tp），此处再 ÷cp → S/(tp·cp)；非 SP → S/cp。权重无 S
     # （已核）→ is_weight 跳过；参数分片仍走 fsdp_degree=dp_shard·cp（static_mem.py:8），不双算。
+    #
+    # ── D-1 修正（2026-07-07，真机确认）：两类张量 cp 下**保持 full-S**（不 ÷cp）──────────────
+    #   1. cp_shard=False：loss/head 区（h_final/logits/logsm/probs/loss）——head 前 hidden
+    #      all-gather 回 full-S，对**所有** cp 算法一致（真机 cp=2 峰满 vocab full-S，各 2020 MiB）。
+    #   2. cp_kv=True 且 method==colossal：attention KV 侧激活——colossal（ulysses_degree=1）
+    #      all-gather KV 到 full-S（额外 KV buffer）；其余算法（ulysses/ring/hybrid）KV 仍随 body ÷cp。
     cp = pm.degree("cp")
-    if cp > 1 and not t.is_weight:
+    method = getattr(pm.pc, "context_parallel_method", "colossal")
+    cp_applies = (cp > 1 and not t.is_weight and t.cp_shard
+                  and not (method == "colossal" and t.cp_kv))
+    if cp_applies:
         for dim_idx, e in enumerate(t.shape):
             if _refs_symbol(e, "S"):
                 if sizes[dim_idx] % cp != 0:
@@ -206,8 +215,14 @@ class ShapeEval:
                 # → S²/cp（去掉 query 那个 S 因子，与张量口径一致：切 query 维、key 维保持全量）。
                 # 每个带 S-workspace 的 op 必有含 S 的激活张量（flash 有 qkv、nll 有 logsm…），
                 # 故非法 S%cp≠0 已在上面 resolve_tensor 先 raise → 此处合法配置下整除，floordiv 安全。
+                #
+                # ── D-1 修正（2026-07-07）：loss/head 区 op 的 workspace/bwd_scratch 保持 full-S ──
+                # 若 op 输出是 full-S 激活（`op.output.cp_shard==False`，即 loss/head 区，如 nll 的
+                # `loss` 输出），其反向物化也 full-S → **不** ÷cp。真机 cp=2 峰实测 nll 反向
+                # `grad_log_softmax`(=bwd_scratch 8·S·B·vocab) 为满 vocab full-S（各 2020 MiB×2），
+                # 旧「整体 ÷cp」错半 → 欠估 ~29%。decoder 区 op（output.cp_shard=True）仍 ÷cp 不变。
                 cp = pm.degree("cp")
-                if cp > 1:
+                if cp > 1 and op.output.cp_shard:
                     if _refs_symbol(op.workspace, "S"):
                         ws //= cp
                     if _refs_symbol(op.bwd_scratch, "S"):

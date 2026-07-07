@@ -86,8 +86,10 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     q            = TensorRef("q",            ("S", "B", Q_OUT), shard={2: "tp"})  # :237 列并行(bf16)
     # per-head Q RMSNorm 输出 fp32（:239-245）—— 真机 256 MiB/层，此前漏建
     q_hnorm      = TensorRef("q_hnorm_fp32", ("S", "B", Q_OUT), shard={2: "tp"}, dtype_bytes=4)
-    kv           = TensorRef("kv",           ("S", "B", "v_head_dim"))           # :249 单共享头
-    kv_a_out     = TensorRef("kv_a_out",     ("S", "B", "v_head_dim"))           # :250
+    # KV 侧激活（kv/kv_a_out）标 cp_kv=True（D-1 修正）：colossal 下 KV all-gather 到 full-S；
+    # 其余 cp 算法随 body ÷cp。dsv4 走 cp=1（DSv4-align 锚点）→ 恒不生效，逐字节不变。
+    kv           = TensorRef("kv",           ("S", "B", "v_head_dim"), cp_kv=True)  # :249 单共享头
+    kv_a_out     = TensorRef("kv_a_out",     ("S", "B", "v_head_dim"), cp_kv=True)  # :250
     core_out     = TensorRef("core_out",     ("S", "B", Q_OUT))                  # :247 [sq,b,n,vd]
     # 分组输出 bmm 的 fp32 输入 cg（:277-283 cast(cg, fp32)）—— 真机 256 MiB/层，此前错 bf16
     cg_fp32      = TensorRef("cg_fp32",      ("S", "B", Q_OUT), dtype_bytes=4)
@@ -120,8 +122,9 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
 
     # ── core attention ────────────────────────────────────────────────────────
     if sparse:
-        compressed_kv = TensorRef("compressed_kv", (S_DIV_R, "B", "1", "v_head_dim"))            # :221
-        kv_gathered   = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"))            # csa.py:208
+        # compressed_kv / kv_gathered 亦 KV 侧（cp_kv=True，D-1 修正）：colossal 下 all-gather 到 full-S。
+        compressed_kv = TensorRef("compressed_kv", (S_DIV_R, "B", "1", "v_head_dim"), cp_kv=True)  # :221
+        kv_gathered   = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"), cp_kv=True)  # csa.py:208
         attn_weights  = TensorRef("attn_weights", ("B", "n_heads", "S", TOPK_DIM))               # csa.py:237
         topk_indices  = TensorRef("topk_indices", ("B", "S", TOPK_DIM), dtype_bytes=4)           # :241 int32
         idx_wq_b  = TensorRef("idx_wq_b",  ("q_lora_rank", IDX_QB_OUT),         is_weight=True)   # indexer.py:109-117

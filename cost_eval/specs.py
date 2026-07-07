@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+_CP_METHODS = ("colossal", "ulysses", "ring", "hybrid")
+
+
 @dataclass
 class ParallelConfig:
     dp_replicate: int = 1
@@ -13,6 +16,14 @@ class ParallelConfig:
     pp: int = 1
     ep: int = 1
     sequence_parallel: bool = False
+    # context-parallel 算法（`parallelism.context_parallel_method`，忠实 mindformers
+    # pynative/distributed/{context_parallel,style}.py）。默认 `colossal`（对齐 mindformers DSv3
+    # yaml）。决定 body 激活的 cp 切分口径（D-1 修正 2026-07-07，真机确认）：
+    #   - ulysses/ring/hybrid：body 激活（含 attention KV）÷cp。
+    #   - colossal（ulysses_degree=1）：body ÷cp，但 **attention KV all-gather 到 full-S**（额外 KV buffer）。
+    # loss/head 区对**所有**算法都是 full-S（head 前 all-gather hidden；真机 cp=2 峰实测满 vocab full-S）。
+    # cp=1 时该字段无效（cp 分支不进入）→ DSv3 anchor 逐字节不变。
+    context_parallel_method: str = "colossal"
     reshard_after_forward: str = "default"   # always|never|default
     cpu_offload: bool = False
     microbatch: int = 1
@@ -22,6 +33,14 @@ class ParallelConfig:
     layers_per_stage: Optional[list] = None
     prefetch_depth: int = 1
     num_microbatches: int = 1                # m = global_batch/(dp*microbatch)，由 adapter 算好
+
+    def __post_init__(self):
+        # cp 算法 fail-loud（仿 head.py:50 loss_type / build_llm._check_implemented_dispatch）：
+        # 非实现取值即报错，不静默按某算法继续（会产「貌似合理实则错误」的切分）。
+        if self.context_parallel_method not in _CP_METHODS:
+            raise ValueError(
+                f"context_parallel_method={self.context_parallel_method!r} 未实现"
+                f"（支持：{_CP_METHODS}）")
 
 
 @dataclass

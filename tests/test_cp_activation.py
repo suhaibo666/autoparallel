@@ -1,12 +1,20 @@
-"""D-1：context-parallel（cp）切激活。
+"""D-1：context-parallel（cp）切激活（含 2026-07-07 真机修正）。
 
-守卫忠实模型（specs/2026-07-06-audit-remediation.md §4·D-1）：cp 是全局序列并行域，每个**非
-权重激活**的 token/query 维 ÷cp（含 flash workspace / loss·index bwd_scratch），而**参数**
-（gather_buf/grad_buf/持久 param 路径）不被本次改动触碰。硬不变量：cp=1 逐字节 no-op。
+守卫忠实模型（specs/2026-07-06-audit-remediation.md §4·D-1 + 「D-1 修正」）：cp 是全局序列并行域，
+**decoder body** 的每个非权重激活 token/query 维 ÷cp（含 flash workspace / index bwd_scratch）；
+**参数**（gather_buf/grad_buf/持久 param）不被触碰。
+
+**D-1 修正（2026-07-07，真机 cp=2 + 算子级 Profiler 确认）**：
+  - **loss/head 区对所有 cp 算法都是 full-S**（`cp_shard=False`）——head 前 hidden all-gather 回 full-S，
+    真机峰实测 logsm/probs/grad_log_softmax 各 2020 MiB 满 vocab full-S（**非** S/cp）。故 loss 层
+    activation_saves 与 nll `bwd_scratch=8·S·B·vocab` **不 ÷cp**（旧「整体 ÷cp」欠估 ~29%，8839 vs 12433）。
+  - **body ÷cp 依 `context_parallel_method`**：ulysses/ring/hybrid KV 随 body ÷cp；`colossal`
+    （ulysses_degree=1）把 attention KV（`cp_kv=True`）all-gather 到 full-S。
+硬不变量：cp=1 逐字节 no-op（两处 cp 分支 `if cp>1` 不进入）。
 """
 from cost_eval.llm_config import LLMConfig
 from cost_eval.build_llm import build_llm_spec
-from cost_eval.specs import ParallelConfig, OptimizerSpec
+from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
 from cost_eval.parallel_model import ParallelModel
 from cost_eval.shape_eval import ShapeEval, resolve_tensor
 from cost_eval.structure_mem import estimate_structure_memory
@@ -34,35 +42,39 @@ def _D():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. cp=2 把「激活派生」桶减半，参数桶（gather/grad）不变
+# 1. cp=2：**decoder body** 激活/workspace ÷cp；**loss/head 区** full-S（不 ÷cp）；参数桶不变
+#    （2026-07-07 真机修正——旧版断言「所有层 act_live/bwd_scratch 一律 ÷cp」是 bug：真机 cp=2 峰
+#     实测满 vocab logsm/probs/grad 各 2020 MiB **full-S**，loss 区若错半则欠估 ~29%（8839 vs 12433））
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_cp2_halves_activation_buckets_params_unchanged():
-    spec = build_llm_spec(_small_cfg())
+def test_cp2_body_halves_but_loss_head_stays_full():
+    spec = build_llm_spec(_small_cfg())   # embedding + 2×(gqa+dense) + lm_head
     l1, _ = _resolve_layers(spec, cp=1)
     l2, _ = _resolve_layers(spec, cp=2)
-    tot_saves1 = tot_saves2 = 0
-    saw_ws = saw_bws = False
+    saw_body_saves = saw_ws = saw_head = False
     for a, b in zip(l1, l2):
         sa = estimate_structure_memory(a.ops)
         sb = estimate_structure_memory(b.ops)
-        # 激活 saves ÷cp（含去重后）
-        assert sb.activation_saves * 2 == sa.activation_saves
-        # 参数 full-gather / grad 缓冲（无 S、非本次路径）不变
+        # 参数 full-gather / grad 缓冲（无 S、非本次路径）——所有层恒不变
         assert sb.param_full_bytes == sa.param_full_bytes
         assert sb.grad_full_bytes == sa.grad_full_bytes
-        # workspace（flash∝S）÷cp
-        if sa.workspace:
-            assert sb.workspace * 2 == sa.workspace
-            saw_ws = True
-        # bwd_scratch（loss 8·S·B·vocab∝S）÷cp
+        # loss/head 层 = 唯一带 bwd_scratch（loss 8·S·B·vocab）的层 → 全 full-S：
+        #   activation_saves（h_final+logits+logsm）与 bwd_scratch 均**不 ÷cp**（真机满 vocab full-S）。
         if sa.bwd_scratch:
-            assert sb.bwd_scratch * 2 == sa.bwd_scratch
-            saw_bws = True
-        tot_saves1 += sa.activation_saves
-        tot_saves2 += sb.activation_saves
-    assert tot_saves1 > 0 and tot_saves2 * 2 == tot_saves1
-    assert saw_ws and saw_bws       # workspace + bwd_scratch 两条 ÷cp 路径都被真实触发
+            assert sb.activation_saves == sa.activation_saves   # loss/head saves full-S（非 ÷cp）
+            assert sb.bwd_scratch == sa.bwd_scratch             # nll bwd_scratch full-S（非 ÷cp）
+            assert sa.workspace == 0                            # head 区无 workspace
+            saw_head = True
+        else:
+            # decoder body / embedding：激活 saves ÷cp、workspace（flash∝S）÷cp
+            assert sb.activation_saves * 2 == sa.activation_saves
+            if sa.activation_saves:
+                saw_body_saves = True
+            if sa.workspace:
+                assert sb.workspace * 2 == sa.workspace
+                saw_ws = True
+    # 三条路径都被真实触发：body saves ÷cp、body flash-ws ÷cp、loss/head full-S
+    assert saw_body_saves and saw_ws and saw_head
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +106,14 @@ def test_cp1_is_noop():
     pm = ParallelModel(ParallelConfig(cp=1), n_layers=4, world_size=1)
     x = TensorRef("x", ("S", "B", "H"), shard={0: "sp"})
     assert resolve_tensor(x, d, pm).local_numel == 16 * 1 * 8       # 无任何切分
+    # cp=1 下 cp_shard / cp_kv / context_parallel_method 全部无效（分支不进入）→ 逐字节 no-op：
+    full = TensorRef("logsm", ("S", "B", "vocab"), cp_shard=False)         # loss 区标记也 no-op
+    kv = TensorRef("kvb_out", ("S", "B", "H"), cp_kv=True)                 # KV 标记也 no-op
+    for method in ("colossal", "ulysses", "ring", "hybrid"):
+        pmm = ParallelModel(ParallelConfig(cp=1, context_parallel_method=method), n_layers=4, world_size=1)
+        assert resolve_tensor(x, d, pmm).local_numel == 16 * 1 * 8
+        assert resolve_tensor(full, d, pmm).local_numel == 16 * 1 * 16
+        assert resolve_tensor(kv, d, pmm).local_numel == 16 * 1 * 8
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,3 +179,95 @@ def test_cp_shards_moe_dispatched_tokens():
     assert s2.activation_saves * 2 == s1.activation_saves     # disp/e_*/logits/comb 皆 ∝S
     assert s2.workspace * 2 == s1.workspace                   # MOE_STAGING_WS ∝S
     assert s2.param_full_bytes == s1.param_full_bytes         # 专家权重无 S，不变
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. D-1 修正（2026-07-07 真机）：loss/head 区 full-S（cp_shard=False）——cp 下不 ÷cp
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_loss_head_region_not_cp_sharded():
+    """loss/head 区 full-S：head 前 hidden all-gather 回 full-S，所有 cp 算法一致（真机 cp=2 峰满 vocab）。"""
+    d = _D()                                    # S=16, B=1, H=8, vocab=16
+    for method in ("colossal", "ulysses", "ring", "hybrid"):
+        pm2 = ParallelModel(ParallelConfig(cp=2, context_parallel_method=method), n_layers=4, world_size=2)
+        # logsm/probs（fp32 满 vocab）+ h_final：cp_shard=False → 序列维保持全量 S（**不** ÷cp）
+        logsm = TensorRef("logsm", ("S", "B", "vocab"), dtype_bytes=4, cp_shard=False)
+        probs = TensorRef("probs", ("S", "B", "vocab"), shard={2: "tp"}, dtype_bytes=4, cp_shard=False)
+        h_final = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"}, cp_shard=False)
+        assert resolve_tensor(logsm, d, pm2).local_numel == 16 * 1 * 16   # full S=16（非 S/cp=8）
+        assert resolve_tensor(probs, d, pm2).local_numel == 16 * 1 * 16   # full（tp=1 → vocab 不切）
+        assert resolve_tensor(h_final, d, pm2).local_numel == 16 * 1 * 8  # full S=16
+    # 对照：cp_shard=True 的同形 decoder 激活（emb_out / body）→ ÷cp
+    dec = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})          # 默认 cp_shard=True
+    pm2 = ParallelModel(ParallelConfig(cp=2), n_layers=4, world_size=2)
+    assert resolve_tensor(dec, d, pm2).local_numel == (16 // 2) * 1 * 8   # S/cp=8
+
+
+def test_loss_bwd_scratch_full_s_via_output_marker():
+    """nll op 输出 `loss`(cp_shard=False) → 其 bwd_scratch=8·S·B·vocab 在 cp 下保持 full-S（真机满 vocab）。
+    对照：decoder 区 op（output.cp_shard=True，如 indexer 的 index_scores）的 bwd_scratch 仍 ÷cp。"""
+    d = DimTable(H=8, F=16, n_heads=2, n_kv=2, head_dim=4, S=16, B=1, vocab=16, n_layers=4)
+    loss = TensorRef("loss", ("B",), cp_shard=False)
+    nll = OpSpec("nll", OpType.ELEMENTWISE, [], loss, saves=[], bwd_scratch="8*S*B*vocab")
+    spec = ModelSpec("t", d, ["x"], {"x": LayerSpec([nll])})
+
+    def bws(cp):
+        pm = ParallelModel(ParallelConfig(cp=cp), n_layers=4, world_size=1)
+        return ShapeEval().resolve(spec, pm).stages[0][0].ops[0].bwd_scratch_bytes
+
+    base = 8 * 16 * 1 * 16
+    assert bws(1) == base
+    assert bws(2) == base            # loss bwd_scratch full-S：cp=2 **不** ÷cp（≠ base//2）
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. D-1 修正 B：cp_kv 张量在 colossal 下 full-S（KV all-gather）；其余算法随 body ÷cp
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_colossal_kv_full_s_others_shard():
+    d = _D()                                    # S=16, B=1, H=8
+    kv = TensorRef("kvb_out", ("S", "B", "H"), cp_kv=True)   # attention KV 侧
+    q = TensorRef("qb_out", ("S", "B", "H"))                 # 非 KV body（默认 cp_shard=True, cp_kv=False）
+    # colossal：KV all-gather → full-S；body 仍 ÷cp
+    pm_col = ParallelModel(ParallelConfig(cp=2, context_parallel_method="colossal"), n_layers=4, world_size=2)
+    assert resolve_tensor(kv, d, pm_col).local_numel == 16 * 1 * 8         # KV full-S=16
+    assert resolve_tensor(q, d, pm_col).local_numel == (16 // 2) * 1 * 8   # body S/cp=8
+    # ulysses/ring/hybrid：KV 随 body ÷cp（无 all-gather）
+    for m in ("ulysses", "ring", "hybrid"):
+        pm = ParallelModel(ParallelConfig(cp=2, context_parallel_method=m), n_layers=4, world_size=2)
+        assert resolve_tensor(kv, d, pm).local_numel == (16 // 2) * 1 * 8  # KV S/cp=8
+
+
+def test_cp_method_fail_loud_and_accepts_valid():
+    import pytest
+    with pytest.raises(ValueError):
+        ParallelConfig(cp=2, context_parallel_method="megatron_cp")   # 未实现 → fail-loud
+    for m in ("colossal", "ulysses", "ring", "hybrid"):
+        assert ParallelConfig(context_parallel_method=m).context_parallel_method == m
+    assert ParallelConfig().context_parallel_method == "colossal"     # 默认对齐 mindformers DSv3 yaml
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. 验证靶（真机硬门）：cp=2 4L full-recompute 预测 ≈ 真机（colossal 12433 / ulysses 12441）
+#    修正前 buggy=8839（loss 区错半，欠估 ~29%）；修正后 loss/head full-S → ~12381（band 12000-12600）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cp2_4L_full_recompute_matches_real_machine():
+    from validate_dsv3 import build_dsv3_spec
+    from cost_eval.report import Evaluator
+    GiB = 2 ** 30
+    MiB = 2 ** 20
+    spec, d, fl = build_dsv3_spec(4)
+    peaks = {}
+    for method in ("colossal", "ulysses"):
+        pc = ParallelConfig(dp_shard=1, cp=2, tp=1, pp=1, sequence_parallel=False,
+                            num_microbatches=1, context_parallel_method=method)
+        ev = Evaluator(spec, pc,
+                       OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4),
+                       HardwareSpec(max_device_memory=64 * GiB, framework_reserve=0),
+                       RecomputeSpec(mode="full", full_layers=fl), SwapSpec())
+        peaks[method] = ev.evaluate().per_stage[0].peak_bytes / MiB
+        # 真机 colossal 12433 / ulysses 12441；修正后预测落 band（旧 buggy 8839 已远在 band 下）
+        assert 12000 <= peaks[method] <= 12600, f"{method}: {peaks[method]:.1f} MiB 越界"
+    # 全重算下 colossal==ulysses（KV all-gather 在重算层、off loss 峰）——修正模型的预期恒等
+    assert peaks["colossal"] == peaks["ulysses"]
