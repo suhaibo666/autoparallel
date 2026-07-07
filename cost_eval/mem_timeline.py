@@ -189,11 +189,12 @@ class Buckets:
     bwd_working_set: int = 0  # 无重算层反向工作集（激活梯度 dL/dact，= forward_max_live − bwd_scratch，§8.5②）
     swap_buf: int = 0         # 激活 swap H2D 预取缓冲（BWD：复原当前卸载层 saves + 反向序后 depth 层在飞预取窗，双缓冲）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
+    optstep: int = 0          # 优化器-step 瞬态（②，真机 profiler）：AdamW 更新最大权重时物化的 k_opt 个 fp32 [weight] 临时（grad/Square/sqrt/m̂/update）；step 在反向后、激活已释，故与激活互斥
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
                 + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
-                + self.swap_buf + self.workspace)
+                + self.swap_buf + self.workspace + self.optstep)
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,7 @@ class MemBreakdown:
     bwd_working_set: int
     swap_buf: int
     workspace: int
+    optstep: int
     framework: int
 
 
@@ -421,7 +423,7 @@ class MemTimeline:
                     bd = MemBreakdown(
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
                         B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
-                        B.swap_buf, B.workspace,
+                        B.swap_buf, B.workspace, B.optstep,
                         framework_reserve,
                     )
                 if record_timeline:
@@ -528,6 +530,21 @@ class MemTimeline:
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = 0
                         # 该层反向结束，释放其 pinned 激活（(mb,lid) 唯一键，chunk 互斥→无碰撞）
                         B.act_live -= pinned.pop((ev_mb, lid))
+
+            # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
+            #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥。AdamW 逐参数更新，峰在
+            #   **最大单权重**：其 fp32 [weight] 临时（grad/grad-reduce/Square(g²)/sqrt(v̂)/m̂/update）
+            #   共 k_opt≈6 份（DSv3 8L pp=2 stage0 标定 10246；与 AdamW 更新 op 链数吻合）。权重取
+            #   resolved local_numel（已按 fsdp 切）→ dp_shard 大时该项小、不上峰（DSv3 4L 锚点不动）。
+            K_OPT = 6
+            max_w = max((w.local_numel for l in layers for op in l.ops for w in op.params),
+                        default=0)
+            if max_w > 0:
+                B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
+                B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
+                B.optstep = K_OPT * max_w * 4          # fp32 瞬态
+                rec("optstep")
+                B.optstep = 0
 
             res[stage] = StagePeak(
                 stage=stage,
