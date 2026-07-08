@@ -5,21 +5,33 @@
 只按**源序**遍历语句,用一张 SSA 表 `varname -> ref` 记录"哪个中间变量当前由哪个
 节点产出",从而在后续调用消费该变量时补一条数据流边 [producer_id, consumer_id]。
 
-设计取向(供 MLA / MoE 抽取任务扩展,勿加 MLP 专属 hack):
+设计取向(供 MLA / MoE 抽取任务扩展,勿加模型专属 hack):
   * 语句处理器(_handle_assign / _handle_call)与算子发射(_emit)解耦;
   * dtype 随 SSA 变量传播,Cast(含 `x.astype(dtype)`)会改写产出变量的 dtype;
-  * 未在 Pass B 绑定的 self.<name> 一律 **fail-loud**(静默丢算子 = DAG 少算子 = 错)。
+  * 未在 Pass B 绑定的 self.<name>:若是**本类(含基类 MRO)里的一个内部方法**(`def`)→
+    **内联展开**;否则 **fail-loud**(静默丢算子 = DAG 少算子 = 错)。
+
+内部方法内联(MLA 需要——construct 在基类、helper 在派生类):
+  * `_lookup_method(name)` 按 MRO(cls_name 起,沿同文件基类 BFS)找最贴近的 `def name`;
+  * 内联时把方法形参绑定到调用点实参:**Name 实参 → 直接复用调用方变量名**(共享 SSA / present /
+    known_none,数据流边跨内联边界连续);非 Name 实参 / 未传实参 → 帧内合成局部名(占位);
+  * 方法内的**局部变量**改写为帧唯一名 `<name>__i<frame>`(避免与调用方/兄弟帧同名互扰);
+  * 方法 `return <expr>` 值绑定回调用点赋值目标(元组按位对齐,别名到 producer);
+  * 递归内联(方法直接/间接自调用,或深度超上限)→ fail-loud。
 
 ref 串格式与 schema/bprop 一致:`"name:符号shape:dtype"`,三段、各段不含冒号;
 shape 此阶段一律占位 `?`(由后续 shape 解析任务回填)。
 """
 from __future__ import annotations
 import ast
+import copy
 
 from .schema import OpNode, OpDAG
 
 # 三态哨兵:一个 `if`/三元条件在剪枝上下文下无法由已知 config 判定。
 _UNDECIDED = object()
+# "已知存在(非 None)"的取值哨兵(用于 present_vars 走 `if v is not None:` 真支)。
+_PRESENT = object()
 
 # mindspore dtype 名 → 本库短标签(best-effort;未知名原样透传)。
 _DTYPE_ALIAS = {
@@ -30,6 +42,27 @@ _DTYPE_ALIAS = {
     "int32": "int32", "int64": "int64", "int16": "int16", "int8": "int8",
     "uint8": "uint8", "bool_": "bool", "bool": "bool",
 }
+
+
+class _ReturnSignal(Exception):
+    """内联方法体命中 `return` 的冒泡信号(携返回值表达式),供 _inline_method 捕获。"""
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+
+class _Renamer(ast.NodeTransformer):
+    """按 mapping 改写方法体里的 ast.Name.id(内联作用域重命名)。"""
+
+    def __init__(self, mapping: dict):
+        self.mapping = mapping
+
+    def visit_Name(self, node: ast.Name):
+        if node.id in self.mapping:
+            node.id = self.mapping[node.id]
+        return node
 
 
 def _dtype_name(expr) -> str | None:
@@ -68,16 +101,39 @@ def _self_attr(node) -> str | None:
     return None
 
 
-def _none_compare_var(left, right) -> str | None:
-    """识别 `<Name> is/is not None` 里的变量名(None 常量可在任一侧);不匹配返回 None。"""
-    for a, b in ((left, right), (right, left)):
-        if isinstance(a, ast.Name) and isinstance(b, ast.Constant) and b.value is None:
-            return a.id
+def _config_flag_name(node) -> str | None:
+    """识别 config-flag 引用,返回其扁平 flag 名:
+       `self.<name>` → <name>(如 hoist 的 self.use_dsa);
+       `self.config.<name>` → <name>(如 self.config.q_lora_rank)。
+    两者都在扁平 config_flags 字典里按叶子名查(不区分是否 hoist)。其它 → None。"""
+    if not isinstance(node, ast.Attribute):
+        return None
+    v = node.value
+    if isinstance(v, ast.Name) and v.id == "self":
+        return node.attr
+    if (isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name)
+            and v.value.id == "self" and v.attr == "config"):
+        return node.attr
     return None
+
+
+def _assigned_names(body) -> set:
+    """收集方法体(含嵌套 if 等)里所有被赋值的变量名——即"局部变量"候选。"""
+    names: set = set()
+    for top in body:
+        for n in ast.walk(top):
+            if isinstance(n, ast.Assign):
+                names |= set(_target_names(n.targets))
+            elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+                if isinstance(n.target, ast.Name):
+                    names.add(n.target.id)
+    return names
 
 
 class _Walker:
     """一次 construct 走查的可变状态容器(便于子类/后续任务复用与扩展)。"""
+
+    _INLINE_CAP = 8   # 内联深度上限(防失控递归);MLA 实测仅 2 层。
 
     def __init__(
         self,
@@ -86,6 +142,9 @@ class _Walker:
         config_flags: dict | None = None,
         none_vars: set | None = None,
         param_defaults: dict | None = None,
+        present_vars: set | None = None,
+        tree: ast.AST | None = None,
+        cls_name: str | None = None,
     ):
         self.binds = binds                 # self.<name> -> Binding(op, attrs)(Pass B 产)
         self.src_file = src_file
@@ -94,15 +153,23 @@ class _Walker:
         self.ssa: dict[str, str] = {}      # varname -> 当前 ref "name:?:dtype"
         self.producer: dict[str, int] = {} # varname -> 产出它的节点 id
         self._next_id = 1                  # 节点 id 从 1 单调递增
+        # ---- 内联支持:类层级 AST(找内部方法定义)+ 递归/帧状态 ----
+        self._tree = tree
+        self._cls_name = cls_name
+        self._inline_stack: list[str] = [] # 当前内联链(检测递归)
+        self._frame_seq = 0                # 帧号(局部变量改写唯一化)
         # ---- 剪枝上下文(§Task5):任一非 None 即"开启剪枝",此后不可判定的 if → fail-loud ----
-        self.config_flags: dict = dict(config_flags or {})   # self.<flag> / self.<attr>==字面量
+        self.config_flags: dict = dict(config_flags or {})   # self.<flag> / self.config.<flag>==字面量
         self.param_defaults: dict = dict(param_defaults or {})  # construct 形参的缺省值
+        self.present_vars: set = set(present_vars or ())     # 已知"存在(非 None)"的变量名
         # "已知为 None 的变量名":显式 none_vars ∪ 缺省即 None 的 construct 形参。
         self.known_none: set[str] = set(none_vars or ())
         for k, v in self.param_defaults.items():
             if v is None:
                 self.known_none.add(k)
-        self._pruning = any(x is not None for x in (config_flags, none_vars, param_defaults))
+        self._pruning = any(
+            x is not None for x in (config_flags, none_vars, param_defaults, present_vars)
+        )
 
     # ---- 语句层:按源序遍历,分派到具体处理器 ----
     def walk_body(self, body) -> None:
@@ -124,6 +191,10 @@ class _Walker:
                 # 无剪枝上下文 → 保持旧的"两支都按源序线性走查"行为(Task 4 回归)。
                 self.walk_body(stmt.body)
                 self.walk_body(stmt.orelse)
+        elif isinstance(stmt, ast.Return):
+            # 内联中的 return 冒泡给 _inline_method 捕获;顶层 construct 的 return 无 op,忽略。
+            if self._inline_stack:
+                raise _ReturnSignal(stmt.value)
         elif isinstance(stmt, ast.Raise):
             # 剪枝模式下:能"走到"一条 raise 说明它在被选中的分支里 → 选到了不支持的路径,fail-loud。
             # (未命中的 raise 守卫根本不会被 walk 到,天然跳过。)非剪枝模式忽略 raise。
@@ -132,23 +203,37 @@ class _Walker:
                     f"construct 剪枝命中被选中的 raise 分支（{self.src_file}:{stmt.lineno}）:"
                     f"`{self._describe(stmt)}` —— config 实际选到了不支持的路径,fail-loud"
                 )
-        # return / pass / For / While / 增强赋值等:当前不产 op(后续任务按需扩展)
+        # pass / For / While / 增强赋值等:当前不产 op(后续任务按需扩展)
 
     # ---- if 剪枝:求值条件,只走命中支 ----
     def _handle_if_pruned(self, stmt: ast.If) -> None:
         r = self._eval_test(stmt.test)
         if r is _UNDECIDED:
+            if self._is_pure_raise_guard(stmt):
+                # 纯断言守卫:条件不可判定、整支仅 raise、无 else —— 视作对合法输入恒成立的
+                # 校验断言(如 `if x.ndim != 3: raise`),跳过(不取 raise 支)而非 fail-loud。
+                # config 门控的 raise 守卫仍可判定(有对应 flag),故只有真·数据/形状断言落到这里。
+                return
             raise ValueError(
                 f"construct 的 if 条件无法由 config 判定（{self.src_file}:{stmt.lineno}）:"
                 f"`{self._describe(stmt.test)}` —— 剪枝上下文下拒绝双走(会重复计激活/内存),fail-loud"
             )
         self.walk_body(stmt.body if r else stmt.orelse)
 
+    @staticmethod
+    def _is_pure_raise_guard(stmt: ast.If) -> bool:
+        return (not stmt.orelse) and bool(stmt.body) and all(
+            isinstance(s, ast.Raise) for s in stmt.body
+        )
+
     def _handle_assign(self, stmt: ast.Assign) -> None:
         val = stmt.value
         targets = _target_names(stmt.targets)
         if isinstance(val, ast.Call):
             self._handle_call(val, targets)
+        elif isinstance(val, ast.Subscript) and isinstance(val.value, ast.Call):
+            # `out = self.linear(x)[0]`:下标只是选调用的某个输出张量 → 按内层 Call 发射算子。
+            self._handle_call(val.value, targets)
         elif isinstance(val, ast.IfExp):
             # 三元:`self.act(x) if <cond> else x`。按 config 求值,只落命中侧那个表达式。
             self._handle_ifexp(val, targets)
@@ -179,7 +264,7 @@ class _Walker:
             if prod is not None:
                 self.producer[t] = prod
 
-    # ---- 调用层:识别 self.<name>(...) 与 <expr>.astype(dtype) 两种形态 ----
+    # ---- 调用层:识别 self.<name>(...) / 内部方法内联 / <expr>.astype(dtype) ----
     def _handle_call(self, call: ast.Call, target_names: list[str]) -> None:
         func = call.func
         # 形态一:self.<name>(...)
@@ -187,17 +272,22 @@ class _Walker:
             name = func.attr
             binding = self.binds.get(name)
             if binding is None:
-                # fail-loud:未绑定算子决不能静默跳过(否则 DAG 缺算子 → 代价算错)
+                # 未绑定:先看它是不是本类(含基类)里的内部方法 → 内联;否则 fail-loud。
+                method = self._lookup_method(name)
+                if method is not None:
+                    self._inline_method(method, call, target_names)
+                    return
                 raise ValueError(
                     f"construct 调用了未绑定的 self.{name}(...)（{self.src_file}:{call.lineno}）:"
-                    f"Pass B(init_binder)未覆盖此名,fail-loud"
+                    f"Pass B(init_binder)未覆盖此名、且非本类内部方法,fail-loud"
                 )
             if binding.op == "Cast":
-                # cast 目标 dtype 取第 2 个位置实参(idx=1):self.cast(x, ms.float32)
+                # cast 目标 dtype 取第 2 个位置实参(idx=1):self.cast(x, ms.float32 / self.compute_dtype)
                 out_dtype = self._resolve_cast_dtype(call.args, 1, binding.attrs)
             else:
                 out_dtype = binding.attrs.get("compute_dtype") or "bf16"
-            self._emit(binding.op, binding.attrs, call.lineno, list(call.args), target_names, out_dtype)
+            arg_exprs = self._expand_args(call.args, binding.attrs)
+            self._emit(binding.op, binding.attrs, call.lineno, arg_exprs, target_names, out_dtype)
             return
         # 形态二:<expr>.astype(<dtype>) —— 视作 Cast(dtype 传播关键路径)
         if isinstance(func, ast.Attribute) and func.attr == "astype":
@@ -205,6 +295,115 @@ class _Walker:
             self._emit("Cast", {}, call.lineno, [func.value], target_names, out_dtype)
             return
         # 其它调用(非 self.、非 astype):当前不产 op(后续任务按需扩展)
+
+    @staticmethod
+    def _expand_args(args, attrs: dict):
+        """variadic 算子(concat/stack 等)接受一个"张量列表"作单实参 → 摊平其元素为多操作数。
+        非 variadic 算子原样返回(reshape 的形状元组等靠 _emit 只取 Name 实参天然忽略)。"""
+        if not attrs.get("variadic"):
+            return list(args)
+        out = []
+        for a in args:
+            if isinstance(a, (ast.List, ast.Tuple)):
+                out.extend(a.elts)
+            else:
+                out.append(a)
+        return out
+
+    # ---- 内部方法内联 ----
+    def _find_class(self, name: str):
+        if self._tree is None:
+            return None
+        return next(
+            (n for n in ast.walk(self._tree)
+             if isinstance(n, ast.ClassDef) and n.name == name),
+            None,
+        )
+
+    def _lookup_method(self, name: str):
+        """按 MRO(cls_name 起沿同文件基类 BFS)找最贴近的 `def name`,找不到返回 None。"""
+        if self._tree is None or self._cls_name is None:
+            return None
+        seen: set = set()
+        queue = [self._cls_name]
+        while queue:
+            c = queue.pop(0)
+            if c in seen:
+                continue
+            seen.add(c)
+            cls = self._find_class(c)
+            if cls is None:
+                continue
+            m = next(
+                (n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name),
+                None,
+            )
+            if m is not None:
+                return m
+            for b in cls.bases:
+                if isinstance(b, ast.Name):
+                    queue.append(b.id)
+        return None
+
+    def _inline_method(self, method: ast.FunctionDef, call: ast.Call, target_names: list[str]) -> None:
+        name = method.name
+        if name in self._inline_stack:
+            raise ValueError(
+                f"construct 内联检测到递归调用 self.{name}(...)（{self.src_file}:{call.lineno}）:"
+                f"内联链 {' -> '.join(self._inline_stack + [name])},fail-loud"
+            )
+        if len(self._inline_stack) >= self._INLINE_CAP:
+            raise ValueError(
+                f"construct 内联深度超过上限 {self._INLINE_CAP}"
+                f"(self.{name} @ {self.src_file}:{call.lineno}),fail-loud"
+            )
+        frame = self._frame_seq
+        self._frame_seq += 1
+        param_rename = self._bind_params(method, call, frame)
+        locals_ = _assigned_names(method.body) - set(param_rename.keys())
+        mapping = {loc: f"{loc}__i{frame}" for loc in locals_}
+        mapping.update(param_rename)   # 形参绑定优先(复用调用方变量名)
+
+        body_copy = [copy.deepcopy(s) for s in method.body]
+        renamer = _Renamer(mapping)
+        body_copy = [renamer.visit(s) for s in body_copy]
+
+        self._inline_stack.append(name)
+        ret = None
+        try:
+            self.walk_body(body_copy)
+        except _ReturnSignal as sig:
+            ret = sig.value
+        finally:
+            self._inline_stack.pop()
+        self._bind_return(ret, target_names)
+
+    def _bind_params(self, method: ast.FunctionDef, call: ast.Call, frame: int) -> dict:
+        params = [a.arg for a in method.args.args if a.arg != "self"]
+        pos = list(call.args)
+        kw = {k.arg: k.value for k in call.keywords if k.arg is not None}
+        rename: dict = {}
+        for i, p in enumerate(params):
+            if i < len(pos):
+                arg = pos[i]
+            elif p in kw:
+                arg = kw[p]
+            else:
+                arg = None   # 未传实参 → 用方法自带默认(此处按帧内合成局部处理)
+            if isinstance(arg, ast.Name):
+                rename[p] = arg.id            # 复用调用方变量名(共享 SSA / present / known_none)
+            else:
+                rename[p] = f"{p}__i{frame}"  # 非 Name 实参 / 缺省 → 帧内合成局部名(占位)
+        return rename
+
+    def _bind_return(self, ret_expr, target_names: list[str]) -> None:
+        if ret_expr is None or not target_names:
+            return
+        elts = ret_expr.elts if isinstance(ret_expr, (ast.Tuple, ast.List)) else [ret_expr]
+        for tgt, e in zip(target_names, elts):
+            if isinstance(e, ast.Name):
+                self._alias([tgt], e.id)
+            # 返回项非 Name(字面量/调用等):该目标不登记 producer(下游若消费则占位 ref)
 
     # ---- 条件求值层(剪枝):返回 True / False / _UNDECIDED,决不"猜" ----
     def _eval_test(self, test):
@@ -218,13 +417,15 @@ class _Walker:
         if isinstance(test, ast.Compare):
             return self._eval_compare(test)
         if isinstance(test, ast.Attribute):
-            # `if self.<flag>:` → bool(config_flags[flag])
-            nm = _self_attr(test)
+            # `if self.<flag>:` / `if self.config.<flag>:` → bool(config_flags[flag])
+            nm = _config_flag_name(test)
             if nm is not None and nm in self.config_flags:
                 return bool(self.config_flags[nm])
             return _UNDECIDED
         if isinstance(test, ast.Name):
-            # `if <var>:` —— 已知 None → False;有非 None 缺省 → 取其真值
+            # `if <var>:` —— present → True;已知 None → False;有非 None 缺省 → 取其真值
+            if test.id in self.present_vars:
+                return True
             if test.id in self.known_none:
                 return False
             if test.id in self.param_defaults:
@@ -252,28 +453,36 @@ class _Walker:
             return _UNDECIDED
         op = node.ops[0]
         left, right = node.left, node.comparators[0]
-        # `<x> is/is not None`
+        lk, lv = self._value(left)
+        rk, rv = self._value(right)
+        # `<x> is/is not <y>`(两侧都要能求成已知值——None 或 present 哨兵或 config 字面量)
         if isinstance(op, (ast.Is, ast.IsNot)):
-            var = _none_compare_var(left, right)
-            if var is None:
-                return _UNDECIDED
-            if var in self.known_none:
-                val_is_none = True
-            elif var in self.param_defaults:
-                val_is_none = self.param_defaults[var] is None
-            else:
-                return _UNDECIDED
-            return val_is_none if isinstance(op, ast.Is) else (not val_is_none)
+            if lk and rk:
+                res = (lv is rv)
+                return res if isinstance(op, ast.Is) else (not res)
+            return _UNDECIDED
         # `<x> ==/!= 字面量`
         if isinstance(op, (ast.Eq, ast.NotEq)):
-            lk, lv = self._value(left)
-            rk, rv = self._value(right)
             if not (lk and rk):
                 return _UNDECIDED
-            return (lv == rv) if isinstance(op, ast.Eq) else (lv != rv)
+            res = (lv == rv)
+            return res if isinstance(op, ast.Eq) else (not res)
+        # 数值序比较 `<x> >/>=/</<= <y>`
+        if isinstance(op, (ast.Gt, ast.GtE, ast.Lt, ast.LtE)):
+            if not (lk and rk):
+                return _UNDECIDED
+            try:
+                if isinstance(op, ast.Gt):
+                    return lv > rv
+                if isinstance(op, ast.GtE):
+                    return lv >= rv
+                if isinstance(op, ast.Lt):
+                    return lv < rv
+                return lv <= rv
+            except TypeError:
+                return _UNDECIDED
         # `<x> in (字面量...)` / `not in`
         if isinstance(op, (ast.In, ast.NotIn)):
-            lk, lv = self._value(left)
             if not lk or not isinstance(right, (ast.Tuple, ast.List)):
                 return _UNDECIDED
             elts = []
@@ -287,13 +496,16 @@ class _Walker:
         return _UNDECIDED
 
     def _value(self, node):
-        """把一个表达式求成"已知 config 值":返回 (known: bool, value)。"""
+        """把一个表达式求成"已知值":返回 (known: bool, value)。
+        value 可为 config 字面量 / None / _PRESENT 哨兵。"""
         if isinstance(node, ast.Constant):
             return True, node.value
-        nm = _self_attr(node)  # self.<attr> → config_flags
+        nm = _config_flag_name(node)  # self.<flag> / self.config.<flag> → config_flags
         if nm is not None and nm in self.config_flags:
             return True, self.config_flags[nm]
         if isinstance(node, ast.Name):
+            if node.id in self.present_vars:
+                return True, _PRESENT
             if node.id in self.known_none:
                 return True, None
             if node.id in self.param_defaults:
@@ -308,10 +520,17 @@ class _Walker:
             return ast.dump(node)
 
     def _resolve_cast_dtype(self, args, idx: int, attrs: dict) -> str:
-        """解析一次 cast 的目标 dtype:优先 idx 位置实参,其次 attrs['to_dtype'],
+        """解析一次 cast 的目标 dtype:优先 idx 位置实参
+        (`self.<dtype_flag>` → config_flags;或 ms.float32 字面量),其次 attrs['to_dtype'],
         最后保守 fp32(cast 多用于升精度)。"""
         if len(args) > idx:
-            d = _dtype_name(args[idx])
+            a = args[idx]
+            nm = _config_flag_name(a)                 # self.compute_dtype → config_flags['compute_dtype']
+            if nm is not None and nm in self.config_flags:
+                v = self.config_flags[nm]
+                if isinstance(v, str):
+                    return _DTYPE_ALIAS.get(v, v)
+            d = _dtype_name(a)
             if d:
                 return d
         if attrs.get("to_dtype"):
@@ -359,41 +578,41 @@ def walk_construct(
     config_flags: dict | None = None,
     none_vars: set | None = None,
     param_defaults: dict | None = None,
+    present_vars: set | None = None,
 ) -> OpDAG:
     """走查 `cls_name` 的 construct(),把每个 self.<name>(...) 调用落成 OpNode,返回 op-DAG。
 
     参数:
       src            — Cell 源码字符串(不执行,仅 ast 解析)
-      cls_name       — 目标类名
+      cls_name       — 目标类名(construct 可继承自基类;内部方法按 MRO 内联)
       binds          — Pass B 产的 {self.<name> -> Binding(op, attrs)}
       src_file       — 源文件名,用于 OpNode.src=file:line 回指
-      config_flags   — 可选。{"gated_linear_unit": True, "activation_type": "swiglu", ...}:
-                       求值 `if self.<flag>:`(→ bool(flag))与 `if self.<attr> ==/!=/in 字面量:`。
-      none_vars      — 可选。已知为 None 的变量名集合(如 bias 关闭时的 bias_parallel);
-                       用于 `if <var> is [not] None:`。
-      param_defaults — 可选。construct 形参在"不传实参"时的缺省值(如 {"per_token_scale": None});
-                       缺省即 None 的形参并入 none_vars 语义,让顶部守卫 `if x is not None: raise` 剪掉。
+      config_flags   — 可选。{"gated_linear_unit": True, "q_lora_rank": 1536, ...}:
+                       求值 `if self.<flag>:` / `if self.config.<flag>:` 与各类字面量比较。
+      none_vars      — 可选。已知为 None 的变量名集合(如 bias 关闭时的 bias_parallel)。
+      param_defaults — 可选。construct 形参在"不传实参"时的缺省值(如 {"rotary_pos_cos": None})。
+      present_vars   — 可选。已知"存在(非 None)"的变量名(如 MLA 恒传的 rotary_pos_emb):
+                       让 `if v is not None:` 判 True、走 rope apply 等"输入存在"支。
 
-    剪枝语义:config_flags/none_vars/param_defaults **任一非 None 即开启剪枝**——此后每个 `if`
-    只走 config 命中支;**不可判定的 if → fail-loud**(拒绝双走:静默重复计激活比响亮停下更糟)。
-    三者全为 None 时保持旧的"两支都线性走查"行为(Task 4 回归不受影响)。
+    剪枝语义:config_flags/none_vars/param_defaults/present_vars **任一非 None 即开启剪枝**——
+    此后每个 `if` 只走 config 命中支;**不可判定的 if → fail-loud**,唯一例外是"纯断言守卫"
+    (条件不可判定、整支仅 raise、无 else)按对合法输入恒成立跳过。四者全为 None 时保持旧的
+    "两支都线性走查"行为(Task 4 回归不受影响)。
 
+    未绑定的 self.<name>:若是本类(含基类)内部方法则内联展开,否则 fail-loud。
     找不到类或其 construct 方法时 fail-loud(ValueError)。
     """
     tree = ast.parse(src)
-    cls = next(
-        (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls_name),
-        None,
-    )
-    if cls is None:
+    if next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls_name), None) is None:
         raise ValueError(f"源码里找不到 class {cls_name}(fail-loud)")
-    construct = next(
-        (n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "construct"),
-        None,
-    )
-    if construct is None:
-        raise ValueError(f"class {cls_name} 缺少 construct 方法(fail-loud)")
 
-    walker = _Walker(binds, src_file, config_flags, none_vars, param_defaults)
+    walker = _Walker(
+        binds, src_file, config_flags, none_vars, param_defaults, present_vars,
+        tree=tree, cls_name=cls_name,
+    )
+    construct = walker._lookup_method("construct")  # 支持 construct 定义在基类
+    if construct is None:
+        raise ValueError(f"class {cls_name}(及其基类)缺少 construct 方法(fail-loud)")
+
     walker.walk_body(construct.body)
     return OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges)

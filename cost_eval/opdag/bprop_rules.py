@@ -52,6 +52,10 @@ def derive_saves(dag) -> list[Save]:
             idxs = spec["inputs"]
         for i in idxs:
             name, shape, dtype = _parse(n.ins[i])
+            if n.op == "Norm":
+                # fp32-残差机制:layernorm_compute_dtype=fp32 时归一化在 fp32 计算并存 fp32 输入,
+                # 覆盖操作数 ref 里传播来的 compute_dtype(bf16)。无该 attr 则用 ref dtype(回归安全)。
+                dtype = n.attrs.get("ln_compute_dtype", dtype)
             saves.setdefault(name, Save(name, dtype, n.id, shape))
         if spec.get("output"):
             name, shape, dtype = _parse(n.out)

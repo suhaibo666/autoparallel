@@ -12,7 +12,12 @@ _CLS2OP = {
     "Mul":   ("Elementwise", {"linear": False}),
     "Cast":  ("Cast", {}),
     "Reshape": ("View", {}), "Transpose": ("View", {}), "SplitWithSize": ("View", {}),
-    "Shape": ("View", {}),
+    "Shape": ("View", {}), "ExpandDims": ("View", {}), "Tile": ("View", {}),
+    # concat/stack:接受"张量列表"作单实参 → variadic(摊平为多操作数);反向仅切片,不存激活 → View。
+    "Concat": ("View", {"variadic": True}),
+    # RoPE 应用(ApplyRotaryPosEmb):对 q/k 的位置分量做旋转 = **线性正交变换**(cos/sin 为位置常量),
+    # 反向不需存激活 → Elementwise(linear=True)。构造点 `ApplyRotaryPosEmb(config)` 直接实例化。
+    "ApplyRotaryPosEmb": ("Elementwise", {"linear": True, "rope": True}),
     # 具名 linear/attention/norm/activation 由 construct 调用点解析(build_module/get_activation),此处不绑。
 }
 

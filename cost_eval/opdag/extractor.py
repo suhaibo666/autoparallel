@@ -69,6 +69,41 @@ def _defining_class(tree: ast.AST, cls_name: str, method: str) -> str | None:
     return None
 
 
+def _init_classes(tree: ast.AST, cls_name: str) -> list[str]:
+    """MRO(derived→base)里**所有定义了 __init__ 的类**,按 BFS 顺序返回。
+
+    MLA 需要:`MLASelfAttention.__init__`(建 q/kv 投影、rope、split 等)+ 基类
+    `MultiLatentAttention.__init__`(建 core_attention、linear_proj、shape/cast/reshape 等)——
+    两级 __init__ 的绑定都要合并,否则 construct 里 `self.shape` / `self.cast` 会缺绑 fail-loud。
+    (MLPInterleaved 自身无 __init__ → 只返回基类 MLP,与旧 _defining_class 行为一致。)
+    """
+    order: list[str] = []
+    seen: set[str] = set()
+    queue = [cls_name]
+    while queue:
+        cname = queue.pop(0)
+        if cname in seen:
+            continue
+        seen.add(cname)
+        cls = _find_class(tree, cname)
+        if cls is None:
+            continue
+        if _method_of(cls, "__init__") is not None:
+            order.append(cname)
+        for base in cls.bases:
+            if isinstance(base, ast.Name):
+                queue.append(base.id)
+    return order
+
+
+# dtype 名归一(与 construct_walker 的短标签一致)。
+_DTYPE_SHORT = {
+    "float32": "fp32", "fp32": "fp32", "float": "fp32",
+    "bfloat16": "bf16", "bf16": "bf16", "bfloat": "bf16",
+    "float16": "fp16", "fp16": "fp16", "half": "fp16",
+}
+
+
 # ── __init__ 里的具名模块绑定 ─────────────────────────────────────────────────
 def _named_module_binds(
     tree: ast.AST, init_cls: str, spec: ResolvedSpec, config_flags: dict, src_file: str
@@ -79,6 +114,10 @@ def _named_module_binds(
         raise ValueError(f"extractor: {init_cls} 无 __init__（fail-loud）")
 
     compute_dtype = config_flags.get("compute_dtype", "bf16")
+    # 归一化层的计算/保存 dtype(fp32-残差机制);缺省 fp32(norm 常在 fp32 统计)。
+    ln_compute_dtype = _DTYPE_SHORT.get(
+        config_flags.get("layernorm_compute_dtype", "fp32"), "fp32"
+    )
     # activation 是否存在:未显式给 activation_type 视作存在;显式给 None → 不绑定(activation_func=None)。
     act_type_given = "activation_type" in config_flags
     act_type = config_flags.get("activation_type")
@@ -99,7 +138,9 @@ def _named_module_binds(
         fname = fn.id if isinstance(fn, ast.Name) else None
 
         if fname == "build_module":
-            binds[name] = _bind_build_module(stmt.value, name, spec, compute_dtype, src_file)
+            binds[name] = _bind_build_module(
+                stmt.value, name, spec, compute_dtype, ln_compute_dtype, src_file
+            )
         elif fname == "get_activation":
             if activation_present:
                 binds[name] = Binding(
@@ -111,7 +152,8 @@ def _named_module_binds(
 
 
 def _bind_build_module(
-    call: ast.Call, self_name: str, spec: ResolvedSpec, compute_dtype: str, src_file: str
+    call: ast.Call, self_name: str, spec: ResolvedSpec, compute_dtype: str,
+    ln_compute_dtype: str, src_file: str
 ) -> Binding:
     if not call.args:
         raise ValueError(
@@ -138,7 +180,11 @@ def _bind_build_module(
             raise ValueError(
                 f"extractor: 叶子类 {leaf!r} 不在 LEAF_OPTYPE（self.{self_name} @ {src_file}）—— fail-loud"
             )
-        return Binding(op=op, attrs={"module": leaf, "compute_dtype": compute_dtype})
+        attrs = {"module": leaf, "compute_dtype": compute_dtype}
+        if op == "Norm":
+            # 归一化层在 fp32 计算并存 fp32 输入(fp32-残差机制)→ 供 bprop_rules 把该 Norm 输入按 fp32 计。
+            attrs["ln_compute_dtype"] = ln_compute_dtype
+        return Binding(op=op, attrs=attrs)
     raise ValueError(
         f"extractor: submodules.{field} 解出非法类型 {leaf!r}（self.{self_name}）—— fail-loud"
     )
@@ -198,6 +244,7 @@ def extract_cell(
     cls_name: str,
     spec: ResolvedSpec,
     config_flags: dict,
+    present_params: set | None = None,
 ) -> OpDAG:
     """读真 mindformers Cell 源,按 config 剪枝,产出其 op-DAG。
 
@@ -206,7 +253,11 @@ def extract_cell(
       cell_file_relpath — Cell 源文件相对 mf_root 的路径(用 "/" 分隔)。
       cls_name          — 目标 Cell 类名(其 construct 被走查;__init__ 可继承自基类)。
       spec              — 该 Cell 的 ResolvedSpec(submodules 字段 → 叶子类名 / 子 ResolvedSpec)。
-      config_flags      — config 派生的 flags(gated_linear_unit / activation_type / add_bias_linear / ...)。
+      config_flags      — config 派生的 flags(gated_linear_unit / activation_type / q_lora_rank /
+                          compute_dtype / layernorm_compute_dtype / ...)。
+      present_params    — 可选。construct 形参中"缺省 None 但真机总被传入"的名字(如 MLA 的
+                          rotary_pos_emb):从 param_defaults 移除并标记为 present,让
+                          `if rotary_pos_emb is not None:` 判 True(走 rope apply 支)。
     行为
       找不到源 / 无法解析具名模块 / 剪枝时遇不可判定 if → fail-loud(ValueError)。
     """
@@ -221,12 +272,15 @@ def extract_cell(
     if _find_class(tree, cls_name) is None:
         raise ValueError(f"extractor: {src_file} 里找不到 class {cls_name}（fail-loud）")
 
-    # 1) 找到实际定义 __init__ 的类(可能是基类),做基础 + 具名绑定。
-    init_cls = _defining_class(tree, cls_name, "__init__")
-    if init_cls is None:
+    # 1) 沿 __init__ 的 MRO 链(base→derived)做基础 + 具名绑定并合并(derived 覆盖 base)。
+    init_classes = _init_classes(tree, cls_name)   # derived→base
+    if not init_classes:
         raise ValueError(f"extractor: {cls_name} 及其基类均无 __init__（fail-loud）")
-    base_binds = bind_init(src, init_cls)
-    named = _named_module_binds(tree, init_cls, spec, config_flags, src_file)
+    base_binds: dict[str, Binding] = {}
+    named: dict[str, Binding] = {}
+    for cname in reversed(init_classes):           # base 先绑,derived 后绑覆盖
+        base_binds.update(bind_init(src, cname))
+        named.update(_named_module_binds(tree, cname, spec, config_flags, src_file))
     combined = {**base_binds, **named}
 
     # 2) walker 的 config_flags:透传 + 注入 activation_func 真值(由 activation_type 决定其是否为 None)。
@@ -240,12 +294,15 @@ def extract_cell(
         # activation_type 为 None:construct 里 `self.activation_func` 恒 falsy。
         walker_flags["activation_func"] = False
 
-    # 3) none_vars(bias 关闭)/ param_defaults(缺省即 None 的形参)。
+    # 3) none_vars(bias 关闭)/ param_defaults(缺省即 None 的形参)/ present_vars(真机总传入的形参)。
     if config_flags.get("add_bias_linear", False):
         none_vars: set[str] = set()
     else:
         none_vars = _bias_none_vars(tree, cls_name, combined)
     param_defaults = _construct_none_defaults(tree, cls_name)
+    present = set(present_params or ())
+    for p in present:
+        param_defaults.pop(p, None)   # present 覆盖"缺省 None":该形参按存在处理
 
     # 4) 走查 + 剪枝。
     return walk_construct(
@@ -256,4 +313,5 @@ def extract_cell(
         config_flags=walker_flags,
         none_vars=none_vars,
         param_defaults=param_defaults,
+        present_vars=present,
     )
