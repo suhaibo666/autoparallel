@@ -391,11 +391,15 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
 # 做子串匹配）。真机实测（`transformer_layer.py:100/134`）:注意力 cell = `self_attention`、FFN cell
 # = **`mlp`**（**非 `feed_forward`**——用错名会静默匹配不到、recompute 不生效,真机 profiler 已证:
 # `select_module:feed_forward` 时 GroupedMatmul 仍 live、峰值≈无重算）。子串集清晰隔离 attn vs ffn:
+# **cell 边界对齐（真机 transformer_layer.py:92/100/126/134）**:`input_layernorm`(ln1) 与
+# `pre_mlp_layernorm`(ln2) 是**独立 cell**,与 `self_attention`/`mlp` 平级 → 重算 self_attention/mlp
+# **不含** ln1/ln2（它们保留）；残差 add 也在 cell 外。故子串集**排除 ln1/ln2/add1/add2**（否则会多重算
+# layernorm 输出、少估保留量）。q_a/kv_a 的 latent-norm 属 attention cell 内 → 保留在集内。
 _SELECT_MODULE_OPS = {
-    # 注意力段（mla/gqa）:ln1/linear_q*/linear_kv*/q_a/kv_a/rope/flash/o_proj/add1
-    "self_attention": {"ln1", "linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj", "add1"},
-    # FFN/MoE 段:ln2/fc/swiglu/gelu/router/dispatch/e_*/combine/shared/add2
-    "mlp": {"ln2", "fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared", "add2"},
+    # self_attention cell:linear_q*/linear_kv*/q_a/kv_a(latent norm)/rope/flash/o_proj（不含 ln1/add1）
+    "self_attention": {"linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj"},
+    # mlp cell:fc/swiglu/gelu/router/dispatch/e_*/combine/shared（不含 ln2/add2）
+    "mlp": {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared"},
 }
 
 
