@@ -344,7 +344,8 @@ class MemTimeline:
     def simulate(self, g, recompute, swap, pm, static_persistent: dict,
                  framework_reserve: int, max_device_memory: int,
                  grad_dtype_bytes: int = 4, record_timeline: bool = False,
-                 alloc_block_bytes: int = 1, cross_entropy_fused: bool = False) -> dict:
+                 alloc_block_bytes: int = 1, cross_entropy_fused: bool = False,
+                 norm_compute_dtype_bytes: int = 0) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -385,7 +386,8 @@ class MemTimeline:
             sm_by_id = {
                 l.layer_id: estimate_structure_memory(
                     l.ops, grad_dtype_bytes=grad_dtype_bytes,
-                    alloc_block_bytes=alloc_block_bytes)
+                    alloc_block_bytes=alloc_block_bytes,
+                    norm_compute_dtype_bytes=norm_compute_dtype_bytes)
                 for l in layers
             }
             # 选择性重算：每层按选择器（op 名/类型子串）把 op 划分为选中/非选中，预算三桶
@@ -396,7 +398,8 @@ class MemTimeline:
                     l.ops,
                     (lambda op, _lid=l.layer_id: recompute.op_matches(
                         _lid, op.name, getattr(op.type, "value", op.type))),
-                    alloc_block_bytes=alloc_block_bytes)
+                    alloc_block_bytes=alloc_block_bytes,
+                    norm_compute_dtype_bytes=norm_compute_dtype_bytes)
                 for l in layers if recompute.is_select(l.layer_id)
             }
             # 实际卸载到 CPU 的层集（三态互斥：recompute 优先于 swap，与 FWD `saved=0` 分支同条件）。

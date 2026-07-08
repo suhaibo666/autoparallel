@@ -63,6 +63,7 @@ class LLMConfig:
 
     # ---- 归一化 / 位置编码（结构相关部分）----
     normalization: str = "RMSNorm"          # RMSNorm | LayerNorm
+    layernorm_compute_dtype_bytes: int = 4  # norm 计算 dtype（真机 layernorm_compute_dtype，一般 fp32=4）→ norm 激活 fp32
     norm_placement: str = "pre"             # pre | post | sandwich
     qk_layernorm: bool = False              # Q/K 上加 norm
     position_embedding_type: str = "rope"   # rope | learned_absolute | none
@@ -143,5 +144,6 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         num_residual_streams=cfg.num_residual_streams,
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
         cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
+        norm_compute_dtype_bytes=cfg.layernorm_compute_dtype_bytes,   # norm 激活 fp32（真机 layernorm_compute_dtype）
         dtype_bytes=cfg.compute_dtype_bytes,
     )

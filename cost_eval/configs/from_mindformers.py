@@ -296,6 +296,8 @@ def _build_llm_config(model: dict) -> LLMConfig:
         add_bias_linear=bool(model.get("add_bias_linear", False)),
         add_qkv_bias=bool(model.get("add_qkv_bias", False)),
         compute_dtype_bytes=_dtype_bytes(model.get("compute_dtype"), 2),
+        # layernorm 计算 dtype（真机 layernorm_compute_dtype，一般 float32）→ norm 激活 fp32（保留 fp32 cast）
+        layernorm_compute_dtype_bytes=_dtype_bytes(model.get("layernorm_compute_dtype"), 4),
     )
 
     # dsv4_hybrid 前沿字段（仅该变体设，否则留 LLMConfig 默认 → 对 mla/gqa 惰性）。

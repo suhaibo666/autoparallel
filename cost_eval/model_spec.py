@@ -42,6 +42,10 @@ class DimTable:
     # gated_linear_unit（SwiGLU）：True→fc1 输出 2·F（gate+up）；False→ungated MLP，fc1 输出 F
     # （plain gelu/relu，D-6）。默认 True（现有全部 spec 走 SwiGLU，故 DSv3/preset 不变）。
     gated_linear_unit: bool = True
+    # layernorm/RMSNorm 计算 dtype 的字节数（真机 `layernorm_compute_dtype`，一般 fp32=4）：norm 在
+    # fp32 下算,会**保留输入的 fp32 cast 副本**供反向（真机 profiler 的 Cast 大头）。默认 4=fp32
+    # （主流配置）。=2 时退回 bf16（compute dtype）。仅影响 norm op 的 saved 激活字节（fp32 = 2× bf16）。
+    norm_compute_dtype_bytes: int = 4
     # 交叉熵是否融合 kernel（①，真机 profiler）：False=unfused pynative log_softmax+NLL op 链
     #   （无重算下 ~8 满 vocab fp32 中间量共存，fat）；True=fused kernel（精简 ~3，如 DSv4 生产）。
     #   默认 False（pynative 常态）。仅在**无重算 + unfused** 下 loss bwd_scratch fat（mem_timeline ①）。

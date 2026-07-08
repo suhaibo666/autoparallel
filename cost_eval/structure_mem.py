@@ -57,7 +57,31 @@ def _align_up(nbytes: int, block: int) -> int:
     return ((nbytes + block - 1) // block) * block
 
 
-def _forward_max_live(resolved_ops, blk: int) -> int:
+def _norm_save_names(resolved_ops) -> set:
+    """norm-type op（layernorm/RMSNorm）**保留的输入**激活名集合——真机 fp32 compute 下保留输入的
+    fp32 cast 供反向（profiler 的 Cast 大头）。**只标 op.saves**（保留的输入 fp32）：norm 输出会被
+    下游 cast 回 bf16、不 fp32；且该 fp32 cast 是**反向保留量**，只进 activation_saves（no-recompute
+    act_live），**不进 forward_max_live**（重算瞬态里 fp32 cast 转瞬即释、不共存,故 full 重算不受影响,
+    DSv3 锚点不动）。"""
+    out = set()
+    for op in resolved_ops:
+        tv = getattr(getattr(op, "type", ""), "value", getattr(op, "type", ""))
+        # 仅 **layernorm/RMSNorm**（layernorm_compute_dtype 驱动）；**排除 softmax/logsoftmax**
+        # ——它是 softmax_compute_dtype 的事、且 loss 区 logsm/probs 已显式建 fp32,勿重复放大 logits。
+        if tv == "norm" and "softmax" not in op.name.lower():
+            for s in op.saves:
+                out.add(s.name)
+    return out
+
+
+def _dt(tensor, norm_names: set, norm_dtype: int) -> int:
+    """张量字节 dtype:norm 保留的激活按 norm_compute_dtype（fp32）,其余按自身 dtype。"""
+    if norm_dtype and tensor.name in norm_names:
+        return max(tensor.dtype_bytes, norm_dtype)
+    return tensor.dtype_bytes
+
+
+def _forward_max_live(resolved_ops, blk: int, norm_names: set = frozenset(), norm_dtype: int = 0) -> int:
     """mini-forward 时间线求**峰值工作集**（设计 §8.5②）。
 
     逐 op 顺序走一遍，维护"当前存活激活张量"集合：某 op 的 `output` 变为存活；某激活作为
@@ -83,7 +107,7 @@ def _forward_max_live(resolved_ops, blk: int) -> int:
         acts.append(op.output)                      # output 恒为激活
         for t in acts:
             if t.name not in byt:
-                byt[t.name] = _align_up(t.local_numel * t.dtype_bytes, blk)
+                byt[t.name] = _align_up(t.local_numel * _dt(t, norm_names, norm_dtype), blk)
                 first[t.name] = i
             last[t.name] = i
     peak = 0
@@ -101,6 +125,7 @@ def estimate_structure_memory(
     opt_state_bytes: int = 0,
     grad_dtype_bytes: int = 4,
     alloc_block_bytes: int = 1,
+    norm_compute_dtype_bytes: int = 0,
 ) -> StructureMemory:
     """把一段属于同一结构的 ResolvedOp 汇总成 `StructureMemory`（按名去重）。
 
@@ -137,7 +162,10 @@ def estimate_structure_memory(
                     f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
                     f"（切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
             persistent += _align_up((w.local_numel // divisor) * opt_state_bytes, blk)
-    activation_saves = sum(_align_up(s.local_numel * s.dtype_bytes, blk) for s in saves.values())
+    # norm 激活 fp32（真机 layernorm_compute_dtype=fp32 → 保留输入 fp32 cast，profiler 的 Cast 大头）
+    norm_names = _norm_save_names(resolved_ops) if norm_compute_dtype_bytes else frozenset()
+    activation_saves = sum(_align_up(s.local_numel * _dt(s, norm_names, norm_compute_dtype_bytes), blk)
+                           for s in saves.values())
     param_full_bytes = sum(_align_up(w.local_numel * w.dtype_bytes, blk) for w in params.values())
     grad_full_bytes = sum(_align_up(w.local_numel * grad_dtype_bytes, blk) for w in params.values())
     bwd_scratch = sum(getattr(op, "bwd_scratch_bytes", 0) for op in resolved_ops)
@@ -150,6 +178,8 @@ def estimate_structure_memory(
             checkpoint_input = _align_up(s.local_numel * s.dtype_bytes, blk)
             break
 
+    # forward_max_live（重算瞬态）**不用 norm fp32**：重算时 fp32 cast 转瞬即释、不与峰值共存,
+    # full 重算 DSv3 锚点 12409.5 逐字节不动（只 no-recompute act_live 的 saved fp32 cast 长驻）。
     forward_max_live = _forward_max_live(resolved_ops, blk)
 
     return StructureMemory(
@@ -236,7 +266,8 @@ def _pinned_input_boundary(selected, pinned_names, blk: int) -> int:
     return total
 
 
-def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int = 1) -> SelectMemory:
+def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int = 1,
+                           norm_compute_dtype_bytes: int = 0) -> SelectMemory:
     """按 `is_selected(op) -> bool` 把一层 op 划分为选中/非选中，算选择性重算三桶。
 
     复用 `estimate_structure_memory` 的 rollup / 去重 / `forward_max_live` 机理（不另写一份）：
@@ -254,8 +285,10 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
     selected = [op for op in ops if is_selected(op)]
     nonselected = [op for op in ops if not is_selected(op)]
 
-    sm_sel = estimate_structure_memory(selected, alloc_block_bytes=blk)
-    sm_non = estimate_structure_memory(nonselected, alloc_block_bytes=blk)
+    sm_sel = estimate_structure_memory(selected, alloc_block_bytes=blk,
+                                       norm_compute_dtype_bytes=norm_compute_dtype_bytes)
+    sm_non = estimate_structure_memory(nonselected, alloc_block_bytes=blk,
+                                       norm_compute_dtype_bytes=norm_compute_dtype_bytes)
 
     # 层入口 checkpoint_input（重算边界，始终保留）：整层第一个有 saves 的 op 的首个 save。
     ci_name = None

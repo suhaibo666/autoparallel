@@ -89,8 +89,14 @@ persistent = so · ( N_dense / fsdp  +  N_expert / efsdp )
 
 **通式**(每个 saved 张量,符号 shape `(S,B,d)`):
 ```
-byte(tensor) = ⌈ (S/σS) · B · (d/τ) · bc ⌉_blk       τ = tp（该维 tp 切）else 1
+byte(tensor) = ⌈ (S/σS) · B · (d/τ) · b(tensor) ⌉_blk    τ = tp（该维 tp 切）else 1
+b(tensor) = 4  若该 save 由 **layernorm/RMSNorm op** 产出（layernorm_compute_dtype=fp32,保留输入
+                fp32 cast 供反向,真机 profiler 的 Cast 大头）——**排除 softmax/logsoftmax**（另属 loss 区）
+          = bc 否则（compute dtype,bf16=2）
 ```
+> **norm 激活 fp32**（`layernorm_compute_dtype_bytes`,默认 4；`DimTable.norm_compute_dtype_bytes`）:norm
+> 在 fp32 下算 → 保留输入的 fp32 cast（2× bf16）。仅进 **activation_saves**（no-recompute act_live 长驻）,
+> **不进 forward_max_live**（重算瞬态里 fp32 cast 转瞬即释,故 full 重算 DSv3 锚点 12409.5 不动）。
 
 **逐层足迹**(GQA + dense 为例,略 blk 取整):
 ```
@@ -233,8 +239,8 @@ DSv3 8L 无重算 pp=2(`B=2, S=4096, V=129280, H=1792`):
 | pp2-stage0(优化器 step) | 10246 | 10311 | 1.006 |
 | pp2-stage1(loss,k_ce=8) | 45655 | 43659 | 0.956 |
 | **cp2-none(loss,k_ce=4)** | 20119 | 18326 | **0.911**（修前 2.17× 过预测） |
-| select self_attention | 18828 | 15361 | 0.816 ⚠️ |
-| DSv4-fused | 15415 | 14336 | 0.930 ⚠️ |
+| select self_attention | 18828 | 15488 | 0.823 ⚠️ |
+| DSv4-fused | 15415 | 14915 | **0.968**（fp32 norm 后,较 0.930 提升） |
 
 **Bug A(loss ÷cp)+ k_ce 制度化把 cp 从 2.17× 过预测拉回 0.91**（真机机理正确）。cp2 full 的 0.998 现是
 **真的对齐**（此前 0.996 是 B=1·full-S 与 B=2·S/cp 数值抵消蒙对,见 §7）。**select/DSv4 仍欠预测**（见 §15）。
@@ -244,8 +250,8 @@ DSv3 8L 无重算 pp=2(`B=2, S=4096, V=129280, H=1792`):
 | select_module（cell 名） | 真机 | 估计器 | ratio |
 |---|---|---|---|
 | both(≈full,退化端) | 13953 | 13833 | **0.991** ✅ |
-| `self_attention`（重算attn,留FFN） | 18828 | 15361 | **0.816** ⚠️ |
-| **`mlp`**（重算FFN,留attn） | **15765** | 14554 | **0.923** |
+| `self_attention`（重算attn,留FFN） | 18828 | 15488 | **0.823** ⚠️ |
+| **`mlp`**（重算FFN,留attn） | **15765** | 14822 | **0.940** |
 | ~~`feed_forward`~~（**错名,已作废**） | ~~19967~~ | — | 真机静默不重算 |
 
 > [!important] **真机 cell 名坑（2026-07-08 定位,用户指出）**:transformer 层 FFN cell = **`mlp`**
