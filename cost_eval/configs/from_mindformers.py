@@ -387,8 +387,25 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     )
 
 
+# mindformers transformer 层的 **cell 名** → 评估器 op 图对应 op 名子串集（`RecomputeSpec.op_matches`
+# 做子串匹配）。真机实测（`transformer_layer.py:100/134`）:注意力 cell = `self_attention`、FFN cell
+# = **`mlp`**（**非 `feed_forward`**——用错名会静默匹配不到、recompute 不生效,真机 profiler 已证:
+# `select_module:feed_forward` 时 GroupedMatmul 仍 live、峰值≈无重算）。子串集清晰隔离 attn vs ffn:
+_SELECT_MODULE_OPS = {
+    # 注意力段（mla/gqa）:ln1/linear_q*/linear_kv*/q_a/kv_a/rope/flash/o_proj/add1
+    "self_attention": {"ln1", "linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj", "add1"},
+    # FFN/MoE 段:ln2/fc/swiglu/gelu/router/dispatch/e_*/combine/shared/add2
+    "mlp": {"ln2", "fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared", "add2"},
+}
+
+
 def _build_recompute(mf: dict) -> RecomputeSpec:
-    """`recompute` 段 → `RecomputeSpec`。无段 → mode="None"。full_recompute_layer 0-indexed decoder → +1 偏移。"""
+    """`recompute` 段 → `RecomputeSpec`。无段 → mode="None"。full_recompute_layer 0-indexed decoder → +1 偏移。
+
+    **select（D-3，真机配置生效）**:`select_module: {cell_name: [ranges]}` → 逐层 op 子串集。
+    cell_name 须是真机 transformer 层的真实 cell 名（`self_attention` / `mlp`）——用错名（如 `feed_forward`）
+    真机会静默不重算,故转换器 fail-loud 未知 cell 名,避免"配置貌似生效实则空转"。
+    """
     rc = mf.get("recompute")
     if not rc:
         return RecomputeSpec(mode="None", full_layers=set())
@@ -399,9 +416,20 @@ def _build_recompute(mf: dict) -> RecomputeSpec:
         return RecomputeSpec(mode="full", full_layers={i + 1 for i in decoder_layers})
     if mode in ("None", None, "none", ""):
         return RecomputeSpec(mode="None", full_layers=set())
+    if mode == "select":
+        sel_mod = rc.get("select_module") or {}
+        select_ops: dict = {}
+        for cell_name, ranges in sel_mod.items():
+            if cell_name not in _SELECT_MODULE_OPS:
+                raise NotImplementedError(
+                    f"select_module cell 名 {cell_name!r} 未映射（支持 {sorted(_SELECT_MODULE_OPS)};"
+                    "真机 transformer 层 cell 名 = self_attention / mlp,`feed_forward` 是错名、真机不生效）。")
+            ops = _SELECT_MODULE_OPS[cell_name]
+            for i in _parse_layer_ranges(ranges):        # 0-indexed decoder → 评估器层 i+1
+                select_ops.setdefault(i + 1, set()).update(ops)
+        return RecomputeSpec(mode="select", select_ops=select_ops)
     raise NotImplementedError(
-        f"recompute.mode={mode!r} 暂未映射（转换器支持 'full' / 'None'；select 细粒度需 select_module 映射，"
-        "见 D-3 / RecomputeSpec.select_ops）。")
+        f"recompute.mode={mode!r} 暂未映射（转换器支持 'full' / 'None' / 'select'）。")
 
 
 def _build_optimizer(mf: dict) -> OptimizerSpec:

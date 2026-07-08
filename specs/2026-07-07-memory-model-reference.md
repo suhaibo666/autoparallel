@@ -239,18 +239,25 @@ DSv3 8L 无重算 pp=2(`B=2, S=4096, V=129280, H=1792`):
 **Bug A(loss ÷cp)+ k_ce 制度化把 cp 从 2.17× 过预测拉回 0.91**（真机机理正确）。cp2 full 的 0.998 现是
 **真的对齐**（此前 0.996 是 B=1·full-S 与 B=2·S/cp 数值抵消蒙对,见 §7）。**select/DSv4 仍欠预测**（见 §15）。
 
-**选择性重算(D-3,真机 2026-07-07,DSv3 8L dp=2)**——`recompute:{mode:select,select_module:{M:[0-7]}}`:
+**选择性重算(D-3,真机 2026-07-08 修正配置后,DSv3 8L dp=2)**——`recompute:{mode:select,select_module:{cell:[0-7]}}`:
 
-| select_module | 真机 | 估计器 | ratio |
+| select_module（cell 名） | 真机 | 估计器 | ratio |
 |---|---|---|---|
 | both(≈full,退化端) | 13953 | 13833 | **0.991** ✅ |
-| `self_attention` | 18828 | 15361 | **0.816** ⚠️ |
-| `feed_forward` | 19967 | 14554 | **0.729** ⚠️ |
+| `self_attention`（重算attn,留FFN） | 18828 | 15361 | **0.816** ⚠️ |
+| **`mlp`**（重算FFN,留attn） | **15765** | 14554 | **0.923** |
+| ~~`feed_forward`~~（**错名,已作废**） | ~~19967~~ | — | 真机静默不重算 |
 
-**退化端(both==full)精确**,但**部分选择系统性欠预测 ~18-27%(OOM-不安全)**。根因非 D-3 机制,
-而是**保留模块(尤其 MoE)的无重算激活 + 反向工作集**在 loss 峰值处欠计——**同 §D-10 ①/D-5 一族**
-(profiler:峰值 live 里 14×112 MiB + 大量 FFN/MoE 小张量尾未建全)。详见
-`analysis/realmachine/select_attn/DIAGNOSIS.md`。
+> [!important] **真机 cell 名坑（2026-07-08 定位,用户指出）**:transformer 层 FFN cell = **`mlp`**
+> （`transformer_layer.py:134`），**非 `feed_forward`**。用 `feed_forward` → `_set_pattern_recompute`
+> 匹配不到任何 cell → **FFN 根本没重算**（真机 profiler:GroupedMatmul 仍 1232 live、峰值 19967≈无重算）。
+> 换 `mlp` 后:log 打印 `layer0: mlp`（生效）、GroupedMatmul **0 live**（FFN 真被重算）、峰值降到 15765。
+> **修正后排序自洽**:真机 keep-FFN(18828) > keep-attn(15765);估计器 self_attn(15361) > mlp(14554)——
+> 方向一致（此前"排序反了"纯是 feed_forward 错名的假象）。转换器已 fail-loud 未知 cell 名。
+
+**退化端(both==full)精确;修正后 select 欠预测收窄到 0.82-0.92**（`mlp` 0.923）。残差是**保留模块的
+fp32 cast 横切量 + 小中间量**在 loss 峰值欠计（同 §D-10 ①/D-5 一族,简化 op 图未建 fp32 cast/view 物化）。
+详见 `analysis/realmachine/{select_attn,select_mlp}/`。
 
 ## 15. 诚实边界 + 已知栈限制
 

@@ -8,14 +8,18 @@ mindformers 配置：`recompute: {mode: select, select_module: {<module>: [0-7]}
 | select_module | 真机 MiB | 估计器 MiB | ratio | 备注 |
 |---|---|---|---|---|
 | `self_attention` | **18828.2** | 15361.5 | **0.816** | 重算 attn、保 FFN saves |
-| `feed_forward` | **19967.3** | 14553.6 | **0.729** | 重算 FFN、保 attn saves |
+| **`mlp`**（重算 FFN） | **15764.7** | 14553.6 | **0.923** | 重算 FFN、保 attn saves（**正确 cell 名**） |
+| ~~`feed_forward`~~ | ~~19967.3~~ | — | — | **错名,真机静默不重算,已作废** |
 | both（attn+ffn ≈ full） | 13953（≈full 锚点） | 13833.1 | **0.991** ✅ | 退化 = full 重算，精确 |
-| 参照 full | 13953 | 13833.1 | 0.99 | |
-| 参照 none | 26182（est） | 26182.0 | — | |
 
-**关键**：**退化端（both ≈ full）精确 0.991**，但**部分选择系统性欠预测**（0.82 / 0.73，OOM-不安全向）。
-且真机呈现一个**反转**：真机重算 FFN 比重算 attn 省得多（19967>18828 → 说明 **attn saves 更大**），
-而估计器预测反了（15361>14553）——估计器把 attn/FFN 的保留激活量级估反了。
+> [!correction] **2026-07-08 更正（用户指出真机配置问题）**:原 `feed_forward` **19967 是假数据**——
+> transformer 层 FFN cell 名是 **`mlp`**（`transformer_layer.py:134`），`feed_forward` 匹配不到任何 cell →
+> **FFN 根本没被重算**（profiler:GroupedMatmul 仍 1232 live、峰值≈无重算）。换 **`mlp`**:log 打 `layer0: mlp`、
+> GroupedMatmul **0 live**、峰值 **15764.7**。**"排序反了"是错名假象**——修正后真机 keep-FFN(18828) >
+> keep-attn(15765)、估计器 self_attn(15361) > mlp(14554)，**方向一致**。
+
+**关键**：**退化端（both ≈ full）精确 0.991**；修正 cell 名后 select 欠预测收窄到 **0.82-0.92**（不再有假的"排序反了"）。
+残差是**保留模块的 fp32 cast 横切量 + 小中间量**在 loss 峰值欠计（简化 op 图未建）。
 
 ## 峰值 live-set 重构（`operator_memory.csv`，self_attention，alloc≤T_peak<release）
 

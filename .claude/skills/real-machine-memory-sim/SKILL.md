@@ -239,8 +239,12 @@ ssh 192.168.9.116 "docker exec shb.ms.2.9 bash -lc 'TAG=<t> LAYERS=8 DP=<n|-1> T
   PORT=<uniq> CARDS=<i,j> W=<workers> bash $REF/run_axis.sh'"
 ssh ... "grep -h MEMPROBE $REF/log_<t>/worker_*.log"
 ```
-**选择性重算**（D-3，`SELECT=self_attention:0-7` / `feed_forward:0-7` → `mode:select`+`select_module`）
-**已验证可跑**：DSv3 8L dp=2 → self_attention **18828**、feed_forward **19967**、both≈full **13953**。
+**选择性重算**（D-3，`SELECT=<cell>:0-7` → `mode:select`+`select_module`）。**⚠ cell 名必须对**:
+transformer 层 FFN cell = **`mlp`**（`transformer_layer.py:134`），**不是 `feed_forward`**！用错名
+`_set_pattern_recompute` 匹配不到 → **静默不重算**（GroupedMatmul 仍 live、峰值≈无重算）。查生效:
+worker log 里 `Final Select Recompute Configuration Map` → `layerN: mlp`。attn cell = `self_attention`。
+**已验证**：DSv3 8L dp=2 → `self_attention` **18828**、**`mlp`** **15765**（重算FFN真生效,GroupedMatmul 0）、
+both≈full **13953**。（`feed_forward` **19967 是错名假数据**——真机没重算,已作废。）
 估计器退化端(both==full)精确 0.991，但**部分选择欠预测**（0.816/0.729，保留 MoE 无重算激活尾欠计，
 见 `analysis/realmachine/select_attn/DIAGNOSIS.md`、参考页 §14）。
 

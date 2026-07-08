@@ -283,3 +283,31 @@ def test_core_has_no_hard_yaml_import():
     top_level = [ln for ln in src.splitlines()
                  if ln.startswith("import yaml") or ln.startswith("from yaml")]
     assert not top_level, f"纯核不应顶层 import yaml：{top_level}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# select recompute 映射（D-3 / 真机配置生效，2026-07-08）：mindformers cell 名 self_attention / mlp
+#   → 评估器 op 子串集。真机实测 FFN cell = `mlp`（非 `feed_forward`——错名真机静默不重算,GroupedMatmul
+#   仍 live、峰值≈无重算）。转换器 fail-loud 未知 cell 名,避免"配置貌似生效实则空转"。
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_select_module_maps_self_attention_and_mlp():
+    from cost_eval.configs.from_mindformers import _build_recompute
+    rc_a = _build_recompute({"recompute": {"mode": "select", "select_module": {"self_attention": ["0-7"]}}})
+    rc_m = _build_recompute({"recompute": {"mode": "select", "select_module": {"mlp": ["0-7"]}}})
+    assert rc_a.mode == "select" and rc_m.mode == "select"
+    # 0-indexed decoder → 评估器层 i+1；attn 子串命中 attention op、不命中 FFN
+    assert "flash" in rc_a.select_ops[1] and "o_proj" in rc_a.select_ops[1]
+    assert "ln2" not in rc_a.select_ops[1] and "combine" not in rc_a.select_ops[1]
+    # mlp 子串命中 FFN op、不命中 attention
+    assert "combine" in rc_m.select_ops[1] and "swiglu" in rc_m.select_ops[1]
+    assert "flash" not in rc_m.select_ops[1] and "o_proj" not in rc_m.select_ops[1]
+    assert rc_a.select_ops.get(8) and rc_m.select_ops.get(8)   # range 0-7 → 层 1..8
+
+
+def test_select_module_feed_forward_fails_loud():
+    """`feed_forward` 是错的 cell 名（真机 FFN cell = mlp）——真机用它会静默不重算,故转换器 fail-loud。"""
+    import pytest
+    from cost_eval.configs.from_mindformers import _build_recompute
+    with pytest.raises(NotImplementedError, match="feed_forward"):
+        _build_recompute({"recompute": {"mode": "select", "select_module": {"feed_forward": ["0-7"]}}})
