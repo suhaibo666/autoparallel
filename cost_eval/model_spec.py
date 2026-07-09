@@ -50,6 +50,12 @@ class DimTable:
     #   （无重算下 ~8 满 vocab fp32 中间量共存，fat）；True=fused kernel（精简 ~3，如 DSv4 生产）。
     #   默认 False（pynative 常态）。仅在**无重算 + unfused** 下 loss bwd_scratch fat（mem_timeline ①）。
     cross_entropy_fused: bool = False
+    # **标定 margin 因子**（B 方案，2026-07-09；非 op 图导出）：保留(非重算)模块在 loss 峰的
+    #   fp32-cast 横切 + 小张量长尾占「当前 kept 激活」的比例。源码级 op-DAG 提取证实此残差**在 op 图
+    #   粒度之下**（profiler live-set 313 个 <100MiB 碎片，`analysis/realmachine/opdag_validation.md`），
+    #   非 op 图可导出 → 明示为标定常数。默认 0=不加（回归安全，full/cp-full 锚点不破）。仅 loss-BWD 事件、
+    #   对 select-kept / no-recompute 层生效（mem_timeline kept_frag 桶）。
+    kept_frag_factor: float = 0.0
     dtype_bytes: int = 2
 
     def as_dict(self) -> dict:

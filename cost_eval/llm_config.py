@@ -72,6 +72,11 @@ class LLMConfig:
     tie_word_embeddings: bool = False       # tie→无独立 lm_head 权重
     loss_type: str = "logsoftmax_nll"       # logsoftmax_nll | chunked | vocab_parallel_ce
     cross_entropy_fused: bool = False        # ①：融合 CE kernel（DSv4=True lean）/ unfused pynative（False，无重算下 fat）
+    # **标定 margin 因子**（B 方案，2026-07-09；非 op 图导出，明示为标定常数）：select 重算下**保留-MoE**层
+    #   在 loss 峰的 fp32-cast 横切 + 小张量长尾（占当前 kept-MoE 激活的比例）。源码级 op-DAG 提取证实此
+    #   残差**在 op 图粒度之下**（profiler live-set 313 个 <100MiB 碎片，`analysis/realmachine/opdag_validation.md`）
+    #   → 无法从显式 op 导出，退标定。默认 0=关（回归安全）。仅 select-kept-MoE 生效（mem_timeline kept_frag）。
+    kept_frag_factor: float = 0.0
     chunk_loss_num: int = 0                 # >1：分块 CE，降 loss 区峰值
     embedding_params_dtype_bytes: int = 4   # embedding/输出 fp32
 
@@ -145,5 +150,6 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
         cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
         norm_compute_dtype_bytes=cfg.layernorm_compute_dtype_bytes,   # norm 激活 fp32（真机 layernorm_compute_dtype）
+        kept_frag_factor=cfg.kept_frag_factor,   # B 标定 margin（select-kept-MoE loss 峰碎片长尾）
         dtype_bytes=cfg.compute_dtype_bytes,
     )

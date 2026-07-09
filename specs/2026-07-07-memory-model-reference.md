@@ -250,8 +250,14 @@ DSv3 8L 无重算 pp=2(`B=2, S=4096, V=129280, H=1792`):
 | select_module（cell 名） | 真机 | 估计器 | ratio |
 |---|---|---|---|
 | both(≈full,退化端) | 13953 | 13833 | **0.991** ✅ |
-| `self_attention`（重算attn,留FFN） | 18828 | 15488 | **0.823** ⚠️ |
-| **`mlp`**（重算FFN,留attn） | **15765** | 14822 | **0.940** |
+| `self_attention`（重算attn,留FFN） | 18828 | 15488→**18844** | 0.823→**1.001** ✅（B margin） |
+| **`mlp`**（重算FFN,留attn） | **15765** | 14822 | **0.940**（不动,MoE 被重算） |
+
+> [!note] **B 标定 margin（2026-07-09,`kept_frag_factor`）**:select-keep-FFN 的 0.823 欠预测经源码级
+> op-DAG 提取定位为**保留-MoE 层 loss 峰的 fp32-cast+小张量长尾**（op 图粒度之下,`opdag_validation.md`）
+> → 明示为**标定常数**（DSv3 preset=1.9,自本行 18828 标定,= 1.9× 当前 kept-MoE 激活）。仅 select-kept-MoE
+> 生效（`mem_timeline._is_kept`）:keep-FFN → **1.001**（OOM-安全）;keep-attn（MoE 被重算）/full/no-recompute
+> **不触发**→ 逐字节不动（0.940 / 12409.5 / pp2 0.962 全保）。融合-CE（DSv4）loss_lids 空 → 亦不触发。
 | ~~`feed_forward`~~（**错名,已作废**） | ~~19967~~ | — | 真机静默不重算 |
 
 > [!important] **真机 cell 名坑（2026-07-08 定位,用户指出）**:transformer 层 FFN cell = **`mlp`**

@@ -190,11 +190,12 @@ class Buckets:
     swap_buf: int = 0         # 激活 swap H2D 预取缓冲（BWD：复原当前卸载层 saves + 反向序后 depth 层在飞预取窗，双缓冲）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
     optstep: int = 0          # 优化器-step 瞬态（②，真机 profiler）：AdamW 更新最大权重时物化的 k_opt 个 fp32 [weight] 临时（grad/Square/sqrt/m̂/update）；step 在反向后、激活已释，故与激活互斥
+    kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
                 + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
-                + self.swap_buf + self.workspace + self.optstep)
+                + self.swap_buf + self.workspace + self.optstep + self.kept_frag)
 
 
 @dataclass(frozen=True)
@@ -211,6 +212,7 @@ class MemBreakdown:
     workspace: int
     optstep: int
     framework: int
+    kept_frag: int = 0
 
 
 @dataclass(frozen=True)
@@ -345,7 +347,8 @@ class MemTimeline:
                  framework_reserve: int, max_device_memory: int,
                  grad_dtype_bytes: int = 4, record_timeline: bool = False,
                  alloc_block_bytes: int = 1, cross_entropy_fused: bool = False,
-                 norm_compute_dtype_bytes: int = 0) -> dict:
+                 norm_compute_dtype_bytes: int = 0,
+                 kept_frag_factor: float = 0.0) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -437,7 +440,7 @@ class MemTimeline:
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
                         B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
                         B.swap_buf, B.workspace, B.optstep,
-                        framework_reserve,
+                        framework_reserve, B.kept_frag,
                     )
                 if record_timeline:
                     series.append(TimelineSample(len(series), tag, t, bd))
@@ -448,6 +451,24 @@ class MemTimeline:
 
             # (mb, layer_id) -> saved bytes currently pinned in act_live
             pinned: dict = {}
+            # 保留-MoE 层当前驻留激活之和（kept_frag margin 用）。碎片长尾主要来自 **MoE 的
+            # dispatch/permute/router + grouped-GEMM 的 fp32 cast**（select_attn 真机 live-set 主导）。
+            # margin **仅 gate 到「select 重算下 MoE/FFN 被保留」的层**——这是唯一**严重且未被补偿**的
+            # 残差族（真机 select_attn 0.823）：
+            #   - full 层 / loss 层：不计（→ margin 0，12409.5/cp-full 锚点不破）；
+            #   - select-attn（重算 attn、留 FFN）：MoE 保留 → 计（sa 靶心，0.823→≥0.95）；
+            #   - select-mlp（重算 FFN）：MoE 已重算 → 不计（sm 0.940 保持准确、不推过头）；
+            #   - **no-recompute（None）不计**：pp2-stage1(0.962)/cp2-none(0.911) 的欠预测已由 k_ce
+            #     制度化平衡（另一族），再加此 margin 会双算过预测 → 明确排除。
+            # 随 FWD pin / BWD pop 同步。
+            kept_act = 0
+            _FFN_MARKERS = {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared"}
+
+            def _is_kept(lid):
+                # 仅 select 重算、且 FFN 未被选中重算（选择器不含 FFN 标记）→ MoE 保留。
+                if not recompute.is_select(lid) or lid in loss_lids:
+                    return False
+                return not (set(recompute.selectors(lid)) & _FFN_MARKERS)
 
             # D-4：把调度统一成 steps=[(kind, mb, ev_layers)]。
             #   v>1（交错式 VPP）：**chunk 粒度** —— 每虚拟步只处理一个 chunk(L/V 层)，忠实 Megatron
@@ -487,6 +508,8 @@ class MemTimeline:
                             saved = sm.activation_saves               # 全量 saves（去重）
                         pinned[(ev_mb, lid)] = saved
                         B.act_live += saved
+                        if _is_kept(lid):
+                            kept_act += saved
                     # 该虚拟步(v>1: 一个 chunk / v<=1: 整 stage)所有层 pin 完毕 → FWD 峰
                     rec("fwd_end")
 
@@ -546,11 +569,21 @@ class MemTimeline:
                             # transformer 层 bwd_scratch=0 → = forward_max_live（此前欠建的反向工作集）。
                             B.bwd_working_set = max(
                                 0, sm.forward_max_live - sm.bwd_scratch)
+                        # **标定 margin**（B 方案，2026-07-09）：保留(非重算)模块在 loss 峰的
+                        #   fp32-cast 横切 + 小张量长尾——源码级 op-DAG 提取证实此残差**在 op 图粒度之下**
+                        #   （profiler live-set 313 个 <100MiB 碎片，opdag_validation.md），非 op 图可导出 →
+                        #   明示为**标定常数**（factor × 当前 kept 激活），仅 loss-BWD 事件生效、与 loss 区共存那一刻。
+                        #   full 重算 kept_act=0 → 0（12409.5/cp-full 锚点不破）；无-loss stage 无 loss_lids → 不触发。
+                        if kept_frag_factor and lid in loss_lids and kept_act > 0:
+                            B.kept_frag = round(kept_frag_factor * kept_act)
                         rec(f"bwd@{lid}")
                         B.gather_buf = B.grad_buf = B.recomp_scratch = 0
-                        B.bwd_scratch = B.bwd_working_set = B.swap_buf = 0
+                        B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
                         # 该层反向结束，释放其 pinned 激活（(mb,lid) 唯一键，chunk 互斥→无碰撞）
-                        B.act_live -= pinned.pop((ev_mb, lid))
+                        _popped = pinned.pop((ev_mb, lid))
+                        B.act_live -= _popped
+                        if _is_kept(lid):
+                            kept_act -= _popped
 
             # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
             #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥。AdamW 逐参数更新，峰在

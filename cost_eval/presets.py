@@ -52,6 +52,11 @@ def deepseek_v3(num_layers: int = 4) -> LLMConfig:
         first_k_dense_replace=1,
         loss_type="logsoftmax_nll",
         compute_dtype_bytes=2,
+        # B 标定 margin（2026-07-09）：select 重算下保留-MoE 层 loss 峰的 fp32-cast+碎片长尾
+        #   （op 图粒度之下，源码级 op-DAG 提取证实，见 opdag_validation.md）。标定自真机
+        #   select_attn（DSv3 8L）：18828 vs 无 margin 15488 → 缺口 = 1.9× 当前 kept-MoE 激活 → ~1.00（OOM-安全）。
+        #   仅 select-kept-MoE 生效；full/no-recompute/select-keep-attn 不触发（锚点不破，见 mem_timeline._is_kept）。
+        kept_frag_factor=1.9,
     )
 
 

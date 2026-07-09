@@ -64,10 +64,16 @@ router one-hot、shared-expert `super().construct()` saves、grouped-GEMM 操作
 **已赢**：① 可再推导 op-DAG（核心诉求）；② 字节级交叉验证手写模型（grouped-GEMM 对齐、fp32-norm 确认）；
 ③ 独立证明手写 op 图那部分无误。**闭合不了的**：18% 残差（op 图粒度之下的长尾）。
 
-**待用户定方向**（A/B/C）：
-- **A** T10 抽显式长尾 + 剩余标定 margin（忠实有限度）；
-- **B** 直接给 select/no-recompute 保留模块 loss 峰一个 profiler 标定 margin（明示为标定常数，最快、OOM-安全）；
-- **C** 到此收尾（提取已达核心目标；残差为已知文档化限制）。
+**方向已定 = B（2026-07-09 用户裁决，已实现）**：给 **select-kept-MoE** 层 loss 峰一个 profiler 标定 margin
+`kept_frag_factor`（DSv3 preset=1.9，自 select_attn 18828 标定），明示为标定常数。
+- **效果**：select_attn（keep-FFN，靶心）**0.823 → 1.001**（OOM-安全）;keep-attn（MoE 被重算）/full/
+  no-recompute（pp2-stage1 0.962）/融合-CE（DSv4）**全不触发、逐字节不动**（`mem_timeline._is_kept`
+  gate:仅 `is_select` 且 FFN 未被重算）。硬门 12409.5 不破。421 测试绿。
+- **实现**：`mem_timeline` 新增 `kept_frag` 桶（仅 loss-BWD 事件、按 1.9× 当前 kept-MoE 激活计）；
+  `DimTable/LLMConfig.kept_frag_factor`（默认 0=回归安全）;preset + 转换器（MoE 且非融合-CE）注入;
+  `tests/test_kept_frag_margin.py` 锁定。
+- **诚实边界**：1.9 是 coarse 平台常数（自 DSv3 单锚点标定），非 op 图导出;其它 select-kept-MoE 配置
+  （不同 S/B/层数）近似覆盖、未逐一真机核对。A（T10 抽显式长尾）为可选后续深化，非本轮。
 
 ## 关联
 - `specs/2026-07-08-source-grounded-opgraph-design.md`（三阶段+oracle、R1/R2/R3）
