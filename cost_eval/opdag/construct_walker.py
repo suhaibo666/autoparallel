@@ -42,6 +42,17 @@ class SubExtract:
     param_names: list = field(default_factory=list)
     returns: list = field(default_factory=list)
 
+# 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
+# flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
+DIRECT_OP_MAP = {
+    "GroupedMatmul": ("GroupedMatMul", {"flatten": True}),  # MoE 分组 GEMM(experts_forward)
+    "Reshape": ("View", {}),                                # Morph 里的 Reshape()(x, shp)
+}
+
+# 张量方法(链式 `<expr>.method(...)`)里视作纯视图/元数据(反向不新增激活)的方法名。
+_VIEW_METHODS = {"reshape", "view", "transpose", "swapaxes", "flatten", "expand_dims",
+                 "tile", "permute", "squeeze", "unsqueeze"}
+
 # 三态哨兵:一个 `if`/三元条件在剪枝上下文下无法由已知 config 判定。
 _UNDECIDED = object()
 # "已知存在(非 None)"的取值哨兵(用于 present_vars 走 `if v is not None:` 真支)。
@@ -160,6 +171,7 @@ class _Walker:
         tree: ast.AST | None = None,
         cls_name: str | None = None,
         subcell_resolver=None,
+        method_aliases: dict | None = None,
     ):
         self.binds = binds                 # self.<name> -> Binding(op, attrs)(Pass B 产)
         self.src_file = src_file
@@ -170,6 +182,8 @@ class _Walker:
         self._next_id = 1                  # 节点 id 从 1 单调递增
         # ---- 子 Cell 递归内联:resolver(cell_name, field, bare) -> SubExtract(None=不递归) ----
         self._subcell_resolver = subcell_resolver
+        # ---- Morph(self.method) 别名:self.<attr> -> 被 Morph 包裹的方法名(调用点内联该方法)----
+        self._method_aliases: dict = dict(method_aliases or {})
         self.construct_params: list[str] = []   # construct 形参(去 self),供上层做子内联时按位重映射
         self.returns: list = []                 # construct 返回值分类(见 SubExtract.returns)
         self._param_set: set[str] = set()
@@ -317,36 +331,76 @@ class _Walker:
         func = call.func
         # 形态一:self.<name>(...)
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
-            name = func.attr
-            binding = self.binds.get(name)
-            if binding is None:
-                # 未绑定:先看它是不是本类(含基类)里的内部方法 → 内联;否则 fail-loud。
-                method = self._lookup_method(name)
-                if method is not None:
-                    self._inline_method(method, call, target_names)
-                    return
-                raise ValueError(
-                    f"construct 调用了未绑定的 self.{name}(...)（{self.src_file}:{call.lineno}）:"
-                    f"Pass B(init_binder)未覆盖此名、且非本类内部方法,fail-loud"
-                )
-            if binding.op == "SubCell" and self._subcell_resolver is not None:
-                # 子 Cell:递归抽取其 DAG,并在调用点内联(镜像内部方法内联的 SSA/边/id 处理)。
-                self._inline_subcell(binding.attrs, call, target_names)
-                return
-            if binding.op == "Cast":
-                # cast 目标 dtype 取第 2 个位置实参(idx=1):self.cast(x, ms.float32 / self.compute_dtype)
-                out_dtype = self._resolve_cast_dtype(call.args, 1, binding.attrs)
-            else:
-                out_dtype = binding.attrs.get("compute_dtype") or "bf16"
-            arg_exprs = self._expand_args(call.args, binding.attrs)
-            self._emit(binding.op, binding.attrs, call.lineno, arg_exprs, target_names, out_dtype)
+            self._handle_self_call(call, func.attr, target_names)
             return
-        # 形态二:<expr>.astype(<dtype>) —— 视作 Cast(dtype 传播关键路径)
+        # 形态二:直接实例化即调用的算子 `OpClass(...)(...)`(如 GroupedMatmul(split_item=3)(...)、Reshape()(x,shp))。
+        if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id in DIRECT_OP_MAP:
+            op, attrs = DIRECT_OP_MAP[func.func.id]
+            arg_exprs = self._expand_args(call.args, {"variadic": True}) if attrs.get("flatten") else list(call.args)
+            self._emit(op, attrs, call.lineno, arg_exprs, target_names, attrs.get("compute_dtype") or "bf16")
+            return
+        # 形态三:链式方法 `<innercall>.method(...)`(如 self.swiglu(x).reshape(...)):先发射内层算子,再处理外层方法。
+        if isinstance(func, ast.Attribute) and isinstance(func.value, (ast.Call, ast.Subscript)):
+            self._handle_chained_call(call, func, target_names)
+            return
+        # 形态四:`<expr>.astype(<dtype>)`(expr 为 Name/Attribute)—— 视作 Cast(dtype 传播关键路径)。
         if isinstance(func, ast.Attribute) and func.attr == "astype":
             out_dtype = self._resolve_cast_dtype(call.args, 0, {})  # astype 目标 dtype 在 idx=0
             self._emit("Cast", {}, call.lineno, [func.value], target_names, out_dtype)
             return
-        # 其它调用(非 self.、非 astype):当前不产 op(后续任务按需扩展)
+        # 其它调用(非上述形态):当前不产 op(如 self.token_dispatcher.token_permutation —— AllToAll 派发,opaque)
+
+    def _handle_self_call(self, call: ast.Call, name: str, target_names: list[str]) -> None:
+        binding = self.binds.get(name)
+        if binding is None:
+            # 未绑定:①Morph(self.method) 别名 → 内联被包裹的方法;②本类(含基类)内部方法 → 内联;③否则 fail-loud。
+            if name in self._method_aliases:
+                m = self._lookup_method(self._method_aliases[name])
+                if m is not None:
+                    self._inline_method(m, call, target_names)
+                    return
+            method = self._lookup_method(name)
+            if method is not None:
+                self._inline_method(method, call, target_names)
+                return
+            raise ValueError(
+                f"construct 调用了未绑定的 self.{name}(...)（{self.src_file}:{call.lineno}）:"
+                f"Pass B(init_binder)未覆盖此名、且非本类内部方法/Morph 别名,fail-loud"
+            )
+        if binding.op == "SubCell" and self._subcell_resolver is not None:
+            # 子 Cell:递归抽取其 DAG,并在调用点内联(镜像内部方法内联的 SSA/边/id 处理)。
+            self._inline_subcell(binding.attrs, call, target_names)
+            return
+        if binding.op == "Cast":
+            # cast 目标 dtype 取第 2 个位置实参(idx=1):self.cast(x, ms.float32 / self.compute_dtype)
+            out_dtype = self._resolve_cast_dtype(call.args, 1, binding.attrs)
+        else:
+            out_dtype = binding.attrs.get("compute_dtype") or "bf16"
+        arg_exprs = self._expand_args(call.args, binding.attrs)
+        self._emit(binding.op, binding.attrs, call.lineno, arg_exprs, target_names, out_dtype)
+
+    def _handle_chained_call(self, call: ast.Call, func: ast.Attribute, target_names: list[str]) -> None:
+        """链式方法 `<innercall>.method(...)`:先把内层调用发射到合成临时名,再按外层方法处理:
+           .astype → Cast(消费临时名);视图类方法(reshape/view/…)→ 目标别名到临时名(不新增激活节点)。"""
+        inner = func.value
+        if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Call):
+            inner = inner.value
+        tmp = f"__chain__i{self._frame_seq}"
+        self._frame_seq += 1
+        self._handle_call(inner, [tmp])          # 发射内层算子(如 swiglu)到 tmp
+        method = func.attr
+        if method == "astype":
+            out_dtype = self._resolve_cast_dtype(call.args, 0, {})
+            self._emit("Cast", {}, call.lineno, [ast.Name(id=tmp, ctx=ast.Load())], target_names, out_dtype)
+        else:
+            # reshape/view/transpose 等:纯视图/元数据,反向不新增激活 → 目标承接内层产物(保 producer 边);
+            # ref 用目标名(而非合成临时名),使 save-set 可读。
+            prod = self.producer.get(tmp)
+            dt = self.ssa.get(tmp, f"{tmp}:?:bf16").split(":")[2]
+            for t in target_names:
+                self.ssa[t] = f"{t}:?:{dt}"
+                if prod is not None:
+                    self.producer[t] = prod
 
     @staticmethod
     def _expand_args(args, attrs: dict):
@@ -721,6 +775,7 @@ def walk_construct(
     param_defaults: dict | None = None,
     present_vars: set | None = None,
     subcell_resolver=None,
+    method_aliases: dict | None = None,
 ) -> OpDAG:
     """走查 `cls_name` 的 construct(),把每个 self.<name>(...) 调用落成 OpNode,返回 op-DAG。
 
@@ -749,7 +804,7 @@ def walk_construct(
         src, cls_name, binds, src_file,
         config_flags=config_flags, none_vars=none_vars,
         param_defaults=param_defaults, present_vars=present_vars,
-        subcell_resolver=subcell_resolver,
+        subcell_resolver=subcell_resolver, method_aliases=method_aliases,
     )[0]
 
 
@@ -763,20 +818,21 @@ def walk_construct_meta(
     param_defaults: dict | None = None,
     present_vars: set | None = None,
     subcell_resolver=None,
+    method_aliases: dict | None = None,
 ):
     """同 walk_construct,但额外返回 (OpDAG, construct 形参名列表, 返回值分类)——供上层递归内联子 Cell。"""
     return _run_walker(
         src, cls_name, binds, src_file,
         config_flags=config_flags, none_vars=none_vars,
         param_defaults=param_defaults, present_vars=present_vars,
-        subcell_resolver=subcell_resolver,
+        subcell_resolver=subcell_resolver, method_aliases=method_aliases,
     )
 
 
 def _run_walker(
     src, cls_name, binds, src_file, *,
     config_flags=None, none_vars=None, param_defaults=None,
-    present_vars=None, subcell_resolver=None,
+    present_vars=None, subcell_resolver=None, method_aliases=None,
 ):
     tree = ast.parse(src)
     if next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls_name), None) is None:
@@ -785,6 +841,7 @@ def _run_walker(
     walker = _Walker(
         binds, src_file, config_flags, none_vars, param_defaults, present_vars,
         tree=tree, cls_name=cls_name, subcell_resolver=subcell_resolver,
+        method_aliases=method_aliases,
     )
     construct = walker._lookup_method("construct")  # 支持 construct 定义在基类
     if construct is None:

@@ -97,6 +97,48 @@ def _init_classes(tree: ast.AST, cls_name: str) -> list[str]:
     return order
 
 
+# ── Morph(self.<method>) 别名侦测 ─────────────────────────────────────────────
+def _unwrap_to_call(node: ast.AST, name: str) -> ast.Call | None:
+    """剥链式 `.add_prim_attr(...)/.shard(...)` 等,取最内层 Call;其 func 为 Name==name 时返回该 Call,否则 None。"""
+    while isinstance(node, ast.Call):
+        f = node.func
+        if isinstance(f, ast.Name):
+            return node if f.id == name else None
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call):
+            node = f.value
+            continue
+        return None
+    return None
+
+
+def _morph_aliases(tree: ast.AST, init_cls: str) -> dict[str, str]:
+    """__init__ 里 `self.<X> = Morph(self.<method>, ...)`(mindspore 自定义融合原语):记录别名 X→method。
+    construct 里 self.X(...) 实为调用被 Morph 包裹的 self.<method>(...) 的计算 → walker 内联该方法以还原其算子
+    (如 FFNGroupedGEMM.morphed_forward → forward_func → GroupedMatmul×2 + swiglu;permute/unpermute 在 forward_func 内)。"""
+    cls = _find_class(tree, init_cls)
+    init = _method_of(cls, "__init__") if cls else None
+    out: dict[str, str] = {}
+    if init is None:
+        return out
+    for stmt in ast.walk(init):
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+            continue
+        tgt = stmt.targets[0]
+        if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                and tgt.value.id == "self"):
+            continue
+        if not isinstance(stmt.value, ast.Call):
+            continue
+        morph = _unwrap_to_call(stmt.value, "Morph")
+        if morph is None or not morph.args:
+            continue
+        a0 = morph.args[0]
+        if (isinstance(a0, ast.Attribute) and isinstance(a0.value, ast.Name)
+                and a0.value.id == "self"):
+            out[tgt.attr] = a0.attr
+    return out
+
+
 # dtype 名归一(与 construct_walker 的短标签一致)。
 _DTYPE_SHORT = {
     "float32": "fp32", "fp32": "fp32", "float": "fp32",
@@ -373,11 +415,13 @@ def _extract_meta(
         raise ValueError(f"extractor: {cls_name} 及其基类均无 __init__（fail-loud）")
     base_binds: dict[str, Binding] = {}
     named: dict[str, Binding] = {}
+    method_aliases: dict[str, str] = {}
     for cname in reversed(init_classes):           # base 先绑,derived 后绑覆盖
         base_binds.update(bind_init(src, cname))
         named.update(_named_module_binds(
             tree, cname, spec, config_flags, src_file, recurse, subcell_specs
         ))
+        method_aliases.update(_morph_aliases(tree, cname))  # Morph(self.method) 别名
     combined = {**base_binds, **named}
 
     # 2) walker 的 config_flags:透传 + 注入 activation_func 真值(由 activation_type 决定其是否为 None)。
@@ -412,4 +456,5 @@ def _extract_meta(
         param_defaults=param_defaults,
         present_vars=present,
         subcell_resolver=resolver,
+        method_aliases=method_aliases,
     )

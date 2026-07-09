@@ -18,6 +18,8 @@ _CLS2OP = {
     # RoPE 应用(ApplyRotaryPosEmb):对 q/k 的位置分量做旋转 = **线性正交变换**(cos/sin 为位置常量),
     # 反向不需存激活 → Elementwise(linear=True)。构造点 `ApplyRotaryPosEmb(config)` 直接实例化。
     "ApplyRotaryPosEmb": ("Elementwise", {"linear": True, "rope": True}),
+    # Swiglu(门控 SiLU):MoE experts 的融合激活(FFNGroupedGEMM.swiglu)。反向需存输入 → 归 Activation。
+    "Swiglu": ("Activation", {"activation_type": "swiglu"}),
     # 具名 linear/attention/norm/activation 由 construct 调用点解析(build_module/get_activation),此处不绑。
 }
 
