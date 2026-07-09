@@ -25,8 +25,22 @@ shape 此阶段一律占位 `?`(由后续 shape 解析任务回填)。
 from __future__ import annotations
 import ast
 import copy
+from dataclasses import dataclass, field
 
 from .schema import OpNode, OpDAG
+
+
+@dataclass
+class SubExtract:
+    """一次子 Cell 递归抽取的结果(供父 walker 在调用点内联):
+      * nodes/edges —— 子 DAG(id 从 1 起,src 指向子文件),edges 为子内部边(子编号);
+      * param_names —— 子 construct 形参(去 self,按序),用于把父调用实参按位重映射到子操作数;
+      * returns     —— 子 construct 返回值逐项分类:("node", 子内 producer id)/("param", 形参名)/("none", None),
+                       用于把"子输出 → 下游消费者"的边接回父 SSA。"""
+    nodes: list = field(default_factory=list)
+    edges: list = field(default_factory=list)
+    param_names: list = field(default_factory=list)
+    returns: list = field(default_factory=list)
 
 # 三态哨兵:一个 `if`/三元条件在剪枝上下文下无法由已知 config 判定。
 _UNDECIDED = object()
@@ -145,6 +159,7 @@ class _Walker:
         present_vars: set | None = None,
         tree: ast.AST | None = None,
         cls_name: str | None = None,
+        subcell_resolver=None,
     ):
         self.binds = binds                 # self.<name> -> Binding(op, attrs)(Pass B 产)
         self.src_file = src_file
@@ -153,6 +168,11 @@ class _Walker:
         self.ssa: dict[str, str] = {}      # varname -> 当前 ref "name:?:dtype"
         self.producer: dict[str, int] = {} # varname -> 产出它的节点 id
         self._next_id = 1                  # 节点 id 从 1 单调递增
+        # ---- 子 Cell 递归内联:resolver(cell_name, field, bare) -> SubExtract(None=不递归) ----
+        self._subcell_resolver = subcell_resolver
+        self.construct_params: list[str] = []   # construct 形参(去 self),供上层做子内联时按位重映射
+        self.returns: list = []                 # construct 返回值分类(见 SubExtract.returns)
+        self._param_set: set[str] = set()
         # ---- 内联支持:类层级 AST(找内部方法定义)+ 递归/帧状态 ----
         self._tree = tree
         self._cls_name = cls_name
@@ -192,9 +212,7 @@ class _Walker:
                 self.walk_body(stmt.body)
                 self.walk_body(stmt.orelse)
         elif isinstance(stmt, ast.Return):
-            # 内联中的 return 冒泡给 _inline_method 捕获;顶层 construct 的 return 无 op,忽略。
-            if self._inline_stack:
-                raise _ReturnSignal(stmt.value)
+            self._handle_return(stmt)
         elif isinstance(stmt, ast.Raise):
             # 剪枝模式下:能"走到"一条 raise 说明它在被选中的分支里 → 选到了不支持的路径,fail-loud。
             # (未命中的 raise 守卫根本不会被 walk 到,天然跳过。)非剪枝模式忽略 raise。
@@ -225,6 +243,36 @@ class _Walker:
         return (not stmt.orelse) and bool(stmt.body) and all(
             isinstance(s, ast.Raise) for s in stmt.body
         )
+
+    def _handle_return(self, stmt: ast.Return) -> None:
+        """return 语句:
+          * 内联方法体内:若返回值直接是 Call / Subscript(Call)(如 helper 的 `return self.op(x)`),
+            先把该算子发射到一个合成目标,再以该合成名冒泡,供 _bind_return 别名到调用点目标;
+            否则(Name/Tuple)原样冒泡表达式。
+          * 顶层 construct:无赋值目标,但 `return self.<child>(x)` 这类直接返回的调用/子 Cell 仍需
+            发射 / 递归内联(否则漏算子、且子 Cell 递归环检测不到)。"""
+        val = stmt.value
+        if self._inline_stack:
+            raise _ReturnSignal(self._materialize_return_call(val))
+        if isinstance(val, ast.Call):
+            self._handle_call(val, target_names=[])
+        elif isinstance(val, ast.Subscript) and isinstance(val.value, ast.Call):
+            self._handle_call(val.value, target_names=[])
+        # 返回 Name/Tuple/其它:顶层无需产 op(下游没有消费者)
+
+    def _materialize_return_call(self, val):
+        """内联方法 `return <Call>`:把该调用发射到合成临时名并返回该 Name(供别名到调用点目标)。"""
+        call = None
+        if isinstance(val, ast.Call):
+            call = val
+        elif isinstance(val, ast.Subscript) and isinstance(val.value, ast.Call):
+            call = val.value
+        if call is None:
+            return val
+        tmp = f"__ret__i{self._frame_seq}"
+        self._frame_seq += 1
+        self._handle_call(call, target_names=[tmp])
+        return ast.Name(id=tmp, ctx=ast.Load())
 
     def _handle_assign(self, stmt: ast.Assign) -> None:
         val = stmt.value
@@ -281,6 +329,10 @@ class _Walker:
                     f"construct 调用了未绑定的 self.{name}(...)（{self.src_file}:{call.lineno}）:"
                     f"Pass B(init_binder)未覆盖此名、且非本类内部方法,fail-loud"
                 )
+            if binding.op == "SubCell" and self._subcell_resolver is not None:
+                # 子 Cell:递归抽取其 DAG,并在调用点内联(镜像内部方法内联的 SSA/边/id 处理)。
+                self._inline_subcell(binding.attrs, call, target_names)
+                return
             if binding.op == "Cast":
                 # cast 目标 dtype 取第 2 个位置实参(idx=1):self.cast(x, ms.float32 / self.compute_dtype)
                 out_dtype = self._resolve_cast_dtype(call.args, 1, binding.attrs)
@@ -404,6 +456,95 @@ class _Walker:
             if isinstance(e, ast.Name):
                 self._alias([tgt], e.id)
             # 返回项非 Name(字面量/调用等):该目标不登记 producer(下游若消费则占位 ref)
+
+    # ---- 子 Cell 递归内联 ----
+    def _inline_subcell(self, attrs: dict, call: ast.Call, target_names: list[str]) -> None:
+        """把 resolver 递归抽出的子 DAG 内联到调用点:
+          1) 子 construct 形参按位重映射到调用方实参(Name 实参→复用其 SSA ref 与 producer);
+          2) 子节点 id 统一加偏移(接父 _next_id,不从 1 重启),子内部边同偏移平移;
+          3) 子叶子消费的"形参操作数"→ 改写成调用方 ref,并补父 producer→子叶子的跨界边;
+          4) 子返回值 → 绑回调用点赋值目标(下游消费即连"子输出→消费者"边)。"""
+        sub = self._subcell_resolver(attrs.get("cell"), attrs.get("field"), attrs.get("bare", False))
+
+        # 1) 形参 -> (调用方 ref, 调用方 producer 或 None)
+        pos = list(call.args)
+        kw = {k.arg: k.value for k in call.keywords if k.arg is not None}
+        param_map: dict[str, tuple[str, int | None]] = {}
+        for i, p in enumerate(sub.param_names):
+            if i < len(pos):
+                arg = pos[i]
+            elif p in kw:
+                arg = kw[p]
+            else:
+                arg = None
+            if isinstance(arg, ast.Name):
+                ref = self.ssa.get(arg.id, f"{arg.id}:?:bf16")
+                param_map[p] = (ref, self.producer.get(arg.id))
+            else:
+                param_map[p] = (f"{p}:?:bf16", None)  # 非 Name 实参 / 未传 → 占位,不连边
+
+        # 2)+3) 偏移平移 + 形参操作数重映射 + 跨界边
+        offset = self._next_id - 1
+        for n in sub.nodes:
+            new_id = n.id + offset
+            new_ins: list[str] = []
+            seen_prod: set[int] = set()
+            for ref in n.ins:
+                nm = ref.split(":")[0]
+                if nm in param_map:
+                    cref, cprod = param_map[nm]
+                    new_ins.append(cref)
+                    if cprod is not None and cprod not in seen_prod:
+                        self.edges.append([cprod, new_id])
+                        seen_prod.add(cprod)
+                else:
+                    new_ins.append(ref)   # 子内部 SSA 操作数:原样保留(边由下面的子内部边补)
+            self.nodes.append(OpNode(
+                id=new_id, op=n.op, src=n.src, module=n.module,
+                ins=new_ins, out=n.out, attrs=dict(n.attrs),
+            ))
+        for s, d in sub.edges:
+            self.edges.append([s + offset, d + offset])
+        self._next_id = offset + len(sub.nodes) + 1
+
+        # 4) 子返回值绑回调用点目标
+        for tgt, r in zip(target_names, sub.returns):
+            kind, val = r
+            if kind == "node":
+                pid = val + offset
+                self.producer[tgt] = pid
+                node = next((n for n in self.nodes if n.id == pid), None)
+                dt = node.out.split(":")[2] if (node and node.out.count(":") == 2) else "bf16"
+                self.ssa[tgt] = f"{tgt}:?:{dt}"
+            elif kind == "param":
+                cref, cprod = param_map.get(val, (f"{val}:?:bf16", None))
+                self.ssa[tgt] = cref
+                if cprod is not None:
+                    self.producer[tgt] = cprod
+            # kind == "none":该目标不登记(下游消费则占位 ref)
+
+    def _resolve_returns(self, body) -> list:
+        """定位 construct 顶层(含嵌套)最后一条 `return`,把返回值逐项分类:
+           Name 且已被某节点产出 → ("node", producer id);Name 且是形参 → ("param", 名);其它 → ("none", None)。"""
+        rets: list[ast.Return] = []
+        for top in body:
+            for n in ast.walk(top):
+                if isinstance(n, ast.Return) and n.value is not None:
+                    rets.append(n)
+        if not rets:
+            return []
+        ret = max(rets, key=lambda r: getattr(r, "lineno", 0))
+        val = ret.value
+        elts = val.elts if isinstance(val, (ast.Tuple, ast.List)) else [val]
+        out: list = []
+        for e in elts:
+            if isinstance(e, ast.Name) and e.id in self.producer:
+                out.append(("node", self.producer[e.id]))
+            elif isinstance(e, ast.Name) and e.id in self._param_set:
+                out.append(("param", e.id))
+            else:
+                out.append(("none", None))
+        return out
 
     # ---- 条件求值层(剪枝):返回 True / False / _UNDECIDED,决不"猜" ----
     def _eval_test(self, test):
@@ -579,6 +720,7 @@ def walk_construct(
     none_vars: set | None = None,
     param_defaults: dict | None = None,
     present_vars: set | None = None,
+    subcell_resolver=None,
 ) -> OpDAG:
     """走查 `cls_name` 的 construct(),把每个 self.<name>(...) 调用落成 OpNode,返回 op-DAG。
 
@@ -600,19 +742,57 @@ def walk_construct(
     "两支都线性走查"行为(Task 4 回归不受影响)。
 
     未绑定的 self.<name>:若是本类(含基类)内部方法则内联展开,否则 fail-loud。
+    子 Cell(binding.op=="SubCell")且传入 subcell_resolver 时递归内联;否则退化为发射 SubCell 节点。
     找不到类或其 construct 方法时 fail-loud(ValueError)。
     """
+    return _run_walker(
+        src, cls_name, binds, src_file,
+        config_flags=config_flags, none_vars=none_vars,
+        param_defaults=param_defaults, present_vars=present_vars,
+        subcell_resolver=subcell_resolver,
+    )[0]
+
+
+def walk_construct_meta(
+    src: str,
+    cls_name: str,
+    binds: dict,
+    src_file: str,
+    config_flags: dict | None = None,
+    none_vars: set | None = None,
+    param_defaults: dict | None = None,
+    present_vars: set | None = None,
+    subcell_resolver=None,
+):
+    """同 walk_construct,但额外返回 (OpDAG, construct 形参名列表, 返回值分类)——供上层递归内联子 Cell。"""
+    return _run_walker(
+        src, cls_name, binds, src_file,
+        config_flags=config_flags, none_vars=none_vars,
+        param_defaults=param_defaults, present_vars=present_vars,
+        subcell_resolver=subcell_resolver,
+    )
+
+
+def _run_walker(
+    src, cls_name, binds, src_file, *,
+    config_flags=None, none_vars=None, param_defaults=None,
+    present_vars=None, subcell_resolver=None,
+):
     tree = ast.parse(src)
     if next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls_name), None) is None:
         raise ValueError(f"源码里找不到 class {cls_name}(fail-loud)")
 
     walker = _Walker(
         binds, src_file, config_flags, none_vars, param_defaults, present_vars,
-        tree=tree, cls_name=cls_name,
+        tree=tree, cls_name=cls_name, subcell_resolver=subcell_resolver,
     )
     construct = walker._lookup_method("construct")  # 支持 construct 定义在基类
     if construct is None:
         raise ValueError(f"class {cls_name}(及其基类)缺少 construct 方法(fail-loud)")
 
+    walker.construct_params = [a.arg for a in construct.args.args if a.arg != "self"]
+    walker._param_set = set(walker.construct_params)
     walker.walk_body(construct.body)
-    return OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges)
+    walker.returns = walker._resolve_returns(construct.body)
+    dag = OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges)
+    return dag, walker.construct_params, walker.returns

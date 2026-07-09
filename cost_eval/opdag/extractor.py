@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 
 from .schema import OpDAG
 from .init_binder import bind_init, Binding
-from .construct_walker import walk_construct
+from .construct_walker import walk_construct_meta, SubExtract
 from .module_resolver import ResolvedSpec, LEAF_OPTYPE
 
 
@@ -106,7 +107,8 @@ _DTYPE_SHORT = {
 
 # ── __init__ 里的具名模块绑定 ─────────────────────────────────────────────────
 def _named_module_binds(
-    tree: ast.AST, init_cls: str, spec: ResolvedSpec, config_flags: dict, src_file: str
+    tree: ast.AST, init_cls: str, spec: ResolvedSpec, config_flags: dict, src_file: str,
+    recurse: bool = False, subcell_specs: dict | None = None,
 ) -> dict[str, Binding]:
     cls = _find_class(tree, init_cls)
     init = _method_of(cls, "__init__")
@@ -139,7 +141,8 @@ def _named_module_binds(
 
         if fname == "build_module":
             binds[name] = _bind_build_module(
-                stmt.value, name, spec, compute_dtype, ln_compute_dtype, src_file
+                stmt.value, name, spec, compute_dtype, ln_compute_dtype, src_file,
+                recurse, subcell_specs,
             )
         elif fname == "get_activation":
             if activation_present:
@@ -153,7 +156,8 @@ def _named_module_binds(
 
 def _bind_build_module(
     call: ast.Call, self_name: str, spec: ResolvedSpec, compute_dtype: str,
-    ln_compute_dtype: str, src_file: str
+    ln_compute_dtype: str, src_file: str,
+    recurse: bool = False, subcell_specs: dict | None = None,
 ) -> Binding:
     if not call.args:
         raise ValueError(
@@ -172,11 +176,15 @@ def _bind_build_module(
             f"（self.{self_name} @ {src_file}）—— fail-loud"
         )
     if isinstance(leaf, ResolvedSpec):
-        # 子 Cell:预留递归展开挂钩(本任务不触发)。
-        return Binding(op="SubCell", attrs={"cell": leaf.cell, "field": field})
+        # 子 Cell(submodules 已解成嵌套 ResolvedSpec):挂 SubCell,recurse 时按 field 取该子 spec 递归。
+        return Binding(op="SubCell", attrs={"cell": leaf.cell, "field": field, "bare": False})
     if isinstance(leaf, str):
         op = LEAF_OPTYPE.get(leaf)
         if op is None:
+            # 裸 Cell 类名(如 experts="FFNGroupedGEMM"):recurse 且 subcell_specs 提供其 ResolvedSpec
+            # → 挂 SubCell(bare),由 resolver 按类名从 subcell_specs 取子 spec 递归;否则维持 fail-loud。
+            if recurse and subcell_specs and leaf in subcell_specs:
+                return Binding(op="SubCell", attrs={"cell": leaf, "field": field, "bare": True})
             raise ValueError(
                 f"extractor: 叶子类 {leaf!r} 不在 LEAF_OPTYPE（self.{self_name} @ {src_file}）—— fail-loud"
             )
@@ -237,6 +245,55 @@ def _construct_none_defaults(tree: ast.AST, cls_name: str) -> dict:
     return out
 
 
+# ── 子 Cell 定位 + 递归 resolver ──────────────────────────────────────────────
+def _find_cell_file(mf_root: str, cell_name: str) -> str:
+    """在 mf_root 里搜 `class <cell_name>` 的定义源,返回相对 mf_root 的路径(用 "/" 分隔)。
+    多处定义取首个命中;找不到 → fail-loud。"""
+    pat = re.compile(rf"^\s*class\s+{re.escape(cell_name)}\b", re.M)
+    for dirpath, _dirs, files in os.walk(mf_root):
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    txt = fh.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if pat.search(txt):
+                return os.path.relpath(p, mf_root).replace(os.sep, "/")
+    raise ValueError(
+        f"extractor: 在 {mf_root} 找不到定义 class {cell_name} 的源文件（fail-loud）"
+    )
+
+
+def _make_subcell_resolver(
+    mf_root: str, parent_spec: ResolvedSpec, config_flags: dict,
+    subcell_specs: dict | None, stack_with_self: set,
+):
+    """构造给 walker 的 resolver:遇 SubCell 调用点 → 取子 spec、定位子文件、递归抽取,返回 SubExtract。"""
+    def resolver(cell_name: str, field: str, bare: bool) -> SubExtract:
+        if bare:
+            sub_spec = (subcell_specs or {}).get(cell_name)
+            if not isinstance(sub_spec, ResolvedSpec):
+                raise ValueError(
+                    f"extractor: 裸类 SubCell {cell_name!r} 未由 subcell_specs 提供 ResolvedSpec（fail-loud）"
+                )
+        else:
+            sub_spec = parent_spec.submodules.get(field)
+            if not isinstance(sub_spec, ResolvedSpec):
+                raise ValueError(
+                    f"extractor: SubCell 字段 {field!r} 在父 spec 里非 ResolvedSpec（得到 {sub_spec!r}）—— fail-loud"
+                )
+        rel = _find_cell_file(mf_root, sub_spec.cell)
+        dag, params, returns = _extract_meta(
+            mf_root, rel, sub_spec.cell, sub_spec, config_flags,
+            recurse=True, subcell_specs=subcell_specs, _stack=stack_with_self,
+        )
+        return SubExtract(nodes=dag.nodes, edges=dag.edges, param_names=params, returns=returns)
+    return resolver
+
+
 # ── 对外入口 ──────────────────────────────────────────────────────────────────
 def extract_cell(
     mf_root: str,
@@ -245,6 +302,8 @@ def extract_cell(
     spec: ResolvedSpec,
     config_flags: dict,
     present_params: set | None = None,
+    recurse: bool = False,
+    subcell_specs: dict | None = None,
 ) -> OpDAG:
     """读真 mindformers Cell 源,按 config 剪枝,产出其 op-DAG。
 
@@ -256,11 +315,40 @@ def extract_cell(
       config_flags      — config 派生的 flags(gated_linear_unit / activation_type / q_lora_rank /
                           compute_dtype / layernorm_compute_dtype / ...)。
       present_params    — 可选。construct 形参中"缺省 None 但真机总被传入"的名字(如 MLA 的
-                          rotary_pos_emb):从 param_defaults 移除并标记为 present,让
-                          `if rotary_pos_emb is not None:` 判 True(走 rope apply 支)。
+                          rotary_pos_emb):从 param_defaults 移除并标记为 present。
+      recurse           — 打开子 Cell 递归内联:当 self.<X>(...) 绑定为 SubCell(submodules 的子
+                          ResolvedSpec,或裸 Cell 类名+subcell_specs 提供其 spec)→ 递归抽取该子
+                          Cell DAG 并在调用点内联(id 续编、形参重映射、跨界连边)。
+      subcell_specs     — 可选。{类名: ResolvedSpec}:为裸 Cell 类名(不在 LEAF_OPTYPE)提供其解析树。
     行为
-      找不到源 / 无法解析具名模块 / 剪枝时遇不可判定 if → fail-loud(ValueError)。
+      找不到源 / 无法解析具名模块 / 剪枝时遇不可判定 if / 子 Cell 递归环 → fail-loud(ValueError)。
     """
+    dag, _params, _returns = _extract_meta(
+        mf_root, cell_file_relpath, cls_name, spec, config_flags,
+        present_params=present_params, recurse=recurse, subcell_specs=subcell_specs,
+    )
+    return dag
+
+
+def _extract_meta(
+    mf_root: str,
+    cell_file_relpath: str,
+    cls_name: str,
+    spec: ResolvedSpec,
+    config_flags: dict,
+    present_params: set | None = None,
+    recurse: bool = False,
+    subcell_specs: dict | None = None,
+    _stack: set | None = None,
+):
+    """extract_cell 的内核,额外返回 (OpDAG, construct 形参名, 返回值分类)——供 resolver 递归内联。
+    `_stack` 携当前正在抽取的 Cell 类名链,用于子 Cell 递归环 fail-loud。"""
+    stack = set(_stack or ())
+    if cls_name in stack:
+        raise ValueError(
+            f"extractor: 检测到子 Cell 递归环——Cell {cls_name!r} 直接/间接自指（链 {sorted(stack)}）,fail-loud"
+        )
+
     path = os.path.join(mf_root, *cell_file_relpath.split("/"))
     if not os.path.isfile(path):
         raise ValueError(f"extractor: 找不到 Cell 源 {path}（fail-loud）")
@@ -272,6 +360,13 @@ def extract_cell(
     if _find_class(tree, cls_name) is None:
         raise ValueError(f"extractor: {src_file} 里找不到 class {cls_name}（fail-loud）")
 
+    # 0) recurse 时给 walker 备一个子 Cell resolver(携带把自己压栈后的递归链)。
+    resolver = None
+    if recurse:
+        resolver = _make_subcell_resolver(
+            mf_root, spec, config_flags, subcell_specs, stack | {cls_name}
+        )
+
     # 1) 沿 __init__ 的 MRO 链(base→derived)做基础 + 具名绑定并合并(derived 覆盖 base)。
     init_classes = _init_classes(tree, cls_name)   # derived→base
     if not init_classes:
@@ -280,7 +375,9 @@ def extract_cell(
     named: dict[str, Binding] = {}
     for cname in reversed(init_classes):           # base 先绑,derived 后绑覆盖
         base_binds.update(bind_init(src, cname))
-        named.update(_named_module_binds(tree, cname, spec, config_flags, src_file))
+        named.update(_named_module_binds(
+            tree, cname, spec, config_flags, src_file, recurse, subcell_specs
+        ))
     combined = {**base_binds, **named}
 
     # 2) walker 的 config_flags:透传 + 注入 activation_func 真值(由 activation_type 决定其是否为 None)。
@@ -304,8 +401,8 @@ def extract_cell(
     for p in present:
         param_defaults.pop(p, None)   # present 覆盖"缺省 None":该形参按存在处理
 
-    # 4) 走查 + 剪枝。
-    return walk_construct(
+    # 4) 走查 + 剪枝(recurse 时携 resolver:SubCell 调用点递归内联)。
+    return walk_construct_meta(
         src,
         cls_name,
         combined,
@@ -314,4 +411,5 @@ def extract_cell(
         none_vars=none_vars,
         param_defaults=param_defaults,
         present_vars=present,
+        subcell_resolver=resolver,
     )
