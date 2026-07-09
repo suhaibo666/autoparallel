@@ -21,6 +21,11 @@ class OpDAG:
     nodes: list[OpNode] = field(default_factory=list)
     edges: list[list[int]] = field(default_factory=list)  # [src_id, dst_id]
     baseline: dict = field(default_factory=dict)
+    # 标量 shape 绑定(`seq, bs, h = x.shape` 这类不产 op 的解包):{"names":[...], "src": "<var>"}。
+    # shape 推断按 src 的已知 shape 逐轴取,填 reshape/split 表达式里的标量名。
+    scalar_binds: list = field(default_factory=list)
+    # self.<attr> → 符号 token 串(由 __init__ 维度求值得,供 shape 推断解析 reshape/split 里的 self.X)。
+    dims_ctx: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)

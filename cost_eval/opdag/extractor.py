@@ -30,6 +30,7 @@ from .schema import OpDAG
 from .init_binder import bind_init, Binding
 from .construct_walker import walk_construct_meta, SubExtract
 from .module_resolver import ResolvedSpec, LEAF_OPTYPE
+from .init_dims import eval_init_dims
 
 
 # ── AST 小工具 ────────────────────────────────────────────────────────────────
@@ -151,6 +152,7 @@ _DTYPE_SHORT = {
 def _named_module_binds(
     tree: ast.AST, init_cls: str, spec: ResolvedSpec, config_flags: dict, src_file: str,
     recurse: bool = False, subcell_specs: dict | None = None,
+    linear_dims: dict | None = None,
 ) -> dict[str, Binding]:
     cls = _find_class(tree, init_cls)
     init = _method_of(cls, "__init__")
@@ -184,7 +186,7 @@ def _named_module_binds(
         if fname == "build_module":
             binds[name] = _bind_build_module(
                 stmt.value, name, spec, compute_dtype, ln_compute_dtype, src_file,
-                recurse, subcell_specs,
+                recurse, subcell_specs, linear_dims,
             )
         elif fname == "get_activation":
             if activation_present:
@@ -200,6 +202,7 @@ def _bind_build_module(
     call: ast.Call, self_name: str, spec: ResolvedSpec, compute_dtype: str,
     ln_compute_dtype: str, src_file: str,
     recurse: bool = False, subcell_specs: dict | None = None,
+    linear_dims: dict | None = None,
 ) -> Binding:
     if not call.args:
         raise ValueError(
@@ -234,6 +237,14 @@ def _bind_build_module(
         if op == "Norm":
             # 归一化层在 fp32 计算并存 fp32 输入(fp32-残差机制)→ 供 bprop_rules 把该 Norm 输入按 fp32 计。
             attrs["ln_compute_dtype"] = ln_compute_dtype
+        # PART A:linear 的 (in,out) 符号维度(build_module 位序 1/2,由 __init__ 求值得)。
+        dims = (linear_dims or {}).get(self_name)
+        if dims is not None:
+            in_d, out_d = dims
+            if in_d is not None:
+                attrs["in_dim"] = in_d
+            if out_d is not None:
+                attrs["out_dim"] = out_d
         return Binding(op=op, attrs=attrs)
     raise ValueError(
         f"extractor: submodules.{field} 解出非法类型 {leaf!r}（self.{self_name}）—— fail-loud"
@@ -413,13 +424,17 @@ def _extract_meta(
     init_classes = _init_classes(tree, cls_name)   # derived→base
     if not init_classes:
         raise ValueError(f"extractor: {cls_name} 及其基类均无 __init__（fail-loud）")
+    # PART A:一次求值 __init__(全 MRO)得各 linear 的符号 (in,out) 维度 + self.<attr> dims_ctx。
+    init_dims = eval_init_dims(tree, cls_name, config_flags)
+
     base_binds: dict[str, Binding] = {}
     named: dict[str, Binding] = {}
     method_aliases: dict[str, str] = {}
     for cname in reversed(init_classes):           # base 先绑,derived 后绑覆盖
         base_binds.update(bind_init(src, cname))
         named.update(_named_module_binds(
-            tree, cname, spec, config_flags, src_file, recurse, subcell_specs
+            tree, cname, spec, config_flags, src_file, recurse, subcell_specs,
+            linear_dims=init_dims.linear_dims,
         ))
         method_aliases.update(_morph_aliases(tree, cname))  # Morph(self.method) 别名
     combined = {**base_binds, **named}
@@ -446,7 +461,7 @@ def _extract_meta(
         param_defaults.pop(p, None)   # present 覆盖"缺省 None":该形参按存在处理
 
     # 4) 走查 + 剪枝(recurse 时携 resolver:SubCell 调用点递归内联)。
-    return walk_construct_meta(
+    dag, params, returns = walk_construct_meta(
         src,
         cls_name,
         combined,
@@ -458,3 +473,5 @@ def _extract_meta(
         subcell_resolver=resolver,
         method_aliases=method_aliases,
     )
+    dag.dims_ctx = init_dims.dims_ctx           # self.<attr> → 符号 token(供 shape 推断解析)
+    return dag, params, returns

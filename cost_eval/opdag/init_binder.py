@@ -11,10 +11,12 @@ _CLS2OP = {
     "Sub":   ("Elementwise", {"linear": True}),
     "Mul":   ("Elementwise", {"linear": False}),
     "Cast":  ("Cast", {}),
-    "Reshape": ("View", {}), "Transpose": ("View", {}), "SplitWithSize": ("View", {}),
-    "Shape": ("View", {}), "ExpandDims": ("View", {}), "Tile": ("View", {}),
+    # View 子类型用 attrs["view"] 标注(供 shape 推断按类型施变换:reshape/transpose/split/...)。
+    "Reshape": ("View", {"view": "reshape"}), "Transpose": ("View", {"view": "transpose"}),
+    "SplitWithSize": ("View", {"view": "split"}), "Shape": ("View", {"view": "shape"}),
+    "ExpandDims": ("View", {"view": "expand_dims"}), "Tile": ("View", {"view": "tile"}),
     # concat/stack:接受"张量列表"作单实参 → variadic(摊平为多操作数);反向仅切片,不存激活 → View。
-    "Concat": ("View", {"variadic": True}),
+    "Concat": ("View", {"variadic": True, "view": "concat"}),
     # RoPE 应用(ApplyRotaryPosEmb):对 q/k 的位置分量做旋转 = **线性正交变换**(cos/sin 为位置常量),
     # 反向不需存激活 → Elementwise(linear=True)。构造点 `ApplyRotaryPosEmb(config)` 直接实例化。
     "ApplyRotaryPosEmb": ("Elementwise", {"linear": True, "rope": True}),
@@ -28,20 +30,36 @@ class Binding:
     op: str
     attrs: dict = field(default_factory=dict)
 
-def _base_call_name(node):
-    """剥链式 .recompute()/.shard() 等,取最内层 Call 的类名。"""
+def _innermost_call(node):
+    """剥链式 .recompute()/.shard()/.add_prim_attr() 等,取最内层"func 为 Name"的 Call 节点。"""
     while isinstance(node, ast.Call):
         f = node.func
         if isinstance(f, ast.Name):
-            return f.id
-        if isinstance(f, ast.Attribute):
-            # X().method() → 递归到 X()
-            if isinstance(f.value, ast.Call):
-                node = f.value
-                continue
-            return None
+            return node
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call):
+            node = f.value
+            continue
         return None
     return None
+
+
+def _base_call_name(node):
+    """剥链式 .recompute()/.shard() 等,取最内层 Call 的类名。"""
+    call = _innermost_call(node)
+    return call.func.id if call is not None else None
+
+
+def _concat_axis(node) -> int:
+    """`Concat(axis=3)` / `Concat(3)` → 3;缺省 0。"""
+    call = _innermost_call(node)
+    if call is None:
+        return 0
+    for kw in call.keywords:
+        if kw.arg == "axis" and isinstance(kw.value, ast.Constant):
+            return int(kw.value.value)
+    if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, int):
+        return int(call.args[0].value)
+    return 0
 
 def bind_init(src: str, cls_name: str) -> dict[str, Binding]:
     tree = ast.parse(src)
@@ -61,5 +79,8 @@ def bind_init(src: str, cls_name: str) -> dict[str, Binding]:
         clsname = _base_call_name(stmt.value)
         if clsname in _CLS2OP:
             op, attrs = _CLS2OP[clsname]
-            out[tgt.attr] = Binding(op=op, attrs=dict(attrs))
+            attrs = dict(attrs)
+            if clsname == "Concat":
+                attrs["concat_axis"] = _concat_axis(stmt.value)
+            out[tgt.attr] = Binding(op=op, attrs=attrs)
     return out

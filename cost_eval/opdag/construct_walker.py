@@ -46,7 +46,7 @@ class SubExtract:
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
 DIRECT_OP_MAP = {
     "GroupedMatmul": ("GroupedMatMul", {"flatten": True}),  # MoE 分组 GEMM(experts_forward)
-    "Reshape": ("View", {}),                                # Morph 里的 Reshape()(x, shp)
+    "Reshape": ("View", {"view": "reshape"}),               # Morph 里的 Reshape()(x, shp)
 }
 
 # 张量方法(链式 `<expr>.method(...)`)里视作纯视图/元数据(反向不新增激活)的方法名。
@@ -187,6 +187,8 @@ class _Walker:
         self.construct_params: list[str] = []   # construct 形参(去 self),供上层做子内联时按位重映射
         self.returns: list = []                 # construct 返回值分类(见 SubExtract.returns)
         self._param_set: set[str] = set()
+        # `<a,b,c> = x.shape`(不产 op 的标量解包)记录,供 shape 推断按 x 已知 shape 逐轴填标量名。
+        self.scalar_binds: list = []
         # ---- 内联支持:类层级 AST(找内部方法定义)+ 递归/帧状态 ----
         self._tree = tree
         self._cls_name = cls_name
@@ -299,6 +301,10 @@ class _Walker:
         elif isinstance(val, ast.IfExp):
             # 三元:`self.act(x) if <cond> else x`。按 config 求值,只落命中侧那个表达式。
             self._handle_ifexp(val, targets)
+        elif (isinstance(val, ast.Attribute) and val.attr == "shape"
+              and isinstance(val.value, ast.Name) and len(targets) >= 2):
+            # `seq, bs, h = x.shape`:不产 op,但记标量→轴解包(shape 推断阶段按 x 已知 shape 填)。
+            self.scalar_binds.append({"names": list(targets), "src": val.value.id})
         # 其它(算术/常量/切片/属性)当前不产 op
 
     def _handle_ifexp(self, ifexp: ast.IfExp, targets: list[str]) -> None:
@@ -337,6 +343,8 @@ class _Walker:
         if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id in DIRECT_OP_MAP:
             op, attrs = DIRECT_OP_MAP[func.func.id]
             arg_exprs = self._expand_args(call.args, {"variadic": True}) if attrs.get("flatten") else list(call.args)
+            if op == "View" and attrs.get("view"):
+                attrs = {**attrs, **self._view_capture(call, attrs["view"], target_names)}
             self._emit(op, attrs, call.lineno, arg_exprs, target_names, attrs.get("compute_dtype") or "bf16")
             return
         # 形态三:链式方法 `<innercall>.method(...)`(如 self.swiglu(x).reshape(...)):先发射内层算子,再处理外层方法。
@@ -376,8 +384,12 @@ class _Walker:
             out_dtype = self._resolve_cast_dtype(call.args, 1, binding.attrs)
         else:
             out_dtype = binding.attrs.get("compute_dtype") or "bf16"
+        attrs = binding.attrs
+        if binding.op == "View" and binding.attrs.get("view"):
+            # View 子类型:捕获变换元信息(reshape 目标 / split 尺寸 / perm / ...)供 shape 推断。
+            attrs = {**binding.attrs, **self._view_capture(call, binding.attrs["view"], target_names)}
         arg_exprs = self._expand_args(call.args, binding.attrs)
-        self._emit(binding.op, binding.attrs, call.lineno, arg_exprs, target_names, out_dtype)
+        self._emit(binding.op, attrs, call.lineno, arg_exprs, target_names, out_dtype)
 
     def _handle_chained_call(self, call: ast.Call, func: ast.Attribute, target_names: list[str]) -> None:
         """链式方法 `<innercall>.method(...)`:先把内层调用发射到合成临时名,再按外层方法处理:
@@ -401,6 +413,57 @@ class _Walker:
                 self.ssa[t] = f"{t}:?:{dt}"
                 if prod is not None:
                     self.producer[t] = prod
+
+    # ---- View 变换元信息捕获(shape 推断的输入;walker 本身不求值)----
+    @staticmethod
+    def _tuple_elts(node):
+        return list(node.elts) if isinstance(node, (ast.Tuple, ast.List)) else None
+
+    @staticmethod
+    def _const_int(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+                and isinstance(node.operand, ast.Constant)):
+            return -int(node.operand.value)
+        return None
+
+    def _kw_or_arg_int(self, call, name, argidx):
+        for kw in call.keywords:
+            if kw.arg == name:
+                return self._const_int(kw.value)
+        if len(call.args) > argidx:
+            return self._const_int(call.args[argidx])
+        return None
+
+    def _view_capture(self, call: ast.Call, kind: str, target_names) -> dict:
+        """把一次 View 调用的变换参数抠成"未求值符号表达式串"(reshape/split 目标)或整数(perm/axis)。"""
+        U = self._describe
+        args = call.args
+        if kind == "reshape":
+            elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
+            return {"reshape_dims": [U(e) for e in elts]} if elts is not None else {}
+        if kind == "split":
+            out = {"split_targets": list(target_names)}
+            elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
+            if elts is not None:
+                out["split_sizes"] = [U(e) for e in elts]
+            dim = self._kw_or_arg_int(call, "dim", 2)
+            if dim is not None:
+                out["split_dim"] = dim
+            return out
+        if kind == "transpose":
+            elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
+            return {"perm": [self._const_int(e) for e in elts]} if elts is not None else {}
+        if kind == "expand_dims":
+            ax = self._const_int(args[1]) if len(args) >= 2 else None
+            return {"expand_axis": ax} if ax is not None else {}
+        if kind == "tile":
+            elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
+            return {"tile_mult": [U(e) for e in elts]} if elts is not None else {}
+        if kind == "shape":
+            return {"shape_src": (U(args[0]) if args else None), "shape_unpack": list(target_names)}
+        return {}
 
     @staticmethod
     def _expand_args(args, attrs: dict):
@@ -851,5 +914,6 @@ def _run_walker(
     walker._param_set = set(walker.construct_params)
     walker.walk_body(construct.body)
     walker.returns = walker._resolve_returns(construct.body)
-    dag = OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges)
+    dag = OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges,
+                scalar_binds=walker.scalar_binds)
     return dag, walker.construct_params, walker.returns
