@@ -277,6 +277,12 @@ fp32 cast 横切量 + 小中间量**在 loss 峰值欠计（同 §D-10 ①/D-5 �
   只补该事件而不误伤逐层反向。**已回退**。根因确认是「保留 MoE-FFN 前向 saves 在 loss 峰被简化 op 图
   漏建（真机 grouped-GEMM 的 permute/capacity-pad/cast 中间量）」,需**按事件定向**的 MoE 模型或显式
   margin,当前机理未及 → 保留为已知残差。cp 侧的欠计经查**非** kept-MoE 而是 Bug A/k_ce(已修)。
+  > [!important] **2026-07-09 源码级 op-DAG 提取精化此归因**（`analysis/realmachine/opdag_validation.md`）:
+  > 静态提取真机 MoE construct 后逐字节比对,**grouped-GEMM 的 matmul 中间量(disp/e_g/e_act=56/64/32 MiB)
+  > 手写 builder 早已精确计入**(DAG 独立交叉验证)。故残差**非** grouped-GEMM 矩阵中间量,而是
+  > profiler live-set 里 **313 个 <100 MiB 小张量的长尾(3666 MiB)**——fp32 cast 横切 / permute 碎片 /
+  > RmsNorm 中间量,**在 op 图粒度之下**(分配器/autograd 保留现实,非显式 construct op 可导出)。
+  > 结论:即"扩提取器"也只能建其中显式部分,剩余碎片尾属**标定 margin**。
 - **此 mindformers build 多维并行栈限制**(真机实测):① SP+MoE 不支持;② TP+MoE(Detach layout bug);
   ③ PP+重算互斥;④ **pp>2 崩在 pynative pipeline+优化器对 decoder-only 中间 stage 的 param/state
   配对(1D layernorm 权重 `[H]` 与 2D 投影权重 `[H,·]` 配错)**——MLA(`[H,rq]`)与 GQA(`[H,H]`)、
