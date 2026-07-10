@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1258 494" font-family="Consolas,Menlo,monospace" font-size="12">
+<rect width="1258" height="494" fill="#fbfbfb"/>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a8a8a"/></marker></defs>
+<text x="24" y="28" font-size="16" font-weight="bold" fill="#222">MoE FFNGroupedGEMM op-DAG  —  saved(激活驻留) 合计 236.0 MiB</text>
+<line x1="234" y1="246" x2="274" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="234" y1="324" x2="274" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="484" y1="90" x2="524" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="734" y1="90" x2="774" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="984" y1="90" x2="1024" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="484" y1="168" x2="1024" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<rect x="24" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="33" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="33" y="97" fill="#f4f4f4">new_input_tensor_shape:?</text>
+<text x="33" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="24" y="142" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="33" y="160" font-weight="bold" fill="#fff">Cast</text>
+<text x="33" y="175" fill="#f4f4f4">tokens:S·B·H</text>
+<text x="33" y="189" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="24" y="220" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="33" y="238" font-weight="bold" fill="#fff">Cast</text>
+<text x="33" y="253" fill="#f4f4f4">w1:?</text>
+<text x="33" y="267" fill="#ffe08a" font-size="11">💾 56.0 MiB · bf16</text>
+<rect x="24" y="298" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="33" y="316" font-weight="bold" fill="#fff">Cast</text>
+<text x="33" y="331" fill="#f4f4f4">w2:?</text>
+<text x="33" y="345" fill="#ffe08a" font-size="11">💾 28.0 MiB · bf16</text>
+<rect x="274" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="283" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="283" y="97" fill="#f4f4f4">w1:E·H·(2·moe_ffn)</text>
+<text x="283" y="111" fill="#ffe08a" font-size="11">💾 56.0 MiB · bf16</text>
+<rect x="274" y="142" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="283" y="160" font-weight="bold" fill="#fff">View</text>
+<text x="283" y="175" fill="#f4f4f4">w2:E·moe_ffn·H</text>
+<text x="283" y="189" fill="#ffe08a" font-size="11">💾 28.0 MiB · bf16</text>
+<rect x="524" y="64" width="210" height="52" rx="7" fill="#2f4b7c" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="533" y="82" font-weight="bold" fill="#fff">GroupedMatMul</text>
+<text x="533" y="97" fill="#f4f4f4">fc1_output__i1:E·cap·(2·moe_ffn)</text>
+<text x="533" y="111" fill="#ffe08a" font-size="11">💾 64.0 MiB · bf16</text>
+<rect x="774" y="64" width="210" height="52" rx="7" fill="#f28e2b" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="783" y="82" font-weight="bold" fill="#fff">Activation</text>
+<text x="783" y="97" fill="#f4f4f4">__chain__i2:E·cap·moe_ffn</text>
+<text x="783" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1024" y="64" width="210" height="52" rx="7" fill="#2f4b7c" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1033" y="82" font-weight="bold" fill="#fff">GroupedMatMul</text>
+<text x="1033" y="97" fill="#f4f4f4">fc2_output__i1:E·cap·H</text>
+<text x="1033" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="24" y="376" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="33" y="394" font-weight="bold" fill="#fff">Cast</text>
+<text x="33" y="409" fill="#f4f4f4">output:?</text>
+<text x="33" y="423" fill="#eee" font-size="11">↻ transient · dtype</text>
+<rect x="24" y="459" width="16" height="12" rx="2" fill="none" stroke="#c0392b" stroke-width="3"/>
+<text x="46" y="469" fill="#333">saved = 反向要存进内存（激活驻留 fwd→bwd）</text>
+<rect x="344" y="459" width="16" height="12" rx="2" fill="none" stroke="#9a9a9a" stroke-width="1"/>
+<text x="366" y="469" fill="#333">transient = 转瞬即释 / 反向重算（不占峰值）</text>
+</svg>

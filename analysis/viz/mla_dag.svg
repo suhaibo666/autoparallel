@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3008 416" font-family="Consolas,Menlo,monospace" font-size="12">
+<rect width="3008" height="416" fill="#fbfbfb"/>
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8a8a8a"/></marker></defs>
+<text x="24" y="28" font-size="16" font-weight="bold" fill="#222">MLA (DSv3) op-DAG  —  saved(激活驻留) 合计 94.0 MiB</text>
+<line x1="234" y1="168" x2="274" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="234" y1="246" x2="274" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="484" y1="168" x2="524" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="484" y1="90" x2="524" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="734" y1="168" x2="774" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="734" y1="168" x2="774" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="984" y1="168" x2="1024" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="484" y1="168" x2="524" y2="246" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1234" y1="90" x2="1274" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="734" y1="246" x2="774" y2="246" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="734" y1="90" x2="774" y2="324" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="984" y1="324" x2="1024" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1234" y1="168" x2="1274" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1234" y1="90" x2="1524" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1484" y1="90" x2="1524" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="984" y1="246" x2="1024" y2="246" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1484" y1="168" x2="1524" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1234" y1="246" x2="1524" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1734" y1="90" x2="1774" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1734" y1="168" x2="1774" y2="168" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1484" y1="168" x2="1524" y2="246" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1984" y1="90" x2="2024" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1984" y1="168" x2="2024" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="1734" y1="246" x2="2024" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="2234" y1="90" x2="2274" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="2484" y1="90" x2="2524" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<line x1="2734" y1="90" x2="2774" y2="90" stroke="#c2c2c2" stroke-width="1.2" marker-end="url(#ar)"/>
+<rect x="24" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="33" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="33" y="97" fill="#f4f4f4">seq_len:?</text>
+<text x="33" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="24" y="142" width="210" height="52" rx="7" fill="#4e79a7" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="33" y="160" font-weight="bold" fill="#fff">MatMul · SequenceParallelLinear</text>
+<text x="33" y="175" fill="#f4f4f4">q_compressed__i0:S·B·q_lora_rank</text>
+<text x="33" y="189" fill="#ffe08a" font-size="11">💾 24.0 MiB · fp32</text>
+<rect x="274" y="64" width="210" height="52" rx="7" fill="#59a14f" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="283" y="82" font-weight="bold" fill="#fff">Norm · Norm</text>
+<text x="283" y="97" fill="#f4f4f4">q_compressed__i0:S·B·q_lora_rank</text>
+<text x="283" y="111" fill="#ffe08a" font-size="11">💾 24.0 MiB · fp32</text>
+<rect x="24" y="220" width="210" height="52" rx="7" fill="#4e79a7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="33" y="238" font-weight="bold" fill="#fff">MatMul · SequenceParallelLinear</text>
+<text x="33" y="253" fill="#f4f4f4">kv_combined__i0:S·B·(kv_lora_rank+qk_pos_emb_head_dim)</text>
+<text x="33" y="267" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="274" y="142" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="283" y="160" font-weight="bold" fill="#fff">View</text>
+<text x="283" y="175" fill="#f4f4f4">kv_compressed__i0:S·B·kv_lora_rank</text>
+<text x="283" y="189" fill="#ffe08a" font-size="11">💾 8.0 MiB · fp32</text>
+<rect x="524" y="64" width="210" height="52" rx="7" fill="#59a14f" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="533" y="82" font-weight="bold" fill="#fff">Norm · Norm</text>
+<text x="533" y="97" fill="#f4f4f4">kv_compressed__i0:S·B·kv_lora_rank</text>
+<text x="533" y="111" fill="#ffe08a" font-size="11">💾 8.0 MiB · fp32</text>
+<rect x="524" y="142" width="210" height="52" rx="7" fill="#4e79a7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="533" y="160" font-weight="bold" fill="#fff">MatMul · ColumnParallelLinear</text>
+<text x="533" y="175" fill="#f4f4f4">q__i1:S·B·(n_heads·(qk_head_dim+qk_pos_emb_head_dim))</text>
+<text x="533" y="189" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="774" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="783" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="783" y="97" fill="#f4f4f4">q_len__i1:?</text>
+<text x="783" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="774" y="142" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="783" y="160" font-weight="bold" fill="#fff">View</text>
+<text x="783" y="175" fill="#f4f4f4">q__i1:S·B·n_heads·(qk_head_dim+qk_pos_emb_head_dim)</text>
+<text x="783" y="189" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1024" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1033" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="1033" y="97" fill="#f4f4f4">q_no_pe__i1:S·B·n_heads·qk_head_dim</text>
+<text x="1033" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="524" y="220" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="533" y="238" font-weight="bold" fill="#fff">View</text>
+<text x="533" y="253" fill="#f4f4f4">k_pos_emb__i0:S·B·1·qk_pos_emb_head_dim</text>
+<text x="533" y="267" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1274" y="64" width="210" height="52" rx="7" fill="#b07aa1" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1283" y="82" font-weight="bold" fill="#fff">Elementwise</text>
+<text x="1283" y="97" fill="#f4f4f4">q_pos_emb__i1:S·B·n_heads·qk_pos_emb_head_dim</text>
+<text x="1283" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="774" y="220" width="210" height="52" rx="7" fill="#b07aa1" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="783" y="238" font-weight="bold" fill="#fff">Elementwise</text>
+<text x="783" y="253" fill="#f4f4f4">k_pos_emb__i0:S·B·1·qk_pos_emb_head_dim</text>
+<text x="783" y="267" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="774" y="298" width="210" height="52" rx="7" fill="#4e79a7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="783" y="316" font-weight="bold" fill="#fff">MatMul · ColumnParallelLinear</text>
+<text x="783" y="331" fill="#f4f4f4">kv__i1:S·B·(n_heads·(qk_head_dim+v_head_dim))</text>
+<text x="783" y="345" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1024" y="142" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1033" y="160" font-weight="bold" fill="#fff">View</text>
+<text x="1033" y="175" fill="#f4f4f4">kv__i1:S·B·n_heads·(qk_head_dim+v_head_dim)</text>
+<text x="1033" y="189" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1274" y="142" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1283" y="160" font-weight="bold" fill="#fff">View</text>
+<text x="1283" y="175" fill="#f4f4f4">k_no_pe__i1:S·B·n_heads·qk_head_dim</text>
+<text x="1283" y="189" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1524" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1533" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="1533" y="97" fill="#f4f4f4">query__i1:S·B·n_heads·(qk_head_dim+qk_pos_emb_head_dim)</text>
+<text x="1533" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1024" y="220" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1033" y="238" font-weight="bold" fill="#fff">View</text>
+<text x="1033" y="253" fill="#f4f4f4">k_pos_emb__i0:S·B·n_heads·qk_pos_emb_head_dim</text>
+<text x="1033" y="267" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1524" y="142" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="1533" y="160" font-weight="bold" fill="#fff">View</text>
+<text x="1533" y="175" fill="#f4f4f4">key__i1:S·B·n_heads·(qk_head_dim+qk_pos_emb_head_dim)</text>
+<text x="1533" y="189" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="1774" y="64" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="1783" y="82" font-weight="bold" fill="#fff">Cast</text>
+<text x="1783" y="97" fill="#f4f4f4">query:S·B·n_heads·(qk_head_dim+qk_pos_emb_head_dim)</text>
+<text x="1783" y="111" fill="#ffe08a" font-size="11">💾 12.0 MiB · bf16</text>
+<rect x="1774" y="142" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="1783" y="160" font-weight="bold" fill="#fff">Cast</text>
+<text x="1783" y="175" fill="#f4f4f4">key:S·B·n_heads·(qk_head_dim+qk_pos_emb_head_dim)</text>
+<text x="1783" y="189" fill="#ffe08a" font-size="11">💾 12.0 MiB · bf16</text>
+<rect x="1524" y="220" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="1533" y="238" font-weight="bold" fill="#fff">Cast</text>
+<text x="1533" y="253" fill="#f4f4f4">value:S·B·n_heads·v_head_dim</text>
+<text x="1533" y="267" fill="#ffe08a" font-size="11">💾 12.0 MiB · bf16</text>
+<rect x="2024" y="64" width="210" height="52" rx="7" fill="#e15759" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="2033" y="82" font-weight="bold" fill="#fff">FlashAttention · FlashAttention</text>
+<text x="2033" y="97" fill="#f4f4f4">context_layer:S·B·n_heads·v_head_dim</text>
+<text x="2033" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="2274" y="64" width="210" height="52" rx="7" fill="#d7d7d7" fill-opacity="0.82" stroke="#c0392b" stroke-width="3"/>
+<text x="2283" y="82" font-weight="bold" fill="#fff">View</text>
+<text x="2283" y="97" fill="#f4f4f4">attn_out:S·B·(n_heads·v_head_dim)</text>
+<text x="2283" y="111" fill="#ffe08a" font-size="11">💾 12.0 MiB · bf16</text>
+<rect x="2524" y="64" width="210" height="52" rx="7" fill="#4e79a7" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="2533" y="82" font-weight="bold" fill="#fff">MatMul · RowParallelLinear</text>
+<text x="2533" y="97" fill="#f4f4f4">output:S·B·H</text>
+<text x="2533" y="111" fill="#eee" font-size="11">↻ transient · bf16</text>
+<rect x="2774" y="64" width="210" height="52" rx="7" fill="#9c9c9c" fill-opacity="0.82" stroke="#9a9a9a" stroke-width="1"/>
+<text x="2783" y="82" font-weight="bold" fill="#fff">Cast</text>
+<text x="2783" y="97" fill="#f4f4f4">output:S·B·H</text>
+<text x="2783" y="111" fill="#eee" font-size="11">↻ transient · ori_dtype</text>
+<rect x="24" y="381" width="16" height="12" rx="2" fill="none" stroke="#c0392b" stroke-width="3"/>
+<text x="46" y="391" fill="#333">saved = 反向要存进内存（激活驻留 fwd→bwd）</text>
+<rect x="344" y="381" width="16" height="12" rx="2" fill="none" stroke="#9a9a9a" stroke-width="1"/>
+<text x="366" y="391" fill="#333">transient = 转瞬即释 / 反向重算（不占峰值）</text>
+</svg>
