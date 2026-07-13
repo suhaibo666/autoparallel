@@ -620,8 +620,14 @@ h1{font-size:19px;margin:5px 0 8px}
 .crcb{cursor:pointer}.crcb:hover circle{fill:#fff}
 .edge{stroke:#c3c9d2;stroke-width:1.4;fill:none}
 .edge.up{stroke:#2f4b7c;stroke-width:2.6}.edge.down{stroke:#e15759;stroke-width:2.6}.edge.dim{opacity:.25}
-.tlpane{padding:10px 12px}
+.tlpane{padding:10px 12px;max-height:60vh;overflow-y:auto}
 .tlpane svg{display:block;width:100%;height:auto}
+.tlblock{border:1px solid var(--line);border-radius:9px;margin-bottom:10px;overflow:hidden}
+.tlblock.on{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+.tlblock>.th{display:flex;gap:10px;align-items:center;padding:6px 12px;background:#fafbfc;cursor:pointer;font:600 12px var(--mono)}
+.tlblock>.th:hover{background:#f0f3f7}
+.tlblock>.th .pk{margin-left:auto;color:var(--saved)}
+.tlblock .tbody{padding:4px 8px 8px}
 .desc{color:var(--mut);font-size:11.5px;margin:0 0 6px}
 .dpane{max-height:calc(100vh - 240px);overflow:auto;padding:12px 14px}
 .dpane .ph{color:var(--mut);font-size:12.5px}
@@ -841,15 +847,27 @@ function hiOp(st,lid,i){
   document.querySelectorAll("#detail li[data-g]").forEach(li=>li.addEventListener("click",()=>hiOp(st,+li.dataset.l,+li.dataset.g)));
 }
 /* ── ④ timeline 堆叠面积图（时间顺序,可点）── */
-function drawTimeline(st){
-  document.getElementById("tlhdr").textContent=`内存时间线 · Stage ${st.stage}（FWD→BWD ${st.timeline.length} 事件）`;
-  document.getElementById("tldesc").innerHTML=`峰值 <b>${fmib(st.peak)}</b> @ ${esc(st.peak_event)}${st.oom?' <span style="color:#c0392b;font-weight:700">⚠OOM</span>':''} · 点图上任意位置看该事件各桶`;
+function drawTimeline(_){
+  // 2026-07-11:全部 stage 的 timeline 同时展示(用户要求"都要展示");当前 stage 块高亮,
+  // 块标题可点(联动切 stage/左图),每块图内可点事件看该刻各桶。
+  document.getElementById("tlhdr").textContent=`内存时间线 · 全部 ${cur.stages.length} 个 stage（FWD→BWD,点图看该刻各桶）`;
+  document.getElementById("tldesc").innerHTML=cur.stages.length>1?`蓝框 = 当前选中 stage（与左侧结构图联动;点任一块标题切换）`:``;
+  document.getElementById("tl").innerHTML=cur.stages.map(st=>{
+    return `<div class="tlblock ${st.stage===curStage?"on":""}" data-s="${st.stage}">
+      <div class="th" data-s="${st.stage}">Stage ${st.stage} <span style="color:#888;font-weight:400">${esc(st.layers_desc)}</span><span class="pk">峰值 ${fmib(st.peak)} @ ${esc(st.peak_event)}${st.oom?" ⚠OOM":""}</span></div>
+      <div class="tbody">${tlSvg(st)}</div></div>`;
+  }).join("");
+  cur.stages.forEach(st=>bindTl(st));
+  document.getElementById("leg").innerHTML=Object.keys(BKC).map(k=>`<span><span style="display:inline-block;width:8px;height:8px;background:${BKC[k]};border-radius:2px"></span>${k}</span>`).join("");
+  document.querySelectorAll(".tlblock>.th").forEach(h=>h.addEventListener("click",()=>{curStage=+h.dataset.s;openLayers=new Set();drawStage();}));
+}
+function tlSvg(st){
   const ev=st.timeline,n=ev.length;
-  const W=640,H=300,PL=52,PR=10,PT=10,PB=46,pw=W-PL-PR,ph=H-PT-PB;
+  const W=640,H=210,PL=52,PR=10,PT=8,PB=40,pw=W-PL-PR,ph=H-PT-PB;
   const ymax=Math.max(...ev.map(e=>e.total))*1.06;
   const X=i=>PL+(n<2?0:i/(n-1)*pw), Y=v=>PT+ph-v/ymax*ph;
-  let s=`<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="var(--mono)" font-size="9.5" id="tlsvg">`;
-  for(let k=0;k<5;k++){const v=ymax*k/4;s+=`<line x1="${PL}" y1="${Y(v)}" x2="${PL+pw}" y2="${Y(v)}" stroke="#ececec"/><text x="${PL-5}" y="${Y(v)+3}" text-anchor="end" fill="#999">${(v/1024).toFixed(0)}G</text>`;}
+  let s=`<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="var(--mono)" font-size="9" id="tlsvg_${st.stage}">`;
+  for(let k=0;k<4;k++){const v=ymax*k/3;s+=`<line x1="${PL}" y1="${Y(v)}" x2="${PL+pw}" y2="${Y(v)}" stroke="#ececec"/><text x="${PL-5}" y="${Y(v)+3}" text-anchor="end" fill="#999">${(v/1024).toFixed(0)}G</text>`;}
   let base=new Array(n).fill(0);
   Object.keys(BKC).forEach(k=>{
     const vals=ev.map(e=>e.buckets[k]||0); if(!vals.some(v=>v>0))return;
@@ -857,20 +875,27 @@ function drawTimeline(st){
     let pts=top.map((v,i)=>`${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
     pts+=" "+base.slice().reverse().map((v,i)=>`${X(n-1-i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
     s+=`<polygon points="${pts}" fill="${BKC[k]}" fill-opacity=".85"/>`; base=top;});
-  s+=`<polyline points="${ev.map((e,i)=>`${X(i).toFixed(1)},${Y(e.total).toFixed(1)}`).join(" ")}" fill="none" stroke="#111" stroke-width="1.5"/>`;
+  s+=`<polyline points="${ev.map((e,i)=>`${X(i).toFixed(1)},${Y(e.total).toFixed(1)}`).join(" ")}" fill="none" stroke="#111" stroke-width="1.4"/>`;
   const pi=ev.findIndex(e=>e.total===st.peak);
-  if(pi>=0)s+=`<circle cx="${X(pi)}" cy="${Y(ev[pi].total)}" r="4" fill="#c0392b"/><text x="${X(pi)+6}" y="${Y(ev[pi].total)-5}" fill="#c0392b" font-weight="bold">★${esc(ev[pi].event)}</text>`;
-  const step=Math.max(1,Math.floor(n/12));
-  for(let i=0;i<n;i+=step)s+=`<text x="${X(i)}" y="${PT+ph+14}" text-anchor="middle" fill="#999" transform="rotate(32 ${X(i)} ${PT+ph+14})">${esc(ev[i].event)}</text>`;
-  s+=`<line id="cursor" x1="-9" y1="${PT}" x2="-9" y2="${PT+ph}" stroke="#111" stroke-dasharray="3 3"/><rect x="${PL}" y="${PT}" width="${pw}" height="${ph}" fill="transparent" style="cursor:crosshair" id="tlhit"/></svg>`;
-  document.getElementById("tl").innerHTML=s;
-  document.getElementById("leg").innerHTML=Object.keys(BKC).map(k=>`<span><span style="display:inline-block;width:8px;height:8px;background:${BKC[k]};border-radius:2px"></span>${k}</span>`).join("");
-  const hit=document.getElementById("tlhit"),svg=document.getElementById("tlsvg");
+  if(pi>=0)s+=`<circle cx="${X(pi)}" cy="${Y(ev[pi].total)}" r="3.5" fill="#c0392b"/><text x="${X(pi)+5}" y="${Y(ev[pi].total)-4}" fill="#c0392b" font-weight="bold">★${esc(ev[pi].event)}</text>`;
+  const step=Math.max(1,Math.floor(n/10));
+  for(let i=0;i<n;i+=step)s+=`<text x="${X(i)}" y="${PT+ph+13}" text-anchor="middle" fill="#999" transform="rotate(32 ${X(i)} ${PT+ph+13})">${esc(ev[i].event)}</text>`;
+  s+=`<line id="cursor_${st.stage}" x1="-9" y1="${PT}" x2="-9" y2="${PT+ph}" stroke="#111" stroke-dasharray="3 3"/><rect x="${PL}" y="${PT}" width="${pw}" height="${ph}" fill="transparent" style="cursor:crosshair" id="tlhit_${st.stage}"/></svg>`;
+  return s;
+}
+function bindTl(st){
+  const ev=st.timeline,n=ev.length;
+  const W=640,PL=52,PR=10,pw=W-PL-PR;
+  const svg=document.getElementById(`tlsvg_${st.stage}`),hit=document.getElementById(`tlhit_${st.stage}`);
+  if(!svg||!hit)return;
   function pick(evt){const r=svg.getBoundingClientRect();const fx=(evt.clientX-r.left)/r.width*W;
     let i=Math.round((fx-PL)/(n<2?1:pw/(n-1)));i=Math.max(0,Math.min(n-1,i));
-    document.getElementById("cursor").setAttribute("x1",X(i));document.getElementById("cursor").setAttribute("x2",X(i));
+    const c=document.getElementById(`cursor_${st.stage}`);
+    const X=PL+(n<2?0:i/(n-1)*pw); c.setAttribute("x1",X);c.setAttribute("x2",X);
+    document.getElementById("dhdr").textContent=`各桶开销 · Stage ${st.stage}`;
     showBuckets(ev[i]);}
-  hit.addEventListener("click",pick);hit.addEventListener("mousemove",e=>{if(e.buttons)pick(e);});
+  hit.addEventListener("click",e=>{e.stopPropagation();pick(e);});
+  hit.addEventListener("mousemove",e=>{if(e.buttons)pick(e);});
 }
 function showBuckets(e){
   const bs=Object.entries(e.buckets).sort((a,b)=>b[1]-a[1]);const mx=Math.max(...bs.map(x=>x[1]),1);
