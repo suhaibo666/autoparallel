@@ -56,13 +56,22 @@ class ParallelModel:
         return [l for l, s in enumerate(self._layer_to_stage()) if s == stage]
 
     def _layer_to_stage(self) -> list:
-        """层 id → stage 映射。**首选** `layers_per_stage`（显式，已在 __init__ 校验和==n_layers）；
-        否则退化为均匀切（floor-division，remainder 归末 stage）。"""
+        """层 id → stage 映射。**首选** `layers_per_stage`（显式，已在 __init__ 校验和==n_layers）。
+
+        默认均匀切（2026-07-11 修正,对齐 mindformers 语义）:**只均匀切中间层**（transformer/mtp,
+        floor-division、remainder 归末 stage）;**embedding（层 0）固定归 stage0、head（末层）固定
+        归末 stage**——伪层不占中间层配额。旧实现把 n_layers（含 2 伪层）整体均匀切,非整除时
+        伪层挤占 transformer 名额（如 N=8 pp=4 → transformer 实分 1,2,2,3 而非 2,2,2,2）。
+        pp 整除 N 时（如 8L pp2 → emb+L1-4 | L5-8+head）与旧实现逐层一致 → pp2 锚点不动。"""
         pp = self.pc.pp
         if self.pc.layers_per_stage:
             mapping = []
             for stage, count in enumerate(self.pc.layers_per_stage):
                 mapping += [stage] * count
             return mapping
-        per = self.n_layers // pp
-        return [min(l // per, pp - 1) for l in range(self.n_layers)]
+        if pp <= 1:
+            return [0] * self.n_layers
+        mid = self.n_layers - 2                      # 中间层数（transformer + mtp）
+        per = max(1, mid // pp)
+        mid_map = [min(i // per, pp - 1) for i in range(mid)]   # remainder 归末 stage
+        return [0] + mid_map + [pp - 1]              # embedding→stage0,head→末 stage
