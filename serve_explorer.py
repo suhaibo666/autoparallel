@@ -67,7 +67,7 @@ PRESETS = {
     "dsv32_exp": {
         "label": "DeepSeek-V3.2-Exp", "base": "v3",
         "source": "HF deepseek-ai/DeepSeek-V3.2-Exp config.json;DSA indexer(64/128/topk2048) 未建模→按 full-attention 上界",
-        "ui": {"attn": "mla", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
+        "ui": {"attn": "dsa", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
                "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1,
                "hidden": 7168, "ffn": 18432, "moe_ffn": 2048, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "vocab": 129280},
         "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
@@ -100,7 +100,7 @@ PRESETS = {
     "glm5": {
         "label": "GLM-5 (zai-org)", "base": "v3",
         "source": "HF zai-org/GLM-5 config.json(glm_moe_dsa);DSA indexer(32/128/topk2048) 未建模→按 full-attention 上界",
-        "ui": {"attn": "mla", "layers": 78, "dense_k": 3, "experts": 256, "topk": 8,
+        "ui": {"attn": "dsa", "layers": 78, "dense_k": 3, "experts": 256, "topk": 8,
                "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1,
                "hidden": 6144, "ffn": 12288, "moe_ffn": 2048, "q_lora": 2048, "kv_lora": 512, "qk_nope": 192, "qk_rope": 64, "v_head": 256, "vocab": 154880},
         "dims": {"hidden_size": 6144, "ffn_hidden_size": 12288, "moe_ffn_hidden_size": 2048,
@@ -209,8 +209,8 @@ def parse_and_validate(p):
             errs.append(f"{name} 必须是 ≥{lo} 的整数")
     if errs:
         return errs, None, None
-    if attn not in ("mla", "gqa", "mha", "dsv4_hybrid"):
-        errs.append(f"attn 结构 {attn!r} 不支持（mla/gqa/mha/dsv4_hybrid）")
+    if attn not in ("mla", "gqa", "mha", "dsa", "dsv4_hybrid"):
+        errs.append(f"attn 结构 {attn!r} 不支持（mla/gqa/mha/dsa/dsv4_hybrid）")
     preset = p.get("preset", "dsv3_mini")
     if preset not in PRESETS:
         errs.append(f"未知模型预设 {preset!r}")
@@ -269,13 +269,16 @@ def parse_and_validate(p):
         base = dataclasses.replace(base, **pr["dims"])
     if dim_over:                               # UI 维度最终覆盖（custom / 预设微调）
         base = dataclasses.replace(base, **dim_over)
+    # dsa（DSv3.2/GLM-5 的 MLA+lightning indexer 稀疏注意力）:结构=MLA,稀疏 topk 不建模 →
+    # FA/saves 按 full-attention **上界**（OOM 安全侧;indexer 小激活忽略,已标注）。
+    _attn_map = {"mha": "gqa", "dsa": "mla"}
     cfg = dataclasses.replace(
         base, num_layers=N, batch_size=B, seq_length=S,
-        attn_type=("gqa" if attn == "mha" else attn),
+        attn_type=_attn_map.get(attn, attn),
         num_attention_heads=heads,
-        # dsv4_hybrid 的 num_query_groups 用基座值（MLA 系惰性=1）;mla/mha=heads;gqa=kv_groups。
+        # dsv4_hybrid 的 num_query_groups 用基座值（MLA 系惰性=1）;mla/mha/dsa=heads;gqa=kv_groups。
         num_query_groups=(base.num_query_groups if attn == "dsv4_hybrid"
-                          else (heads if attn in ("mla", "mha") else kvg)),
+                          else (heads if attn in ("mla", "mha", "dsa") else kvg)),
         first_k_dense_replace=dense_k,
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk)
@@ -416,9 +419,75 @@ def eval_config(p):
             "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0)}
 
 
+def _sel_ops_to_text(select_ops):
+    """RecomputeSpec.select_ops {lid: set} → 「细粒度选重」文本（逆向,mindformers 口径展示）。
+    相同 op 集聚层、层压 ranges;op 集==cell 展开集则显示 cell 名。"""
+    from cost_eval.configs.from_mindformers import _SELECT_MODULE_OPS
+    by_ops = {}
+    for lid, ops in (select_ops or {}).items():
+        by_ops.setdefault(frozenset(ops), []).append(lid - 1)   # → 0-indexed decoder
+    parts = []
+    for ops, lids in by_ops.items():
+        name = next((cell for cell, cops in _SELECT_MODULE_OPS.items() if frozenset(cops) == ops), None)
+        if name is None:
+            name = ",".join(sorted(ops))
+        lids.sort()
+        rngs, s0 = [], lids[0]
+        for prev, cur in zip(lids, lids[1:] + [None]):
+            if cur != prev + 1:
+                rngs.append(f"{s0}-{prev}" if prev > s0 else f"{s0}")
+                s0 = cur
+        parts.append(f"{name}:{','.join(rngs)}")
+    return "; ".join(parts)
+
+
+def _bundle_to_fields(b):
+    """EvaluatorConfigBundle → UI 字段 dict（yaml 导入回填;只读转换,不落盘）。"""
+    llm, pc, rc = b.llm, b.parallel, b.recompute
+    f = {
+        "attn": llm.attn_type, "layers": llm.num_layers,
+        "dense_k": (llm.first_k_dense_replace or 0),
+        "experts": (llm.num_moe_experts or 0), "topk": (llm.moe_router_topk or 1),
+        "heads": llm.num_attention_heads, "kv_groups": llm.num_query_groups,
+        "seq": llm.seq_length, "batch": llm.batch_size,
+        "hidden": llm.hidden_size, "ffn": llm.ffn_hidden_size,
+        "moe_ffn": (llm.moe_ffn_hidden_size or llm.ffn_hidden_size),
+        "q_lora": (llm.q_lora_rank or 1), "kv_lora": (llm.kv_lora_rank or 1),
+        "qk_nope": (llm.qk_nope_head_dim or 1), "qk_rope": (llm.qk_rope_head_dim or 1),
+        "v_head": (llm.v_head_dim or llm.head_dim), "vocab": llm.vocab_size,
+        "dp": pc.dp_shard, "tp": pc.tp, "ep": pc.ep, "pp": pc.pp, "cp": pc.cp,
+        "method": pc.context_parallel_method,
+        "recompute": ("full" if rc.mode == "full" else ("custom" if rc.mode == "select" else "None")),
+        "sel_cfg": (_sel_ops_to_text(rc.select_ops) if rc.mode == "select" else ""),
+    }
+    if getattr(pc, "layers_per_stage", None):
+        lp = list(pc.layers_per_stage)
+        lp[0] -= 1; lp[-1] -= 1                       # 去 embedding/head 伪层 → transformer 层分配
+        f["pp_split"] = ",".join(str(x) for x in lp)
+    return f
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if u.path == "/api/parse_yaml":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            txt = self.rfile.read(n).decode("utf-8", errors="replace")
+            try:
+                import yaml as _yaml
+                mf = _yaml.safe_load(txt)
+                if not isinstance(mf, dict):
+                    raise ValueError("yaml 顶层须是映射(mindformers 训练配置)")
+                from cost_eval.configs.from_mindformers import from_mindformers_dict
+                self._send(json.dumps({"ok": True, "fields": _bundle_to_fields(from_mindformers_dict(mf))},
+                                      ensure_ascii=False))
+            except Exception as e:
+                self._send(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
+            return
+        self.send_response(404); self.end_headers()
 
     def _send(self, body, ctype="application/json"):
         b = body.encode("utf-8") if isinstance(body, str) else body
@@ -505,6 +574,7 @@ h1{font-size:19px;margin:5px 0 8px}
   <h1>LLM 内存实验台 — 结构可配 · 切分自由 · op-DAG + timeline</h1>
   <div class="cfgrow"><span class="cap">模型结构</span>
     <div class="fld"><label>模型预设</label><select id="preset" name="preset" style="min-width:170px">
+      <option value="custom">Custom（自定义）</option>
       <option value="dsv3_mini" selected>DSv3-mini（仓库锚点）</option>
       <option value="dsv3_671b">DeepSeek-V3 671B</option>
       <option value="dsv32_exp">DeepSeek-V3.2-Exp</option>
@@ -512,7 +582,8 @@ h1{font-size:19px;margin:5px 0 8px}
       <option value="dsv4_pro">DeepSeek-V4-Pro</option>
       <option value="glm5">GLM-5 (zai-org)</option>
     </select></div>
-    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
+    <div class="fld"><label>yaml 导入</label><input type="file" id="yamlfile" accept=".yaml,.yml" style="font-size:11px;width:170px" title="选 mindformers 训练 yaml → 解析回填到对话框(不改动 yaml 文件本身)"></div>
+    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsa">DSA(MLA+indexer,上界)</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
     <div class="fld"><label>layers</label><input name="layers" type="number" min="1" value="8"></div>
     <div class="fld"><label>dense 层数</label><input name="dense_k" type="number" min="0" value="1" title="前 K 层 dense,其余 MoE(first_k_dense_replace);=layers 则纯 dense"></div>
     <div class="fld"><label>experts</label><input name="experts" type="number" min="0" value="8"></div>
@@ -745,6 +816,21 @@ function applyPreset(key){
   document.getElementById("kmeta").textContent="来源: "+pr.source;
 }
 document.getElementById("preset").addEventListener("change",e=>{applyPreset(e.target.value);syncChips();refreshSoon();});
+/* yaml 导入:解析 mindformers 训练配置 → 回填对话框(不改 yaml 文件本身) */
+document.getElementById("yamlfile").addEventListener("change",async e=>{
+  const f=e.target.files[0]; if(!f)return;
+  const txt=await f.text();
+  let d; try{const r=await fetch("/api/parse_yaml",{method:"POST",body:txt}); d=await r.json();}
+  catch(err){d={ok:false,error:String(err)};}
+  const eb=document.getElementById("err");
+  if(!d.ok){eb.style.display="block";eb.innerHTML="✗ yaml 解析失败: "+esc(d.error);e.target.value="";return;}
+  eb.style.display="none";
+  Object.entries(d.fields).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el&&v!==null&&v!==undefined)el.value=v;});
+  document.getElementById("preset").value="custom";
+  document.getElementById("kmeta").textContent="来源: yaml 导入("+f.name+"),已回填可改(不写回文件)";
+  e.target.value="";       // 允许重选同一文件
+  syncChips();refreshSoon();
+});
 /* 结构字段被手改 → 已偏离预设 → 下拉自动跳 Custom（并行/重算字段不算偏离） */
 const STRUCT_FIELDS=["attn","layers","dense_k","experts","topk","heads","kv_groups","seq","batch",
   "hidden","ffn","moe_ffn","q_lora","kv_lora","qk_nope","qk_rope","v_head","vocab"];
