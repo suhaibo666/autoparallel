@@ -118,6 +118,66 @@ def _i(p, k, d):
         return -1
 
 
+def parse_pp_split(s, pp, N):
+    """「pp 层分配」文本 → layers_per_stage（含伪层）。对应 mindformers `num_layer_list` 口径:
+    用户输 **transformer 层数/stage**（如 "3,5"）,服务端补伪层:stage0 +1(embedding)、末 stage +1(head)。
+    返回 (errors, tuple|None)。空串 → None(均匀切)。"""
+    s = (s or "").strip()
+    if not s:
+        return [], None
+    try:
+        parts = [int(x) for x in s.replace("，", ",").split(",")]
+    except ValueError:
+        return [f"pp 层分配 {s!r} 解析失败（应为逗号分隔整数,如 3,5）"], None
+    if len(parts) != pp:
+        return [f"pp 层分配段数({len(parts)}) 必须 == pp({pp})"], None
+    if sum(parts) != N:
+        return [f"pp 层分配之和({sum(parts)}) 必须 == transformer 层数({N})"], None
+    if any(x < 1 for x in parts):
+        return [f"pp 层分配每段须 ≥1:{parts}"], None
+    full = list(parts)
+    full[0] += 1                      # stage0 含 embedding 伪层
+    full[-1] += 1                     # 末 stage 含 head 伪层
+    return [], tuple(full)
+
+
+def parse_select_cfg(s, N):
+    """「细粒度选重」文本 → {layer_id(1-based): set(op 子串)}。对应 mindformers
+    `select_module: {cell: [ranges]}` 口径(0-indexed decoder 层,同 from_mindformers +1 偏移):
+      格式  `pattern: 层范围; pattern: 层范围`
+      pattern = cell 名(self_attention/mlp,展开为该 cell 的 op 集)或任意 op 名子串(flash/e_fc1/ln2…)
+      层范围 = `0-3,6`（逗号分段,`a-b` 闭区间）
+    返回 (errors, dict|None)。空串 → None。"""
+    s = (s or "").strip()
+    if not s:
+        return [], None
+    out = {}
+    for part in s.replace("；", ";").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            return [f"细粒度选重 {part!r} 缺 `:`（格式 pattern: 层范围,如 self_attention:0-3）"], None
+        pat, rng = (x.strip() for x in part.split(":", 1))
+        ops = (_SEL_ATTN if pat == "self_attention" else
+               (_SEL_MLP if pat == "mlp" else {pat}))
+        if not pat:
+            return ["细粒度选重 pattern 为空"], None
+        for seg in rng.replace("，", ",").split(","):
+            seg = seg.strip()
+            if not seg:
+                continue
+            try:
+                a, b = (int(x) for x in seg.split("-")) if "-" in seg else (int(seg), int(seg))
+            except ValueError:
+                return [f"细粒度选重层范围 {seg!r} 解析失败（a-b 或单层号,0-indexed）"], None
+            if not (0 <= a <= b < N):
+                return [f"细粒度选重层范围 {seg!r} 越界（0-indexed decoder 层,0..{N-1}）"], None
+            for l0 in range(a, b + 1):
+                out.setdefault(l0 + 1, set()).update(ops)   # +1: 评估器层 id(embedding=0)
+    return [], (out or None)
+
+
 def parse_and_validate(p):
     """query dict → (errors:list[str], cfg:LLMConfig|None, pc_args:dict|None)。全部校验先行、报中文。"""
     errs = []
@@ -188,11 +248,17 @@ def parse_and_validate(p):
         a, b = (int(x) for x in lr.split("-")) if "-" in lr else (int(lr), int(lr))
     except ValueError:
         a = b = -1
-    if rmode == "custom":
+    # 细粒度选重文本（mindformers select_module 口径）:非空即优先于图上勾选
+    e_sel, sel_cfg = parse_select_cfg(p.get("sel_cfg", ""), N)
+    errs += e_sel
+    if rmode == "custom" and sel_cfg is None:
         if not sel_ops_raw:
-            errs.append("custom 重算需至少勾选一个 op（图上点 ↻）")
+            errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度选重」文本")
         if not (1 <= a <= b <= N):
             errs.append(f"重算层范围 {lr!r} 非法（1-{N} 内的 a-b）")
+    # pp 层分配（mindformers num_layer_list 口径）
+    e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, N)
+    errs += e_pp
     if errs:
         return errs, None, None
 
@@ -214,7 +280,8 @@ def parse_and_validate(p):
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
-                   rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b))
+                   rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b),
+                   sel_cfg=sel_cfg, pp_split=pp_split)
     return [], cfg, pc_args
 
 
@@ -309,8 +376,11 @@ def eval_config(p):
     elif pa["rmode"] == "select":
         selset = _SEL_ATTN if pa["sel"] == "attn" else (_SEL_MLP if pa["sel"] == "mlp" else _SEL_ATTN | _SEL_MLP)
         rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in range(1, N + 1)})
+    elif pa["sel_cfg"]:
+        # 细粒度文本（mindformers select_module 口径,每 pattern 可不同层集）——非空即优先。
+        rc = RecomputeSpec("select", select_ops=pa["sel_cfg"])
     elif pa["rmode"] == "custom":
-        # 细粒度（问题2）:任意 op 名 × 层范围 —— 与 mindformers select_recompute（op 位置级）同口径。
+        # 图上勾选:任意 op 名 × 单一层范围 —— 与 mindformers select_recompute（op 位置级）同口径。
         a, b = pa["sel_range"]
         rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in range(a, b + 1)})
     else:
@@ -318,7 +388,8 @@ def eval_config(p):
     mbs = pa["pp"] if pa["pp"] > 1 else 1
     pc = ParallelConfig(dp_shard=pa["dp"], tp=pa["tp"], ep=pa["ep"], pp=pa["pp"], cp=pa["cp"],
                         sequence_parallel=(pa["dp"] > 1 or pa["tp"] > 1), num_microbatches=mbs,
-                        context_parallel_method=pa["method"])
+                        context_parallel_method=pa["method"],
+                        layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None))
     ev = Evaluator(spec, pc, OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4),
                    HardwareSpec(max_device_memory=64 * 2 ** 30, framework_reserve=0), rc, SwapSpec())
     rep = ev.evaluate(record_timeline=True)
@@ -467,11 +538,13 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>tp</label><input name="tp" type="number" min="1" value="1"></div>
     <div class="fld"><label>ep</label><input name="ep" type="number" min="1" value="1"></div>
     <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
+    <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的 transformer 层数(mindformers num_layer_list 口径),段数=pp、和=layers;embedding/head 自动归 stage0/末 stage"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
     <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="custom 重算作用的层范围 a-b,空=全部"></div>
+    <div class="fld"><label>细粒度选重(mf 口径)</label><input name="sel_cfg" placeholder="self_attention:0-3; flash:4-7" style="width:210px" title="mindformers select_module 口径:pattern=cell 名(self_attention/mlp)或 op 名子串;层范围 0-indexed(a-b,逗号分段);分号分隔多条;非空即生效(优先于图上勾选)"></div>
     <input type="hidden" name="sel_ops" value="">
     <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
   </div>
