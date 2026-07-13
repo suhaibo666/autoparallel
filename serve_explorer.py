@@ -284,10 +284,11 @@ h1{font-size:19px;margin:5px 0 8px}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .tab{padding:5px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;font:600 12px var(--mono)}
 .tab.on{background:var(--blue);color:#fff;border-color:var(--blue)}.tab.oom{border-color:#c0392b;color:#c0392b}.tab.on.oom{background:#c0392b;color:#fff}
-.grid{display:grid;grid-template-columns:460px 1fr 330px;gap:14px;align-items:start}
+.grid{display:grid;grid-template-columns:1fr 340px;gap:14px;align-items:start}
+.maincol{display:flex;flex-direction:column;gap:14px;min-width:0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .card>header{padding:11px 15px;border-bottom:1px solid var(--line);font-weight:600;font-size:13.5px}
-.gpane{max-height:calc(100vh - 240px);overflow:auto;padding:10px 12px}
+.gpane{max-height:56vh;overflow:auto;padding:10px 12px}
 .lay{border:1px solid var(--line);border-radius:9px;margin-bottom:8px;overflow:hidden}
 .lay>.hd{display:flex;align-items:center;gap:9px;padding:7px 11px;background:#fafbfc;cursor:pointer;font:12.5px var(--mono)}
 .lay>.hd:hover{background:#f0f3f7}
@@ -356,11 +357,13 @@ h1{font-size:19px;margin:5px 0 8px}
 <div class="wrap">
   <div class="tabs" id="tabs"></div>
   <div class="grid">
-    <div class="card"><header id="ghdr">模型结构 · op-DAG（点层展开）</header><div class="gpane" id="gpane"></div></div>
-    <div class="card"><header id="tlhdr">内存时间线（FWD→BWD,按时间顺序）</header>
-      <div class="tlpane"><p class="desc" id="tldesc"></p><div id="tl"></div></div>
-      <div class="legend" id="leg"></div></div>
-    <div class="card"><header id="dhdr">详情</header><div class="dpane" id="detail"><p class="ph">悬停/点击左侧算子 → 算子详情（存的激活/上下游）；点中间 timeline → 该刻各桶。</p></div></div>
+    <div class="maincol">
+      <div class="card"><header id="ghdr">模型结构 · op-DAG（点层展开）</header><div class="gpane" id="gpane"></div></div>
+      <div class="card"><header id="tlhdr">内存时间线（FWD→BWD,按时间顺序）</header>
+        <div class="tlpane"><p class="desc" id="tldesc"></p><div id="tl"></div></div>
+        <div class="legend" id="leg"></div></div>
+    </div>
+    <div class="card"><header id="dhdr">详情</header><div class="dpane" id="detail"><p class="ph">悬停/点击左侧算子 → 算子详情（存的激活/上下游）；点 timeline → 该刻各桶。</p></div></div>
   </div>
 </div>
 <script>
