@@ -83,8 +83,20 @@ def parse_and_validate(p):
         errs.append(f"无 MoE 层（dense_k={dense_k} ≥ layers 或 experts=0），ep({ep}) 无意义,请设 1")
     if (dp * cp * tp) % ep:
         errs.append(f"ep({ep}) 必须整除 dp_shard·cp·tp={dp*cp*tp}（专家在该区内分片,ParallelModel 规则）")
-    if rmode not in ("None", "full", "select"):
+    if rmode not in ("None", "full", "select", "custom"):
         errs.append(f"recompute {rmode!r} 不支持")
+    # custom（细粒度,mindformers select_recompute 口径）:sel_ops=逗号分隔 op 名;sel_layers=a-b 范围
+    sel_ops_raw = [s.strip() for s in p.get("sel_ops", "").split(",") if s.strip()]
+    lr = p.get("sel_layers", "").strip() or f"1-{N}"
+    try:
+        a, b = (int(x) for x in lr.split("-")) if "-" in lr else (int(lr), int(lr))
+    except ValueError:
+        a = b = -1
+    if rmode == "custom":
+        if not sel_ops_raw:
+            errs.append("custom 重算需至少勾选一个 op（图上点 ↻）")
+        if not (1 <= a <= b <= N):
+            errs.append(f"重算层范围 {lr!r} 非法（1-{N} 内的 a-b）")
     if errs:
         return errs, None, None
 
@@ -98,7 +110,7 @@ def parse_and_validate(p):
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
-                   rmode=rmode, sel=sel, N=N)
+                   rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b))
     return [], cfg, pc_args
 
 
@@ -155,6 +167,10 @@ def eval_config(p):
     elif pa["rmode"] == "select":
         selset = _SEL_ATTN if pa["sel"] == "attn" else (_SEL_MLP if pa["sel"] == "mlp" else _SEL_ATTN | _SEL_MLP)
         rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in range(1, N + 1)})
+    elif pa["rmode"] == "custom":
+        # 细粒度（问题2）:任意 op 名 × 层范围 —— 与 mindformers select_recompute（op 位置级）同口径。
+        a, b = pa["sel_range"]
+        rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in range(a, b + 1)})
     else:
         rc = RecomputeSpec("None")
     mbs = pa["pp"] if pa["pp"] > 1 else 1
@@ -249,6 +265,9 @@ h1{font-size:19px;margin:5px 0 8px}
 .opn:first-child::before{top:50%}.opn:last-child::before{bottom:50%}
 .opn::after{content:"";position:absolute;left:-13px;top:50%;width:6px;height:6px;border-radius:50%;background:#aab2bd;transform:translateY(-50%)}
 .opn.hl{outline:3px solid #111}.opn.rel-u{outline:2.5px solid #2f4b7c}.opn.rel-d{outline:2.5px solid #e15759}
+.opn.rc{background-image:repeating-linear-gradient(45deg,transparent 0 6px,rgba(255,255,255,.22) 6px 12px)!important;box-shadow:inset 0 0 0 2px #fff}
+.rcb{float:right;margin:-2px -4px 0 6px;width:19px;height:19px;line-height:19px;text-align:center;border-radius:5px;background:rgba(255,255,255,.25);cursor:pointer;font-weight:700}
+.rcb:hover{background:rgba(255,255,255,.5)}.rcb.on{background:#fff;color:#c0392b}
 .tlpane{padding:10px 12px}
 .tlpane svg{display:block;width:100%;height:auto}
 .desc{color:var(--mut);font-size:11.5px;margin:0 0 6px}
@@ -287,10 +306,13 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
-    <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select</option></select></div>
+    <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
+    <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="custom 重算作用的层范围 a-b,空=全部"></div>
+    <input type="hidden" name="sel_ops" value="">
     <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
   </div>
+  <div class="cfgrow" id="rcrow" style="display:none"><span class="cap">重算 op</span><div id="rcchips" style="font:11.5px var(--mono);color:var(--mut)">（在左图 op 节点上点 <b>↻</b> 勾选;再点取消）</div></div>
   <div class="errbox" id="err"></div>
 </div>
 <div class="wrap">
@@ -347,7 +369,9 @@ function drawGraph(st){
     const opsH=open?`<div class="ops">`+L.ops.map(o=>{
       const c=OPC[o.type]||"#8b93a0";
       const tag=o.act_mib>0?`<span class="sv">💾 存激活 ${o.act_mib} MiB</span>`:(o.param_mib>0?`<span class="tr">⚙ 参数 ${o.param_mib}M</span>`:`<span class="tr">↻ transient</span>`);
-      return `<div class="opn" style="background:${c}" data-l="${L.id}" data-i="${o.i}"><span class="nm">${esc(o.name)}</span> <span class="meta">${esc(o.type)}</span><br><span class="meta">→ ${esc(o.out.name)} · ${o.out.mib}M</span> &nbsp;${tag}</div>`;
+      const rcOn=customOps.has(o.name);
+      const rcBtn=`<span class="rcb ${rcOn?"on":""}" data-op="${esc(o.name)}" title="标记该 op 重算(custom)">↻</span>`;
+      return `<div class="opn ${rcOn?"rc":""}" style="background:${c}" data-l="${L.id}" data-i="${o.i}">${rcBtn}<span class="nm">${esc(o.name)}</span> <span class="meta">${esc(o.type)}</span><br><span class="meta">→ ${esc(o.out.name)} · ${o.out.mib}M</span> &nbsp;${tag}</div>`;
     }).join("")+`</div>`:"";
     return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops</span><span class="am">激活 ${L.act_mib} MiB</span></div>${opsH}</div>`;
   }).join("");
@@ -356,6 +380,28 @@ function drawGraph(st){
     el.addEventListener("mouseenter",()=>hiOp(st,+el.dataset.l,+el.dataset.i));
     el.addEventListener("click",()=>hiOp(st,+el.dataset.l,+el.dataset.i));
   });
+  document.querySelectorAll(".rcb").forEach(b=>b.addEventListener("click",e=>{
+    e.stopPropagation(); toggleRc(b.dataset.op);}));
+}
+/* ── ② 细粒度重算:任意 op 勾选(与 mindformers select_recompute 同口径) ── */
+let customOps=new Set();
+function toggleRc(op){
+  customOps.has(op)?customOps.delete(op):customOps.add(op);
+  document.querySelector("[name=sel_ops]").value=[...customOps].join(",");
+  if(customOps.size&&document.querySelector("[name=recompute]").value!=="custom")
+    document.querySelector("[name=recompute]").value="custom";
+  syncChips(); refreshSoon();
+}
+function syncChips(){
+  const row=document.getElementById("rcrow");
+  const isC=document.querySelector("[name=recompute]").value==="custom";
+  row.style.display=isC?"flex":"none";
+  if(!isC)return;
+  document.getElementById("rcchips").innerHTML=customOps.size
+    ? [...customOps].map(o=>`<span style="display:inline-block;background:#eaf0f8;border:1px solid #c8d4e6;border-radius:6px;padding:2px 8px;margin:0 5px 3px 0;cursor:pointer" data-rm="${esc(o)}">↻ ${esc(o)} ✕</span>`).join("")
+      +`<span style="color:#999">（点 chip 移除;作用层范围见上方「重算层范围」）</span>`
+    : "（在左图 op 节点上点 <b>↻</b> 勾选;再点取消）";
+  document.querySelectorAll("#rcchips [data-rm]").forEach(c=>c.addEventListener("click",()=>toggleRc(c.dataset.rm)));
 }
 function hiOp(st,lid,i){
   const L=st.graph.find(x=>x.id===lid), o=L.ops[i];
@@ -418,7 +464,7 @@ function showBuckets(e){
     bs.map(([k,v])=>`<div class="barrow"><span class="bl">${k}</span><span class="bartrack"><span class="barfill" style="width:${v/mx*100}%;background:${BKC[k]||'#ccc'}"></span></span><span class="bv">${v.toFixed(0)}·${(v/e.total*100).toFixed(0)}%</span></div><div style="font-size:10px;color:#999;margin:-2px 0 3px 120px">${BKD[k]||""}</div>`).join("")+
     `<p style="color:#999;font-size:11px;margin-top:10px">悬停左侧算子可切回算子详情。</p>`;
 }
-document.querySelectorAll(".top [name]").forEach(e=>e.addEventListener("change",refreshSoon));
+document.querySelectorAll(".top [name]").forEach(e=>e.addEventListener("change",()=>{syncChips();refreshSoon();}));
 document.querySelectorAll(".top input[type=number]").forEach(e=>e.addEventListener("input",refreshSoon));
 refresh();
 </script></body></html>"""
