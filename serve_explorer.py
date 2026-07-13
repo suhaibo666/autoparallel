@@ -158,10 +158,12 @@ def graph_json(layers, norm_dtype, spec, dims):
         sm = estimate_structure_memory(l.ops, norm_compute_dtype_bytes=norm_dtype)
         orig_ops = spec.get_layer(l.layer_type).ops
         ops, edges = [], []
+        eseen = set()
         produced = {}
         for i, (op, oop) in enumerate(zip(l.ops, orig_ops)):
             for t in op.inputs:
-                if t.name in produced:
+                if t.name in produced and (produced[t.name], i) not in eseen:
+                    eseen.add((produced[t.name], i))
                     edges.append([produced[t.name], i])
             produced[op.output.name] = i
             acts = []
@@ -300,10 +302,10 @@ h1{font-size:19px;margin:5px 0 8px}
 .opn::before{content:"";position:absolute;left:-11px;top:-6px;bottom:-6px;border-left:2px solid #ccd2da}
 .opn:first-child::before{top:50%}.opn:last-child::before{bottom:50%}
 .opn::after{content:"";position:absolute;left:-13px;top:50%;width:6px;height:6px;border-radius:50%;background:#aab2bd;transform:translateY(-50%)}
-.opn.hl{outline:3px solid #111}.opn.rel-u{outline:2.5px solid #2f4b7c}.opn.rel-d{outline:2.5px solid #e15759}
-.opn.rc{background-image:repeating-linear-gradient(45deg,transparent 0 6px,rgba(255,255,255,.22) 6px 12px)!important;box-shadow:inset 0 0 0 2px #fff}
-.rcb{float:right;margin:-2px -4px 0 6px;width:19px;height:19px;line-height:19px;text-align:center;border-radius:5px;background:rgba(255,255,255,.25);cursor:pointer;font-weight:700}
-.rcb:hover{background:rgba(255,255,255,.5)}.rcb.on{background:#fff;color:#c0392b}
+.cnode{cursor:pointer}.cnode.dim{opacity:.2}.cnode.hl rect{stroke:#111!important;stroke-width:3.2px!important}
+.crcb{cursor:pointer}.crcb:hover circle{fill:#fff}
+.edge{stroke:#c3c9d2;stroke-width:1.4;fill:none}
+.edge.up{stroke:#2f4b7c;stroke-width:2.6}.edge.down{stroke:#e15759;stroke-width:2.6}.edge.dim{opacity:.25}
 .tlpane{padding:10px 12px}
 .tlpane svg{display:block;width:100%;height:auto}
 .desc{color:var(--mut);font-size:11.5px;margin:0 0 6px}
@@ -396,27 +398,57 @@ function drawStage(){
   const ev=st.timeline, pi=ev.findIndex(z=>z.total===st.peak);
   showBuckets(ev[pi>=0?pi:0]);
 }
-/* ── ③ 模型结构 op-DAG（逐层可展开;字节=切分后）── */
+/* ── ③ 模型结构 op-DAG（逐层可展开;真 SVG DAG:拓扑分层+连线箭头,分支/汇合可见）── */
+function cellLayout(ops,edges){
+  // 拓扑最长路分层:lv=深度(行,竖向);同 lv 并排(lane,横向)→ 分支支路可见。
+  const succ={},ind={}; ops.forEach(o=>ind[o.i]=0);
+  edges.forEach(([a,b])=>{(succ[a]=succ[a]||[]).push(b);ind[b]++;});
+  const lv={}; ops.forEach(o=>lv[o.i]=0);
+  const q=ops.filter(o=>ind[o.i]===0).map(o=>o.i), ind2=Object.assign({},ind);
+  while(q.length){const u=q.shift();(succ[u]||[]).forEach(v=>{lv[v]=Math.max(lv[v],lv[u]+1);if(--ind2[v]===0)q.push(v);});}
+  const lanes={}, pos={};
+  ops.forEach(o=>{const l=lv[o.i];lanes[l]=lanes[l]||0;pos[o.i]={lv:l,lane:lanes[l]++};});
+  return {pos,maxlv:Math.max(...ops.map(o=>lv[o.i]),0),maxlane:Math.max(...Object.values(lanes),1)};
+}
+function cellSvg(L){
+  const NW=196,NH=48,CW=214,RH=68,MX=8,MY=8;
+  const {pos,maxlv,maxlane}=cellLayout(L.ops,L.edges);
+  const W=MX*2+(maxlane)*CW+NW-CW+CW, H=MY*2+maxlv*RH+NH;
+  const X=i=>MX+pos[i].lane*CW, Y=i=>MY+pos[i].lv*RH;
+  let s=`<svg width="${Math.max(W,420)}" height="${H}" viewBox="0 0 ${Math.max(W,420)} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="var(--mono)" font-size="10.5">`;
+  s+=`<defs><marker id="ar${L.id}" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0L6,3L0,6Z" fill="#9aa2ad"/></marker></defs>`;
+  // 真实 edges:producer 底边中点 → consumer 顶边中点(贝塞尔+箭头)
+  L.edges.forEach(([a,b])=>{
+    const x1=X(a)+NW/2,y1=Y(a)+NH,x2=X(b)+NW/2,y2=Y(b);
+    s+=`<path class="edge" id="ce_${L.id}_${a}_${b}" d="M${x1},${y1} C${x1},${y1+22} ${x2},${y2-22} ${x2},${y2}" marker-end="url(#ar${L.id})"/>`;});
+  L.ops.forEach(o=>{
+    const c=OPC[o.type]||"#8b93a0", rcOn=customOps.has(o.name);
+    const x=X(o.i),y=Y(o.i);
+    const tag=o.act_mib>0?`💾 ${o.act_mib}M`:(o.param_mib>0?`⚙ ${o.param_mib}M`:"↻ transient");
+    const tagc=o.act_mib>0?"#ffe08a":"#e8e8e8";
+    s+=`<g class="cnode ${rcOn?"rc":""}" data-l="${L.id}" data-i="${o.i}">`;
+    s+=`<rect x="${x}" y="${y}" width="${NW}" height="${NH}" rx="7" fill="${c}" fill-opacity="0.88" stroke="${o.act_mib>0?"#c0392b":"#8d949e"}" stroke-width="${o.act_mib>0?2.5:1}"${rcOn?' stroke-dasharray="5 3"':''}/>`;
+    s+=`<text x="${x+8}" y="${y+15}" fill="#fff" font-weight="bold">${esc(o.name)} <tspan font-weight="normal" fill-opacity=".85">${esc(o.type)}</tspan></text>`;
+    s+=`<text x="${x+8}" y="${y+29}" fill="#f0f0f0" font-size="9.5">→${esc(o.out.name)}:(${esc(o.out.sym)})</text>`;
+    s+=`<text x="${x+8}" y="${y+42}" fill="${tagc}" font-size="9.5">${esc(tag)}${rcOn?"  ↻重算":""}</text>`;
+    s+=`<g class="crcb" data-op="${esc(o.name)}"><circle cx="${x+NW-13}" cy="${y+13}" r="9" fill="${rcOn?"#fff":"rgba(255,255,255,.28)"}"/><text x="${x+NW-13}" y="${y+17}" text-anchor="middle" font-weight="bold" fill="${rcOn?"#c0392b":"#fff"}">↻</text></g></g>`;});
+  return s+`</svg>`;
+}
 function drawGraph(st){
   document.getElementById("ghdr").textContent=`模型结构 · Stage ${st.stage}（${st.n_layers} 层,点层展开 op-DAG）`;
   if(openLayers.size===0){const seen=new Set();st.graph.forEach(L=>{if(!seen.has(L.type)){seen.add(L.type);openLayers.add(L.id);}});}
-  document.getElementById("gpane").innerHTML=st.graph.map(L=>{
+  document.getElementById("gpane").innerHTML=st.graph.map((L,idx)=>{
     const open=openLayers.has(L.id);
-    const opsH=open?`<div class="ops">`+L.ops.map(o=>{
-      const c=OPC[o.type]||"#8b93a0";
-      const tag=o.act_mib>0?`<span class="sv">💾 存激活 ${o.act_mib} MiB</span>`:(o.param_mib>0?`<span class="tr">⚙ 参数 ${o.param_mib}M</span>`:`<span class="tr">↻ transient</span>`);
-      const rcOn=customOps.has(o.name);
-      const rcBtn=`<span class="rcb ${rcOn?"on":""}" data-op="${esc(o.name)}" title="标记该 op 重算(custom)">↻</span>`;
-      return `<div class="opn ${rcOn?"rc":""}" style="background:${c}" data-l="${L.id}" data-i="${o.i}">${rcBtn}<span class="nm">${esc(o.name)}</span> <span class="meta">${esc(o.type)}</span><br><span class="meta">→ ${esc(o.out.name)}:(${esc(o.out.sym)}) · ${o.out.mib}M</span> &nbsp;${tag}</div>`;
-    }).join("")+`</div>`:"";
-    return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops</span><span class="am">激活 ${L.act_mib} MiB</span></div>${opsH}</div>`;
+    const opsH=open?`<div class="ops" style="display:block;overflow-x:auto">${cellSvg(L)}</div>`:"";
+    const conn=idx<st.graph.length-1?`<div style="text-align:center;color:#9aa2ad;font:12px var(--mono);line-height:1">↓</div>`:"";
+    return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops · ${L.edges.length} edges</span><span class="am">激活 ${L.act_mib} MiB</span></div>${opsH}</div>${conn}`;
   }).join("");
   document.querySelectorAll(".lay>.hd").forEach(h=>h.addEventListener("click",()=>{const id=+h.dataset.l;openLayers.has(id)?openLayers.delete(id):openLayers.add(id);drawGraph(st);}));
-  document.querySelectorAll(".opn").forEach(el=>{
+  document.querySelectorAll(".cnode").forEach(el=>{
     el.addEventListener("mouseenter",()=>hiOp(st,+el.dataset.l,+el.dataset.i));
     el.addEventListener("click",()=>hiOp(st,+el.dataset.l,+el.dataset.i));
   });
-  document.querySelectorAll(".rcb").forEach(b=>b.addEventListener("click",e=>{
+  document.querySelectorAll(".crcb").forEach(b=>b.addEventListener("click",e=>{
     e.stopPropagation(); toggleRc(b.dataset.op);}));
 }
 /* ── ② 细粒度重算:任意 op 勾选(与 mindformers select_recompute 同口径) ── */
@@ -442,9 +474,13 @@ function syncChips(){
 function hiOp(st,lid,i){
   const L=st.graph.find(x=>x.id===lid), o=L.ops[i];
   const pred=L.edges.filter(e=>e[1]===i).map(e=>e[0]), succ=L.edges.filter(e=>e[0]===i).map(e=>e[1]);
-  document.querySelectorAll(".opn").forEach(el=>{el.classList.remove("hl","rel-u","rel-d");
+  const keep=new Set([i,...pred,...succ]);
+  document.querySelectorAll(".cnode").forEach(el=>{el.classList.remove("hl","dim");
     if(+el.dataset.l!==lid)return; const j=+el.dataset.i;
-    if(j===i)el.classList.add("hl"); else if(pred.includes(j))el.classList.add("rel-u"); else if(succ.includes(j))el.classList.add("rel-d");});
+    if(j===i)el.classList.add("hl"); else if(!keep.has(j))el.classList.add("dim");});
+  document.querySelectorAll(".edge").forEach(e=>e.classList.remove("up","down","dim"));
+  L.edges.forEach(([a,b])=>{const e=document.getElementById(`ce_${lid}_${a}_${b}`);if(!e)return;
+    if(b===i)e.classList.add("up"); else if(a===i)e.classList.add("down"); else e.classList.add("dim");});
   const c=OPC[o.type]||"#8b93a0";
   const actsH=o.acts.length?o.acts.map(a=>`<div style="margin-bottom:4px"><span style="color:#c0392b;font-weight:700">💾 ${a.mib} MiB</span> = ${esc(a.name)} <span style="color:#555">${esc(a.calc)}</span></div>`).join(""):'<span style="color:#999">（反向不存激活）</span>';
   const U=pred.length?pred.map(j=>`<li data-l="${lid}" data-g="${j}">↑ ${esc(L.ops[j].name)} (${esc(L.ops[j].type)})</li>`).join(""):'<li style="color:#999;cursor:default">（层输入）</li>';
