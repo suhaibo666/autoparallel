@@ -119,9 +119,10 @@ def _i(p, k, d):
 
 
 def parse_pp_split(s, pp, N):
-    """「pp 层分配」文本 → layers_per_stage（含伪层）。对应 mindformers `num_layer_list` 口径:
-    用户输 **transformer 层数/stage**（如 "3,5"）,服务端补伪层:stage0 +1(embedding)、末 stage +1(head)。
-    返回 (errors, tuple|None)。空串 → None(均匀切)。"""
+    """「pp 层分配」文本 → **transformer 层分配**（不含伪层）。对应 mindformers `num_layer_list`
+    口径:用户只输 transformer 层数/stage（如 "5,5,6,6,6,6,5,4"）——embedding/head/MTP **不占配额**,
+    由 eval_config 在 cfg 构建后归置(embedding→stage0、head+mtp→末 stage,2026-07-11 修:此前在此处
+    补伪层拿不到 mtp 数,V4 带 MTP 时和差 1 报错)。返回 (errors, tuple|None)。空串 → None(均匀切)。"""
     s = (s or "").strip()
     if not s:
         return [], None
@@ -135,10 +136,7 @@ def parse_pp_split(s, pp, N):
         return [f"pp 层分配之和({sum(parts)}) 必须 == transformer 层数({N})"], None
     if any(x < 1 for x in parts):
         return [f"pp 层分配每段须 ≥1:{parts}"], None
-    full = list(parts)
-    full[0] += 1                      # stage0 含 embedding 伪层
-    full[-1] += 1                     # 末 stage 含 head 伪层
-    return [], tuple(full)
+    return [], tuple(parts)
 
 
 def parse_select_cfg(s, N):
@@ -284,6 +282,14 @@ def parse_and_validate(p):
         first_k_dense_replace=dense_k,
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk)
+    # pp 层分配 → 含伪层的 layers_per_stage:embedding→stage0、head+MTP→末 stage（不占用户配额;
+    # mtp 数只有 cfg 构建后可知——V4 预设 num_nextn_predict_layers=1）。
+    if pp_split is not None:
+        mtp = int(getattr(cfg, "mtp_num_layers", 0) or 0)
+        full = list(pp_split)
+        full[0] += 1
+        full[-1] += 1 + mtp
+        pp_split = tuple(full)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
                    rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b),
                    sel_cfg=sel_cfg, pp_split=pp_split, vpp=vpp)
@@ -510,7 +516,8 @@ def _bundle_to_fields(b):
     }
     if getattr(pc, "layers_per_stage", None):
         lp = list(pc.layers_per_stage)
-        lp[0] -= 1; lp[-1] -= 1                       # 去 embedding/head 伪层 → transformer 层分配
+        lp[0] -= 1                                     # 去 embedding 伪层
+        lp[-1] -= 1 + int(getattr(llm, "mtp_num_layers", 0) or 0)   # 去 head 伪层 + MTP 层
         f["pp_split"] = ",".join(str(x) for x in lp)
     return f
 
