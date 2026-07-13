@@ -114,43 +114,79 @@ def parse_and_validate(p):
     return [], cfg, pc_args
 
 
-def _rt(t):
-    return {"name": t.name, "mib": round(t.local_numel * t.dtype_bytes / MiB, 2)}
+def _dtype_lbl(b):
+    return {1: "int8(1B)", 2: "bf16(2B)", 4: "fp32(4B)"}.get(b, f"{b}B")
 
 
-def graph_json(layers, norm_dtype):
-    """一个 stage 的 ResolvedLayer 列表 → 逐层 op-DAG JSON。
-    per-op saves 按 norm-fp32 口径调整（与仿真器一致）;层头激活 = estimate_structure_memory 去重值。"""
+def _shape_info(tref, rt, dims, dtype_b):
+    """符号 shape × 每维数值 × 切分除数 → 计算说明（让 MiB 可追溯）。
+    tref=原始 TensorRef(符号 shape+shard 标注);rt=ResolvedTensor(切分后 numel,真值)。"""
+    from cost_eval.shape_eval import eval_expr
+
+    def _dim(d):
+        s = str(d)
+        return f"({s})" if ("+" in s or "*" in s) else s   # 复合维加括号防歧义
+    sym = "·".join(_dim(d) for d in tref.shape) if tref is not None else "?"
+    vals = None
+    div = 1
+    axes = ""
+    if tref is not None:
+        try:
+            vs = [int(round(eval_expr(str(d), dims))) for d in tref.shape]
+            vals = "×".join(str(v) for v in vs)
+            full = 1
+            for v in vs:
+                full *= v
+            # 除数 = 全量/切分后（真值,来自 resolve）;轴标注只列 shard 声明（cp 是否真切由除数体现）
+            div = max(1, round(full / rt.local_numel)) if rt.local_numel else 1
+            axes = "·".join(sorted(set(tref.shard.values())))
+        except Exception:
+            pass
+    calc = f"({sym})" + (f"={vals}" if vals else "")
+    if div > 1:
+        calc += f" ÷{div}" + (f"({axes})" if axes else "")
+    calc += f" ·{_dtype_lbl(dtype_b)}"
+    return calc
+
+
+def graph_json(layers, norm_dtype, spec, dims):
+    """一个 stage 的 ResolvedLayer 列表 → 逐层 op-DAG JSON（含 shape 计算说明）。
+    per-op saves 按 norm-fp32 口径调整（与仿真器一致）;层头激活 = estimate_structure_memory 去重值。
+    原始 OpSpec（符号 shape/shard）与 resolved op 按序对齐——resolve 保序遍历,zip 安全。"""
     out = []
     for l in layers:
         sm = estimate_structure_memory(l.ops, norm_compute_dtype_bytes=norm_dtype)
+        orig_ops = spec.get_layer(l.layer_type).ops
         ops, edges = [], []
         produced = {}
-        for i, op in enumerate(l.ops):
+        for i, (op, oop) in enumerate(zip(l.ops, orig_ops)):
             for t in op.inputs:
                 if t.name in produced:
                     edges.append([produced[t.name], i])
             produced[op.output.name] = i
             acts = []
             act_b = 0
-            for t in op.saves:
-                b = t.local_numel * t.dtype_bytes
-                # norm-fp32 口径:norm(非 softmax) 的 saved 输入按 fp32 计（与 structure_mem 一致）
-                if op.type == "norm" and "softmax" not in op.name.lower() and norm_dtype > t.dtype_bytes:
-                    b = t.local_numel * norm_dtype
+            for t, ot in zip(op.saves, oop.saves):
+                is_norm_fp32 = (op.type == "norm" and "softmax" not in op.name.lower()
+                                and norm_dtype > t.dtype_bytes)
+                eff_dtype = norm_dtype if is_norm_fp32 else t.dtype_bytes
+                b = t.local_numel * eff_dtype
                 acts.append({"name": t.name, "mib": round(b / MiB, 2),
-                             "dtype": ("fp32" if (op.type == "norm" and "softmax" not in op.name.lower()
-                                                  and norm_dtype == 4) else f"{t.dtype_bytes}B")})
+                             "calc": _shape_info(ot, t, dims, eff_dtype)
+                                     + (" ←norm 存 fp32 输入" if is_norm_fp32 else "")})
                 act_b += b
             ops.append({"i": i, "name": op.name, "type": op.type,
                         "act_mib": round(act_b / MiB, 2), "acts": acts,
                         "param_mib": round(sum(t.local_numel * t.dtype_bytes for t in op.params) / MiB, 2),
-                        "out": _rt(op.output), "ins": [t.name for t in op.inputs],
+                        "out": {"name": op.output.name,
+                                "mib": round(op.output.local_numel * op.output.dtype_bytes / MiB, 2),
+                                "sym": "·".join(str(d) for d in oop.output.shape),
+                                "calc": _shape_info(oop.output, op.output, dims, op.output.dtype_bytes)},
+                        "ins": [t.name for t in op.inputs],
                         "ws_mib": round(op.workspace_bytes / MiB, 1)})
         out.append({"id": l.layer_id, "type": l.layer_type,
                     "act_mib": round(sm.activation_saves / MiB, 1),
-                    "param_mib": round(sm.param_bytes / MiB, 1) if hasattr(sm, "param_bytes") else
-                                 round(sum(o["param_mib"] for o in ops), 1),
+                    "param_mib": round(sum(o["param_mib"] for o in ops), 1),
                     "ops": ops, "edges": edges})
     return out
 
@@ -193,7 +229,7 @@ def eval_config(p):
         stages.append({
             "stage": sp.stage, "peak": round(sp.peak_bytes / MiB, 1), "peak_event": sp.peak_event,
             "oom": sp.oom, "layers_desc": rng, "n_layers": len(lys),
-            "graph": graph_json(lys, norm_dtype),
+            "graph": graph_json(lys, norm_dtype, spec, d),
             "timeline": [{"event": s.event, "total": round(s.total_bytes / MiB, 1),
                           "buckets": {k: round(getattr(s.breakdown, k, 0) / MiB, 1) for k in BK
                                       if getattr(s.breakdown, k, 0)}} for s in sp.timeline],
@@ -371,7 +407,7 @@ function drawGraph(st){
       const tag=o.act_mib>0?`<span class="sv">💾 存激活 ${o.act_mib} MiB</span>`:(o.param_mib>0?`<span class="tr">⚙ 参数 ${o.param_mib}M</span>`:`<span class="tr">↻ transient</span>`);
       const rcOn=customOps.has(o.name);
       const rcBtn=`<span class="rcb ${rcOn?"on":""}" data-op="${esc(o.name)}" title="标记该 op 重算(custom)">↻</span>`;
-      return `<div class="opn ${rcOn?"rc":""}" style="background:${c}" data-l="${L.id}" data-i="${o.i}">${rcBtn}<span class="nm">${esc(o.name)}</span> <span class="meta">${esc(o.type)}</span><br><span class="meta">→ ${esc(o.out.name)} · ${o.out.mib}M</span> &nbsp;${tag}</div>`;
+      return `<div class="opn ${rcOn?"rc":""}" style="background:${c}" data-l="${L.id}" data-i="${o.i}">${rcBtn}<span class="nm">${esc(o.name)}</span> <span class="meta">${esc(o.type)}</span><br><span class="meta">→ ${esc(o.out.name)}:(${esc(o.out.sym)}) · ${o.out.mib}M</span> &nbsp;${tag}</div>`;
     }).join("")+`</div>`:"";
     return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops</span><span class="am">激活 ${L.act_mib} MiB</span></div>${opsH}</div>`;
   }).join("");
@@ -410,14 +446,14 @@ function hiOp(st,lid,i){
     if(+el.dataset.l!==lid)return; const j=+el.dataset.i;
     if(j===i)el.classList.add("hl"); else if(pred.includes(j))el.classList.add("rel-u"); else if(succ.includes(j))el.classList.add("rel-d");});
   const c=OPC[o.type]||"#8b93a0";
-  const actsH=o.acts.length?o.acts.map(a=>`<div><span style="color:#c0392b;font-weight:700">💾 ${a.mib} MiB</span> ${esc(a.name)} · ${esc(a.dtype)}</div>`).join(""):'<span style="color:#999">（反向不存激活）</span>';
+  const actsH=o.acts.length?o.acts.map(a=>`<div style="margin-bottom:4px"><span style="color:#c0392b;font-weight:700">💾 ${a.mib} MiB</span> = ${esc(a.name)} <span style="color:#555">${esc(a.calc)}</span></div>`).join(""):'<span style="color:#999">（反向不存激活）</span>';
   const U=pred.length?pred.map(j=>`<li data-l="${lid}" data-g="${j}">↑ ${esc(L.ops[j].name)} (${esc(L.ops[j].type)})</li>`).join(""):'<li style="color:#999;cursor:default">（层输入）</li>';
   const D=succ.length?succ.map(j=>`<li data-l="${lid}" data-g="${j}">↓ ${esc(L.ops[j].name)} (${esc(L.ops[j].type)})</li>`).join(""):'<li style="color:#999;cursor:default">（层输出）</li>';
   document.getElementById("dhdr").textContent="算子详情";
   document.getElementById("detail").innerHTML=`<span class="badge" style="background:${c}">${esc(o.name)}</span> <span style="font:600 11px var(--mono);color:var(--blue)">${esc(o.type)} · L${lid} ${esc(L.type)}</span>
     <div class="kv">
     <div class="k">要存的激活（切分后）</div><div class="v">${actsH}</div>
-    <div class="k">输出</div><div class="v">${esc(o.out.name)} · ${o.out.mib} MiB</div>
+    <div class="k">输出</div><div class="v">${esc(o.out.name)} · ${o.out.mib} MiB<br><span style="color:#555">${esc(o.out.calc)}</span></div>
     <div class="k">输入</div><div class="v">${o.ins.map(esc).join(", ")||"—"}</div>
     ${o.param_mib?`<div class="k">参数(持久,切分后)</div><div class="v">⚙ ${o.param_mib} MiB</div>`:""}
     ${o.ws_mib?`<div class="k">workspace</div><div class="v">${o.ws_mib} MiB</div>`:""}
