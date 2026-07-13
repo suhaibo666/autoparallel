@@ -144,7 +144,11 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         # attn_weights（走 scratch）；unfused 才 save 它们。
         sparse_saves = ([q_hnorm, core_out] if fused
                         else [q_hnorm, kv_gathered, attn_weights, core_out])
-        ops.append(OpSpec("sparse_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out, compressed_kv], core_out,
+        # inputs 含 topk_indices（仅 CSA）= 稀疏选 KV 的**数据流依赖**（indexer→sparse_attn 边;
+        # 2026-07-11 补边:此前缺此边致 indexer 成 op 图孤立叶节点。saves/字节不变）。
+        sparse_ins = ([q_hnorm, kv_a_out, compressed_kv, topk_indices] if enable_indexer
+                      else [q_hnorm, kv_a_out, compressed_kv])
+        ops.append(OpSpec("sparse_attn", OpType.FLASH_ATTN, sparse_ins, core_out,
                           params=[attn_sink], saves=sparse_saves, workspace=FLASH_LSE_WS))
     else:
         # 滑窗（ratio 0/1）：纯 flash（sliding-window），saves Q(=q_hnorm)/O(core_out)+lse（[S,S] 从不物化，§7.4）

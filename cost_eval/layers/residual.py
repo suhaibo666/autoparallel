@@ -179,4 +179,27 @@ def mhc_wrap(body_ops: list, n_streams: int, d: DimTable) -> list:
 
     attn_hc = build_hyper_connection_ops("attn", d)
     ffn_hc = build_hyper_connection_ops("ffn", d)
+
+    # ── 数据流衔接边（2026-07-11 补边;按上方 docstring 已声明的语义,inputs 追加引用、
+    #    saves/输出不动 → 零字节;此前名字断链致 mHC 段在 op 图成孤立叶节点）──
+    #  ① aggregate「由 body 的 ln1 承接」(:85-87) → 段首 op inputs += hc mapping_proj 输出;
+    #  ② output_cell 残差更新由段尾残差 add 体现(:87) → 段尾 op inputs += h_res;
+    #  ③ ffn_hc 吃的 ffn_streams = attn 段更新后的残差流(= attn 段尾输出 h1) → inputs += h1。
+    def _add_dep(op: OpSpec, *refs) -> OpSpec:
+        return OpSpec(op.name, op.type, list(op.inputs) + list(refs), op.output,
+                      params=list(op.params), saves=list(op.saves),
+                      workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs))
+
+    def _link(hc, seg, prev_carrier):
+        if not seg:
+            return seg
+        seg = list(seg)
+        seg[0] = _add_dep(seg[0], hc[1].output)          # ① proj(聚合来源) → 段首(ln)
+        seg[-1] = _add_dep(seg[-1], hc[2].output)        # ② h_res → 段尾残差 add
+        return seg
+
+    attn_seg = _link(attn_hc, attn_seg, None)
+    if attn_seg:
+        ffn_hc = [_add_dep(ffn_hc[0], attn_seg[-1].output)] + ffn_hc[1:]   # ③ h1 → ffn_hc_norm
+    ffn_seg = _link(ffn_hc, ffn_seg, None)
     return attn_hc + attn_seg + ffn_hc + ffn_seg

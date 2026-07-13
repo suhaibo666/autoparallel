@@ -131,8 +131,12 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     eh_cat = TensorRef("eh_cat", ("S", "B", "2*H"))                          # cat → 2H（:379）
     eh_out = TensorRef("x", ("S", "B", "H"), shard={0: "sp"})               # eh_proj 输出 → decoder 输入
     eh_w = TensorRef("eh_w", ("2*H", "H"), is_weight=True)                   # Linear(2H → H，:304-312)
+    # enorm inputs 含 emb_out = MTP 共享 embedding 输出(roll 后即 decoder_input)的**数据流依赖**
+    # (embedding→enorm 边,2026-07-11 补边;saves 不变零字节)。hnorm 输入 mtp_hidden 为**主干跨层输入**
+    # (真实外部入口,层内无 producer 属语义正确,不补假边)。
+    emb_out_ref = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})
     ops += [
-        OpSpec("enorm", OpType.NORM, [dec_in], en_out, saves=[dec_in]),
+        OpSpec("enorm", OpType.NORM, [dec_in, emb_out_ref], en_out, saves=[dec_in]),
         OpSpec("hnorm", OpType.NORM, [hid], hn_out, saves=[hid]),
         OpSpec("eh_cat", OpType.ELEMENTWISE, [en_out, hn_out], eh_cat, saves=[]),
         OpSpec("eh_proj", OpType.MATMUL, [eh_cat, eh_w], eh_out, params=[eh_w], saves=[eh_cat]),
@@ -150,6 +154,8 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     ffn_ops = list(FFN_REGISTRY[ffn](dims))
     if ffn == "moe" and cfg.moe_shared_expert_num > 0:
         ffn_ops += build_shared_expert_ops(dims)
+        from .ffn import build_moe_merge_op
+        ffn_ops.append(build_moe_merge_op(dims))   # 合流 op(2026-07-11 补边,与主干 _build_decoder_body 同构)
     # mHC：MTP 的**内层 transformer_layer 同样跑在打包残差流上**（multi_token_prediction.py
     # :381-399：`expand_hyper_connection_streams` → transformer_layer → `collapse_...`，
     # `self.hc = config.enable_hyper_connections`）。故 mHC 开启时 MTP decoder 也要 ×n 包装
@@ -162,7 +168,21 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         expand = OpSpec("mtp_hc_expand", OpType.ELEMENTWISE, [eh], mtp_streams, saves=[])
         collapse_out = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
         collapse = OpSpec("mtp_hc_collapse", OpType.ELEMENTWISE, [mtp_streams], collapse_out, saves=[])
+        # collapse 的真实入流 = mhc 层尾更新后的残差流(wrapped 末 op 输出);此处先占位,wrap 后补依赖。
         wrapped = mhc_wrap(attn_ops + ffn_ops, cfg.num_residual_streams, dims)
+        # expand→attn_hc_norm 补边(2026-07-11):expand 输出 mtp_hc_streams 即 mhc 段入口流
+        # (名字断链;inputs 追加引用,saves 不变零字节)。
+        w0 = wrapped[0]
+        wrapped[0] = OpSpec(w0.name, w0.type, list(w0.inputs) + [mtp_streams], w0.output,
+                            params=list(w0.params), saves=list(w0.saves),
+                            workspace=w0.workspace, bwd_scratch=w0.bwd_scratch, attrs=dict(w0.attrs))
+        # collapse←层尾更新流 补边(2026-07-11):collapse 规约的是 mhc 更新后的 streams(wrapped 末
+        # op 输出,如 moe_add 的 h2×n),非 expand 的原始流——名字断链致 moe_add 孤立。
+        collapse = OpSpec(collapse.name, collapse.type,
+                          list(collapse.inputs) + [wrapped[-1].output], collapse.output,
+                          params=list(collapse.params), saves=list(collapse.saves),
+                          workspace=collapse.workspace, bwd_scratch=collapse.bwd_scratch,
+                          attrs=dict(collapse.attrs))
         ops += [expand] + wrapped + [collapse]
     else:
         ops += attn_ops + ffn_ops
