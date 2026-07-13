@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.stdout.reconfigure(encoding="utf-8")
-from cost_eval.presets import deepseek_v3
+from cost_eval.presets import deepseek_v3, deepseek_v4
 from cost_eval.build_llm import build_llm_spec
 from cost_eval.structure_mem import estimate_structure_memory
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
@@ -29,6 +29,70 @@ _CP_METHODS = ("colossal", "ulysses", "ring", "hybrid")
 # select 选择器（同 from_mindformers._SELECT_MODULE_OPS 口径）
 _SEL_ATTN = {"linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj", "qkv"}
 _SEL_MLP = {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared"}
+
+# ── 模型预设（结构字段自 HF config.json,2026-07-11 抓取;dims=对 LLMConfig 的覆盖）─────────
+# ui: 预设填充到页面输入框的值;dims: 服务端构建 LLMConfig 时 replace 的全尺寸维度。
+# base: "v3"=deepseek_v3 缩层基座 / "v4"=deepseek_v4（dsv4_hybrid,compress_ratios 逐层按 0/4/128
+# 循环近似——HF 全列表未逐层抓取,已标注）。
+PRESETS = {
+    "dsv3_mini": {
+        "label": "DSv3-mini（仓库锚点）", "base": "v3",
+        "source": "仓库缩层配置(真机验证锚点 12473)",
+        "ui": {"attn": "mla", "layers": 8, "dense_k": 1, "experts": 8, "topk": 4,
+               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1},
+        "dims": {},
+    },
+    "dsv3_671b": {
+        "label": "DeepSeek-V3 671B", "base": "v3",
+        "source": "HF deepseek-ai/DeepSeek-V3 config.json",
+        "ui": {"attn": "mla", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
+               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1},
+        "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
+                 "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
+                 "qk_rope_head_dim": 64, "v_head_dim": 128, "head_dim": 192,
+                 "vocab_size": 129280, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 2048},
+    },
+    "dsv32_exp": {
+        "label": "DeepSeek-V3.2-Exp", "base": "v3",
+        "source": "HF deepseek-ai/DeepSeek-V3.2-Exp config.json;DSA indexer(64/128/topk2048) 未建模→按 full-attention 上界",
+        "ui": {"attn": "mla", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
+               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1},
+        "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
+                 "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
+                 "qk_rope_head_dim": 64, "v_head_dim": 128, "head_dim": 192,
+                 "vocab_size": 129280, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 2048},
+    },
+    "dsv4_flash": {
+        "label": "DeepSeek-V4-Flash", "base": "v4",
+        "source": "HF deepseek-ai/DeepSeek-V4-Flash config.json;compress_ratios 逐层按 0/4/128 循环近似",
+        "ui": {"attn": "dsv4_hybrid", "layers": 43, "dense_k": 1, "experts": 256, "topk": 6,
+               "heads": 64, "kv_groups": 1, "seq": 4096, "batch": 1},
+        "dims": {"hidden_size": 4096, "moe_ffn_hidden_size": 2048,
+                 "q_lora_rank": 1024, "o_lora_rank": 1024, "o_groups": 8,
+                 "dsa_indexer_n_heads": 64, "dsa_indexer_head_dim": 128, "dsa_indexer_topk": 512,
+                 "vocab_size": 129280, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 2048},
+    },
+    "dsv4_pro": {
+        "label": "DeepSeek-V4-Pro", "base": "v4",
+        "source": "HF deepseek-ai/DeepSeek-V4-Pro config.json;compress_ratios 逐层按 0/4/128 循环近似",
+        "ui": {"attn": "dsv4_hybrid", "layers": 61, "dense_k": 1, "experts": 384, "topk": 6,
+               "heads": 128, "kv_groups": 1, "seq": 4096, "batch": 1},
+        "dims": {"hidden_size": 7168, "moe_ffn_hidden_size": 3072,
+                 "q_lora_rank": 1536, "o_lora_rank": 1024, "o_groups": 16,
+                 "dsa_indexer_n_heads": 64, "dsa_indexer_head_dim": 128, "dsa_indexer_topk": 1024,
+                 "vocab_size": 129280, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 3072},
+    },
+    "glm5": {
+        "label": "GLM-5 (zai-org)", "base": "v3",
+        "source": "HF zai-org/GLM-5 config.json(glm_moe_dsa);DSA indexer(32/128/topk2048) 未建模→按 full-attention 上界",
+        "ui": {"attn": "mla", "layers": 78, "dense_k": 3, "experts": 256, "topk": 8,
+               "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1},
+        "dims": {"hidden_size": 6144, "ffn_hidden_size": 12288, "moe_ffn_hidden_size": 2048,
+                 "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_head_dim": 192,
+                 "qk_rope_head_dim": 64, "v_head_dim": 256, "head_dim": 256,
+                 "vocab_size": 154880, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 2048},
+    },
+}
 
 
 def _i(p, k, d):
@@ -56,8 +120,11 @@ def parse_and_validate(p):
             errs.append(f"{name} 必须是 ≥{lo} 的整数")
     if errs:
         return errs, None, None
-    if attn not in ("mla", "gqa", "mha"):
-        errs.append(f"attn 结构 {attn!r} 不支持（mla/gqa/mha）")
+    if attn not in ("mla", "gqa", "mha", "dsv4_hybrid"):
+        errs.append(f"attn 结构 {attn!r} 不支持（mla/gqa/mha/dsv4_hybrid）")
+    preset = p.get("preset", "dsv3_mini")
+    if preset not in PRESETS:
+        errs.append(f"未知模型预设 {preset!r}")
     if method not in _CP_METHODS:
         errs.append(f"cp 算法 {method!r} 不支持（{'/'.join(_CP_METHODS)}）")
     if dense_k > N:
@@ -100,12 +167,18 @@ def parse_and_validate(p):
     if errs:
         return errs, None, None
 
-    base = deepseek_v3(N)
+    # 预设基座（dims 覆盖 = HF config.json 的全尺寸维度）+ UI 字段最终覆盖。
+    pr = PRESETS[preset]
+    base = (deepseek_v4(N) if pr["base"] == "v4" else deepseek_v3(N))
+    if pr["dims"]:
+        base = dataclasses.replace(base, **pr["dims"])
     cfg = dataclasses.replace(
         base, num_layers=N, batch_size=B, seq_length=S,
         attn_type=("gqa" if attn == "mha" else attn),
         num_attention_heads=heads,
-        num_query_groups=(heads if attn in ("mla", "mha") else kvg),
+        # dsv4_hybrid 的 num_query_groups 用基座值（MLA 系惰性=1）;mla/mha=heads;gqa=kv_groups。
+        num_query_groups=(base.num_query_groups if attn == "dsv4_hybrid"
+                          else (heads if attn in ("mla", "mha") else kvg)),
         first_k_dense_replace=dense_k,
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk)
@@ -253,7 +326,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            self._send(PAGE, "text/html"); return
+            self._send(PAGE.replace("__PRESETS__", json.dumps(PRESETS, ensure_ascii=False)),
+                       "text/html"); return
         if u.path == "/api/eval":
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             try:
@@ -328,7 +402,15 @@ h1{font-size:19px;margin:5px 0 8px}
   <div class="eyebrow">pynative-cost-evaluator · interactive v2</div>
   <h1>LLM 内存实验台 — 结构可配 · 切分自由 · op-DAG + timeline</h1>
   <div class="cfgrow"><span class="cap">模型结构</span>
-    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option></select></div>
+    <div class="fld"><label>模型预设</label><select id="preset" name="preset" style="min-width:170px">
+      <option value="dsv3_mini" selected>DSv3-mini（仓库锚点）</option>
+      <option value="dsv3_671b">DeepSeek-V3 671B</option>
+      <option value="dsv32_exp">DeepSeek-V3.2-Exp</option>
+      <option value="dsv4_flash">DeepSeek-V4-Flash</option>
+      <option value="dsv4_pro">DeepSeek-V4-Pro</option>
+      <option value="glm5">GLM-5 (zai-org)</option>
+    </select></div>
+    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
     <div class="fld"><label>layers</label><input name="layers" type="number" min="1" value="8"></div>
     <div class="fld"><label>dense 层数</label><input name="dense_k" type="number" min="0" value="1" title="前 K 层 dense,其余 MoE(first_k_dense_replace);=layers 则纯 dense"></div>
     <div class="fld"><label>experts</label><input name="experts" type="number" min="0" value="8"></div>
@@ -367,8 +449,10 @@ h1{font-size:19px;margin:5px 0 8px}
   </div>
 </div>
 <script>
+const PRESETS=__PRESETS__;
 const OPC={matmul:"#4e79a7",flash_attn:"#e15759",elementwise:"#b07aa1",norm:"#59a14f",rope:"#8cd17d",
-  moe_router:"#f9a825",moe_gemm:"#2f4b7c",dispatch:"#76b7b2",combine:"#76b7b2",embedding:"#7cae60"};
+  moe_router:"#f9a825",moe_gemm:"#2f4b7c",dispatch:"#76b7b2",combine:"#76b7b2",embedding:"#7cae60",
+  dsa:"#e15759",csa:"#e15759",hca:"#e15759"};
 const BKC={persistent:"#6b6b6b",act_live:"#4e79a7",kept_frag:"#c0392b",gather_buf:"#59a14f",grad_buf:"#f28e2b",recomp_scratch:"#b07aa1",bwd_scratch:"#e15759",bwd_working_set:"#8cd17d",swap_buf:"#76b7b2",workspace:"#bab0ac",optstep:"#ff9da7",framework:"#d7d7d7"};
 const BKD={persistent:"参数+优化器状态",act_live:"存活激活",kept_frag:"B margin(保留-MoE碎片)",gather_buf:"FSDP all-gather",grad_buf:"梯度缓冲",recomp_scratch:"full重算重物化",bwd_scratch:"反向临时(loss fp32)",bwd_working_set:"无重算反向工作集",swap_buf:"激活swap",workspace:"算子workspace",optstep:"优化器step",framework:"框架"};
 let cur=null,curStage=0,openLayers=new Set();
@@ -539,7 +623,14 @@ function showBuckets(e){
     bs.map(([k,v])=>`<div class="barrow"><span class="bl">${k}</span><span class="bartrack"><span class="barfill" style="width:${v/mx*100}%;background:${BKC[k]||'#ccc'}"></span></span><span class="bv">${v.toFixed(0)}·${(v/e.total*100).toFixed(0)}%</span></div><div style="font-size:10px;color:#999;margin:-2px 0 3px 120px">${BKD[k]||""}</div>`).join("")+
     `<p style="color:#999;font-size:11px;margin-top:10px">悬停左侧算子可切回算子详情。</p>`;
 }
-document.querySelectorAll(".top [name]").forEach(e=>e.addEventListener("change",()=>{syncChips();refreshSoon();}));
+/* 模型预设:选中即填充结构字段(HF config.json 值),用户仍可手改覆盖 */
+function applyPreset(key){
+  const pr=PRESETS[key]; if(!pr)return;
+  Object.entries(pr.ui).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el)el.value=v;});
+  document.getElementById("kmeta").textContent="来源: "+pr.source;
+}
+document.getElementById("preset").addEventListener("change",e=>{applyPreset(e.target.value);syncChips();refreshSoon();});
+document.querySelectorAll(".top [name]").forEach(e=>{if(e.id!=="preset")e.addEventListener("change",()=>{syncChips();refreshSoon();});});
 document.querySelectorAll(".top input[type=number]").forEach(e=>e.addEventListener("input",refreshSoon));
 refresh();
 </script></body></html>"""
