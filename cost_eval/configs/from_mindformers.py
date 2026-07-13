@@ -82,6 +82,13 @@ _IGNORED_MODEL_KEYS = {
     "moe_aux_loss_coeff", "scoring_func", "norm_topk_prob", "moe_token_drop_policy",
     "moe_router_enable_expert_bias", "moe_router_bias_update_rate",
     "use_pad_tokens", "topk_group", "n_group",
+    # ── 2026-07-11 增补（真机老式 deepseek3 yaml 实测字段,逐项论证内存中性）──────────────
+    # kernel 融合 flags:只改瞬时 workspace 形态,不改驻留 saves（融合残差已按 D-5 口径处理）。
+    "apply_rope_fusion", "bias_swiglu_fusion", "use_fused_ops_topkrouter",
+    # mask 压缩:评估器不建 attention mask 常驻（mask 属 workspace 级）→ 压缩与否不改 op 图。
+    "use_attn_mask_compression",
+    # 纯 loss 标量权重,无内存效应。
+    "mtp_loss_factor",
 }
 
 

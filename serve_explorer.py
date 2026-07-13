@@ -185,7 +185,9 @@ def parse_and_validate(p):
     heads = _i(p, "heads", 8); kvg = _i(p, "kv_groups", heads)
     dense_k = _i(p, "dense_k", 1); E = _i(p, "experts", 8); topk = _i(p, "topk", 4)
     dp = _i(p, "dp", 2); tp = _i(p, "tp", 1); ep = _i(p, "ep", 1)
-    pp = _i(p, "pp", 1); cp = _i(p, "cp", 1)
+    pp = _i(p, "pp", 1); cp = _i(p, "cp", 1); vpp = _i(p, "vpp", 1)
+    if vpp < 1:
+        errs.append("vpp 必须是 ≥1 的整数")
     attn = p.get("attn", "mla"); method = p.get("method", "colossal")
     rmode = p.get("recompute", "None"); sel = p.get("select", "attn")
     # 结构维度（custom/微调:UI 传入即覆盖;未传(-1)则用预设 dims/基座默认）
@@ -284,7 +286,7 @@ def parse_and_validate(p):
         moe_router_topk=topk)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
                    rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b),
-                   sel_cfg=sel_cfg, pp_split=pp_split)
+                   sel_cfg=sel_cfg, pp_split=pp_split, vpp=vpp)
     return [], cfg, pc_args
 
 
@@ -391,7 +393,7 @@ def eval_config(p):
     mbs = pa["pp"] if pa["pp"] > 1 else 1
     pc = ParallelConfig(dp_shard=pa["dp"], tp=pa["tp"], ep=pa["ep"], pp=pa["pp"], cp=pa["cp"],
                         sequence_parallel=(pa["dp"] > 1 or pa["tp"] > 1), num_microbatches=mbs,
-                        context_parallel_method=pa["method"],
+                        context_parallel_method=pa["method"], interleave=pa["vpp"],
                         layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None))
     ev = Evaluator(spec, pc, OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4),
                    HardwareSpec(max_device_memory=64 * 2 ** 30, framework_reserve=0), rc, SwapSpec())
@@ -441,6 +443,52 @@ def _sel_ops_to_text(select_ops):
     return "; ".join(parts)
 
 
+def _mf_adapt(mf):
+    """老式 mindformers yaml（`parallel_config`/`recompute_config`/`runner_config`,model.model_config
+    嵌套,offset/pp_interleave_num 在 model 段）→ 转换器新式段。**只改内存中的 dict,不落盘**;
+    新式 yaml 原样通过。返回 (mf, vpp)。"""
+    mf = dict(mf)
+    off = vpp = None
+    m = mf.get("model")
+    if isinstance(m, dict) and "model_config" in m:            # model.model_config 展平
+        mc = dict(m["model_config"])
+        off = mc.pop("offset", None)                           # pipeline 层偏移(老式放 model 段)
+        vpp = mc.pop("pp_interleave_num", None)                # VPP 交错数
+        mf["model"] = mc
+    if "parallelism" not in mf and isinstance(mf.get("parallel_config"), dict):
+        pcfg = mf["parallel_config"]
+        mf["parallelism"] = {
+            "tensor_parallel": pcfg.get("model_parallel", 1),
+            "pipeline_parallel": pcfg.get("pipeline_stage", 1),
+            "expert_parallel": pcfg.get("expert_parallel", 1),
+            "context_parallel": pcfg.get("context_parallel", 1),
+            "data_parallel_shard": pcfg.get("data_parallel", 1),
+            "sequence_parallel": bool(pcfg.get("use_seq_parallel", False)),
+            "pipeline_parallel_microbatch_size": pcfg.get("micro_batch_num", 1),
+        }
+    if "recompute" not in mf and isinstance(mf.get("recompute_config"), dict):
+        rcfg = mf["recompute_config"]
+        N = int((mf.get("model") or {}).get("num_hidden_layers", 0) or 0)
+        if rcfg.get("recompute") is True:                      # 老式 recompute:True = 全层 full
+            mf["recompute"] = {"mode": "full", "full_recompute_layer": [f"0-{N-1}"]}
+        elif isinstance(rcfg.get("select_recompute"), dict):
+            mf["recompute"] = {"mode": "select", "select_module": rcfg["select_recompute"]}
+    if "training" not in mf:
+        mf["training"] = {"local_batch_size": (mf.get("runner_config") or {}).get("batch_size", 1)}
+    # offset → parallelism.num_layer_list:嵌套(VPP per-chunk)按 stage 跨 chunk 求和;flat 走 offset;int 忽略。
+    if isinstance(off, (list, tuple)) and off:
+        par = mf.setdefault("parallelism", {})
+        pp = int(par.get("pipeline_parallel", 1) or 1)
+        N = int((mf.get("model") or {}).get("num_hidden_layers", 0) or 0)
+        if isinstance(off[0], (list, tuple)):
+            v = len(off)
+            base = N // (pp * v)
+            par["num_layer_list"] = [sum(base + int(off[c][s]) for c in range(v)) for s in range(pp)]
+        else:
+            par["offset"] = list(off)
+    return mf, int(vpp or 1)
+
+
 def _bundle_to_fields(b):
     """EvaluatorConfigBundle → UI 字段 dict（yaml 导入回填;只读转换,不落盘）。"""
     llm, pc, rc = b.llm, b.parallel, b.recompute
@@ -481,9 +529,17 @@ class H(BaseHTTPRequestHandler):
                 mf = _yaml.safe_load(txt)
                 if not isinstance(mf, dict):
                     raise ValueError("yaml 顶层须是映射(mindformers 训练配置)")
+                mf, vpp = _mf_adapt(mf)
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
-                self._send(json.dumps({"ok": True, "fields": _bundle_to_fields(from_mindformers_dict(mf))},
-                                      ensure_ascii=False))
+                try:
+                    fields = _bundle_to_fields(from_mindformers_dict(mf))
+                except KeyError as ke:
+                    raise ValueError(
+                        f"yaml 的 model_config 缺结构字段 {ke}（该 yaml 依赖 mindformers 类内默认值,"
+                        "评估器不猜默认以免杜撰）——请补全该字段,或选预设后手工调整") from ke
+                if vpp > 1:
+                    fields["vpp"] = vpp
+                self._send(json.dumps({"ok": True, "fields": fields}, ensure_ascii=False))
             except Exception as e:
                 self._send(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
             return
@@ -610,6 +666,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>ep</label><input name="ep" type="number" min="1" value="1"></div>
     <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
     <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的 transformer 层数(mindformers num_layer_list 口径),段数=pp、和=layers;embedding/head 自动归 stage0/末 stage"></div>
+    <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num)"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
