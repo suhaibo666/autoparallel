@@ -154,8 +154,8 @@ def test_mla_moe_decoder_has_shared_expert():
         i for i, op in enumerate(layer.ops) if op.type == OpType.COMBINE
     )
     post_combine_ops = layer.ops[combine_idx + 1:]
-    # Must have exactly 3 shared expert ops
-    assert len(post_combine_ops) == 3
+    # 3 shared expert ops + moe_add(2026-07-11 补边:routed+shared 合流,零字节)
+    assert len(post_combine_ops) == 4
     # The two matmul ones must not use ep sharding
     shared_matmuls = [op for op in post_combine_ops if op.type == OpType.MATMUL]
     assert len(shared_matmuls) == 2
@@ -165,10 +165,10 @@ def test_mla_moe_decoder_has_shared_expert():
 
 
 def test_mla_moe_decoder_total_op_count():
-    """10 attn + 6 moe FFN + 3 shared expert = 19 ops total."""
+    """10 attn + 6 moe FFN + 3 shared expert + 1 moe_add(合流,2026-07-11 补边) = 20 ops total."""
     from cost_eval.layers.mla import build_mla_moe_decoder
     layer = build_mla_moe_decoder(DM)
-    assert len(layer.ops) == 19
+    assert len(layer.ops) == 20
 
 
 # ---------------------------------------------------------------------------

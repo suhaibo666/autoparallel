@@ -144,10 +144,12 @@ def build_mla_attn_ops(d: DimTable) -> list:
         OpSpec("linear_qkv", OpType.MATMUL,      [ln1_out, qkv_w],  qkv_out,
                params=[qkv_w], saves=[ln1_out]),
         # 3. q_a LayerNorm（在 q_lora_rank 维上；输入为 qkv split 切片）
-        OpSpec("q_a_norm",   OpType.NORM,        [q_a_in],          q_a_out,
+        #    inputs 含 qkv_out = 切片视图的**数据流依赖**（qkv_out→q_a_norm 边;字节仍按切片 q_a_in 计,
+        #    saves 不变——此前名字断链致 op 图出现孤立叶节点）。
+        OpSpec("q_a_norm",   OpType.NORM,        [q_a_in, qkv_out], q_a_out,
                saves=[q_a_in]),
         # 4. kv_a LayerNorm（在 kv_lora_rank 维上）
-        OpSpec("kv_a_norm",  OpType.NORM,        [kv_a_in],         kv_a_out,
+        OpSpec("kv_a_norm",  OpType.NORM,        [kv_a_in, qkv_out], kv_a_out,
                saves=[kv_a_in]),
         # 5. linear_qb（列并行：q_lora → n_heads*(nope+rope)）
         OpSpec("linear_qb",  OpType.MATMUL,      [q_a_out, qb_w],   qb_out,

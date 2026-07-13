@@ -91,8 +91,9 @@ def test_mla_dense_decoder_fields_identical():
 
 
 def test_mla_moe_decoder_fields_identical():
-    from cost_eval.layers.ffn import build_shared_expert_ops
-    recomposed = build_mla_attn_ops(DM) + build_moe_ffn_ops(DM) + build_shared_expert_ops(DM)
+    from cost_eval.layers.ffn import build_shared_expert_ops, build_moe_merge_op
+    recomposed = (build_mla_attn_ops(DM) + build_moe_ffn_ops(DM) + build_shared_expert_ops(DM)
+                  + [build_moe_merge_op(DM)])
     _assert_ops_identical(recomposed, mla.build_mla_moe_decoder(DM).ops)
 
 

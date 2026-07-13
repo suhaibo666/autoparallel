@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from ..model_spec import DimTable, LayerSpec
 from .attention import build_mla_attn_ops
-from .ffn import build_dense_ffn_ops, build_moe_ffn_ops, build_shared_expert_ops
+from .ffn import (build_dense_ffn_ops, build_moe_ffn_ops, build_shared_expert_ops,
+                  build_moe_merge_op)
 
 # 向后兼容：旧代码从 mla 导入 MLA 符号维度别名 / attn builder
 from .attention import (  # noqa: F401
@@ -49,7 +50,10 @@ def build_mla_moe_decoder(d: DimTable) -> LayerSpec:
         吃 h1，intermediate=moe_shared_F，纯 tp 切、不 ep。
 
     Shared expert 输出名 ``sh_o`` 与 MoE combine 输出 ``comb`` 不同名，避免冲突。
+    尾接 ``moe_add``（2026-07-11 补边）:routed(comb)+shared(sh_o) 合流 → h2（moe_layer 真实语义,
+    线性 add saves=[] 零字节;修 op 图孤立叶节点,与 build_llm 装配保持逐字段一致）。
     """
     return LayerSpec(
         ops=build_mla_attn_ops(d) + build_moe_ffn_ops(d) + build_shared_expert_ops(d)
+        + [build_moe_merge_op(d)]
     )

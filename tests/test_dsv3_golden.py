@@ -21,7 +21,10 @@ GOLDEN_OPS = {
                   "rope", "flash", "o_proj", "add1", "ln2", "fc1", "swiglu", "fc2", "add2"],
     "mla_moe": ["ln1", "linear_qkv", "q_a_norm", "kv_a_norm", "linear_qb", "linear_kvb",
                 "rope", "flash", "o_proj", "add1", "router", "dispatch", "e_fc1",
-                "e_swiglu", "e_fc2", "combine", "shared_fc1", "shared_swiglu", "shared_fc2"],
+                "e_swiglu", "e_fc2", "combine", "shared_fc1", "shared_swiglu", "shared_fc2",
+                # moe_add(2026-07-11 补边):routed+shared 合流(moe_layer 真实语义,线性 add saves=[]
+                # 零字节——下方字节 golden 全部不动即为证;修 op 图 combine/shared_fc2 孤立叶节点)。
+                "moe_add"],
     "lm_head": ["lm_head", "logsoftmax", "nll"],
 }
 # ── 冻结 golden：N=4 峰值逐桶字节（framework_reserve=177 MiB、full 重算 1..4、FSDP dp_shard=2、

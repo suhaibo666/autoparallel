@@ -124,7 +124,9 @@ def build_moe_ffn_ops(d: DimTable) -> list:
                saves=[logits]),
         # 2. Dispatch（all-to-all；把 token 路由到各 expert rank）
         #    workspace = 置换发送 staging 缓冲（experts.py permute → routed_input [S·B·topk,H]）
-        OpSpec("dispatch", OpType.DISPATCH,   [hin],       disp,
+        #    inputs 含 logits = 路由索引的**数据流依赖**（router→dispatch 边;dispatch 按 topk 选路,
+        #    字节/saves 不变——此前缺此边致 router 成孤立叶节点）。
+        OpSpec("dispatch", OpType.DISPATCH,   [hin, logits], disp,
                saves=[disp], workspace=MOE_STAGING_WS),
         # 3. 专家 fc1（grouped GEMM，按 ep 切分的专家矩阵）
         OpSpec("e_fc1",    OpType.MOE_GEMM,   [disp, w1], g,
@@ -140,6 +142,20 @@ def build_moe_ffn_ops(d: DimTable) -> list:
         OpSpec("combine",  OpType.COMBINE,    [eo],        comb,
                saves=[comb], workspace=MOE_STAGING_WS),
     ]
+
+
+def build_moe_merge_op(d: DimTable) -> "OpSpec":
+    """MoE 层尾合流 op（2026-07-11 补边）：routed 输出(comb) + shared 输出(sh_o) 相加 → h2。
+
+    真机语义:`moe_layer construct: output = routed + shared` + transformer_layer 残差。此前 moe 层
+    未建此 op（dense 层有 add2、moe 层没有,不对称）→ combine/shared_fc2 成 op 图孤立叶节点。
+    线性 elementwise:saves=[]（反向直传）→ **激活字节零变化**;仅 forward_max_live 尾部多一个
+    live 输出（若动锚点即回退）。
+    """
+    comb = TensorRef("comb", ("S", "B", "H"), shard={0: "sp"})
+    sh_o = TensorRef("sh_o", ("S", "B", "H"), partial="tp")
+    h2   = TensorRef("h2",   ("S", "B", "H"), shard={0: "sp"})
+    return OpSpec("moe_add", OpType.ELEMENTWISE, [comb, sh_o], h2, saves=[])
 
 
 def build_shared_expert_ops(d: DimTable) -> list:
