@@ -35,18 +35,30 @@ _SEL_MLP = {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shar
 # base: "v3"=deepseek_v3 缩层基座 / "v4"=deepseek_v4（dsv4_hybrid,compress_ratios 逐层按 0/4/128
 # 循环近似——HF 全列表未逐层抓取,已标注）。
 PRESETS = {
+    "custom": {
+        "label": "Custom（自定义）", "base": "v3",
+        "source": "自定义结构（改任意字段即自动切到此项;维度全由下方输入框决定）",
+        "ui": {"attn": "mla", "layers": 8, "dense_k": 1, "experts": 8, "topk": 4,
+               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1,
+               "hidden": 1792, "ffn": 3072, "moe_ffn": 1024, "q_lora": 1536, "kv_lora": 512,
+               "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
+        "dims": {},
+    },
     "dsv3_mini": {
         "label": "DSv3-mini（仓库锚点）", "base": "v3",
         "source": "仓库缩层配置(真机验证锚点 12473)",
         "ui": {"attn": "mla", "layers": 8, "dense_k": 1, "experts": 8, "topk": 4,
-               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1},
+               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1,
+               "hidden": 1792, "ffn": 3072, "moe_ffn": 1024, "q_lora": 1536, "kv_lora": 512,
+               "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {},
     },
     "dsv3_671b": {
         "label": "DeepSeek-V3 671B", "base": "v3",
         "source": "HF deepseek-ai/DeepSeek-V3 config.json",
         "ui": {"attn": "mla", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
-               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1},
+               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1,
+               "hidden": 7168, "ffn": 18432, "moe_ffn": 2048, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "vocab": 129280},
         "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
                  "qk_rope_head_dim": 64, "v_head_dim": 128, "head_dim": 192,
@@ -56,7 +68,8 @@ PRESETS = {
         "label": "DeepSeek-V3.2-Exp", "base": "v3",
         "source": "HF deepseek-ai/DeepSeek-V3.2-Exp config.json;DSA indexer(64/128/topk2048) 未建模→按 full-attention 上界",
         "ui": {"attn": "mla", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
-               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1},
+               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1,
+               "hidden": 7168, "ffn": 18432, "moe_ffn": 2048, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "vocab": 129280},
         "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
                  "qk_rope_head_dim": 64, "v_head_dim": 128, "head_dim": 192,
@@ -66,7 +79,8 @@ PRESETS = {
         "label": "DeepSeek-V4-Flash", "base": "v4",
         "source": "HF deepseek-ai/DeepSeek-V4-Flash config.json;compress_ratios 逐层按 0/4/128 循环近似",
         "ui": {"attn": "dsv4_hybrid", "layers": 43, "dense_k": 1, "experts": 256, "topk": 6,
-               "heads": 64, "kv_groups": 1, "seq": 4096, "batch": 1},
+               "heads": 64, "kv_groups": 1, "seq": 4096, "batch": 1,
+               "hidden": 4096, "ffn": 12288, "moe_ffn": 2048, "q_lora": 1024, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {"hidden_size": 4096, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1024, "o_lora_rank": 1024, "o_groups": 8,
                  "dsa_indexer_n_heads": 64, "dsa_indexer_head_dim": 128, "dsa_indexer_topk": 512,
@@ -76,7 +90,8 @@ PRESETS = {
         "label": "DeepSeek-V4-Pro", "base": "v4",
         "source": "HF deepseek-ai/DeepSeek-V4-Pro config.json;compress_ratios 逐层按 0/4/128 循环近似",
         "ui": {"attn": "dsv4_hybrid", "layers": 61, "dense_k": 1, "experts": 384, "topk": 6,
-               "heads": 128, "kv_groups": 1, "seq": 4096, "batch": 1},
+               "heads": 128, "kv_groups": 1, "seq": 4096, "batch": 1,
+               "hidden": 7168, "ffn": 18432, "moe_ffn": 3072, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {"hidden_size": 7168, "moe_ffn_hidden_size": 3072,
                  "q_lora_rank": 1536, "o_lora_rank": 1024, "o_groups": 16,
                  "dsa_indexer_n_heads": 64, "dsa_indexer_head_dim": 128, "dsa_indexer_topk": 1024,
@@ -86,7 +101,8 @@ PRESETS = {
         "label": "GLM-5 (zai-org)", "base": "v3",
         "source": "HF zai-org/GLM-5 config.json(glm_moe_dsa);DSA indexer(32/128/topk2048) 未建模→按 full-attention 上界",
         "ui": {"attn": "mla", "layers": 78, "dense_k": 3, "experts": 256, "topk": 8,
-               "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1},
+               "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1,
+               "hidden": 6144, "ffn": 12288, "moe_ffn": 2048, "q_lora": 2048, "kv_lora": 512, "qk_nope": 192, "qk_rope": 64, "v_head": 256, "vocab": 154880},
         "dims": {"hidden_size": 6144, "ffn_hidden_size": 12288, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_head_dim": 192,
                  "qk_rope_head_dim": 64, "v_head_dim": 256, "head_dim": 256,
@@ -112,6 +128,19 @@ def parse_and_validate(p):
     pp = _i(p, "pp", 1); cp = _i(p, "cp", 1)
     attn = p.get("attn", "mla"); method = p.get("method", "colossal")
     rmode = p.get("recompute", "None"); sel = p.get("select", "attn")
+    # 结构维度（custom/微调:UI 传入即覆盖;未传(-1)则用预设 dims/基座默认）
+    _DIMF = {"hidden": "hidden_size", "ffn": "ffn_hidden_size", "moe_ffn": "moe_ffn_hidden_size",
+             "q_lora": "q_lora_rank", "kv_lora": "kv_lora_rank", "qk_nope": "qk_nope_head_dim",
+             "qk_rope": "qk_rope_head_dim", "v_head": "v_head_dim", "vocab": "vocab_size"}
+    dim_over = {}
+    for uik, field in _DIMF.items():
+        v = _i(p, uik, -1)
+        if p.get(uik) is not None and v < 1:
+            errs.append(f"{uik} 必须是 ≥1 的整数")
+        elif v >= 1:
+            dim_over[field] = v
+    if "qk_nope_head_dim" in dim_over and "qk_rope_head_dim" in dim_over:
+        dim_over["head_dim"] = dim_over["qk_nope_head_dim"] + dim_over["qk_rope_head_dim"]
 
     for name, v, lo in [("layers", N, 1), ("batch", B, 1), ("seq", S, 1), ("heads", heads, 1),
                         ("dp_shard", dp, 1), ("tp", tp, 1), ("ep", ep, 1), ("pp", pp, 1), ("cp", cp, 1),
@@ -169,9 +198,11 @@ def parse_and_validate(p):
 
     # 预设基座（dims 覆盖 = HF config.json 的全尺寸维度）+ UI 字段最终覆盖。
     pr = PRESETS[preset]
-    base = (deepseek_v4(N) if pr["base"] == "v4" else deepseek_v3(N))
+    base = (deepseek_v4(N) if (pr["base"] == "v4" or attn == "dsv4_hybrid") else deepseek_v3(N))
     if pr["dims"]:
         base = dataclasses.replace(base, **pr["dims"])
+    if dim_over:                               # UI 维度最终覆盖（custom / 预设微调）
+        base = dataclasses.replace(base, **dim_over)
     cfg = dataclasses.replace(
         base, num_layers=N, batch_size=B, seq_length=S,
         attn_type=("gqa" if attn == "mha" else attn),
@@ -420,6 +451,17 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>seq</label><input name="seq" type="number" min="1" value="4096"></div>
     <div class="fld"><label>batch</label><input name="batch" type="number" min="1" value="1"></div>
   </div>
+  <div class="cfgrow"><span class="cap">结构维度</span>
+    <div class="fld"><label>hidden</label><input name="hidden" type="number" min="1" value="1792"></div>
+    <div class="fld"><label>ffn</label><input name="ffn" type="number" min="1" value="3072"></div>
+    <div class="fld"><label>moe_ffn</label><input name="moe_ffn" type="number" min="1" value="1024"></div>
+    <div class="fld"><label>q_lora</label><input name="q_lora" type="number" min="1" value="1536"></div>
+    <div class="fld"><label>kv_lora</label><input name="kv_lora" type="number" min="1" value="512"></div>
+    <div class="fld"><label>qk_nope</label><input name="qk_nope" type="number" min="1" value="128"></div>
+    <div class="fld"><label>qk_rope</label><input name="qk_rope" type="number" min="1" value="64"></div>
+    <div class="fld"><label>v_head</label><input name="v_head" type="number" min="1" value="192"></div>
+    <div class="fld"><label>vocab</label><input name="vocab" type="number" min="1" value="129280" style="width:90px"></div>
+  </div>
   <div class="cfgrow"><span class="cap">并行切分</span>
     <div class="fld"><label>dp_shard</label><input name="dp" type="number" min="1" value="2"></div>
     <div class="fld"><label>tp</label><input name="tp" type="number" min="1" value="1"></div>
@@ -630,8 +672,15 @@ function applyPreset(key){
   document.getElementById("kmeta").textContent="来源: "+pr.source;
 }
 document.getElementById("preset").addEventListener("change",e=>{applyPreset(e.target.value);syncChips();refreshSoon();});
-document.querySelectorAll(".top [name]").forEach(e=>{if(e.id!=="preset")e.addEventListener("change",()=>{syncChips();refreshSoon();});});
-document.querySelectorAll(".top input[type=number]").forEach(e=>e.addEventListener("input",refreshSoon));
+/* 结构字段被手改 → 已偏离预设 → 下拉自动跳 Custom（并行/重算字段不算偏离） */
+const STRUCT_FIELDS=["attn","layers","dense_k","experts","topk","heads","kv_groups","seq","batch",
+  "hidden","ffn","moe_ffn","q_lora","kv_lora","qk_nope","qk_rope","v_head","vocab"];
+function markCustom(){const sel=document.getElementById("preset");if(sel.value!=="custom"){sel.value="custom";
+  document.getElementById("kmeta").textContent="来源: "+PRESETS.custom.source;}}
+document.querySelectorAll(".top [name]").forEach(e=>{if(e.id==="preset")return;
+  e.addEventListener("change",()=>{if(STRUCT_FIELDS.includes(e.name))markCustom();syncChips();refreshSoon();});});
+document.querySelectorAll(".top input[type=number]").forEach(e=>e.addEventListener("input",()=>{
+  if(STRUCT_FIELDS.includes(e.name))markCustom();refreshSoon();}));
 refresh();
 </script></body></html>"""
 
