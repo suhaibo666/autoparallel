@@ -39,7 +39,7 @@ PRESETS = {
         "label": "Custom（自定义）", "base": "v3",
         "source": "自定义结构（改任意字段即自动切到此项;维度全由下方输入框决定）",
         "ui": {"attn": "mla", "layers": 8, "dense_k": 1, "experts": 8, "topk": 4,
-               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1,
+               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1, "mtp": 0,
                "hidden": 1792, "ffn": 3072, "moe_ffn": 1024, "q_lora": 1536, "kv_lora": 512,
                "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {},
@@ -48,7 +48,7 @@ PRESETS = {
         "label": "DSv3-mini（仓库锚点）", "base": "v3",
         "source": "仓库缩层配置(真机验证锚点 12473)",
         "ui": {"attn": "mla", "layers": 8, "dense_k": 1, "experts": 8, "topk": 4,
-               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1,
+               "heads": 8, "kv_groups": 8, "seq": 4096, "batch": 1, "mtp": 0,
                "hidden": 1792, "ffn": 3072, "moe_ffn": 1024, "q_lora": 1536, "kv_lora": 512,
                "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {},
@@ -57,7 +57,7 @@ PRESETS = {
         "label": "DeepSeek-V3 671B", "base": "v3",
         "source": "HF deepseek-ai/DeepSeek-V3 config.json",
         "ui": {"attn": "mla", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
-               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1,
+               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1, "mtp": 1,
                "hidden": 7168, "ffn": 18432, "moe_ffn": 2048, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "vocab": 129280},
         "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
@@ -68,7 +68,7 @@ PRESETS = {
         "label": "DeepSeek-V3.2-Exp", "base": "v3",
         "source": "HF deepseek-ai/DeepSeek-V3.2-Exp config.json;DSA indexer(64/128/topk2048) 未建模→按 full-attention 上界",
         "ui": {"attn": "dsa", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
-               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1,
+               "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1, "mtp": 1,
                "hidden": 7168, "ffn": 18432, "moe_ffn": 2048, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "vocab": 129280},
         "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
@@ -79,7 +79,7 @@ PRESETS = {
         "label": "DeepSeek-V4-Flash", "base": "v4",
         "source": "HF deepseek-ai/DeepSeek-V4-Flash config.json;compress_ratios 逐层按 0/4/128 循环近似",
         "ui": {"attn": "dsv4_hybrid", "layers": 43, "dense_k": 1, "experts": 256, "topk": 6,
-               "heads": 64, "kv_groups": 1, "seq": 4096, "batch": 1,
+               "heads": 64, "kv_groups": 1, "seq": 4096, "batch": 1, "mtp": 1,
                "hidden": 4096, "ffn": 12288, "moe_ffn": 2048, "q_lora": 1024, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {"hidden_size": 4096, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1024, "o_lora_rank": 1024, "o_groups": 8,
@@ -90,7 +90,7 @@ PRESETS = {
         "label": "DeepSeek-V4-Pro", "base": "v4",
         "source": "HF deepseek-ai/DeepSeek-V4-Pro config.json;compress_ratios 逐层按 0/4/128 循环近似",
         "ui": {"attn": "dsv4_hybrid", "layers": 61, "dense_k": 1, "experts": 384, "topk": 6,
-               "heads": 128, "kv_groups": 1, "seq": 4096, "batch": 1,
+               "heads": 128, "kv_groups": 1, "seq": 4096, "batch": 1, "mtp": 1,
                "hidden": 7168, "ffn": 18432, "moe_ffn": 3072, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 192, "vocab": 129280},
         "dims": {"hidden_size": 7168, "moe_ffn_hidden_size": 3072,
                  "q_lora_rank": 1536, "o_lora_rank": 1024, "o_groups": 16,
@@ -101,7 +101,7 @@ PRESETS = {
         "label": "GLM-5 (zai-org)", "base": "v3",
         "source": "HF zai-org/GLM-5 config.json(glm_moe_dsa);DSA indexer(32/128/topk2048) 未建模→按 full-attention 上界",
         "ui": {"attn": "dsa", "layers": 78, "dense_k": 3, "experts": 256, "topk": 8,
-               "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1,
+               "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1, "mtp": 0,
                "hidden": 6144, "ffn": 12288, "moe_ffn": 2048, "q_lora": 2048, "kv_lora": 512, "qk_nope": 192, "qk_rope": 64, "v_head": 256, "vocab": 154880},
         "dims": {"hidden_size": 6144, "ffn_hidden_size": 12288, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_head_dim": 192,
@@ -133,7 +133,7 @@ def parse_pp_split(s, pp, N):
     if len(parts) != pp:
         return [f"pp 层分配段数({len(parts)}) 必须 == pp({pp})"], None
     if sum(parts) != N:
-        return [f"pp 层分配之和({sum(parts)}) 必须 == transformer 层数({N})"], None
+        return [f"pp 层分配之和({sum(parts)}) 必须 == 可切分总层数 transformer+mtp({N})"], None
     if any(x < 1 for x in parts):
         return [f"pp 层分配每段须 ≥1:{parts}"], None
     return [], tuple(parts)
@@ -184,8 +184,12 @@ def parse_and_validate(p):
     dense_k = _i(p, "dense_k", 1); E = _i(p, "experts", 8); topk = _i(p, "topk", 4)
     dp = _i(p, "dp", 2); tp = _i(p, "tp", 1); ep = _i(p, "ep", 1)
     pp = _i(p, "pp", 1); cp = _i(p, "cp", 1); vpp = _i(p, "vpp", 1)
+    mtp = _i(p, "mtp", 0)
     if vpp < 1:
         errs.append("vpp 必须是 ≥1 的整数")
+    if mtp < 0:
+        errs.append("mtp 层数必须是 ≥0 的整数")
+    T = N + max(0, mtp)      # 可切分总层数 = transformer + MTP（2026-07-11 用户口径:mtp 计入切分）
     attn = p.get("attn", "mla"); method = p.get("method", "colossal")
     rmode = p.get("recompute", "None"); sel = p.get("select", "attn")
     # 结构维度（custom/微调:UI 传入即覆盖;未传(-1)则用预设 dims/基座默认）
@@ -228,8 +232,8 @@ def parse_and_validate(p):
         errs.append(f"kv_groups({kvg}) 必须整除 heads({heads})")
     if S % cp:
         errs.append(f"cp({cp}) 必须整除序列长 seq({S})")
-    if pp > N:
-        errs.append(f"pp({pp}) 不能超过 transformer 层数({N})")
+    if pp > T:
+        errs.append(f"pp({pp}) 不能超过可切分总层数 transformer+mtp({T})")
     if has_moe:
         if E % ep:
             errs.append(f"ep({ep}) 必须整除专家数 experts({E})")
@@ -257,7 +261,7 @@ def parse_and_validate(p):
         if not (1 <= a <= b <= N):
             errs.append(f"重算层范围 {lr!r} 非法（1-{N} 内的 a-b）")
     # pp 层分配（mindformers num_layer_list 口径）
-    e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, N)
+    e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, T)
     errs += e_pp
     if errs:
         return errs, None, None
@@ -281,14 +285,15 @@ def parse_and_validate(p):
                           else (heads if attn in ("mla", "mha", "dsa") else kvg)),
         first_k_dense_replace=dense_k,
         num_moe_experts=(E if has_moe else None),
-        moe_router_topk=topk)
+        moe_router_topk=topk,
+        mtp_num_layers=max(0, mtp))
     # pp 层分配 → 含伪层的 layers_per_stage:embedding→stage0、head+MTP→末 stage（不占用户配额;
     # mtp 数只有 cfg 构建后可知——V4 预设 num_nextn_predict_layers=1）。
     if pp_split is not None:
-        mtp = int(getattr(cfg, "mtp_num_layers", 0) or 0)
+        # mtp 计入用户配额(和==N+mtp,MTP 位于层序列末端、落在末段配额里)→ 只补 embedding/head 伪层。
         full = list(pp_split)
         full[0] += 1
-        full[-1] += 1 + mtp
+        full[-1] += 1
         pp_split = tuple(full)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
                    rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b),
@@ -511,13 +516,13 @@ def _bundle_to_fields(b):
         "v_head": (llm.v_head_dim or llm.head_dim), "vocab": llm.vocab_size,
         "dp": pc.dp_shard, "tp": pc.tp, "ep": pc.ep, "pp": pc.pp, "cp": pc.cp,
         "method": pc.context_parallel_method,
+        "mtp": int(getattr(llm, "mtp_num_layers", 0) or 0),
         "recompute": ("full" if rc.mode == "full" else ("custom" if rc.mode == "select" else "None")),
         "sel_cfg": (_sel_ops_to_text(rc.select_ops) if rc.mode == "select" else ""),
     }
     if getattr(pc, "layers_per_stage", None):
         lp = list(pc.layers_per_stage)
-        lp[0] -= 1                                     # 去 embedding 伪层
-        lp[-1] -= 1 + int(getattr(llm, "mtp_num_layers", 0) or 0)   # 去 head 伪层 + MTP 层
+        lp[0] -= 1; lp[-1] -= 1        # 去 embedding/head 伪层(mtp 计入可切分层数,保留在配额里)
         f["pp_split"] = ",".join(str(x) for x in lp)
     return f
 
@@ -655,6 +660,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>kv_groups</label><input name="kv_groups" type="number" min="1" value="8" title="gqa 的 KV 组数(=heads 即 MHA)"></div>
     <div class="fld"><label>seq</label><input name="seq" type="number" min="1" value="4096"></div>
     <div class="fld"><label>batch</label><input name="batch" type="number" min="1" value="1"></div>
+    <div class="fld"><label>mtp 层数</label><input name="mtp" type="number" min="0" value="0" title="MTP(num_nextn_predict_layers);计入可切分总层数(pp 分配的和=layers+mtp),位于层序列末端"></div>
   </div>
   <div class="cfgrow"><span class="cap">结构维度</span>
     <div class="fld"><label>hidden</label><input name="hidden" type="number" min="1" value="1792"></div>
