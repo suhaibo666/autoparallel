@@ -51,10 +51,15 @@ def _is_residual_carrier(t: TensorRef) -> bool:
 
 
 def _scale_ref(t: TensorRef) -> TensorRef:
-    """残差承载张量 → H 维乘以 num_residual_streams（`[S,B,H]→[S,B,n*H]`），其余原样返回。"""
+    """残差承载张量 → H 维乘以 num_residual_streams（`[S,B,H]→[S,B,n*H]`），其余原样返回。
+
+    P1-03（2026-07-14）：放大后**重命名** `{name}_xn`——此前保留原名导致同一 resolved layer 内
+    同名张量两种 numel（MTP 层 `x` 同时 =H 与 =nH），而 structure_mem/ShapeEval.produced 按名
+    去重 → 首见 size 覆盖后续语义、字节错算。段内边由 scaled op 集合内的一致重命名保持；
+    ShapeEval.resolve 现有同名异 numel fail-loud 不变量防回潮。"""
     if not _is_residual_carrier(t):
         return t
-    return TensorRef(t.name, ("S", "B", NH), shard=dict(t.shard),
+    return TensorRef(f"{t.name}_xn", ("S", "B", NH), shard=dict(t.shard),
                      is_weight=t.is_weight, partial=t.partial, dtype_bytes=t.dtype_bytes)
 
 

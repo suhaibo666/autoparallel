@@ -68,6 +68,11 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
     # → loss/head 区随 cp ÷cp（**不**在 head 前 all-gather）。故这些张量恢复默认 `cp_shard=True`（÷cp），
     # nll 的 bwd_scratch 亦随 op.output.cp_shard=True 在 ShapeEval.resolve ÷cp。主 lm_head 与 MTP 头共享。
     x = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})   # head 输入随 cp ÷cp（S/(sp·cp)）
+    # 主干 final RMSNorm（P1-01/P2-03 补，2026-07-14）：真机 output_layer 前有 final_layernorm
+    # （独立 FSDP wrap，parallelize.py:1165-1170），此前整个 op 缺失——其保留输入（fp32 cast，
+    # norm_names 机制）在 loss 峰仍存活，且 gamma 参数缺失致参数图不守恒。
+    h_last = TensorRef("h_last", ("S", "B", "H"), shard={0: "sp"})
+    fn_g = TensorRef("final_norm_g", ("H",), is_weight=True, dtype_bytes=4)
     logits = TensorRef("logits_lm", ("S", "B", "vocab"), shard=dict(vshard))  # bf16, saved, ÷cp
     logsm = TensorRef("logsm", ("S", "B", "vocab"), shard=dict(vshard), dtype_bytes=4)  # fp32, saved, ÷cp
     loss = TensorRef("loss", ("B",))   # nll 输出
@@ -110,6 +115,7 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
         nll_op = OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch=bwd)
 
     return [
+        OpSpec("final_norm", OpType.NORM, [h_last], x, params=[fn_g], saves=[h_last]),
         head_op,
         OpSpec("logsoftmax", OpType.NORM, [logits], logsm, saves=[logits]),
         nll_op,
@@ -152,9 +158,11 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     # (embedding→enorm 边,2026-07-11 补边;saves 不变零字节)。hnorm 输入 mtp_hidden 为**主干跨层输入**
     # (真实外部入口,层内无 producer 属语义正确,不补假边)。
     emb_out_ref = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})
+    en_g = TensorRef("enorm_g", ("H",), is_weight=True, dtype_bytes=4)   # P1-01 norm gamma
+    hn_g = TensorRef("hnorm_g", ("H",), is_weight=True, dtype_bytes=4)
     ops += [
-        OpSpec("enorm", OpType.NORM, [dec_in, emb_out_ref], en_out, saves=[dec_in]),
-        OpSpec("hnorm", OpType.NORM, [hid], hn_out, saves=[hid]),
+        OpSpec("enorm", OpType.NORM, [dec_in, emb_out_ref], en_out, params=[en_g], saves=[dec_in]),
+        OpSpec("hnorm", OpType.NORM, [hid], hn_out, params=[hn_g], saves=[hid]),
         OpSpec("eh_cat", OpType.ELEMENTWISE, [en_out, hn_out], eh_cat, saves=[]),
         OpSpec("eh_proj", OpType.MATMUL, [eh_cat, eh_w], eh_out, params=[eh_w], saves=[eh_cat]),
     ]
@@ -208,6 +216,11 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     #    weight=output_weight)` 用主模型 output_layer + 其权重）→ MTP head op **不携带 params**
     #    （H×vocab 权重与主 lm_head tie，已计一次，C2）；loss 段（logsoftmax/nll）保留。──
     head_ops = list(build_head_and_loss_ops(cfg))
-    head_ops[0].params = []                        # lm_head 段首 op（MATMUL）tie 主 head
+    # tie 主 head：清 **lm_head** op 的 params（H×vocab 权重与主 head 共享，只计一次，C2）。
+    # P1-01 后 head 段首 op 是 final_norm（MTP 有自己的 final norm，parallelize.py:1184-1248
+    # MTP 同构 wrap → 其 gamma 保留），故按 op 名定位而非位置。
+    for op in head_ops:
+        if op.name == "lm_head":
+            op.params = []
     ops += head_ops
     return ops

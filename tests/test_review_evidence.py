@@ -75,8 +75,9 @@ def test_reshard_policy_changes_the_gather_lifetime():
     assert always_signature != never_signature
 
 
-@pytest.mark.xfail(strict=True, reason="MoE router weight is absent from the handwritten LayerSpec")
 def test_every_moe_router_owns_its_weight_parameter():
+    # P1-01 已修（2026-07-14）：router 权重 [n_experts,H] fp32 入图（真机 router 因 fp32 精度
+    # 单独 FSDP wrap，parallelize.py:1116-1128；optimizer 参数表含 router.weight）。xfail 移除。
     spec = build_llm_spec(deepseek_v3(4))
     routers = [
         op
@@ -110,8 +111,9 @@ def test_tp_halves_embedding_and_lm_head_local_parameters():
     assert tp2 == {name: numel // 2 for name, numel in tp1.items()}
 
 
-@pytest.mark.xfail(strict=True, reason="mHC/MTP reuses tensor name x for H and nH shapes")
 def test_tensor_name_has_one_shape_within_each_resolved_layer():
+    # P1-03 已修（2026-07-14）：mHC 放大承载张量重命名 {name}_xn + ShapeEval.resolve 同名异
+    # numel fail-loud 不变量。xfail 移除。
     spec = build_llm_spec(deepseek_v4(4))
     graph = ShapeEval().resolve(
         spec,

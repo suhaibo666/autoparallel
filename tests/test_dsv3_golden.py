@@ -25,18 +25,21 @@ GOLDEN_OPS = {
                 # moe_add(2026-07-11 补边):routed+shared 合流(moe_layer 真实语义,线性 add saves=[]
                 # 零字节——下方字节 golden 全部不动即为证;修 op 图 combine/shared_fc2 孤立叶节点)。
                 "moe_add"],
-    "lm_head": ["lm_head", "logsoftmax", "nll"],
+    "lm_head": ["final_norm", "lm_head", "logsoftmax", "nll"],   # P1-01: 补 final_norm(真机实存)
 }
 # ── 冻结 golden：N=4 峰值逐桶字节（framework_reserve=177 MiB、full 重算 1..4、FSDP dp_shard=2、
 #    **prefetch_depth=0**——旧单缓冲回归路径：depth=0 逐字节复现预取建模前的 breakdown，
 #    守卫「depth=0 复现旧行为」；默认 depth=1 的拆解路径另见 test_fsdp_prefetch.py）─
+# P1-01（2026-07-14）：+router fp32 权重/norm gamma（persistent/gather/grad +371712 B 级）
+# + final_norm op（act_live + 其 fp32 保留输入）——真机实存、修前欠算；峰 12472.5 → 12500.9 MiB
+# （真机 12473.1 → 1.0022，0.2% 保守侧）。
 GOLDEN_BREAKDOWN = {
-    "persistent": 4015915008, "act_live": 3250585600, "gather_buf": 463339520,
-    "grad_buf": 926679040, "recomp_scratch": 0, "bwd_scratch": 4236247040,
+    "persistent": 4016286720, "act_live": 3279945728, "gather_buf": 463346688,
+    "grad_buf": 926686208, "recomp_scratch": 0, "bwd_scratch": 4236247040,
     "swap_buf": 0, "workspace": 0, "framework": 185597952,
 }
 GOLDEN_PEAK_EVENT = "bwd@5"
-GOLDEN_PEAK_BYTES = 13078364160        # = 12472.5 MiB（真机锚点）
+GOLDEN_PEAK_BYTES = 13108110336        # = 12500.9 MiB（真机 12473.1 → 1.0022）
 
 
 def _spec():
@@ -70,6 +73,6 @@ def test_dsv3_breakdown_frozen_and_anchor():
         assert getattr(b, k) == v, (k, getattr(b, k), v)
     assert p.peak_event == GOLDEN_PEAK_EVENT
     assert p.peak_bytes == GOLDEN_PEAK_BYTES
-    assert abs(p.peak_bytes / MiB - 12472.5) < 1e-6
+    assert abs(p.peak_bytes / MiB - 12500.9) < 0.1
     # 逐桶之和恰为峰值（无遗漏/重复）
     assert sum(GOLDEN_BREAKDOWN.values()) == GOLDEN_PEAK_BYTES

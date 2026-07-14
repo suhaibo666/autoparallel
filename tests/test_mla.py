@@ -92,8 +92,9 @@ def test_mla_param_numel_matches_formula():
     """Σ param numel must equal the closed-form expression for MLA attn weights."""
     from cost_eval.layers.mla import build_mla_attn_ops
     ops = build_mla_attn_ops(DM)
+    from math import prod
     total = sum(
-        eval_expr(w.shape[0], DM) * eval_expr(w.shape[1], DM)
+        prod(eval_expr(e, DM) for e in w.shape)
         for op in ops
         for w in op.params
     )
@@ -102,6 +103,7 @@ def test_mla_param_numel_matches_formula():
         + DM.q_lora_rank * DM.n_heads * (DM.qk_nope_head_dim + DM.qk_rope_head_dim)  # linear_qb
         + DM.kv_lora_rank * DM.n_heads * (DM.qk_nope_head_dim + DM.v_head_dim)       # linear_kvb
         + DM.n_heads * DM.v_head_dim * DM.H                                            # o_proj
+        + DM.H + DM.q_lora_rank + DM.kv_lora_rank    # P1-01: ln1/q_a_norm/kv_a_norm gamma
     )
     assert total == expected
 

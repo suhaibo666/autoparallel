@@ -103,20 +103,28 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     wkv      = TensorRef("wkv",      ("H", "v_head_dim"),    is_weight=True)                    # :120-128
     wo_group = TensorRef("wo_group", (O_GROUP_OUT, O_CHUNK), is_weight=True)                    # :140-143 linear_o_group_proj
     o_w      = TensorRef("o_w",      (O_GROUP_OUT, "H"),     is_weight=True)                    # :145-153 linear_proj
+    # norm gamma（P1-01，fp32 独立 wrap，parallelize.py:414-461/:1140-1142）；q_hnorm 为
+    # per-head RMSNorm → gamma = 每头维（Q_OUT//n_heads = v_head_dim）
+    ln1_g  = TensorRef("ln1_g",       ("H",),            is_weight=True, dtype_bytes=4)
+    qan_g  = TensorRef("q_a_norm_g",  ("q_lora_rank",),  is_weight=True, dtype_bytes=4)
+    qhn_g  = TensorRef("q_hnorm_g",   ("v_head_dim",),   is_weight=True, dtype_bytes=4)
+    kvan_g = TensorRef("kv_a_norm_g", ("v_head_dim",),   is_weight=True, dtype_bytes=4)
 
     # ── base：Q 低秩 down→norm→up→**per-head fp32 norm** + 单头 KV down→norm + RoPE ──
     ops = [
-        OpSpec("ln1",           OpType.NORM,   [x],              ln1, saves=[x]),                 # 1 Pre-norm
+        OpSpec("ln1",           OpType.NORM,   [x],              ln1, params=[ln1_g], saves=[x]), # 1 Pre-norm
         OpSpec("linear_q_down", OpType.MATMUL, [ln1, wq_down],   q_compressed,                   # 2 :234
                params=[wq_down], saves=[ln1]),
-        OpSpec("q_a_norm",      OpType.NORM,   [q_compressed],   q_a_out, saves=[q_compressed]), # 3 :235
+        OpSpec("q_a_norm",      OpType.NORM,   [q_compressed],   q_a_out,
+               params=[qan_g], saves=[q_compressed]),                                            # 3 :235
         OpSpec("linear_q_up",   OpType.MATMUL, [q_a_out, wq_up], q,                              # 4 :237
                params=[wq_up], saves=[q_a_out]),
         # 5 per-head Query RMSNorm（:239-245）：rms_norm 反向需 bf16 输入 q（128 MiB/层，saved）；
         #   fp32 输出 q_hnorm 由下游 attention save（QK 反向需 Q，256 MiB/层）——两者共存至 loss 峰值。
-        OpSpec("q_hnorm",       OpType.NORM,   [q],              q_hnorm, saves=[q]),
+        OpSpec("q_hnorm",       OpType.NORM,   [q],              q_hnorm, params=[qhn_g], saves=[q]),
         OpSpec("linear_kv",     OpType.MATMUL, [ln1, wkv],       kv, params=[wkv], saves=[ln1]), # 6 :249
-        OpSpec("kv_a_norm",     OpType.NORM,   [kv],             kv_a_out, saves=[kv]),          # 7 :250
+        OpSpec("kv_a_norm",     OpType.NORM,   [kv],             kv_a_out,
+               params=[kvan_g], saves=[kv]),                                                     # 7 :250
         OpSpec("rope",          OpType.ROPE,   [q_hnorm],        q_hnorm, saves=[]),             # 8 :256-261 in-place
     ]
 

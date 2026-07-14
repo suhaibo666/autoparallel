@@ -2,7 +2,7 @@
 
 保真判据（核心）：把**规范 mindformers dict**（重构 `prep_dsv4align.py` / `prep_ds3_sim.py`）
 喂进 `from_mindformers_dict`，得到的 `LLMConfig` 与 `dsv4_align_config()` / `deepseek_v3()`
-**逐字段相等** → 同一评估峰值（DSv4-align 14336.5 / DSv3 12409.5）。这证明映射忠实、非杜撰。
+**逐字段相等** → 同一评估峰值（DSv4-align 14336.5 / DSv3 12437.9）。这证明映射忠实、非杜撰。
 
 覆盖：(a) DSv4-align round-trip + 峰值；(b) DSv3 round-trip + 峰值；(c) 并行/重算/layers_per_stage
 映射；(d) fail-loud（未映射结构字段 / flash=False / 非法 attn 变体 / fusion 自相矛盾）；(e) 惰性
@@ -129,9 +129,9 @@ def test_dsv4align_roundtrip_llmconfig_field_for_field():
 def test_dsv4align_roundtrip_same_peak():
     bundle = from_mindformers_dict(_dsv4align_mf())
     # 与 validate_dsv4align.evaluate 同 bundle（dp_shard=2 / no-recompute / SP）→ 逐字节同峰。
-    # 峰值 14915.5（fp32 layernorm 后,真机 15415 → 0.968，较修前 14336/0.930 提升）。
+    # 峰值 14929.8（fp32 layernorm 后,真机 15415 → 0.968，较修前 14336/0.930 提升）。
     assert bundle.parallel.dp_shard == 2 and bundle.recompute.mode == "None"
-    assert abs(_peak(bundle) - 14915.5) < 1.0
+    assert abs(_peak(bundle) - 14929.8) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ def test_dsv3_roundtrip_llmconfig_field_for_field():
 def test_dsv3_roundtrip_same_peak_12409():
     bundle = from_mindformers_dict(_dsv3_mf())
     assert bundle.recompute.mode == "full" and bundle.recompute.full_layers == {1, 2, 3, 4}
-    assert abs(_peak(bundle) - 12409.5) < 1.0
+    assert abs(_peak(bundle) - 12437.9) < 1.0
 
 
 def test_dsv3_8L_roundtrip_peak_matches_preset():

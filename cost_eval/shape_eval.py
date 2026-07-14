@@ -253,6 +253,18 @@ class ShapeEval:
                     ws, tuple(comms), bws,
                 ))
                 produced[op.output.name] = Placement.of(op.output)
+            # P1-03 不变量（2026-07-14 fail-loud）：同一 resolved layer 内张量名 → local_numel
+            # 必须唯一——structure_mem/act_live 的按名去重把同名异 size 首见覆盖、静默错算
+            # （mHC/MTP 的 `x` 曾同时 =H 与 =nH）。发现即报错防回潮。
+            sizes_by_name: dict = {}
+            for rop in r_ops:
+                for rt in (*rop.inputs, rop.output, *rop.params, *rop.saves):
+                    prev = sizes_by_name.setdefault(rt.name, rt.local_numel)
+                    if prev != rt.local_numel:
+                        raise ValueError(
+                            f"layer {layer_id}({ltype}) 张量 {rt.name!r} 出现两种 numel "
+                            f"{prev} != {rt.local_numel}（同名异形会被按名去重静默错算，"
+                            "P1-03——请在 builder 侧重命名消歧）")
             stages.setdefault(stage, []).append(
                 ResolvedLayer(layer_id, ltype, tuple(r_ops))
             )

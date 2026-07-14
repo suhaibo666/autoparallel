@@ -103,8 +103,9 @@ def test_wrap_scales_residual_hidden_by_n():
     wrapped = mhc_wrap(body, N, DS)
 
     # ln1 saves the residual input x; after wrapping it is [S,B,num_residual_streams*H].
+    # P1-03(2026-07-14): 放大后重命名 x→x_xn(同名异形会被按名去重静默错算)。
     ln1 = next(op for op in wrapped if op.name == "ln1")
-    x_saved = next(s for s in ln1.saves if s.name == "x")
+    x_saved = next(s for s in ln1.saves if s.name == "x_xn")
     assert "num_residual_streams*H" in x_saved.shape
     # numeric: exactly n× the unscaled [S,B,H] residual save.
     base = next(s for op in body if op.name == "ln1" for s in op.saves if s.name == "x")
@@ -116,13 +117,15 @@ def test_wrap_scales_every_sp_residual_carrier():
     tp-partial sublayer outputs (o/o2) and norm outputs (ln1/ln2) are NOT."""
     from cost_eval.layers.residual import mhc_wrap
     wrapped = mhc_wrap(_body(DS), N, DS)
-    carriers = {"x", "h1", "h2"}
+    # P1-03(2026-07-14): 放大后的承载张量统一重命名 {name}_xn，原名不得再出现（防同名异形）。
+    carriers = {"x_xn", "h1_xn", "h2_xn"}
     seen = set()
     for op in wrapped:
         for t in (list(op.inputs) + [op.output] + list(op.saves)):
             if t.name in carriers:
                 seen.add(t.name)
                 assert t.shape == ("S", "B", "num_residual_streams*H"), t.name
+            assert t.name not in ("x", "h1", "h2"), f"未重命名的承载张量 {t.name}"
             if t.name in ("o", "o2"):              # sublayer outputs stay [S,B,H]
                 assert t.shape == ("S", "B", "H"), t.name
     assert carriers <= seen

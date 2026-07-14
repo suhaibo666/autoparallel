@@ -73,6 +73,9 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     # ── 权重张量（is_weight=True，标注 tp 切分）──────────────────────────────
     qkv_w  = TensorRef("qkv_w", ("H", QKV),   shard={1: "tp"}, is_weight=True)
     o_w    = TensorRef("o_w",   (NHD, "H"),   shard={0: "tp"}, is_weight=True)
+    # norm gamma（P1-01，2026-07-14）：RMSNorm 权重 (H,) fp32——真机每层 norm 因 fp32 精度
+    # 独立 FSDP wrap（parallelize.py:318-328/:1140-1142），此前缺失致参数图不守恒。
+    ln1_g  = TensorRef("ln1_g", ("H",), is_weight=True, dtype_bytes=4)
 
     # flash attention workspace = softmax LSE 机理公式（∝ S·n_heads，见 FLASH_LSE_WS）
     fa_ws = FLASH_LSE_WS
@@ -80,7 +83,7 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     return [
         # 1. Pre-norm（LayerNorm / RMSNorm）
         OpSpec("ln1",    OpType.NORM,        [x],          ln1,
-               saves=[x]),
+               params=[ln1_g], saves=[x]),
         # 2. QKV 投影
         OpSpec("qkv",    OpType.MATMUL,      [ln1, qkv_w], qkv,
                params=[qkv_w], saves=[ln1]),
@@ -145,13 +148,17 @@ def build_mla_attn_ops(d: DimTable) -> list:
     qb_w   = TensorRef("qb_w",   ("q_lora_rank", QB_OUT),   shard={1: "tp"}, is_weight=True)
     kvb_w  = TensorRef("kvb_w",  ("kv_lora_rank", KVB_OUT), shard={1: "tp"}, is_weight=True)
     o_w    = TensorRef("o_w",    (ATTN_OUT, "H"),            shard={0: "tp"}, is_weight=True)
+    # norm gamma（P1-01）：各 norm 的 RMSNorm 权重 fp32（真机独立 FSDP wrap，parallelize.py:1140-1142）
+    ln1_g  = TensorRef("ln1_g",       ("H",),            is_weight=True, dtype_bytes=4)
+    qan_g  = TensorRef("q_a_norm_g",  ("q_lora_rank",),  is_weight=True, dtype_bytes=4)
+    kvan_g = TensorRef("kv_a_norm_g", ("kv_lora_rank",), is_weight=True, dtype_bytes=4)
 
     fa_ws = FLASH_LSE_WS   # softmax LSE 机理公式（∝ S·n_heads），MLA 与 GQA 同（不依赖 head_dim）
 
     return [
         # 1. Pre-norm
         OpSpec("ln1",        OpType.NORM,        [x],               ln1_out,
-               saves=[x]),
+               params=[ln1_g], saves=[x]),
         # 2. linear_qkv（列并行：H → q_lora+kv_lora+k_pe）
         OpSpec("linear_qkv", OpType.MATMUL,      [ln1_out, qkv_w],  qkv_out,
                params=[qkv_w], saves=[ln1_out]),
@@ -159,10 +166,10 @@ def build_mla_attn_ops(d: DimTable) -> list:
         #    inputs 含 qkv_out = 切片视图的**数据流依赖**（qkv_out→q_a_norm 边;字节仍按切片 q_a_in 计,
         #    saves 不变——此前名字断链致 op 图出现孤立叶节点）。
         OpSpec("q_a_norm",   OpType.NORM,        [q_a_in, qkv_out], q_a_out,
-               saves=[q_a_in]),
+               params=[qan_g], saves=[q_a_in]),
         # 4. kv_a LayerNorm（在 kv_lora_rank 维上）
         OpSpec("kv_a_norm",  OpType.NORM,        [kv_a_in, qkv_out], kv_a_out,
-               saves=[kv_a_in]),
+               params=[kvan_g], saves=[kv_a_in]),
         # 5. linear_qb（列并行：q_lora → n_heads*(nope+rope)）
         OpSpec("linear_qb",  OpType.MATMUL,      [q_a_out, qb_w],   qb_out,
                params=[qb_w], saves=[q_a_out]),

@@ -11,9 +11,10 @@ from cost_eval.layers.dense import build_dense_decoder
 
 
 def test_dense_param_numel_matches_formula():
+    from math import prod
     layer = build_dense_decoder(D)
     total = sum(
-        eval_expr(w.shape[0], D) * eval_expr(w.shape[1], D)
+        prod(eval_expr(e, D) for e in w.shape)
         for op in layer.ops
         for w in op.params
     )
@@ -21,7 +22,8 @@ def test_dense_param_numel_matches_formula():
     o = D.n_heads * D.head_dim * D.H
     fc1 = D.H * 2 * D.F
     fc2 = D.F * D.H
-    assert total == qkv + o + fc1 + fc2
+    norms = 2 * D.H          # P1-01(2026-07-14): ln1_g + ln2_g gamma(H,) 入图
+    assert total == qkv + o + fc1 + fc2 + norms
 
 
 def test_dense_has_flash_attn_and_saves():

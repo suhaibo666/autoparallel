@@ -57,6 +57,6 @@ def test_ce_fat_only_no_recompute_and_unfused():
 
 
 def test_dsv3_4L_full_recompute_anchor_unchanged():
-    # DSv3 4L full 重算：① 不触发（非无重算）、② 不上峰（opt-step < loss 反向）→ 12409.5 逐字节
+    # DSv3 4L full 重算：① 不触发（非无重算）、② 不上峰（opt-step < loss 反向）→ 12437.9 逐字节
     r = _rep(4, B=1, pp=1, mode="full", dp=2, mbs=1)
-    assert abs(r.per_stage[0].peak_bytes / MiB - 12409.5) < 0.05, r.per_stage[0].peak_bytes / MiB
+    assert abs(r.per_stage[0].peak_bytes / MiB - 12437.9) < 0.05, r.per_stage[0].peak_bytes / MiB

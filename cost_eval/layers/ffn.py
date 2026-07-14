@@ -56,11 +56,12 @@ def build_dense_ffn_ops(d: DimTable) -> list:
     # ── 权重张量（is_weight=True，标注 tp 切分）──────────────────────────────
     fc1_w  = TensorRef("fc1_w", ("H", fc1_out), shard={1: "tp"}, is_weight=True)
     fc2_w  = TensorRef("fc2_w", ("F",  "H"),    shard={0: "tp"}, is_weight=True)
+    ln2_g  = TensorRef("ln2_g", ("H",), is_weight=True, dtype_bytes=4)   # P1-01 norm gamma
 
     return [
         # 7. Pre-FFN norm
         OpSpec("ln2",    OpType.NORM,        [h1],         ln2,
-               saves=[h1]),
+               params=[ln2_g], saves=[h1]),
         # 8. FFN 上投影（gated→2F gate+up；ungated→F）
         OpSpec("fc1",    OpType.MATMUL,      [ln2, fc1_w], g,
                params=[fc1_w], saves=[ln2]),
@@ -117,11 +118,17 @@ def build_moe_ffn_ops(d: DimTable) -> list:
     # shape 用全量维度（n_experts），shard={0:"ep"} 在 resolve_tensor 中做整除
     w1 = TensorRef("e_w1", ("n_experts", "H",     e_fc1_out), shard={0: "ep"}, is_weight=True)
     w2 = TensorRef("e_w2", ("n_experts", "moe_F", "H"),       shard={0: "ep"}, is_weight=True)
+    # router 权重（P1-01，2026-07-14）：[n_experts, H] **fp32**——真机 router 因 fp32 精度
+    # 单独 FSDP wrap（parallelize.py:1116-1128），optimizer 参数表含
+    # `decoder.layers.N.mlp.router.weight`（NPU 旁证）。此前缺失 → 参数图不守恒。
+    # （aux-loss-free 的 expert_bias [n_experts] 是 hook 更新的 buffer 非 optimizer 参数
+    # （gpt_model.py:658-671），字节可忽略，不入 params。）
+    router_w = TensorRef("router_w", ("n_experts", "H"), is_weight=True, dtype_bytes=4)
 
     return [
         # 1. Router（softmax + top-k 选择，输出 logits 存 backward 用）
-        OpSpec("router",   OpType.MOE_ROUTER, [hin],       logits,
-               saves=[logits]),
+        OpSpec("router",   OpType.MOE_ROUTER, [hin, router_w], logits,
+               params=[router_w], saves=[logits]),
         # 2. Dispatch（all-to-all；把 token 路由到各 expert rank）
         #    workspace = 置换发送 staging 缓冲（experts.py permute → routed_input [S·B·topk,H]）
         #    inputs 含 logits = 路由索引的**数据流依赖**（router→dispatch 边;dispatch 按 topk 选路,

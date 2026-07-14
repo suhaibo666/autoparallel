@@ -34,23 +34,23 @@ def test_select_attn_keepFFN_margin_closes_residual():
 def test_margin_off_reproduces_pre_fix_underprediction():
     # factor=0（关）→ 复现修前 15488（证明 margin 是唯一变量、可关）。
     off = _peak(RecomputeSpec("select", select_ops=ATTN), factor=0.0)
-    assert abs(off - 15487.5) < 1.0, off
+    assert abs(off - 15516.4) < 1.0, off
 
 
 def test_select_mlp_keepattn_unchanged_moe_recomputed():
     # keep-attn（重算 FFN → MoE 被重算）：margin gate 关 → 与 factor=0 逐字节相同（不被推过头）。
-    # P1-09（2026-07-14）：14821.6 → 14837.1——attn 保留层的 fa_stats（softmax max/sum）
+    # P1-09（2026-07-14）：14821.6 → 14865.9——attn 保留层的 fa_stats（softmax max/sum）
     # 驻留至反向（+15.5 MiB，8 层），ratio 0.940→0.941（真机 15765，欠预测方向收窄）。
     on = _peak(RecomputeSpec("select", select_ops=MLP))
     off = _peak(RecomputeSpec("select", select_ops=MLP), factor=0.0)
     assert abs(on - off) < 1e-6, (on, off)
-    assert abs(off - 14837.1) < 1.0, off
+    assert abs(off - 14865.9) < 1.0, off
 
 
 def test_full_recompute_hard_gate_unbroken():
-    # full 重算：kept-MoE=0 → margin 0 → DSv3 4L 硬门 12409.5 逐字节不破。
+    # full 重算：kept-MoE=0 → margin 0 → DSv3 4L 硬门 12437.9 逐字节不破。
     p = _peak(RecomputeSpec("full", full_layers={1, 2, 3, 4}), N=4)
-    assert abs(p - 12409.5) < 0.05, p
+    assert abs(p - 12437.9) < 0.05, p
 
 
 def test_per_stage_none_loss_stage_keeps_kce_fat():

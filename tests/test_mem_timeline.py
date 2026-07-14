@@ -133,11 +133,13 @@ def test_none_full_byte_identical_anchor():
     累计梯度常驻至 optimizer 的真机语义）。
     P1-09（2026-07-14）：none 锚 3641344 → 3768320——fa_stats（softmax max/sum
     [2,B,N,S,8] fp32）驻留 fwd→bwd 取代 lse：+62·B·n_heads·S = +31744 B/层 × 4 层
-    = +126976 B（无重算层 act_live 净增；full 层 saves 被丢弃重物化 → full 锚不受此项影响）。"""
+    = +126976 B（无重算层 act_live 净增；full 层 saves 被丢弃重物化 → full 锚不受此项影响）。
+    P1-01（2026-07-14）：+norm gamma（ln1_g/ln2_g (H,) fp32 ×4 层）→ persistent/grad_accum
+    小幅增：none 3768320→3777024、full（optstep 峰）3211264→3220480。"""
     none = _sim(RecomputeSpec("None"))
     full = _sim(RecomputeSpec("full", {0, 1, 2, 3}))
-    assert none.peak_bytes == 3768320
-    assert full.peak_bytes == 3211264
+    assert none.peak_bytes == 3777024
+    assert full.peak_bytes == 3220480
 
 
 def test_select_core_attn_peak_between_none_and_full():

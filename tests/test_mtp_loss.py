@@ -40,7 +40,8 @@ def _names(ops):
 
 def test_default_logsoftmax_nll_unchanged():
     ops = build_head_and_loss_ops(_cfg())
-    assert _names(ops) == ["lm_head", "logsoftmax", "nll"]
+    # P1-01(2026-07-14): 补主干 final_norm op(真机 output_layer 前 final_layernorm,此前整体缺失)
+    assert _names(ops) == ["final_norm", "lm_head", "logsoftmax", "nll"]
     nll = next(op for op in ops if op.name == "nll")
     assert nll.bwd_scratch == "8*S*B*vocab"
     logits = next(op.output for op in ops if op.name == "lm_head")
@@ -147,8 +148,9 @@ def test_mtp_eh_proj_2h_to_h():
 def test_mtp_op_count():
     cfg = _cfg(mtp_num_layers=1)
     ops = build_mtp_ops(cfg)
-    # embedding(1) + enorm/hnorm/eh_cat/eh_proj(4) + gqa(6) + dense(5) + head(3) = 19
-    assert len(ops) == 19
+    # embedding(1) + enorm/hnorm/eh_cat/eh_proj(4) + gqa(6) + dense(5) + head(4 含 final_norm) = 20
+    # P1-01(2026-07-14): head 段补 final_norm → 19→20
+    assert len(ops) == 20
 
 
 def test_mtp_resolves_without_error():
