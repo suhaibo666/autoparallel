@@ -49,3 +49,31 @@ def test_full_recompute_hard_gate_unbroken():
     # full 重算：kept-MoE=0 → margin 0 → DSv3 4L 硬门 12409.5 逐字节不破。
     p = _peak(RecomputeSpec("full", full_layers={1, 2, 3, 4}), N=4)
     assert abs(p - 12409.5) < 0.05, p
+
+
+def test_per_stage_none_loss_stage_keeps_kce_fat():
+    """review P0.1（2026-07-14）:K_CE fat 判据按 stage——per-stage select 下未重算的 loss stage
+    须与全局 None 等值(修前被全局 mode=='select' 误关 k_ce,低估 71%:43899→12569)。"""
+    from serve_explorer import eval_config
+    mixed = eval_config({"layers": "8", "dp": "1", "pp": "2", "batch": "2",
+                         "sel_stage": "s0:both; s1:none"})
+    glob_none = eval_config({"layers": "8", "dp": "1", "pp": "2", "batch": "2"})
+    assert mixed["ok"] and glob_none["ok"]
+    # stage1(无重算+loss)与全局 None 的 stage1 等值(fat 生效)
+    assert abs(mixed["stages"][1]["peak"] - glob_none["stages"][1]["peak"]) < 1.0
+    # stage0(both 重算)低于全局 None 的 stage0,且峰回落到 optstep 锚点(10311,重算后逐层反向不再超它)
+    assert mixed["stages"][0]["peak"] < glob_none["stages"][0]["peak"]
+    assert abs(mixed["stages"][0]["peak"] - 10311.0) < 50
+
+
+def test_select_module_ops_single_source_and_qkv():
+    """review P1.5（2026-07-14）:serve 与转换器 select 选择器**单一来源**,且 self_attention 集
+    含 "qkv"(GQA/MHA 融合投影 op 名——修前转换器缺失,GQA yaml select 静默漏选)。"""
+    import serve_explorer
+    from cost_eval.configs.from_mindformers import _SELECT_MODULE_OPS, _build_recompute
+    assert serve_explorer._SEL_ATTN == set(_SELECT_MODULE_OPS["self_attention"])
+    assert serve_explorer._SEL_MLP == set(_SELECT_MODULE_OPS["mlp"])
+    assert "qkv" in _SELECT_MODULE_OPS["self_attention"]
+    rc = _build_recompute({"recompute": {"mode": "select",
+                                         "select_module": {"self_attention": ["0-3"]}}})
+    assert rc.op_matches(1, "qkv", "matmul")     # GQA 融合投影被选中

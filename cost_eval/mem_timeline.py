@@ -423,6 +423,11 @@ class MemTimeline:
             loss_lids = (set() if cross_entropy_fused else
                          {l.layer_id for l in layers
                           if any(getattr(op, "name", "") == "nll" for op in l.ops)})
+            # 本 stage 是否完全无重算（K_CE fat 判据,review P0.1）:该 stage 任一层被 full/select
+            # 重算则 lean（真机:重算模式下 CE 链早期中间量已释,cp2 profiler 见证）。
+            _stage_no_recompute = not any(
+                recompute.is_full(l.layer_id) or recompute.is_select(l.layer_id)
+                for l in layers)
 
             B = Buckets(persistent=static_persistent.get(stage, 0))
             peak: int = -1
@@ -533,8 +538,13 @@ class MemTimeline:
                         #   =8·S·B·vocab=2 份（probs+grad）→ 改到 k_ce-1 份（logsm 1 份在 act_live）。
                         #   **k_ce 与制度相关（真机 profiler）**：流水线末 stage（pp>1，有 loss）CE 链保留更多
                         #   中间量 → k_ce≈8（pp2-stage1 实测）；单 stage（pp=1）CE 链释放快 → k_ce≈3
-                        #   （cp2-none/select 实测仅 3 份共存）。仅 mode=='None' + loss 层，full/select 不动。
-                        if recompute.mode == "None" and lid in loss_lids and sm.bwd_scratch > 0:
+                        #   （cp2-none/select 实测仅 3 份共存）。
+                        #   **2026-07-14 修（review P0.1）**：判据从「全局 mode=='None'」改为
+                        #   「**本 stage 无任何层被重算**」——全局 None/full/select 下行为逐字节不变
+                        #   （None→全 stage 无重算→fat ✓;full/select→loss stage 含被重算 transformer→lean ✓）;
+                        #   per-stage select（如 s0:both;s1:none）时未重算的 loss stage 恢复 fat
+                        #   （修前被全局 mode=='select' 误关,低估 45%）。
+                        if _stage_no_recompute and lid in loss_lids and sm.bwd_scratch > 0:
                             K_CE = 8 if pp > 1 else 4
                             B.bwd_scratch = sm.bwd_scratch // 2 * (K_CE - 1)
                         # 激活 swap（§8.1 swap_buf="从 CPU 预取回的激活"）：被卸载层反向前 H2D 取回，

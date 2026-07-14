@@ -484,7 +484,9 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
 # layernorm 输出、少估保留量）。q_a/kv_a 的 latent-norm 属 attention cell 内 → 保留在集内。
 _SELECT_MODULE_OPS = {
     # self_attention cell:linear_q*/linear_kv*/q_a/kv_a(latent norm)/rope/flash/o_proj（不含 ln1/add1）
-    "self_attention": {"linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj"},
+    # "qkv" = GQA/MHA 融合投影 op 名(attention.py:74;2026-07-14 review P1.5 补——此前仅 MLA 的
+    # linear_q*/linear_kv* 可命中,GQA select 静默漏选 qkv)。
+    "self_attention": {"linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj", "qkv"},
     # mlp cell:fc/swiglu/gelu/router/dispatch/e_*/combine/shared（不含 ln2/add2）
     "mlp": {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared"},
 }

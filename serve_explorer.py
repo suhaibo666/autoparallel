@@ -26,9 +26,11 @@ MiB = 2 ** 20
 BK = ["persistent", "act_live", "kept_frag", "gather_buf", "grad_buf", "recomp_scratch",
       "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "optstep", "framework"]
 _CP_METHODS = ("colossal", "ulysses", "ring", "hybrid")
-# select 选择器（同 from_mindformers._SELECT_MODULE_OPS 口径）
-_SEL_ATTN = {"linear_q", "linear_kv", "q_a", "kv_a", "rope", "flash", "o_proj", "qkv"}
-_SEL_MLP = {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared"}
+# select 选择器:**单一来源** = 转换器 _SELECT_MODULE_OPS（2026-07-14 review P1.5:此前双维护
+# 导致口径漂移——serve 多 "qkv" 而转换器没有,GQA yaml select 静默漏选）。
+from cost_eval.configs.from_mindformers import _SELECT_MODULE_OPS as _SEL_MODULE_OPS
+_SEL_ATTN = set(_SEL_MODULE_OPS["self_attention"])
+_SEL_MLP = set(_SEL_MODULE_OPS["mlp"])
 
 # ── 模型预设（结构字段自 HF config.json,2026-07-11 抓取;dims=对 LLMConfig 的覆盖）─────────
 # ui: 预设填充到页面输入框的值;dims: 服务端构建 LLMConfig 时 replace 的全尺寸维度。
@@ -553,13 +555,9 @@ def _mf_adapt(mf):
             "sequence_parallel": bool(pcfg.get("use_seq_parallel", False)),
             "pipeline_parallel_microbatch_size": pcfg.get("micro_batch_num", 1),
         }
-    if "recompute" not in mf and isinstance(mf.get("recompute_config"), dict):
-        rcfg = mf["recompute_config"]
-        N = int((mf.get("model") or {}).get("num_hidden_layers", 0) or 0)
-        if rcfg.get("recompute") is True:                      # 老式 recompute:True = 全层 full
-            mf["recompute"] = {"mode": "full", "full_recompute_layer": [f"0-{N-1}"]}
-        elif isinstance(rcfg.get("select_recompute"), dict):
-            mf["recompute"] = {"mode": "select", "select_module": rcfg["select_recompute"]}
+    # 老式 `recompute_config` 段（graph 模式:recompute:True/[per-stage 列表]/select_recompute）
+    # **不支持、不转换**（2026-07-14 review P1.6,用户裁决:只支持 pynative 新式 `recompute:` 段）。
+    # 不静默:do_POST 检测到该段会在 warnings 里明示"未转换,请在页面手动配置重算"。
     if "training" not in mf:
         mf["training"] = {"local_batch_size": (mf.get("runner_config") or {}).get("batch_size", 1)}
     # offset → parallelism.num_layer_list:嵌套(VPP per-chunk)按 stage 跨 chunk 求和;flat 走 offset;int 忽略。
@@ -626,10 +624,14 @@ class H(BaseHTTPRequestHandler):
                 mf = _yaml.safe_load(txt)
                 if not isinstance(mf, dict):
                     raise ValueError("yaml 顶层须是映射(mindformers 训练配置)")
+                legacy_rc = isinstance(mf.get("recompute_config"), dict) and "recompute" not in mf
                 mf, vpp = _mf_adapt(mf)
                 # 缺必需结构字段（该 yaml 依赖 mindformers 类内默认）→ **用页面当前值兜底并显式警告**,
                 # 不阻断导入（评估器仍不猜任何默认,兜底值来自用户当前对话框,可见可改）。
                 warnings = []
+                if legacy_rc:
+                    warnings.append("老式 recompute_config(graph 模式)不支持,已忽略——"
+                                    "仅支持 pynative 新式 recompute 段;请在页面手动配置重算")
                 m = mf.get("model")
                 if isinstance(m, dict):
                     _REQ = {"num_hidden_layers": "layers", "num_attention_heads": "heads",
