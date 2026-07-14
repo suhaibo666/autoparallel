@@ -72,6 +72,10 @@ class ParallelModel:
         if pp <= 1:
             return [0] * self.n_layers
         mid = self.n_layers - 2                      # 中间层数（transformer + mtp）
-        per = max(1, mid // pp)
-        mid_map = [min(i // per, pp - 1) for i in range(mid)]   # remainder 归末 stage
+        # 标准均匀切（2026-07-14 修:此前 remainder 全堆末 stage,N=8 pp=3 切成 2,2,4 不均匀）:
+        # 前 rem 个 stage 各多 1 层 → N=8 pp=3 = 3,3,2。整除时逐层不变（锚点安全）。
+        base, rem = divmod(mid, pp)
+        mid_map = []
+        for s in range(pp):
+            mid_map += [s] * (base + (1 if s < rem else 0))
         return [0] + mid_map + [pp - 1]              # embedding→stage0,head→末 stage

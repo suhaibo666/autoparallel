@@ -153,11 +153,13 @@ def stage_decoder_layers(pp, N, mtp, pp_split):
                     out[s].add(i)
             pre += cnt
     else:
-        per = max(1, mid // pp)
-        for i in range(mid):                       # 0-based 可切层
-            s = min(i // per, pp - 1)
-            if i + 1 <= N:
-                out[s].add(i + 1)
+        base, rem = divmod(mid, pp)                # 与 ParallelModel 同:前 rem 个 stage 各多 1
+        i = 0
+        for s in range(pp):
+            for _ in range(base + (1 if s < rem else 0)):
+                if i + 1 <= N:
+                    out[s].add(i + 1)
+                i += 1
     return out
 
 
@@ -609,23 +611,43 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/api/parse_yaml":
             n = int(self.headers.get("Content-Length", 0) or 0)
-            txt = self.rfile.read(n).decode("utf-8", errors="replace")
+            body = self.rfile.read(n).decode("utf-8", errors="replace")
+            # 前端 POST JSON{yaml, defaults};兼容裸 yaml 文本(旧格式)。
+            defaults = {}
+            txt = body
+            try:
+                j = json.loads(body)
+                if isinstance(j, dict) and "yaml" in j:
+                    txt = j["yaml"]; defaults = j.get("defaults") or {}
+            except ValueError:
+                pass
             try:
                 import yaml as _yaml
                 mf = _yaml.safe_load(txt)
                 if not isinstance(mf, dict):
                     raise ValueError("yaml 顶层须是映射(mindformers 训练配置)")
                 mf, vpp = _mf_adapt(mf)
+                # 缺必需结构字段（该 yaml 依赖 mindformers 类内默认）→ **用页面当前值兜底并显式警告**,
+                # 不阻断导入（评估器仍不猜任何默认,兜底值来自用户当前对话框,可见可改）。
+                warnings = []
+                m = mf.get("model")
+                if isinstance(m, dict):
+                    _REQ = {"num_hidden_layers": "layers", "num_attention_heads": "heads",
+                            "hidden_size": "hidden", "vocab_size": "vocab", "seq_length": "seq"}
+                    from cost_eval.configs.from_mindformers import _MODEL_KEY_ALIASES
+                    alias_ok = {v for k, v in _MODEL_KEY_ALIASES.items() if k in m}
+                    m = dict(m)
+                    for mk, uik in _REQ.items():
+                        if m.get(mk) is None and mk not in alias_ok and defaults.get(uik):
+                            m[mk] = int(defaults[uik])
+                            warnings.append(f"{mk} 缺失(yaml 依赖类内默认)→ 用页面当前值 {defaults[uik]} 兜底,请核对")
+                    mf = dict(mf); mf["model"] = m
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
-                try:
-                    fields = _bundle_to_fields(from_mindformers_dict(mf))
-                except KeyError as ke:
-                    raise ValueError(
-                        f"yaml 的 model_config 缺结构字段 {ke}（该 yaml 依赖 mindformers 类内默认值,"
-                        "评估器不猜默认以免杜撰）——请补全该字段,或选预设后手工调整") from ke
+                fields = _bundle_to_fields(from_mindformers_dict(mf))
                 if vpp > 1:
                     fields["vpp"] = vpp
-                self._send(json.dumps({"ok": True, "fields": fields}, ensure_ascii=False))
+                self._send(json.dumps({"ok": True, "fields": fields, "warnings": warnings},
+                                      ensure_ascii=False))
             except Exception as e:
                 self._send(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
             return
@@ -990,11 +1012,12 @@ document.getElementById("preset").addEventListener("change",e=>{applyPreset(e.ta
 document.getElementById("yamlfile").addEventListener("change",async e=>{
   const f=e.target.files[0]; if(!f)return;
   const txt=await f.text();
-  let d; try{const r=await fetch("/api/parse_yaml",{method:"POST",body:txt}); d=await r.json();}
+  let d; try{const r=await fetch("/api/parse_yaml",{method:"POST",body:JSON.stringify({yaml:txt,defaults:qs()})}); d=await r.json();}
   catch(err){d={ok:false,error:String(err)};}
   const eb=document.getElementById("err");
   if(!d.ok){eb.style.display="block";eb.innerHTML="✗ yaml 解析失败: "+esc(d.error);e.target.value="";return;}
-  eb.style.display="none";
+  if(d.warnings&&d.warnings.length){eb.style.display="block";eb.innerHTML="⚠ yaml 导入警告:<br>· "+d.warnings.map(esc).join("<br>· ");}
+  else eb.style.display="none";
   Object.entries(d.fields).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el&&v!==null&&v!==undefined)el.value=v;});
   document.getElementById("preset").value="custom";
   document.getElementById("kmeta").textContent="来源: yaml 导入("+f.name+"),已回填可改(不写回文件)";

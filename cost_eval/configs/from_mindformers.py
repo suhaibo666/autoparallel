@@ -45,6 +45,9 @@ _DTYPE_BYTES = {
 _MAPPED_MODEL_KEYS = {
     "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "vocab_size", "seq_length", "intermediate_size", "head_dim", "qk_head_dim",
+    # 同义旧名（_MODEL_KEY_ALIASES 规范化消费,glm4 系）
+    "num_layers", "ffn_hidden_size", "padded_vocab_size", "kv_channels",
+    "multi_query_group_num", "layernorm_compute_type", "param_init_type",
     "multi_latent_attention", "experimental_attention_variant",
     "kv_lora_rank", "q_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim",
     "csa_compress_ratios", "csa_window_size", "sliding_window",
@@ -52,7 +55,8 @@ _MAPPED_MODEL_KEYS = {
     "o_groups", "o_lora_rank",
     "apply_dsa_kernel_fusion", "force_unfused_dsa", "use_flash_attention",
     "gated_linear_unit", "moe_intermediate_size", "moe_capacity_factor",
-    "n_routed_experts", "num_experts_per_tok", "n_shared_experts",
+    "n_routed_experts", "num_experts", "num_experts_per_tok", "n_shared_experts",
+    "untie_embeddings_and_output_weights",
     "moe_shared_expert_intermediate_size", "first_k_dense_replace", "moe_layer_freq",
     "enable_hyper_connections", "hc_mult", "num_nextn_predict_layers",
     "add_bias_linear", "add_qkv_bias",
@@ -89,6 +93,43 @@ _IGNORED_MODEL_KEYS = {
     "use_attn_mask_compression",
     # 纯 loss 标量权重,无内存效应。
     "mtp_loss_factor",
+    # ── 2026-07-14 增补（mf_suhaibo/configs 全量扫描,逐字段论证）──────────────────────
+    # 数据管道/输入处理标志,不进 op 图。
+    "input_sliced_sig", "use_pad_token", "bos_token_id", "eos_token_id", "pad_token_id",
+    # qkv_concat:合并 vs 分开 qkv matmul——saves 总字节相同(同一份激活,1 大 vs 3 小),评估器按
+    # 合并建模,内存等量。
+    "qkv_concat",
+    # fp32 残差链:其**驻留**副本已由 norm-fp32 建模覆盖(ln 存 fp32 输入=残差张量的 fp32 副本,
+    # layernorm_compute_dtype 驱动);残差 add 反向直传不存 → 无额外驻留。
+    "fp32_residual_connection",
+    # router 计算顺序/融合 kernel:logits [S,B,E] 微小且已建,顺序/融合不改驻留。
+    "moe_router_pre_softmax", "moe_router_fusion", "use_fused_ops_permute",
+    # 数值稳定/结构微变体:scaling 是标量;post-ln 的 norm 输入 saves 与 pre-ln 等量。
+    "apply_query_key_layer_scaling", "apply_residual_connection_post_layernorm",
+    # attention bias 向量(内存微小,同 add_qkv_bias 口径的省略惯例)。
+    "attention_bias", "add_bias_attn",
+    # 融合 kernel flags(瞬时 workspace 形态,不改驻留;同 D-5 口径)。
+    "use_fused_mla", "use_fused_swiglu", "use_fused_rope",
+    # 推理/KV-cache/IO 专用字段,不在训练 op 图。
+    "block_size", "num_blocks", "checkpoint_name_or_path", "max_decode_length",
+    "repetition_penalty", "temperature", "top_k", "top_p", "do_sample", "is_dynamic",
+    "batch_size",   # model 段的推理默认 batch;训练 batch 由 runner/training 段决定
+    # GLM 系杂项(池化/激活命名/并行残差标志,结构上已由 attn/ffn 类型与维度捕获)。
+    "post_layer_norm", "add_bias_linear_fc", "swiglu", "geglu", "parallel_residual",
+    # ── 2026-07-14 第二轮（glm4/qwen3/telechat 全字段）────────────────────────────────
+    # softmax fp32 计算(=softmax_compute_dtype 语义,loss 区 fp32 已建模);类注册/生成长度=IO。
+    "attention_softmax_in_fp32", "auto_map", "max_length", "type",
+    # 融合/排布 flags:字节等量(bias_dropout 融合=瞬时;mlp_concat 同 qkv_concat 论证;
+    # contiguous/interleaved 权重排布只改排列不改字节)。
+    "bias_dropout_fusion", "mlp_concat", "use_contiguous_weight_layout_attention",
+    # gqa 标志(信息已由 num_key_value_heads/multi_query_group_num 表达)。
+    "multi_query_attention", "rmsnorm",
+    # p-tuning/量化/推理缓存:默认关;启用属推理/微调前缀场景,不在本训练 op 图。
+    "pre_seq_len", "prefix_projection", "quantization_bit", "use_past", "use_cache",
+    # rope 缩放变体(内存等价 rope);loss 系数;路由均衡策略(容量已由 capacity_factor 建模);部署参数。
+    "rope_ratio", "rotary_scaling_factor", "router_aux_loss_coef",
+    "moe_router_force_expert_balance", "moe_z_loss_coeff", "npu_nums_per_device",
+    "layernorm_epsilon",   # glm4 命名(=rms_norm_eps 同义,数值稳定参数,无内存效应)
 }
 
 
@@ -236,9 +277,34 @@ def _dsa_fused(model: dict) -> bool:
     return True
 
 
+# 同义字段规范化（glm4/qwen 等旧命名 → deepseek 系标准名;2026-07-14 全量 configs 扫描）。
+# 规范化后后续映射逻辑零改动;旧名计入 _MAPPED（它们被消费）。
+_MODEL_KEY_ALIASES = {
+    "num_layers": "num_hidden_layers",            # glm4
+    "ffn_hidden_size": "intermediate_size",       # glm4
+    "padded_vocab_size": "vocab_size",            # glm4
+    "kv_channels": "head_dim",                    # glm4
+    "multi_query_group_num": "num_key_value_heads",   # glm4 GQA 组数
+    "layernorm_compute_type": "layernorm_compute_dtype",  # glm4
+    "param_init_type": "params_dtype",            # glm4
+}
+_REQUIRED_MODEL_KEYS = ("num_hidden_layers", "num_attention_heads", "hidden_size",
+                        "vocab_size", "seq_length")
+
+
 # ── LLMConfig ────────────────────────────────────────────────────────────────────────
 def _build_llm_config(model: dict) -> LLMConfig:
     """`model.*` → `LLMConfig`（设计 D-7 字段映射表）。fail-loud：未识别 model key / flash=False。"""
+    model = dict(model)
+    for old_k, new_k in _MODEL_KEY_ALIASES.items():
+        if old_k in model and new_k not in model:
+            model[new_k] = model[old_k]
+    # 必需结构字段聚合校验（一次列全;缺=该 yaml 依赖 mindformers 类内默认,评估器不猜以免杜撰）。
+    miss = [k for k in _REQUIRED_MODEL_KEYS if model.get(k) is None]
+    if miss:
+        raise ValueError(
+            f"yaml 的 model 段缺必需结构字段 {miss}（该 yaml 依赖 mindformers 类内默认值,"
+            "评估器不猜默认）——请补全这些字段,或改用页面预设后手工调整。")
     unknown = set(model) - _MAPPED_MODEL_KEYS - _IGNORED_MODEL_KEYS
     if unknown:
         raise NotImplementedError(
@@ -253,7 +319,8 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "（评估器只建 flash 路径，saves=Q/K/V/O+lse，不物化 [S,S]）——请用 flash 或补 op 图。")
 
     attn_type = _infer_attn_type(model)
-    num_moe_experts = model.get("n_routed_experts")   # None/0 → 纯 dense（build_llm._is_moe_layer）
+    # n_routed_experts（deepseek 系）/ num_experts（qwen3_moe/general 模板同义字段）
+    num_moe_experts = model.get("n_routed_experts") or model.get("num_experts")
 
     kwargs = dict(
         # 核心维度
@@ -292,7 +359,10 @@ def _build_llm_config(model: dict) -> LLMConfig:
         # （见 _IGNORED_MODEL_KEYS 注释）——round-trip 必要条件。
         position_embedding_type=_position_embedding(model),
         # 装配
-        tie_word_embeddings=bool(model.get("tie_word_embeddings", False)),
+        # tie:qwen3 系用反义字段 untie_embeddings_and_output_weights（True=不 tie）
+        tie_word_embeddings=bool(model.get(
+            "tie_word_embeddings",
+            not model.get("untie_embeddings_and_output_weights", True))),
         loss_type="logsoftmax_nll",
         embedding_params_dtype_bytes=_dtype_bytes(model.get("params_dtype"), 4),
         # ③ 残差 / MTP / bias / dtype

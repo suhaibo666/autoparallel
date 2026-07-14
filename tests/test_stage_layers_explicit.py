@@ -40,7 +40,9 @@ def test_none_falls_back_to_uniform_split():
     assert [pm.stage_of(l) for l in range(8)] == [0, 0, 0, 0, 1, 1, 1, 1]
 
 
-def test_uniform_split_remainder_on_last_stage():
-    # 非整除 7 层 pp=2 → per=3 → 末 stage 拿 remainder（审计 D-8 记录的行为；显式配可规避）
+def test_uniform_split_standard():
+    # 标准均匀切（2026-07-14 修,用户指正）:只切中间层(mid=n_layers-2),余数**前置**(前 rem 个
+    # stage 各多 1);embedding→stage0、head→末 stage。n_layers=7(mid=5) pp=2 → 3+2 →
+    # 映射 [emb|3 层 | 2 层|head] = [0,0,0,0,1,1,1]。旧行为(余数堆末 stage)已废。
     pm = ParallelModel(ParallelConfig(pp=2, layers_per_stage=None), n_layers=7, world_size=2)
-    assert [pm.stage_of(l) for l in range(7)] == [0, 0, 0, 1, 1, 1, 1]
+    assert [pm.stage_of(l) for l in range(7)] == [0, 0, 0, 0, 1, 1, 1]
