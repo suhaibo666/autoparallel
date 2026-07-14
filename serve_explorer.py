@@ -139,6 +139,71 @@ def parse_pp_split(s, pp, N):
     return [], tuple(parts)
 
 
+def stage_decoder_layers(pp, N, mtp, pp_split):
+    """stage → decoder 层 id 集（1..N,评估器口径;mtp 层不参与 select,忽略）。
+    与 ParallelModel._layer_to_stage 的切分规则严格一致:pp_split(用户 transformer+mtp 配额)
+    或均匀切(mid=N+mtp,per=mid//pp,remainder 归末)。"""
+    mid = N + max(0, mtp)
+    out = {s: set() for s in range(pp)}
+    if pp_split:                                  # 用户配额(不含伪层)
+        pre = 0
+        for s, cnt in enumerate(pp_split):
+            for i in range(pre + 1, pre + cnt + 1):   # 全局可切层 1..mid
+                if i <= N:                             # >N 的是 mtp,忽略
+                    out[s].add(i)
+            pre += cnt
+    else:
+        per = max(1, mid // pp)
+        for i in range(mid):                       # 0-based 可切层
+            s = min(i // per, pp - 1)
+            if i + 1 <= N:
+                out[s].add(i + 1)
+    return out
+
+
+def parse_stage_select(s, pp, N, mtp, pp_split):
+    """「per-stage 选重」文本 → {layer_id: set(op 子串)}（2026-07-14,用户口径:按 stage 配置）。
+    语法 `s<i>[-<j>]: 模式; ...`,模式 = none | self_attention | mlp | both(≈full,真机退化端 0.991)
+    | 任意 op 名子串(逗号分)。stage→层映射与当前 pp 切分(含 pp_split/mtp)严格一致。
+    返回 (errors, dict|None)。空串 → None。"""
+    s = (s or "").strip()
+    if not s:
+        return [], None
+    smap = stage_decoder_layers(pp, N, mtp, pp_split)
+    out = {}
+    for part in s.replace("；", ";").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            return [f"per-stage 选重 {part!r} 缺 `:`（格式 s0:both 或 s1-3:self_attention）"], None
+        rng, mode = (x.strip() for x in part.split(":", 1))
+        if not rng.startswith("s"):
+            return [f"per-stage 选重段 {rng!r} 须以 s 开头（如 s0 / s2-5）"], None
+        body = rng[1:]
+        try:
+            a, b = (int(x) for x in body.split("-")) if "-" in body else (int(body), int(body))
+        except ValueError:
+            return [f"per-stage 选重 stage 范围 {rng!r} 解析失败"], None
+        if not (0 <= a <= b < pp):
+            return [f"per-stage 选重 stage 范围 {rng!r} 越界（0..{pp-1}）"], None
+        ml = mode.strip().lower()
+        if ml in ("none", "no", ""):
+            continue
+        if ml == "both":
+            ops = _SEL_ATTN | _SEL_MLP           # ≈full(真机退化端 0.991)
+        elif ml == "self_attention":
+            ops = set(_SEL_ATTN)
+        elif ml == "mlp":
+            ops = set(_SEL_MLP)
+        else:
+            ops = {x.strip() for x in mode.replace("，", ",").split(",") if x.strip()}
+        for st in range(a, b + 1):
+            for lid in smap[st]:
+                out.setdefault(lid, set()).update(ops)
+    return [], (out or None)
+
+
 def parse_select_cfg(s, N):
     """「细粒度选重」文本 → {layer_id(1-based): set(op 子串)}。对应 mindformers
     `select_module: {cell: [ranges]}` 口径(0-indexed decoder 层,同 from_mindformers +1 偏移):
@@ -287,6 +352,15 @@ def parse_and_validate(p):
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk,
         mtp_num_layers=max(0, mtp))
+    # per-stage 选重（2026-07-14 用户口径）:与 sel_cfg 互斥,非空优先;基于**归置前**的配额算层映射。
+    e_ss, stage_sel = parse_stage_select(p.get("sel_stage", ""), pp, N, mtp, pp_split)
+    errs += e_ss
+    if stage_sel is not None and sel_cfg is not None:
+        errs.append("「细粒度选重」与「per-stage 选重」同时非空——请只用一个（per-stage 优先级更高易混淆）")
+    if errs:
+        return errs, None, None
+    if stage_sel is not None:
+        sel_cfg = stage_sel
     # pp 层分配 → 含伪层的 layers_per_stage:embedding→stage0、head+MTP→末 stage（不占用户配额;
     # mtp 数只有 cfg 构建后可知——V4 预设 num_nextn_predict_layers=1）。
     if pp_split is not None:
@@ -691,6 +765,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
     <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="custom 重算作用的层范围 a-b,空=全部"></div>
+    <div class="fld"><label>per-stage 选重</label><input name="sel_stage" placeholder="s0:both; s1-2:self_attention; s3:none" style="width:200px" title="按 stage 配置选择重算(与当前 pp 切分一致):模式 = none | self_attention | mlp | both(≈full,真机退化端0.991) | 任意 op 名子串;非空即生效"></div>
     <div class="fld"><label>细粒度选重(mf 口径)</label><input name="sel_cfg" placeholder="self_attention:0-3; flash:4-7" style="width:210px" title="mindformers select_module 口径:pattern=cell 名(self_attention/mlp)或 op 名子串;层范围 0-indexed(a-b,逗号分段);分号分隔多条;非空即生效(优先于图上勾选)"></div>
     <input type="hidden" name="sel_ops" value="">
     <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
