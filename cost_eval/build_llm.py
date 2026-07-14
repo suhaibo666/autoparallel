@@ -23,6 +23,53 @@ from .layers.head import build_embedding_ops, build_head_and_loss_ops, build_mtp
 from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
 
 
+def _validate_structure(cfg: LLMConfig) -> None:
+    """结构合法性统一校验（P1-10/P1-11，2026-07-14 review）：非法/不自洽配置 fail-loud，
+    不静默 floor/近似产错图。"""
+    # head_dim 静默 floor（P1-11）：H 不被 n_heads 整除且未显式给 head_dim → 此前 to_dimtable
+    # 直接 `H // n_heads` 截断（错维产错图）。
+    if cfg.head_dim is None and cfg.hidden_size % cfg.num_attention_heads != 0:
+        raise ValueError(
+            f"hidden_size({cfg.hidden_size}) 不被 num_attention_heads({cfg.num_attention_heads}) "
+            "整除且未显式给 head_dim——静默 floor 会产错误 op 图，请显式配置 head_dim。")
+    if cfg.num_query_groups is not None and cfg.attn_type in ("gqa", "mha"):
+        if cfg.num_query_groups <= 0 or cfg.num_attention_heads % cfg.num_query_groups != 0:
+            raise ValueError(
+                f"num_query_groups({cfg.num_query_groups}) 须整除 "
+                f"num_attention_heads({cfg.num_attention_heads})（GQA 分组约束）。")
+    # csa_compress_ratios（P1-10）：此前 2/3 等非法比被当稀疏 HCA 类路径接受（dsv4_hybrid.py
+    # sparse = ratio not in (0,1)）——只有 {0,1(滑窗), 4(CSA), 128(HCA)} 是真实实现取值。
+    if cfg.csa_compress_ratios is not None:
+        if len(cfg.csa_compress_ratios) != cfg.num_layers:
+            raise ValueError(
+                f"csa_compress_ratios 长度({len(cfg.csa_compress_ratios)}) 必须 == "
+                f"num_layers({cfg.num_layers})（每层一个压缩比）。")
+        for r in cfg.csa_compress_ratios:
+            if int(r) not in (0, 1, 4, 128):
+                raise NotImplementedError(
+                    f"csa_compress_ratios 含非法压缩比 {r}（实现取值：0/1=滑窗、4=CSA、128=HCA；"
+                    "其它值会被误当稀疏路径接受、产错图——拒绝）。")
+            if int(r) not in (0, 1) and cfg.seq_length % int(r) != 0:
+                raise ValueError(
+                    f"seq_length({cfg.seq_length}) 不被压缩比 {r} 整除（compressor n_compressed "
+                    "= S//ratio 需整除，静默 floor 会错算 compressed KV 字节）。")
+    if isinstance(cfg.moe_layer_freq, (list, tuple)) and len(cfg.moe_layer_freq) != cfg.num_layers:
+        raise ValueError(
+            f"moe_layer_freq 长度({len(cfg.moe_layer_freq)}) 必须 == num_layers({cfg.num_layers})。")
+    if cfg.num_moe_experts and cfg.moe_router_topk > cfg.num_moe_experts:
+        raise ValueError(
+            f"moe_router_topk({cfg.moe_router_topk}) > num_moe_experts({cfg.num_moe_experts})。")
+    if isinstance(cfg.window_pattern, (list, tuple)) and len(cfg.window_pattern) != cfg.num_layers:
+        raise ValueError(
+            f"window_pattern 长度({len(cfg.window_pattern)}) 必须 == num_layers({cfg.num_layers})。")
+    if cfg.o_groups:
+        nvd = cfg.num_attention_heads * (cfg.v_head_dim or 0)
+        if nvd and nvd % cfg.o_groups != 0:
+            raise ValueError(
+                f"n_heads·v_head_dim({nvd}) 不被 o_groups({cfg.o_groups}) 整除"
+                "（分组输出投影 O_CHUNK 需整除）。")
+
+
 def _check_implemented_dispatch(cfg: LLMConfig) -> None:
     """对**改变 op 图**但当前只建了单一取值的分派字段，非实现取值即显式报错（I2）。
 
@@ -194,6 +241,7 @@ def build_llm_spec(cfg: LLMConfig) -> ModelSpec:
     每层 pattern + embedding/lm_head（tie/loss 感知）。`build_llm_spec(deepseek_v3(N))` 须
     逐桶复现 `build_dsv3_spec(N)`（Task 1.3 硬门）。
     """
+    _validate_structure(cfg)                 # P1-10/11：非法/不自洽结构 fail-loud，不静默 floor
     _check_implemented_dispatch(cfg)         # I2：未实现的结构分派项显式报错，不静默产错图
     dims = to_dimtable(cfg)
     pattern = gen_layer_pattern(cfg)           # list[LayerContext]

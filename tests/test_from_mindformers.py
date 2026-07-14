@@ -157,13 +157,20 @@ def test_dsv3_8L_roundtrip_peak_matches_preset():
 
 # ── (c) 并行 / 重算 / layers_per_stage 映射 ────────────────────────────────────────────
 def test_parallelism_axes_map_through():
+    # P0-02(2026-07-14): tp>1 强制 sequence_parallel=True(pynative config.py:471-477 运行时硬约束,
+    # adapter 现 fail-loud)——旧断言固化的 tp=2+sp=False 组合真机跑不起来,改为合法组合 + 拒绝断言。
+    import pytest
     mf = _dsv4align_mf()
     mf["parallelism"].update(tensor_parallel=2, expert_parallel=2, context_parallel=2,
-                             data_parallel_shard=4, sequence_parallel=False)
+                             data_parallel_shard=4, sequence_parallel=True)
     mf["model"]["num_hidden_layers"] = 4
     pc = from_mindformers_dict(mf).parallel
     assert (pc.tp, pc.ep, pc.cp, pc.dp_shard) == (2, 2, 2, 4)
-    assert pc.sequence_parallel is False
+    assert pc.sequence_parallel is True
+
+    mf["parallelism"]["sequence_parallel"] = False
+    with pytest.raises(ValueError, match="sequence_parallel"):
+        from_mindformers_dict(mf)
 
 
 def test_auto_dp_shard_from_batch():

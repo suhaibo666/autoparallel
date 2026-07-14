@@ -71,10 +71,11 @@ class TensorRef:
     is_weight: bool = False
     partial: Optional[str] = None      # 该张量在此轴上是未规约部分和
     dtype_bytes: Optional[int] = None  # 覆盖 DimTable.dtype_bytes（如 fp32 loss 张量=4）
-    # ── context-parallel（cp）切分标注（D-1 修正 2026-07-07，真机确认）───────────────────
-    # cp_shard=False：该激活为**全序列 full-S**，cp 下**不** ÷cp（loss/head 区——head 前 hidden
-    #   all-gather 回 full-S，对**所有** cp 算法一致；真机 cp=2 峰实测满 vocab logsm/probs/grad
-    #   各 2020 MiB full-S）。默认 True = 随序列切分（emb_out + 所有 decoder 层激活 = S/cp）。
+    # ── context-parallel（cp）切分标注（D-1 修正 2026-07-07；P2-08 对齐 2026-07-14）──────────
+    # cp_shard=False：该激活为**全序列 full-S**，cp 下**不** ÷cp。注意：loss/head 区**不再**是
+    #   此例——早期"cp=2 满 vocab full-S 实测"已被 Bug A 复核推翻（B=2·S/cp 误读为 B=1·full-S），
+    #   loss/head 区现随 cp ÷cp（权威口径 head.py:59-64），全库当前**无任何张量**设 cp_shard=False，
+    #   字段保留供未来真 full-S 语义使用。默认 True = 随序列切分（S/cp）。
     # cp_kv=True：该张量为 attention **KV 侧**激活；`colossal`（ulysses_degree=1）下 KV all-gather
     #   到 **full-S**（不 ÷cp），其余 cp 算法（ulysses/ring/hybrid）仍随 body ÷cp。默认 False。
     cp_shard: bool = True

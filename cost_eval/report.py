@@ -18,6 +18,9 @@ class PeakMemoryReport:
     """各 PP stage 峰值显存报告。
 
     `peak_bytes`/`oom` 是 **allocated 峰值**（max_memory_allocated，OOM 主判据，真机验证）。
+    **P2-01 口径声明（2026-07-14）**：`.oom` 只回答 allocated 口径；设备真实容量约束是 reserved
+    （真机实测 reserved − allocated ≈ 658-680 MiB，review_evidence_2026-07-14.md）——调用方做
+    容量临界判定时应同时核查 `reserved_estimate_bytes(stage)`，勿把单一布尔当最终 OOM 结论。
     `hccl_reserved_bytes`（D-2）是 **reserved 池**的 HCCL 通信缓冲估计（按通信域数，`framework.
     hccl_reserved_buffer`）——**不进 allocated 峰值**（ep=2 真机证实），但计入 `reserved 估计`：
     `reserved ≈ allocated_peak + hccl_reserved (+ 池碎片)`。设备 HBM 的真实约束是 reserved，
@@ -38,6 +41,13 @@ class Evaluator:
 
     def __init__(self, model_spec, parallel_config, optimizer, hardware,
                  recompute, swap):
+        # P1-16（2026-07-14 review）：运行时可行性守卫——mindformers 不支持 PP>1 + activation
+        # swap（源码核对记录见 tests/test_swap_offload.py），评估器接受该组合会把真机跑不起来的
+        # 策略评为可行（搜索器排序污染）。fail-loud 而非静默评估。
+        if parallel_config.pp > 1 and getattr(swap, "enable", False):
+            raise ValueError(
+                "PP>1 + activation swap：mindformers 不支持该组合（tests/test_swap_offload.py "
+                "源码核对）——真机跑不起来的策略拒绝评估，请关 swap 或 pp=1。")
         self.spec = model_spec
         self.pc = parallel_config
         self.opt = optimizer

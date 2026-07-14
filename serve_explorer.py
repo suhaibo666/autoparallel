@@ -497,6 +497,23 @@ def eval_config(p):
         rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in range(a, b + 1)})
     else:
         rc = RecomputeSpec("None")
+    # P1-02④（2026-07-14 review）：select 选择器**命中数校验**——错拼 op 子串此前静默空转
+    # （层仍被标 select → kept_frag margin 生效 →「越错越贵」，真机应≈none）。判据按**每层
+    # 选择器并集**（预设 cell 集刻意覆盖 MLA+GQA 两套 op 词汇,逐 selector 判会误杀）：某层
+    # 的全部 selector 在该层 op 图零命中 → 报错并列出可用 op 名,不静默评估。
+    if rc.mode == "select":
+        for lid, sels in sorted(rc.select_ops.items()):
+            if not (0 <= lid < len(spec.layer_pattern)):
+                return {"ok": False, "errors": [f"选重层号 {lid} 超出层图范围(0..{len(spec.layer_pattern)-1})"]}
+            lops = spec.layer_specs[spec.layer_pattern[lid]].ops
+            hit = any(s.lower() in op.name.lower()
+                      or s.lower() in str(getattr(op.type, "value", op.type)).lower()
+                      for s in sels for op in lops)
+            if not hit:
+                return {"ok": False, "errors": [
+                    f"选重 pattern {sorted(sels)} 在层 {lid}({spec.layer_pattern[lid]}) 的 op 图"
+                    f"**零命中**——静默空转会错算(真机同样不生效)。该层可用 op 名: "
+                    f"{', '.join(op.name for op in lops)}"]}
     mbs = pa["mbs"] or (pa["pp"] if pa["pp"] > 1 else 1)   # 用户显式 or auto=pp
     pc = ParallelConfig(dp_shard=pa["dp"], tp=pa["tp"], ep=pa["ep"], pp=pa["pp"], cp=pa["cp"],
                         sequence_parallel=(pa["dp"] > 1 or pa["tp"] > 1), num_microbatches=mbs,
@@ -695,6 +712,10 @@ class H(BaseHTTPRequestHandler):
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
                 bundle = from_mindformers_dict(mf)
                 fields = _bundle_to_fields(bundle)
+                # P1-17（2026-07-14 review）：回填是 **UI 支持子集**——固定假设显式列出（一次性）。
+                warnings.append(
+                    "回填为 UI 支持子集;固定假设:设备容量 64GiB、AdamW fp32、swap 关——"
+                    "dp_replicate/reshard/offload/prefetch 已解析但不进对话框")
                 if bundle.parallel.dp_replicate > 1:
                     # P0.3:epo=False 的纯数据并行——权重/优化器逐 dp rank 复制不切分,评估器按
                     # dp_replicate 建模(持久态不 ÷dp,单卡峰值与 dp=1 相同)。页面无 dp_replicate

@@ -32,7 +32,7 @@ python serve_explorer.py 9000       # 指定端口
 | 项 | 说明 |
 |---|---|
 | **模型预设** | `Custom` / `DSv3-mini`（仓库缩层锚点，真机验证 12473）/ `DeepSeek-V3 671B` / `DeepSeek-V3.2-Exp` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro` / `GLM-5`。结构字段抓自 **HF config.json**（2026-07，来源显示在 KPI 下方）。选中即填充全部字段；**手改任意结构字段自动跳回 Custom**（并行/重算字段不算偏离） |
-| **yaml 导入** | 选 mindformers 训练 yaml → 解析回填全部对话框（**不写回文件**）。支持新式段（`parallelism`/`recompute`）与老式段（`parallel_config`/`recompute_config`/`model.model_config` 嵌套、`offset`（含 VPP 嵌套列表）/`pp_interleave_num`）。glm4/qwen 系字段名自动别名映射。**缺必需结构字段**（yaml 依赖 mindformers 类内默认）→ 用页面当前值兜底 + 黄条警告逐字段列出，请核对。select 重算配置会逆向渲染成「细粒度选重」文本 |
+| **yaml 导入** | 选 mindformers 训练 yaml → 解析回填 **UI 支持的字段子集**（**不写回文件**;P1-17 措辞收窄 2026-07-14）。**固定假设不参与回填**:设备容量 64 GiB、AdamW fp32、swap 关闭;`data_parallel_replicate`/`reshard_after_forward_policy`/offload/prefetch 不进对话框（评估仍按解析值,页面黄条会列出固定假设）。支持新式段（`parallelism`/`recompute`）与老式段（`parallel_config`/`recompute_config`/`model.model_config` 嵌套、`offset`（含 VPP 嵌套列表）/`pp_interleave_num`）。glm4/qwen 系字段名自动别名映射。**缺必需结构字段**（yaml 依赖 mindformers 类内默认）→ 用页面当前值兜底 + 黄条警告逐字段列出，请核对。select 重算配置会逆向渲染成「细粒度选重」文本 |
 
 ### 3.2 模型结构
 

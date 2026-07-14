@@ -33,8 +33,10 @@ def _evaluate(spec, pc: ParallelConfig, *, timeline: bool = False):
     return evaluator.evaluate(record_timeline=timeline)
 
 
-@pytest.mark.xfail(strict=True, reason="MindFormers parallel fields are silently replaced by defaults")
 def test_parallel_adapter_preserves_memory_semantic_fields():
+    # P0-02 已修（2026-07-14）：parallelism 段 fail-loud schema——method/interleave/reshard
+    # round-trip 保真，未知键 NotImplementedError。xfail 移除。
+    # （补 sequence_parallel=True：tp>1 时 pynative 强制 SP，config.py:471-477，adapter 现按此守卫。）
     mf = {
         "training": {"local_batch_size": 1, "global_batch_size": 2},
         "parallelism": {
@@ -42,6 +44,7 @@ def test_parallel_adapter_preserves_memory_semantic_fields():
             "context_parallel": 2,
             "pipeline_parallel": 2,
             "pipeline_parallel_microbatch_size": 2,
+            "sequence_parallel": True,
             "context_parallel_method": "ulysses",
             "pipeline_parallel_interleave_num": 4,
             "reshard_after_forward_policy": "never",
@@ -55,6 +58,24 @@ def test_parallel_adapter_preserves_memory_semantic_fields():
         4,
         "never",
     )
+
+
+def test_parallel_adapter_rejects_unknown_and_unmodeled_keys():
+    """P0-02 fail-loud 三态：未知键（拼错）/ 未建模真值键 / gpipe 调度 → 各自报错。"""
+    base = {"training": {"local_batch_size": 1},
+            "parallelism": {"tensor_parallel": 1}}
+
+    bad = {**base, "parallelism": {**base["parallelism"], "context_parallel_methd": "ulysses"}}
+    with pytest.raises(NotImplementedError, match="context_parallel_methd"):
+        _build_parallel(bad, mtp=0, num_layers=4)
+
+    bad = {**base, "parallelism": {**base["parallelism"], "dense_fsdp_shard_size": 8}}
+    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
+        _build_parallel(bad, mtp=0, num_layers=4)
+
+    bad = {**base, "parallelism": {**base["parallelism"], "pipeline_parallel_schedule": "gpipe"}}
+    with pytest.raises(NotImplementedError, match="gpipe"):
+        _build_parallel(bad, mtp=0, num_layers=4)
 
 
 def test_reshard_policy_changes_the_gather_lifetime():

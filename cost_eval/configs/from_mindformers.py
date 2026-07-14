@@ -62,6 +62,7 @@ _MAPPED_MODEL_KEYS = {
     "add_bias_linear", "add_qkv_bias",
     "normalization", "norm_placement",
     "compute_dtype", "params_dtype", "position_embedding_type", "tie_word_embeddings",
+    "chunk_loss_num",   # P1-06（2026-07-14）：分块 CE（loss.py chunked 变体）→ llm.chunk_loss_num
 }
 # ② 已知「内存中性」忽略集：均**不改内存 op 图**，刻意复现手写映射的省略（如 dsv4_align_config()
 #    docstring「qk_layernorm/add_bias omitted（memory-negligible; would fail-loud in build_llm）」——
@@ -86,6 +87,8 @@ _IGNORED_MODEL_KEYS = {
     "moe_aux_loss_coeff", "scoring_func", "norm_topk_prob", "moe_token_drop_policy",
     "moe_router_enable_expert_bias", "moe_router_bias_update_rate",
     "use_pad_tokens", "topk_group", "n_group",
+    # calculate_per_token_loss：只改 loss 规约形态（[N] 向量 vs 标量），字节可忽略（P1-06 核查）。
+    "calculate_per_token_loss",
     # ── 2026-07-11 增补（真机老式 deepseek3 yaml 实测字段,逐项论证内存中性）──────────────
     # kernel 融合 flags:只改瞬时 workspace 形态,不改驻留 saves（融合残差已按 D-5 口径处理）。
     "apply_rope_fusion", "bias_swiglu_fusion", "use_fused_ops_topkrouter",
@@ -215,13 +218,16 @@ def _infer_attn_type(model: dict) -> str:
     variant = model.get("experimental_attention_variant")
     variant = variant.strip() if isinstance(variant, str) else variant
     if variant:
-        if variant != "dsv4_hybrid":
+        # P1-05（2026-07-14 review）：放行 "dsa"（DSv3.2/GLM-5 lightning indexer，layers/dsa.py
+        # 预估计）——此前 builder 支持而入口拒绝，功能不可达。dsa 建立在 MLA 低秩投影上，同样需
+        # multi_latent_attention=True；indexer 三维 >0 由 builder fail-loud（dsa.py:90-95）。
+        if variant not in ("dsv4_hybrid", "dsa"):
             raise NotImplementedError(
-                f"experimental_attention_variant={variant!r} 暂未建 op 图（仅 'dsv4_hybrid' 已实现）。")
+                f"experimental_attention_variant={variant!r} 暂未建 op 图（支持 'dsv4_hybrid' / 'dsa'）。")
         if not mla:
             raise NotImplementedError(
-                "experimental_attention_variant='dsv4_hybrid' 需 multi_latent_attention=True。")
-        return "dsv4_hybrid"
+                f"experimental_attention_variant={variant!r} 需 multi_latent_attention=True。")
+        return variant
     if mla:
         return "mla"
     nkv = model.get("num_key_value_heads")
@@ -405,20 +411,28 @@ def _build_llm_config(model: dict) -> LLMConfig:
                           else 0.0),
     )
 
-    # dsv4_hybrid 前沿字段（仅该变体设，否则留 LLMConfig 默认 → 对 mla/gqa 惰性）。
+    # dsv4_hybrid / dsa 前沿字段（仅这两变体设，否则留 LLMConfig 默认 → 对 mla/gqa 惰性）。
+    if attn_type in ("dsv4_hybrid", "dsa"):
+        kwargs.update(
+            dsa_indexer_n_heads=int(model.get("dsa_indexer_n_heads", 0)),
+            dsa_indexer_head_dim=int(model.get("dsa_indexer_head_dim", 0)),
+            dsa_indexer_topk=int(model.get("dsa_indexer_topk", 0)),
+        )
     if attn_type == "dsv4_hybrid":
         ratios = model.get("csa_compress_ratios")
         kwargs.update(
             csa_compress_ratios=(tuple(int(r) for r in ratios) if ratios is not None else None),
             csa_window_size=int(model.get("csa_window_size", 128)),
             window_size=int(model.get("csa_window_size", model.get("sliding_window", 128))),
-            dsa_indexer_n_heads=int(model.get("dsa_indexer_n_heads", 0)),
-            dsa_indexer_head_dim=int(model.get("dsa_indexer_head_dim", 0)),
-            dsa_indexer_topk=int(model.get("dsa_indexer_topk", 0)),
             o_groups=int(model.get("o_groups", 0)),
             o_lora_rank=int(model.get("o_lora_rank", 0)),
             dsa_fused=_dsa_fused(model),
-            # ①：DSv4 融合生产路径用融合 CE kernel（精简）→ 无重算下不 fat（对齐 dsv4_align_config）。
+            # P1-06 澄清（2026-07-14 review，部分认可）：pynative 公共路径的 LM CE **恒为 unfused
+            # 小算子组合**（loss/loss.py 全文无 fused CE 开关）——但 DSv4 真机锚（deepseek_v4 fork
+            # dsv4_sim，15415.5）在 lean-CE 建模下 0.968、fat 会 +~2GiB 过冲，即 fork 的 loss 区
+            # 实测行为 lean（fork loss.py:378+ 有 chunked-fused backward 族）。此处保留
+            # 「fused-DSA 生产 → lean CE」作为**该 fork 的经验规则**（有真机锚背书），风险
+            # （attention fused + CE unfused 的组合会低估）已文档化；非 dsv4 模型恒 unfused（默认 False）。
             cross_entropy_fused=_dsa_fused(model),
         )
     return LLMConfig(**kwargs)
@@ -462,13 +476,100 @@ def _layers_per_stage(par: dict, num_layers: int, pp: int, mtp: int) -> list | N
     return stages
 
 
+# ── P0-02（2026-07-14 review）：parallelism 段全键分类表（fail-loud schema）──────────────
+# 依据 mindformers pynative ParallelismConfig（config.py:341-484，allow_extra=False——mindformers
+# 自己对未知键也 ValueError）逐键核查。此前只读部分键、其余**静默丢弃** → 用户以为评估的是自己的
+# 配置，实际是默认值（"输出仍是合理数字"是最危险的错）。现在：未映射的内存相关键 fail-loud。
+_PAR_MAPPED = {
+    "tensor_parallel", "expert_parallel", "context_parallel", "pipeline_parallel",
+    "pipeline_parallel_microbatch_size", "data_parallel", "data_parallel_shard",
+    "sequence_parallel", "context_parallel_method",           # colossal/ulysses 已建模
+    "pipeline_parallel_interleave_num",                       # → pc.interleave（VPP）
+    "reshard_after_forward_policy",                           # → pc.reshard_after_forward（P0-03 已接线）
+    "cpu_offload",                                            # → pc.cpu_offload（optstep/persistent 卸载）
+    "pipeline_parallel_layers_per_stage",                     # pynative 真键（"0-3,8-11|4-7" 格式）
+    "pipeline_parallel_schedule",                             # 1f1b/interleaved 已建模;gpipe 等 fail-loud
+    # 评估器内部扩展键（_mf_adapt 老式转换产物，非 pynative schema）：
+    "data_parallel_replicate", "num_layer_list", "offset",
+}
+# 内存中性/死键（忽略集，逐键论证）：
+_PAR_NEUTRAL = {
+    "disable_gradient_division",        # 梯度除法时机，字节不变
+    "pipeline_parallel_p2p_transport",  # p2p 传输实现选择（hccl/msft），buffer 字节同
+    "enable_mc2",                       # matmul-通信融合，workspace 级、无独立驻留
+    "npu_nums_per_device",              # 物理映射，不改单卡内存图
+    "context_parallel_mask_type",       # mask 生成方式（压缩 mask 均为小量）
+    "data_parallel_shard_strategy",     # 死键：pynative 全库无消费点（2026-07-14 核查）
+    "enable_loss_parallel",             # 死键：pynative 无消费者（config.py:444-449 旧 DTensor 流残留;
+                                        # TP>1 恒 vocab-parallel、无开关，loss.py:326-336）
+}
+# 影响内存但未建模 → 出现（真值/非默认值）即 fail-loud：
+_PAR_UNSUPPORTED_TRUTHY = {
+    "context_parallel_async": "cp 通信异步 overlap 的在飞双缓冲未建模（二阶内存效应）",
+    "pipeline_parallel_overlap_p2p": "PP p2p overlap 的 send/recv 双缓冲未建模",
+    "pipeline_parallel_overlap_b_f": "PP B/F overlap 的额外在飞激活未建模",
+    "pipeline_parallel_enable_dxdw_split": "dx/dw 拆分使 dw 图延迟释放，生命周期未建模",
+    "expert_parallel_async_d2h": "EP 异步 D2H 的 staging 缓冲未建模",
+    "dense_fsdp_shard_size": "分组 FSDP 域（dense 权重按子域切）改变每卡持久/gather 字节，未建模",
+    "ulysses_degree_in_cp": "hybrid CP（ulysses×ring 二维）未建模（仅 colossal/ulysses 全域）",
+}
+
+
+def _parse_pp_layers_per_stage(spec: str, pp: int) -> list:
+    """pynative `pipeline_parallel_layers_per_stage`（config.py:397）→ 每 stage decoder 层数。
+
+    格式：stage 间 `|` 分隔；stage 内多个 interleave chunk 用 `,` 分隔；每段是 `a-b` 闭区间或
+    单层号。本函数只取每 stage 的**层数和**（chunk 边界的 round-robin 放置由 parallel_model
+    处理，显式配额下 per-chunk ranges 仍为文档化近似——P1-15 残留）。"""
+    stages = []
+    for stage_part in str(spec).split("|"):
+        n = 0
+        for seg in stage_part.split(","):
+            seg = seg.strip()
+            if not seg:
+                continue
+            if "-" in seg:
+                a, b = seg.split("-", 1)
+                if int(b) < int(a):
+                    raise ValueError(f"pipeline_parallel_layers_per_stage 区间非法: {seg!r}")
+                n += int(b) - int(a) + 1
+            else:
+                n += 1
+        stages.append(n)
+    if len(stages) != pp:
+        raise ValueError(
+            f"pipeline_parallel_layers_per_stage 段数({len(stages)}) 必须 == pipeline_parallel({pp})")
+    return stages
+
+
 def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     par = mf.get("parallelism", {}) or {}
     train = mf.get("training", {}) or {}
+    # P0-02：schema fail-loud——未知键（含拼错）不静默丢弃。
+    unknown = set(par) - _PAR_MAPPED - _PAR_NEUTRAL - set(_PAR_UNSUPPORTED_TRUTHY)
+    if unknown:
+        raise NotImplementedError(
+            f"未识别的 parallelism 字段（可能改变内存但未映射/拼错）：{sorted(unknown)}。"
+            "已映射见 _PAR_MAPPED，内存中性忽略见 _PAR_NEUTRAL，已知未建模见 _PAR_UNSUPPORTED_TRUTHY。")
+    for k, why in _PAR_UNSUPPORTED_TRUTHY.items():
+        v = par.get(k)
+        if v not in (None, False, 0, "", 1) or (k == "dense_fsdp_shard_size" and v == 1):
+            raise NotImplementedError(f"parallelism.{k}={v!r} 未建模：{why}——拒绝静默近似导入。")
+    sched = par.get("pipeline_parallel_schedule")
+    if sched not in (None, "", "1f1b", "interleaved_1f1b"):
+        raise NotImplementedError(
+            f"pipeline_parallel_schedule={sched!r} 未建模（仅 1f1b/interleaved_1f1b；"
+            "gpipe 驻留全部 microbatch 激活、zero-bubble 调度不同——峰值语义不同，拒绝按 1f1b 近似）。")
+    cp_method = str(par.get("context_parallel_method", "colossal") or "colossal")
     tp = int(par.get("tensor_parallel", 1) or 1)
     ep = int(par.get("expert_parallel", 1) or 1)
     cp = int(par.get("context_parallel", 1) or 1)
     pp = int(par.get("pipeline_parallel", 1) or 1)
+    # tp>1 强制 sequence_parallel（pynative config.py:471-477 运行时硬约束）。
+    if tp > 1 and not bool(par.get("sequence_parallel", False)):
+        raise ValueError(
+            "tensor_parallel>1 时 mindformers pynative 强制 sequence_parallel=True"
+            "（config.py:471-477）——该 yaml 真机跑不起来，请补 sequence_parallel: true。")
     local_bs = int(train.get("local_batch_size", 1) or 1)
     global_bs = train.get("global_batch_size")
     # num_microbatches：pp>1 取 pipeline_parallel_microbatch_size，否则 1
@@ -479,21 +580,49 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     # 评估器正确建模该语义：持久态只 ÷fsdp_degree=dp_shard·cp（static_mem.py:31），dp_replicate 仅进
     # world size（report.py:53）与通信域数（framework.py:52，reserved 池）。老式 yaml 的
     # `parallel_config.data_parallel` + enable_parallel_optimizer=False 由 _mf_adapt 映射到此键。
+    # P0-02 补：pynative 新式 yaml 的真键是 `data_parallel`（总 dp），dp_replicate 为运行时派生
+    # `data_parallel // data_parallel_shard`（trainer.py:449-454）——两键并存时按此派生。
     dp_repl = int(par.get("data_parallel_replicate", 1) or 1)
+    dp_total = par.get("data_parallel")
     # dp_shard：显式 >0 直取；<=0（auto，P4:55=-1）→ global // (local·num_microbatches·dp_replicate)
     # （global = dp_shard·dp_replicate·local·num_microbatches）。
     dp_cfg = int(par.get("data_parallel_shard", -1))
     if dp_cfg > 0:
         dp_shard = dp_cfg
+        if dp_total is not None:
+            if int(dp_total) % dp_shard != 0:
+                raise ValueError(
+                    f"data_parallel({dp_total}) 不被 data_parallel_shard({dp_shard}) 整除"
+                    "（trainer.py:449-454 的 dp_replicate 派生要求整除）。")
+            dp_repl = max(dp_repl, int(dp_total) // dp_shard)
+    elif dp_total is not None:
+        # 只给总 dp、无 shard → 全 replicate（无 zero/FSDP 切分）。
+        dp_shard, dp_repl = 1, max(dp_repl, int(dp_total))
     elif global_bs is not None:
         dp_shard = max(1, int(global_bs) // (local_bs * num_microbatches * dp_repl))
     else:
         dp_shard = 1
+    # microbatch 数的 trainer 覆盖语义（P0-02 补，trainer.py:472-475）：真机会把 yaml 的
+    # pipeline_parallel_microbatch_size 重算为 global//(dp·local)——两者可推且不一致时按派生值
+    # （yaml 值在真机上根本不生效，沿用会静默评错峰值）。
+    if pp > 1 and global_bs is not None and dp_cfg > 0:
+        derived_m = int(global_bs) // (dp_cfg * dp_repl * local_bs)
+        if derived_m >= 1 and derived_m != num_microbatches:
+            num_microbatches = derived_m
+    # 显式 pipeline_parallel_layers_per_stage（pynative 真键）优先；老式 num_layer_list/offset 兜底。
+    pp_lps = par.get("pipeline_parallel_layers_per_stage")
+    if pp_lps is not None and pp > 1:
+        par = dict(par)
+        par["num_layer_list"] = _parse_pp_layers_per_stage(pp_lps, pp)
     return ParallelConfig(
         dp_replicate=dp_repl,
         dp_shard=dp_shard,
         cp=cp, tp=tp, pp=pp, ep=ep,
         sequence_parallel=bool(par.get("sequence_parallel", False)),
+        context_parallel_method=cp_method,                          # P0-02：不再静默丢弃
+        interleave=int(par.get("pipeline_parallel_interleave_num", 1) or 1),
+        reshard_after_forward=str(par.get("reshard_after_forward_policy", "default") or "default"),
+        cpu_offload=bool(par.get("cpu_offload", False)),
         num_microbatches=num_microbatches,
         microbatch=ppm,
         layers_per_stage=_layers_per_stage(par, num_layers, pp, mtp),
@@ -525,11 +654,35 @@ def _build_recompute(mf: dict) -> RecomputeSpec:
     cell_name 须是真机 transformer 层的真实 cell 名（`self_attention` / `mlp`）——用错名（如 `feed_forward`）
     真机会静默不重算,故转换器 fail-loud 未知 cell 名,避免"配置貌似生效实则空转"。
     """
+    # P1-02（2026-07-14 review）：recompute 相关段的静默丢弃全部改 fail-loud。
+    # ① `recompute_comm` 段（config.py:811-826，通信重算）：改变通信输出的保存/重算 → 内存相关。
+    rcc = mf.get("recompute_comm")
+    if isinstance(rcc, dict) and any(rcc.values()):
+        raise NotImplementedError(
+            "recompute_comm 段（通信重算）未建模——改变通信输出激活的驻留，拒绝静默丢弃。")
     rc = mf.get("recompute")
     if not rc:
         return RecomputeSpec(mode="None", full_layers=set())
+    # ② `exclude_op`（config.py:791）：语义=「重算中**保留**指定 op 子串不重算」→ 真机比无 exclude
+    # 多驻留。RecomputeSpec 只有选中重算（inclusion）通道、无法表达 exclusion → 静默丢弃会**低估**
+    # （OOM 不安全方向），拒绝导入。
+    if rc.get("exclude_op"):
+        raise NotImplementedError(
+            f"recompute.exclude_op={rc.get('exclude_op')!r} 未建模：exclude 语义（重算中保留指定 op）"
+            "评估器暂不可表达，静默丢弃会低估显存（OOM 不安全）——请去掉该键或等 exclusion 通道实现。")
+    # ③ 未知 recompute 键 fail-loud（与 model/parallelism 段同哲学）。
+    _RC_KNOWN = {"mode", "full_recompute_layer", "select_module", "exclude_op"}
+    rc_unknown = set(rc) - _RC_KNOWN
+    if rc_unknown:
+        raise NotImplementedError(
+            f"未识别的 recompute 字段：{sorted(rc_unknown)}（已知：{sorted(_RC_KNOWN)}）。")
     mode = rc.get("mode", "None")
     if mode == "full":
+        # ④ mode=full 无层列表：此前静默得到空集（等效 None、貌似生效实则空转）→ fail-loud。
+        if rc.get("full_recompute_layer") is None:
+            raise ValueError(
+                "recompute.mode='full' 但缺 full_recompute_layer（层列表）——静默空集等效不重算、"
+                "与配置意图相反，请显式给出层号/区间（如 [\"0-3\"]）。")
         decoder_layers = _parse_layer_ranges(rc.get("full_recompute_layer"))
         # 评估器 layer 0=embedding、1..N=decoder → mindformers 0-indexed decoder i → 评估器层 i+1。
         return RecomputeSpec(mode="full", full_layers={i + 1 for i in decoder_layers})
@@ -587,10 +740,28 @@ def from_mindformers_dict(mf: dict) -> EvaluatorConfigBundle:
     llm = dataclasses.replace(llm, batch_size=int(train.get("local_batch_size", 1) or 1))
 
     parallel = _build_parallel(mf, mtp=llm.mtp_num_layers, num_layers=llm.num_layers)
+    # P0-04/P1-06（2026-07-14）：tp>1 → vocab-parallel CE（pynative **无条件、无开关**，
+    # loss.py:326-336，logits 每卡 [N,V/tp] 不物化全量）；chunk_loss_num>1 → chunked。
+    # 两者组合（chunked vocab-parallel，loss.py:468+）评估器单 loss_type 暂不可表达 → fail-loud。
+    chunk = int(model.get("chunk_loss_num", 0) or 0)
+    if parallel.tp > 1:
+        if chunk > 1:
+            raise NotImplementedError(
+                "tp>1 + chunk_loss_num>1（chunked vocab-parallel CE）组合暂未建模——"
+                "评估器 loss_type 单值，拒绝按其一近似。")
+        llm = dataclasses.replace(llm, loss_type="vocab_parallel_ce")
+    elif chunk > 1:
+        llm = dataclasses.replace(llm, loss_type="chunked", chunk_loss_num=chunk)
     recompute = _build_recompute(mf)
     optimizer = _build_optimizer(mf)
     hardware = _build_hardware(mf)
-    swap = SwapSpec()   # swap/offload 段映射未实现（见 D-7 限制）→ 默认 disabled。
+    # P0-02：swap 段（config.py:829-848）不再静默硬编码 disabled——启用即 fail-loud。
+    sw = mf.get("swap") or {}
+    if isinstance(sw, dict) and sw.get("enable"):
+        raise NotImplementedError(
+            "swap 段（激活卸载）导入未支持：layer_swap/op_swap 的映射未实现——"
+            "请在评估器侧手动构造 SwapSpec，或去掉 swap.enable。")
+    swap = SwapSpec()   # swap 关闭（缺省/enable=False）→ disabled（与真机同语义）。
     return EvaluatorConfigBundle(
         llm=llm, parallel=parallel, recompute=recompute,
         swap=swap, optimizer=optimizer, hardware=hardware,

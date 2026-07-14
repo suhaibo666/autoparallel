@@ -21,7 +21,8 @@ class ParallelConfig:
     # yaml）。决定 body 激活的 cp 切分口径（D-1 修正 2026-07-07，真机确认）：
     #   - ulysses/ring/hybrid：body 激活（含 attention KV）÷cp。
     #   - colossal（ulysses_degree=1）：body ÷cp，但 **attention KV all-gather 到 full-S**（额外 KV buffer）。
-    # loss/head 区对**所有**算法都是 full-S（head 前 all-gather hidden；真机 cp=2 峰实测满 vocab full-S）。
+    # loss/head 区亦随 cp **÷cp**（P2-08 对齐 2026-07-14：早期"full-S 实测"是把 B=2·S/cp 误读为
+    # B=1·full-S——Bug A，cp2-none profiler 复核证 loss buffer=[S/cp,B,V]，权威口径见 head.py:59-64）。
     # cp=1 时该字段无效（cp 分支不进入）→ DSv3 anchor 逐字节不变。
     context_parallel_method: str = "colossal"
     reshard_after_forward: str = "default"   # always|never|default
