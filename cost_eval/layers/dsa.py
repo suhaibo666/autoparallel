@@ -41,13 +41,20 @@
    kernel 输入：q_cat 全量 + key_cat/kv_a_out（latent 全量，非 topk 子集）+ topk_indices
    + 输出 attn_lat + softmax_max/sum（2×fp32 `[B,1,S,n]`，:102/:108-118）。
 
+**indexer KL loss（P0-05，2026-07-14 已建主项）**：
+  - 静态图在 loss 内做全量 `bmm(q,k) → [B, n_heads, S, S]` fp32 **瞬态**
+    （`dsa_indexer_loss.py:118-120`，n = **主注意力** num_attention_heads :62；sparse 模式
+    也先物化全量 bmm 再 gather 到 topk :120→:131）。B=1/S=4096/n=128 时恰 **8.0 GiB/层**
+    （旧注释 "~8.6 GiB" 是 GB 误标 GiB，2026-07-14 订正）。q/k 均 stop_gradient
+    （`multi_latent_attention.py:308-310`）→ 纯前向瞬态、零反向保存。
+  - 建模：`idx_kl_loss` op 的 **workspace_ref**（TensorRef `[B,n_heads,S,S]` fp32，head 维
+    ÷tp、首个 S 维 ÷cp——与静态图 shard `("dp","tp","cp","None")` 一致，
+    `dsa_indexer_loss.py:184,193`）。仍为**预估计**：取单份主项（softmax1 输入/输出若共存
+    则 ×2，fused/分块实现可能更低——待 pynative 代码落地后按真实 kernel 重校准）。
+
 **有意省略（预估计范围外，重校准时再议）**：
-  - **indexer KL loss**（`dsa_indexer_loss.py:121`，`multi_latent_attention.py:317-319`）：
-    静态图在 loss 内做全量 `bmm(q,k) [B,n_heads,S,S]` fp32 **瞬态**（sparse 模式下随后
-    gather 到 topk）。该瞬态 ∝ n_heads·S² fp32（DSv3.2 满维 S=4096 时 ~8.6 GiB/层 ÷tp·cp），
-    但评估器 workspace 表达式**不随 tp 切分**（只 ÷cp 一次）→ 直接建模会系统性高估 tp 并行
-    下的真值；且 q/k 已 stop_gradient、pynative 实现大概率分块计算。故整个 idx_loss op 不建，
-    留待 pynative 代码落地后按真实 kernel 行为补。
+  - dense-warmup 的 head-sum 前逐头分数 `[B,S,n_idx,S]` fp32（`dsa_indexer.py:212-216`）——
+    fused lightning_indexer 稳态不物化；head-sum 后 `[B,S,1,S]` 已建（indexer op bwd_scratch）。
   - indexer 的 EOD mask 生成 / actual_seq_len 处理（TND 打包细节，字节量可忽略）。
 
 符号维（`DimTable` 字段，已存在）：`dsa_indexer_n_heads / dsa_indexer_head_dim /
@@ -57,7 +64,7 @@ v_head_dim）。三个 indexer 维必须 >0（fail-loud，不静默产错图）�
 from __future__ import annotations
 
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
-from .attention import FLASH_LSE_WS, QKV_PROJ, QB_OUT, ATTN_OUT
+from .attention import QKV_PROJ, QB_OUT, ATTN_OUT
 
 __all__ = ["build_dsa_attn_ops"]
 
@@ -123,6 +130,12 @@ def build_dsa_attn_ops(d: DimTable) -> list:
     # fused lightning_indexer 双输出（:257-265 return_value=True）：均存活到 indexer loss
     topk_indices = TensorRef("topk_indices", ("B", "S", "dsa_indexer_topk"), dtype_bytes=4)
     idx_scores   = TensorRef("index_scores", ("B", "S", "dsa_indexer_topk"), dtype_bytes=4)
+    # indexer KL loss 的 QK 全量分数瞬态（P0-05）：[B, n_heads(主注意力), S, S] fp32，
+    # head 维 ÷tp、首个 S 维 ÷cp（dsa_indexer_loss.py:118-120/:184,193）；q/k stop_gradient
+    # → 纯前向瞬态（workspace_ref），零 saves。B1/S4096/n128 = 8.0 GiB/层 ÷(tp·cp)。
+    kl_scores    = TensorRef("kl_attn_scores", ("B", "n_heads", "S", "S"),
+                             shard={1: "tp"}, dtype_bytes=4)
+    kl_loss_out  = TensorRef("idx_kl_loss_out", ("B", "S"), dtype_bytes=4)
 
     # ── 权重张量 ─────────────────────────────────────────────────────────────
     qkv_w   = TensorRef("qkv_w",  ("H",            QKV_PROJ),  shard={1: "tp"}, is_weight=True)
@@ -163,11 +176,19 @@ def build_dsa_attn_ops(d: DimTable) -> list:
         OpSpec("q_absorb",   OpType.MATMUL, [qb_out, kvb_w],   q_cat,
                params=[kvb_w], saves=[qb_out]),                   # multi_latent_attention.py:251-253
         OpSpec("kv_cat",     OpType.ELEMENTWISE, [kv_a_out, qkv_out], key_cat, saves=[]),  # :254
+        # indexer KL loss（P0-05 预估计）：全量 QK bmm [B,n_heads,S,S] fp32 前向瞬态
+        # （workspace_ref → ÷tp·cp）;q/k stop_gradient → 零 saves;输出 per-token loss（字节可忽略）。
+        # inputs = 数据流依赖（indexer 分数 + 主注意力 q/k → KL 蒸馏边）。
+        OpSpec("idx_kl_loss", OpType.ELEMENTWISE, [idx_scores, q_cat, key_cat], kl_loss_out,
+               saves=[], workspace_ref=kl_scores),
         # saves 忠实按 fused kernel 输入（dsa_attention.py:140-149）：Q 全量 + latent KV 全量
-        # （kernel 按 indices 稀疏访问，**不物化 selected-KV**）+ indices + 输出 + softmax 统计
+        # （kernel 按 indices 稀疏访问，**不物化 selected-KV**）+ indices + 输出 + softmax 统计。
+        # workspace = SFA 重算再物化瞬态：**SFA 契约无 ×8 内层块**（softmax_shape=(b,1,sq,nq)，
+        # dsa_attention.py:113-118）→ 2×fp32×[S,B,n_heads] = 8·B·n_heads·S（修 2026-07-14：
+        # 原误用 vanilla FA 的 FLASH_LSE_WS=64·B·n_heads·S，8× 高估且与 sfa_stats saves 双算）。
         OpSpec("sparse_flash", OpType.FLASH_ATTN, [q_cat, key_cat, topk_indices], attn_lat,
                saves=[q_cat, key_cat, kv_a_out, topk_indices, attn_lat, sfa_stats],
-               workspace=FLASH_LSE_WS),
+               workspace="8*B*n_heads*S"),
         OpSpec("v_absorb",   OpType.MATMUL, [attn_lat],        attn_out,
                saves=[attn_lat]),                                 # :301-305（权重同 kvb_w，不重复计）
         OpSpec("o_proj",     OpType.MATMUL, [attn_out, o_w],   o,

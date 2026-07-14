@@ -39,10 +39,12 @@ def test_margin_off_reproduces_pre_fix_underprediction():
 
 def test_select_mlp_keepattn_unchanged_moe_recomputed():
     # keep-attn（重算 FFN → MoE 被重算）：margin gate 关 → 与 factor=0 逐字节相同（不被推过头）。
+    # P1-09（2026-07-14）：14821.6 → 14837.1——attn 保留层的 fa_stats（softmax max/sum）
+    # 驻留至反向（+15.5 MiB，8 层），ratio 0.940→0.941（真机 15765，欠预测方向收窄）。
     on = _peak(RecomputeSpec("select", select_ops=MLP))
     off = _peak(RecomputeSpec("select", select_ops=MLP), factor=0.0)
     assert abs(on - off) < 1e-6, (on, off)
-    assert abs(off - 14821.6) < 1.0, off             # 保持 0.940 准确
+    assert abs(off - 14837.1) < 1.0, off
 
 
 def test_full_recompute_hard_gate_unbroken():
@@ -61,9 +63,11 @@ def test_per_stage_none_loss_stage_keeps_kce_fat():
     assert mixed["ok"] and glob_none["ok"]
     # stage1(无重算+loss)与全局 None 的 stage1 等值(fat 生效)
     assert abs(mixed["stages"][1]["peak"] - glob_none["stages"][1]["peak"]) < 1.0
-    # stage0(both 重算)低于全局 None 的 stage0,且峰回落到 optstep 锚点(10311,重算后逐层反向不再超它)
+    # stage0(both 重算)低于全局 None 的 stage0,且峰回落到 optstep 锚点(重算后逐层反向不再超它)。
+    # P0-01(2026-07-14):optstep 锚 10311→10213——K_OPT 6→4 重标(旧 6 含 ≈1.9 份累计梯度)
+    # + grad_accum 桶显式化,二者净效应 −98 MiB;对照真机 10246.2 → 0.997(修前 1.006)。
     assert mixed["stages"][0]["peak"] < glob_none["stages"][0]["peak"]
-    assert abs(mixed["stages"][0]["peak"] - 10311.0) < 50
+    assert abs(mixed["stages"][0]["peak"] - 10213.0) < 50
 
 
 def test_select_module_ops_single_source_and_qkv():

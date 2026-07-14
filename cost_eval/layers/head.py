@@ -15,10 +15,15 @@ from ..model_spec import OpSpec, OpType, TensorRef
 def build_embedding_ops(cfg: LLMConfig) -> list:
     """word embedding 段（1 op），逐字段同 `validate_dsv3.build_embedding`。
 
-    ``emb_w (vocab,H)`` 为 vocab embedding 权重（tp=1 不切）；输出 ``emb_out (S,B,H)``
-    在 SP 轴分布。ELEMENTWISE（gather 语义），无 saves。
+    ``emb_w (vocab,H)`` 为 vocab embedding 权重，**vocab 维 ÷tp**（P0-04 修，2026-07-14）：
+    pynative TP>1 **无条件**走 RowwiseParallel Shard(0)（parallelize.py:751-759 +
+    style.py:583-588 `{"weight": (Shard(0),)}`，每卡 V/tp×H）。旧注释引用的 `vocab_emb_dp`
+    只存在于静态图 legacy 路径（pynative 下零命中），已废。dtype 按
+    `cfg.embedding_params_dtype_bytes`（P1-04 接线；默认 2 = compute/gather 副本 bf16，
+    真机锚点验证口径）。输出 ``emb_out (S,B,H)`` 在 SP 轴分布。ELEMENTWISE（gather 语义），无 saves。
     """
-    w = TensorRef("emb_w", ("vocab", "H"), is_weight=True)        # vocab_emb_dp：tp=1 不切
+    w = TensorRef("emb_w", ("vocab", "H"), shard={0: "tp"}, is_weight=True,
+                  dtype_bytes=cfg.embedding_params_dtype_bytes)
     out = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})
     return [OpSpec("embedding", OpType.ELEMENTWISE, [], out, params=[w], saves=[])]
 
@@ -67,21 +72,33 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
     logsm = TensorRef("logsm", ("S", "B", "vocab"), shard=dict(vshard), dtype_bytes=4)  # fp32, saved, ÷cp
     loss = TensorRef("loss", ("B",))   # nll 输出
 
+    # P0-04（2026-07-14）：lm_head 权重 vocab 维 ÷tp——pynative TP>1 无条件 ColwiseParallel
+    # Shard(0)（out-features=vocab；parallelize.py:765-767 + style.py:439-443），且
+    # gather_output=False（style.py:425 默认未覆盖）→ logits 每卡 [N, V/tp] 不 all-gather。
+    # dtype 同 embedding（P1-04 接线）。
     if cfg.tie_word_embeddings:
         # 复用 embedding 权重：不新增 head_w 参数（vocab×H 只在 embedding 计一次）
-        w = TensorRef("emb_w", ("vocab", "H"), is_weight=True)
+        w = TensorRef("emb_w", ("vocab", "H"), shard={0: "tp"}, is_weight=True,
+                      dtype_bytes=cfg.embedding_params_dtype_bytes)
         head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[], saves=[x])
     else:
-        w = TensorRef("head_w", ("H", "vocab"), is_weight=True)
+        w = TensorRef("head_w", ("H", "vocab"), shard={1: "tp"}, is_weight=True,
+                      dtype_bytes=cfg.embedding_params_dtype_bytes)
         head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x])
 
     # NLL 反向：默认/chunked 用 bwd_scratch（满 vocab 瞬态物化）；vocab_parallel 用 sharded probs save。
     if cfg.loss_type == "vocab_parallel_ce":
         # ctx.exp_vals [N,V_local]（loss.py:120）→ softmax 分子，∝1/tp；建为 sharded save。
         # loss/head 区随 cp ÷cp（Bug A 修正）：vocab 按 tp 切，序列维亦 ÷cp。
+        # P0-04 补全（2026-07-14）：①手写 backward 物化 grad_local_logits [N,V/tp] fp32
+        #   （loss.py:69-82）→ bwd_scratch_ref（TensorRef 才能 ÷tp）；②max/sum-exp/target-logit
+        #   三个 [N,1] fp32 all-reduce 项（loss.py:37-66）→ workspace "12*S*B"（3×4B，量级小如实建）。
+        #   per-token loss [N] 在 TP 内复制（不切），与源码一致。
         probs = TensorRef("probs", ("S", "B", "vocab"), shard={2: "tp"}, dtype_bytes=4)
+        vp_grad = TensorRef("vp_grad_logits", ("S", "B", "vocab"), shard={2: "tp"}, dtype_bytes=4)
         nll_op = OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss,
-                        saves=[logsm, probs], bwd_scratch=None)
+                        saves=[logsm, probs], bwd_scratch=None,
+                        bwd_scratch_ref=vp_grad, workspace="12*S*B")
     else:
         if cfg.loss_type == "chunked":
             # 分块 CE：一次物化 1/k 满 vocab 梯度（loss.py:442-464）→ bwd_scratch ÷ k。

@@ -587,17 +587,37 @@ def _mf_adapt(mf):
     if "training" not in mf:
         mf["training"] = {"local_batch_size": (mf.get("runner_config") or {}).get("batch_size", 1)}
     # offset → parallelism.num_layer_list:嵌套(VPP per-chunk)按 stage 跨 chunk 求和;flat 走 offset;int 忽略。
+    # P1-18(final review 2026-07-14):嵌套换算依赖 num_hidden_layers——yaml 依赖类内默认时此刻缺失,
+    # 用 N=0 算出的列表恒错(sum≠N,671b 导入失败根因)。缺 N 时暂存 `_nested_offset`,
+    # 由 `_materialize_nested_offset` 在页面兜底注入 N 后再换算。
     if isinstance(off, (list, tuple)) and off:
         par = mf.setdefault("parallelism", {})
-        pp = int(par.get("pipeline_parallel", 1) or 1)
-        N = int((mf.get("model") or {}).get("num_hidden_layers", 0) or 0)
         if isinstance(off[0], (list, tuple)):
-            v = len(off)
-            base = N // (pp * v)
-            par["num_layer_list"] = [sum(base + int(off[c][s]) for c in range(v)) for s in range(pp)]
+            par["_nested_offset"] = [list(c) for c in off]
+            _materialize_nested_offset(mf)          # N 在场则就地换算,缺场保持暂存
         else:
             par["offset"] = list(off)
     return mf, int(vpp or 1)
+
+
+def _materialize_nested_offset(mf, warnings=None):
+    """消费 `_nested_offset` 暂存：有 `num_hidden_layers` 则换算成 `num_layer_list`
+    （base=N//(pp·v)，按 stage 跨 chunk 求和）；仍无 N 则丢弃并警告——绝不静默错算。"""
+    par = mf.get("parallelism")
+    if not isinstance(par, dict) or "_nested_offset" not in par:
+        return
+    N = int((mf.get("model") or {}).get("num_hidden_layers", 0) or 0)
+    if N <= 0:
+        if warnings is None:
+            return                                   # 等下一次(兜底后)的物化机会
+        par.pop("_nested_offset")
+        warnings.append("offset(嵌套 VPP)未换算:num_hidden_layers 缺失且页面无兜底,已忽略该 offset")
+        return
+    off = par.pop("_nested_offset")
+    pp = int(par.get("pipeline_parallel", 1) or 1)
+    v = len(off)
+    base = N // (pp * v)
+    par["num_layer_list"] = [sum(base + int(off[c][s]) for c in range(v)) for s in range(pp)]
 
 
 def _bundle_to_fields(b):
@@ -670,6 +690,8 @@ class H(BaseHTTPRequestHandler):
                             m[mk] = int(defaults[uik])
                             warnings.append(f"{mk} 缺失(yaml 依赖类内默认)→ 用页面当前值 {defaults[uik]} 兜底,请核对")
                     mf = dict(mf); mf["model"] = m
+                # P1-18:嵌套 offset 在必需字段兜底后物化(兜底可能刚注入 num_hidden_layers)
+                _materialize_nested_offset(mf, warnings)
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
                 bundle = from_mindformers_dict(mf)
                 fields = _bundle_to_fields(bundle)

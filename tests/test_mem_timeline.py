@@ -56,10 +56,13 @@ def test_full_recompute_lowers_peak_and_moves_event():
                        framework_reserve=0, max_device_memory=10**12)
     full = mt.simulate(g, RecomputeSpec("full", {0, 1, 2, 3}), SwapSpec(), pm, persistent,
                        framework_reserve=0, max_device_memory=10**12)
-    # full 重算降低峰值（act_live 大降 > 反向重物化一层），峰值落在反向（FSDP gather+grad 共存）
+    # full 重算降低峰值（act_live 大降 > 反向重物化一层）；none 峰仍在反向（FSDP gather+grad 共存）。
+    # P0-01（2026-07-14）：grad_accum 常驻至 optstep → full（激活峰被压低）的全局峰移到 optstep
+    # （persistent + K_OPT 瞬态 + 累计梯度共存）——真机语义（optimizer 前全部 reduced grad 驻留）。
     assert full[0].peak_bytes < none[0].peak_bytes
     assert none[0].peak_event.startswith("bwd")
-    assert full[0].peak_event.startswith("bwd")
+    assert full[0].peak_event == "optstep"
+    assert full[0].breakdown.grad_accum > 0            # 累计梯度与 optstep 瞬态共存
 
 
 def test_oom_flag():
@@ -87,10 +90,10 @@ def test_no_recompute_adds_bwd_working_set():
     assert b.bwd_working_set > 0                       # 无重算反向工作集入峰
     sm = _peak_layer_sm(g, r[0].peak_event)
     assert b.bwd_working_set == max(0, sm.forward_max_live - sm.bwd_scratch)
-    # 逐桶之和 == 峰值（新桶已并入 total，无遗漏/重复）
+    # 逐桶之和 == 峰值（新桶已并入 total，无遗漏/重复；P0-01 后含 grad_accum/kept_frag）
     assert (b.persistent + b.act_live + b.gather_buf + b.grad_buf + b.recomp_scratch
             + b.bwd_scratch + b.bwd_working_set + b.swap_buf + b.workspace
-            + b.framework) == r[0].peak_bytes
+            + b.framework + b.kept_frag + b.grad_accum) == r[0].peak_bytes
 
 
 def test_full_recompute_scratch_is_forward_max_live():
@@ -98,11 +101,14 @@ def test_full_recompute_scratch_is_forward_max_live():
     `recomp_scratch = max(0, forward_max_live − checkpoint_input)`（层入口已 pin 进 act_live）。"""
     g, pm, persistent = _setup(pp=1)
     full = MemTimeline().simulate(g, RecomputeSpec("full", {0, 1, 2, 3}), SwapSpec(), pm,
-                                  persistent, framework_reserve=0, max_device_memory=10**12)
-    b = full[0].breakdown
-    assert full[0].peak_event.startswith("bwd")
-    assert b.recomp_scratch > 0                        # 峰值落在重算 transformer 层反向
-    sm = _peak_layer_sm(g, full[0].peak_event)
+                                  persistent, framework_reserve=0, max_device_memory=10**12,
+                                  record_timeline=True)
+    # P0-01 后 full 的全局峰移到 optstep（grad_accum 常驻）——重算机理断言改从 timeline 取
+    # 首个反向事件（bwd@3，重算层）验证 recomp_scratch 语义。
+    bwd3 = next(s for s in full[0].timeline if s.event == "bwd@3")
+    b = bwd3.breakdown
+    assert b.recomp_scratch > 0                        # 重算 transformer 层反向重物化
+    sm = _peak_layer_sm(g, "bwd@3")
     assert b.recomp_scratch == max(0, sm.forward_max_live - sm.checkpoint_input)
     # forward_max_live ≠ activation_saves（守「取峰值工作集而非 saves 之和」的实质改动）
     assert sm.forward_max_live != sm.activation_saves
@@ -120,11 +126,18 @@ def _sim(recompute):
 
 
 def test_none_full_byte_identical_anchor():
-    """None/full 峰值字节锚点（守卫本次改动不动既有两态；toy dense 4 层）。"""
+    """None/full 峰值字节锚点（守卫两态；toy dense 4 层）。
+
+    P0-01（2026-07-14）：full 锚 2768896 → 3211264——峰移到 optstep
+    （= persistent 2293760 + K_OPT·max_w·4 262144 + grad_accum 655360，
+    累计梯度常驻至 optimizer 的真机语义）。
+    P1-09（2026-07-14）：none 锚 3641344 → 3768320——fa_stats（softmax max/sum
+    [2,B,N,S,8] fp32）驻留 fwd→bwd 取代 lse：+62·B·n_heads·S = +31744 B/层 × 4 层
+    = +126976 B（无重算层 act_live 净增；full 层 saves 被丢弃重物化 → full 锚不受此项影响）。"""
     none = _sim(RecomputeSpec("None"))
     full = _sim(RecomputeSpec("full", {0, 1, 2, 3}))
-    assert none.peak_bytes == 3641344
-    assert full.peak_bytes == 2768896
+    assert none.peak_bytes == 3768320
+    assert full.peak_bytes == 3211264
 
 
 def test_select_core_attn_peak_between_none_and_full():

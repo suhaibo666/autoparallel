@@ -195,13 +195,15 @@ class Buckets:
     bwd_working_set: int = 0  # 无重算层反向工作集（激活梯度 dL/dact，= forward_max_live − bwd_scratch，§8.5②）
     swap_buf: int = 0         # 激活 swap H2D 预取缓冲（BWD：复原当前卸载层 saves + 反向序后 depth 层在飞预取窗，双缓冲）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
-    optstep: int = 0          # 优化器-step 瞬态（②，真机 profiler）：AdamW 更新最大权重时物化的 k_opt 个 fp32 [weight] 临时（grad/Square/sqrt/m̂/update）；step 在反向后、激活已释，故与激活互斥
+    optstep: int = 0          # 优化器-step 瞬态（②，真机 profiler）：AdamW 更新最大权重时物化的 k_opt 个 fp32 [weight] 临时（Square/sqrt/m̂/update；grad 已拆去 grad_accum 桶，P0-01 重标 K_OPT 6→4）；step 在反向后、激活已释，故与激活互斥
     kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）
+    grad_accum: int = 0       # **已规约梯度累计驻留**（P0-01，2026-07-14）：真机证实 step-scoped cumulative——每层首次反向后其 reduced 本地分片常驻，至 optimizer 后 zero_grad 释放（两卡探针 1889.5 MiB 吻合）。与 grad_buf（当前层 reduce-scatter 前 full 瞬态）正交
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
                 + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
-                + self.swap_buf + self.workspace + self.optstep + self.kept_frag)
+                + self.swap_buf + self.workspace + self.optstep + self.kept_frag
+                + self.grad_accum)
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,7 @@ class MemBreakdown:
     optstep: int
     framework: int
     kept_frag: int = 0
+    grad_accum: int = 0       # P0-01 尾部追加（default=0，序不破，照 kept_frag 先例）
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,7 @@ class TimelineSample:
     event: str            # 事件标签（如 fwd:3 / fwd_end / bwd@5）
     total_bytes: int      # 该事件时刻总占用（Σ桶 + framework_reserve）
     breakdown: MemBreakdown
+    mb: int = -1          # microbatch 序号（P2-06：与 profiler 对齐用；optstep 等非微批事件 = -1）
 
 
 @dataclass(frozen=True)
@@ -239,6 +243,7 @@ class StagePeak:
     peak_event: str
     oom: bool
     timeline: tuple = ()   # record_timeline=True 时为 tuple[TimelineSample]（全事件序列），否则空
+    peak_mb: int = -1      # 峰值事件的 microbatch 序号（P2-06；非微批事件 = -1）
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +393,16 @@ class MemTimeline:
         # swap 关时 swaps() 恒 False → 下方 swap_buf 恒 0（与预取深度无关）。
         swap_depth = getattr(swap, "default_prefetch", 1)
 
+        fsdp_d, efsdp_d = pm.fsdp_degree(), pm.efsdp_degree()
         for stage, layers in g.stages.items():
             layer_ids = [l.layer_id for l in layers]
             by_id = {l.layer_id: l for l in layers}
             # 每层的 StructureMemory rollup（模块化组装，单点去重）——预算一次，事件循环直取各桶。
+            # fsdp/efsdp 传入供 grad_shard_bytes（P0-01 累计梯度分片，divisor 与 persistent 同口径）。
             sm_by_id = {
                 l.layer_id: estimate_structure_memory(
                     l.ops, grad_dtype_bytes=grad_dtype_bytes,
+                    fsdp=fsdp_d, efsdp=efsdp_d,
                     alloc_block_bytes=alloc_block_bytes,
                     norm_compute_dtype_bytes=norm_compute_dtype_bytes)
                 for l in layers
@@ -435,14 +443,49 @@ class MemTimeline:
                 recompute.is_full(l.layer_id) or recompute.is_select(l.layer_id)
                 for l in layers)
 
+            # ── P0-03（2026-07-14 review）：reshard_after_forward 接线 ─────────────────
+            # 语义（hyper_parallel fsdp.py:42-74 / hsdp_scheduler.py:225-250 / parallelize.py:1172-1182）:
+            #   always → 前向后即 reshard,反向 re-gather（旧行为,transient）;
+            #   never  → unsharded 权重从 fwd 驻留到**本模块 post_backward**（reshard_after_backward
+            #            默认 True,state.py:505-537——非整 step 驻留）,反向不 re-gather;
+            #   default→ PP 整体不 reshard（not pp_enabled,fsdp.py:74）= never 语义;
+            #            非 PP 同 always,**除 output_layer**（parallelize.py:1176 显式 False = never 语义）。
+            # 粒度简化（文档化）：按层残余组建（norm 组恒 always、字节 ~H 级忽略;experts/router 独立
+            # wrap 的时间线差异并入层组）。fsdp=1（无真实切分）时 gather_buf 是逐层 bf16 cast 缓冲
+            # （用完即释）,reshard 语义不适用 → 恒走 transient 路径（pp2 dp1 锚点不动）。
+            _pol = getattr(pm.pc, "reshard_after_forward", "default")
+            if fsdp_d > 1 or efsdp_d > 1:
+                if _pol == "never":
+                    no_reshard = set(layer_ids)
+                elif _pol == "always":
+                    no_reshard = set()
+                else:  # default
+                    no_reshard = set(layer_ids) if pp > 1 else set(loss_lids)
+            else:
+                no_reshard = set()
+            resident_gather: dict = {}     # lid -> param_full_bytes（当前 unsharded 驻留）
+
+            def _res() -> int:
+                return sum(resident_gather.values())
+
+            def _prefetch_nonres(order: list, idx: int, d: int) -> int:
+                """预取双缓冲（_prefetch_param_bytes 语义）,跳过已 resident（unsharded）的层
+                （对其 prefetch 是 no-op）。resident 空 ≡ 原函数（回归路径零漂移）。"""
+                total = 0
+                for j in range(idx + 1, min(idx + 1 + d, len(order))):
+                    if order[j] not in resident_gather:
+                        total += sm_by_id[order[j]].param_full_bytes
+                return total
+
             B = Buckets(persistent=static_persistent.get(stage, 0))
             peak: int = -1
             peak_ev: str = ""
+            peak_mb: int = -1
             peak_bd: MemBreakdown = None  # type: ignore[assignment]
             series: list = []
 
-            def rec(tag: str) -> None:
-                nonlocal peak, peak_ev, peak_bd
+            def rec(tag: str, mb: int = -1) -> None:
+                nonlocal peak, peak_ev, peak_bd, peak_mb
                 t = B.total() + framework_reserve
                 is_peak = t > peak
                 bd = None
@@ -451,13 +494,14 @@ class MemTimeline:
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
                         B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
                         B.swap_buf, B.workspace, B.optstep,
-                        framework_reserve, B.kept_frag,
+                        framework_reserve, B.kept_frag, B.grad_accum,
                     )
                 if record_timeline:
-                    series.append(TimelineSample(len(series), tag, t, bd))
+                    series.append(TimelineSample(len(series), tag, t, bd, mb))
                 if is_peak:
                     peak = t
                     peak_ev = tag
+                    peak_mb = mb
                     peak_bd = bd
 
             # (mb, layer_id) -> saved bytes currently pinned in act_live
@@ -497,18 +541,26 @@ class MemTimeline:
                 steps = [(ev.kind, ev.mb, layer_ids)
                          for ev in build_interleaved_1f1b(stage, pp, m, v)]
 
+            # P0-01：已完成首次反向的层集（其 reduced grad shard 已常驻 grad_accum）。
+            grad_done: set = set()
+
             for ev_kind, ev_mb, ev_layers in steps:
                 if ev_kind == "FWD":
                     for idx, lid in enumerate(ev_layers):
                         sm = sm_by_id[lid]
                         # 1. FSDP all-gather 整层参数(compute dtype) + 预取下 depth 层双缓冲
-                        #    （FSDP2 前向隐式 depth-1 overlap）+ workspace → 采样
-                        B.gather_buf = sm.param_full_bytes + _prefetch_param_bytes(
-                            ev_layers, idx, depth, sm_by_id)
+                        #    （FSDP2 前向隐式 depth-1 overlap）+ workspace → 采样。
+                        #    no-reshard 层（P0-03）：本层 gather 进 resident（驻留到其 post_backward）。
+                        if lid in no_reshard:
+                            resident_gather[lid] = sm.param_full_bytes
+                            B.gather_buf = _res() + _prefetch_nonres(ev_layers, idx, depth)
+                        else:
+                            B.gather_buf = _res() + sm.param_full_bytes + _prefetch_nonres(
+                                ev_layers, idx, depth)
                         B.workspace = sm.workspace
-                        rec(f"fwd:{lid}")
+                        rec(f"fwd:{lid}", ev_mb)
                         B.workspace = 0
-                        B.gather_buf = 0   # reshard_after_forward(default)：用完即释
+                        B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
                             saved = sm.checkpoint_input               # 仅保留层入口
@@ -525,7 +577,7 @@ class MemTimeline:
                         if _is_kept(lid):
                             kept_act += saved
                     # 该虚拟步(v>1: 一个 chunk / v<=1: 整 stage)所有层 pin 完毕 → FWD 峰
-                    rec("fwd_end")
+                    rec("fwd_end", ev_mb)
 
                 else:  # BWD（逆序层）—— FSDP gather + full grad + recompute + bwd_scratch 共存
                     bwd_order = list(reversed(ev_layers))
@@ -538,16 +590,20 @@ class MemTimeline:
                         #   + reduce-scatter 前 full 梯度(grad dtype)
                         #   + (full 重算)重物化激活 recomp_scratch / (无重算)反向工作集 bwd_working_set
                         #   + (op)反向临时物化 bwd_scratch(如 loss probs)
-                        #   共存，叠在 persistent + 其余 act_live 之上
-                        B.gather_buf = sm.param_full_bytes + _prefetch_param_bytes(
-                            bwd_order, idx, depth, sm_by_id)
+                        #   共存，叠在 persistent + 其余 act_live 之上。
+                        #   resident（no-reshard）层反向不 re-gather（hsdp_scheduler.py:241-250：
+                        #   仅 reshard_after_forward=True 才 re-gather 自身）——其 param_full 已在 _res()。
+                        _regather = 0 if lid in resident_gather else sm.param_full_bytes
+                        B.gather_buf = _res() + _regather + _prefetch_nonres(
+                            bwd_order, idx, depth)
                         B.grad_buf = sm.grad_full_bytes
                         B.bwd_scratch = sm.bwd_scratch
                         # ① 无重算下 loss 层：unfused CE 链共存 k_ce 份满 vocab fp32。现 bwd_scratch
                         #   =8·S·B·vocab=2 份（probs+grad）→ 改到 k_ce-1 份（logsm 1 份在 act_live）。
                         #   **k_ce 与制度相关（真机 profiler）**：流水线末 stage（pp>1，有 loss）CE 链保留更多
-                        #   中间量 → k_ce≈8（pp2-stage1 实测）；单 stage（pp=1）CE 链释放快 → k_ce≈3
-                        #   （cp2-none/select 实测仅 3 份共存）。
+                        #   中间量 → k_ce≈8（pp2-stage1 实测）；单 stage（pp=1）CE 链释放快 → 实测 3 份
+                        #   共存（cp2-none/select），代码取 **4 = 3 观测 + 1 保守**（OOM-安全侧，
+                        #   P2-08 注释对齐 2026-07-14）。
                         #   **2026-07-14 修（review P0.1）**：判据从「全局 mode=='None'」改为
                         #   「**本 stage 无任何层被重算**」——全局 None/full/select 下行为逐字节不变
                         #   （None→全 stage 无重算→fat ✓;full/select→loss stage 含被重算 transformer→lean ✓）;
@@ -595,24 +651,40 @@ class MemTimeline:
                         #   full 重算 kept_act=0 → 0（12409.5/cp-full 锚点不破）；无-loss stage 无 loss_lids → 不触发。
                         if kept_frag_factor and lid in loss_lids and kept_act > 0:
                             B.kept_frag = round(kept_frag_factor * kept_act)
-                        rec(f"bwd@{lid}")
-                        B.gather_buf = B.grad_buf = B.recomp_scratch = 0
+                        rec(f"bwd@{lid}", ev_mb)
+                        B.grad_buf = B.recomp_scratch = 0
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
+                        # post_backward：resident 层此刻 reshard（reshard_after_backward 默认 True，
+                        # state.py:505-537）→ 从 resident 集移除；gather_buf 回落到其余 resident。
+                        resident_gather.pop(lid, None)
+                        B.gather_buf = _res()
                         # 该层反向结束，释放其 pinned 激活（(mb,lid) 唯一键，chunk 互斥→无碰撞）
                         _popped = pinned.pop((ev_mb, lid))
                         B.act_live -= _popped
                         if _is_kept(lid):
                             kept_act -= _popped
+                        # P0-01：该层**首次**反向完成 → reduced grad shard 常驻（后续 microbatch
+                        # 就地 AssignAdd/RS-accumulate 累加,不新增内存 → 只加一次）。当前层的 shard
+                        # 在事件结束后才计入——fsdp=1 时 grad_buf 与驻留 grad 是同一缓冲,事件内不双计;
+                        # mb≥2 时该层已在 done 集,full grad(新物化)与旧 shard 共存,如实计。
+                        # cpu_offload：梯度随优化器在 host 侧,不驻设备（与下方 max_w=0 门同口径,文档化假设）。
+                        if lid not in grad_done:
+                            grad_done.add(lid)
+                            if not pm.pc.cpu_offload:
+                                B.grad_accum += sm.grad_shard_bytes
 
             # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
-            #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥。AdamW 逐参数更新，峰在
-            #   **最大单权重**：其 fp32 [weight] 临时（grad/grad-reduce/Square(g²)/sqrt(v̂)/m̂/update）
-            #   共 k_opt≈6 份（DSv3 8L pp=2 stage0 标定 10246；与 AdamW 更新 op 链数吻合）。
+            #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥（**累计梯度 grad_accum
+            #   除外**——真机探针证实全部 reduced grad 在 optimizer 前仍驻留，P0-01）。AdamW 逐参数
+            #   更新，峰在**最大单权重**：其 fp32 [weight] 临时（Square(g²)/sqrt(v̂)/m̂/update）。
+            #   ★K_OPT 重标 6→4（P0-01，2026-07-14）：旧 6 是在**含累计梯度**的真机 optstep 峰
+            #   （DSv3 8L pp2 stage0 = 10246.2）上标定的混合常数——其中 ≈1.9 份（=G_s0 1669.5 MiB）
+            #   实为累计梯度、非 AdamW 瞬态。拆出 grad_accum 桶后重标：
+            #   (10246.2 − persistent 5008.5 − G 1669.5) / max_w 883.8 = 4.04 ≈ 4（重标后 0.997）。
             #   ★权重须按 FSDP 切（optim_grads_params：AdamW step 只跑本 rank 的 1/fsdp 分片）——
             #   dense÷fsdp、expert÷efsdp（与 static_mem.persistent 同口径，resolve 只切了 tp/ep）。
             #   cpu_offload 时优化器 step 在 CPU、无设备瞬态 → 该项 0。
-            K_OPT = 6
-            fsdp_d, efsdp_d = pm.fsdp_degree(), pm.efsdp_degree()
+            K_OPT = 4
             max_w = 0 if pm.pc.cpu_offload else max(
                 (w.local_numel // (efsdp_d if getattr(w, "is_expert", False) else fsdp_d)
                  for l in layers for op in l.ops for w in op.params),
@@ -620,9 +692,10 @@ class MemTimeline:
             if max_w > 0:
                 B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
                 B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
-                B.optstep = K_OPT * max_w * 4          # fp32 瞬态
+                B.optstep = K_OPT * max_w * 4          # fp32 瞬态（grad_accum 保持驻留，与之共存）
                 rec("optstep")
                 B.optstep = 0
+            B.grad_accum = 0                           # zero_grad 语义：optimizer 后释放（真机探针）
 
             res[stage] = StagePeak(
                 stage=stage,
@@ -631,6 +704,7 @@ class MemTimeline:
                 peak_event=peak_ev,
                 oom=(peak > max_device_memory),
                 timeline=tuple(series),
+                peak_mb=peak_mb,
             )
 
         return res

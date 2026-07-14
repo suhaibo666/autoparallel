@@ -227,6 +227,15 @@ class ShapeEval:
                         ws //= cp
                     if _refs_symbol(op.bwd_scratch, "S"):
                         bws //= cp
+                # TensorRef 型 workspace / bwd_scratch（P0-05/P0-04）：走 resolve_tensor 的
+                # shard（÷tp/ep）+ cp 机制（首个 S 维 ÷cp）求 local 字节，解决字符串表达式
+                # 不随 tp 切分的表达缺口。
+                if getattr(op, "workspace_ref", None) is not None:
+                    wr = resolve_tensor(op.workspace_ref, spec.dims, pm)
+                    ws += wr.local_numel * wr.dtype_bytes
+                if getattr(op, "bwd_scratch_ref", None) is not None:
+                    br = resolve_tensor(op.bwd_scratch_ref, spec.dims, pm)
+                    bws += br.local_numel * br.dtype_bytes
                 comms = []
                 for t in op.inputs:
                     src = produced.get(t.name)

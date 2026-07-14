@@ -79,7 +79,11 @@ class LLMConfig:
     #   → 无法从显式 op 导出，退标定。默认 0=关（回归安全）。仅 select-kept-MoE 生效（mem_timeline kept_frag）。
     kept_frag_factor: float = 0.0
     chunk_loss_num: int = 0                 # >1：分块 CE，降 loss 区峰值
-    embedding_params_dtype_bytes: int = 4   # embedding/输出 fp32
+    # embedding/head 权重的驻留/gather 副本 dtype（P1-04 接线，2026-07-14）：真机 FSDP 下
+    # compute 副本为 bf16=2（全部锚点在此口径验证；fp32 master 在 persistent 的 opt 倍数里另计）。
+    # 旧默认 4（"fp32"）从未生效（builder 未传，恒 resolve 成 2）——属 dead config + 文档漂移，
+    # 现改默认 2 = 已验证行为、字段真实接线；fp32 直存场景显式置 4。
+    embedding_params_dtype_bytes: int = 2
 
     # ---- ③ 残差变体（横切）----
     residual_variant: str = "plain"         # plain | mhc

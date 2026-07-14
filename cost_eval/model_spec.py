@@ -95,6 +95,12 @@ class OpSpec:
     saves: list = field(default_factory=list)     # save_for_backward → 激活
     workspace: Optional[str] = None               # fwd 期 kernel scratch（符号字节）
     bwd_scratch: Optional[str] = None             # bwd 期临时物化（符号字节），如 loss probs(fp32)
+    # TensorRef 型 workspace / bwd_scratch（P0-05/P0-04，2026-07-14）：字符串表达式只 ÷cp、
+    # 无法表达 tp/ep 切分（shape_eval:224-229）；须按并行域缩放的瞬态（如 DSA indexer KL 的
+    # [B,n_heads,S,S] fp32 head 维 ÷tp、vocab-parallel CE 的 [N,V/tp] fp32 梯度）走 TensorRef
+    # ——经 resolve_tensor 的 shard/cp 机制求 local 字节后并入对应 *_bytes。与字符串表达式可叠加。
+    workspace_ref: Optional[TensorRef] = None
+    bwd_scratch_ref: Optional[TensorRef] = None
     attrs: dict = field(default_factory=dict)
 
 

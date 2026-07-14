@@ -26,6 +26,11 @@ class StructureMemory:
     - `activation_saves`：saves 去重后总字节（全量保存时 pin 进 act_live）。
     - `param_full_bytes`：full-unsharded 参数字节（compute dtype）——FSDP all-gather 缓冲。
     - `grad_full_bytes`：full-unsharded 梯度字节（grad dtype）——反向 reduce-scatter 前 grad_buf。
+    - `grad_shard_bytes`：**已规约本地梯度分片**字节（P0-01，2026-07-14）——真机证实梯度是
+      step-scoped cumulative（两卡探针 7566.1−5676.6=1889.5 MiB ≡ 逻辑梯度/2）：该结构首次反向后
+      其 reduced shard 常驻至 optimizer、zero_grad 释放。divisor 与 persistent 完全同口径
+      （dense÷fsdp、expert÷efsdp）+ 逐权重块对齐；公式经 DSv4 FSDP-2 真机 0.999 交叉验证
+      （1887.6 vs 1889.5，review_evidence_2026-07-14.md）。需传 fsdp/efsdp，默认 1=全量。
     - `bwd_scratch`：该结构各 op 反向临时物化之和（如 loss probs/grad_log_softmax fp32）。
     - `workspace`：该结构各 op workspace 的最大值（FWD 逐层瞬时）。
     - `checkpoint_input`：full 重算时保留的层入口激活（首个有 saves 的 op 的首个 save）字节。
@@ -44,6 +49,7 @@ class StructureMemory:
     workspace: int = 0
     checkpoint_input: int = 0
     forward_max_live: int = 0
+    grad_shard_bytes: int = 0
 
 
 def _align_up(nbytes: int, block: int) -> int:
@@ -168,6 +174,17 @@ def estimate_structure_memory(
                            for s in saves.values())
     param_full_bytes = sum(_align_up(w.local_numel * w.dtype_bytes, blk) for w in params.values())
     grad_full_bytes = sum(_align_up(w.local_numel * grad_dtype_bytes, blk) for w in params.values())
+    # P0-01（2026-07-14 review）：已规约梯度分片（step-scoped cumulative）。divisor 与上方
+    # persistent 完全同口径（dense÷fsdp、expert÷efsdp），不整除同样 fail-loud（I1，OOM 安全）。
+    grad_shard_bytes = 0
+    for w in params.values():
+        divisor = efsdp if w.is_expert else fsdp
+        if w.local_numel % divisor != 0:
+            raise ValueError(
+                f"{w.name} local_numel={w.local_numel} 不被 "
+                f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
+                f"（grad shard 切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
+        grad_shard_bytes += _align_up((w.local_numel // divisor) * grad_dtype_bytes, blk)
     bwd_scratch = sum(getattr(op, "bwd_scratch_bytes", 0) for op in resolved_ops)
     workspace = max((op.workspace_bytes for op in resolved_ops), default=0)
 
@@ -191,6 +208,7 @@ def estimate_structure_memory(
         workspace=workspace,
         checkpoint_input=checkpoint_input,
         forward_max_live=forward_max_live,
+        grad_shard_bytes=grad_shard_bytes,
     )
 
 

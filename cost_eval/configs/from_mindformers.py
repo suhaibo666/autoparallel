@@ -380,7 +380,11 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "tie_word_embeddings",
             not model.get("untie_embeddings_and_output_weights", True))),
         loss_type="logsoftmax_nll",
-        embedding_params_dtype_bytes=_dtype_bytes(model.get("params_dtype"), 4),
+        # P1-04 修正（2026-07-14）：该字段语义 = embedding/head 权重的**驻留/gather 副本** dtype。
+        # 真机证据：params_dtype=fp32 的 DSv3/DSv4 跑全部在 compute 副本 bf16=2 口径锚定
+        # （12409.5 等；fp32 master 已在 persistent 的 opt 倍数计）→ 映射自 compute_dtype，
+        # 不再错映 params_dtype（旧映射在字段接线后会 +vocab×H×2B 破锚点，且与真机不符）。
+        embedding_params_dtype_bytes=_dtype_bytes(model.get("compute_dtype"), 2),
         # ③ 残差 / MTP / bias / dtype
         residual_variant=("mhc" if model.get("enable_hyper_connections") else "plain"),
         num_residual_streams=(int(model.get("hc_mult", 1))

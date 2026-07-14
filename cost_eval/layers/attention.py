@@ -15,14 +15,25 @@ from ..model_spec import DimTable, OpSpec, OpType, TensorRef
 QKV = "(n_heads+2*n_kv)*head_dim"   # qkv 投影输出维：(H + 2·n_kv)·d_h，对称 GQA
 NHD = "n_heads*head_dim"            # o_proj 输入维 = n_heads·head_dim
 
-# ── FlashAttention workspace（机理公式，∝ S·n_heads —— 从 framework_reserve 拆出）──────
-# Ascend `FlashAttentionScore`（`flash_attention.py:136-196` MindSpore 算子）除 attention_out
-# 外还返回 **softmax_max + softmax_sum**（softmax LSE 统计），每个 shape `[B, n_heads, S, 8]`
-# fp32（末维 8 = flash 内层 reduce 分块，CANN 固定），供 `FlashAttentionScoreGrad` 反向复用。
-# 工作集 = 2 张量 × 8 × 4B = **64·B·n_heads·S** bytes。**∝ S·n_heads**（随序列缩放——正是要点），
-# 取代此前 `S·B·n_heads·head_dim`（把整份 Q/O numel 当字节的经验近似）。block scratch（O(block·d)）
-# 二阶、近常数，并入该文档，不单列。仅在该 flash op 的**前向事件**计入（非全局常数、非 loss 峰）。
+# ── FlashAttention softmax 统计量（P1-09 修正 2026-07-14）────────────────────────────
+# Ascend `FlashAttentionScore` 除 attention_out 外还输出 **softmax_max + softmax_sum**，各
+# `[B, n_heads, S, 8]` fp32（末维 8 = flash 内层 reduce 分块，CANN 固定），是
+# `FlashAttentionScoreGrad` 的**输入**（MindSpeed fusion_attention_v2.py:38-40
+# `ctx.save_for_backward(..., softmax_max, softmax_sum, ...)`）→ 必须**从前向驻留到该层反向**。
+# 修前误建为 fwd-only workspace + lse [S,B,n_heads] 2B saves（仅真值 1/32，且 workspace 不 ÷tp）。
+# 修后：`_fa_stats(...)` TensorRef（2×[B,N,S,8] fp32 = 64·B·n_heads·S 字节，head 维 ÷tp、S 维
+# 天然 ÷cp）进 flash op 的 **saves**——无重算层驻留至反向（act_live），重算层随 saves 丢弃重物化。
+# 下方 workspace 表达式**保留**的残余职责：重算路径反向重跑 forward 时再物化统计量的瞬态
+# （进 forward_max_live → recomp_scratch，full 重算锚点 12409.5 依赖此项）；已知限制：workspace
+# 字符串只 ÷cp 不 ÷tp（shape_eval:224-229），tp>1 时重算瞬态偏保守（OOM-安全侧，无锚点覆盖）。
 FLASH_LSE_WS = "64*B*n_heads*S"
+
+
+def _fa_stats() -> TensorRef:
+    """softmax_max+sum 的驻留张量：[2, B, n_heads, S, 8] fp32，head 维 ÷tp（本地头数），
+    首个 S 维由 resolve_tensor 的 cp 规则天然 ÷cp。numel×4B = 64·B·n_heads·S/(tp·cp) 字节。"""
+    return TensorRef("fa_stats", ("2", "B", "n_heads", "S", "8"),
+                     shard={2: "tp"}, dtype_bytes=4)
 
 # ── MLA 符号维度表达式（与 DimTable 字段名一致，供 eval_expr 求值）──────────
 # linear_qkv 输出维（q_lora+kv_lora+k_pe）
@@ -55,7 +66,7 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     ln1    = TensorRef("ln1",  ("S", "B", "H"))
     qkv    = TensorRef("qkv",  ("S", "B", QKV),        shard={2: "tp"})
     attn   = TensorRef("attn", ("S", "B", NHD),        shard={2: "tp"})
-    lse    = TensorRef("lse",  ("S", "B", "n_heads"),  shard={2: "tp"})
+    fa_st  = _fa_stats()   # softmax_max/sum 驻留（P1-09：FlashAttentionScoreGrad 输入）
     o      = TensorRef("o",    ("S", "B", "H"),        partial="tp")
     h1     = TensorRef("h1",   ("S", "B", "H"),        shard={0: "sp"})
 
@@ -76,9 +87,10 @@ def build_gqa_attn_ops(d: DimTable) -> list:
         # 3. RoPE（in-place，输出复用 qkv 张量引用）
         OpSpec("rope",   OpType.ROPE,        [qkv],        qkv,
                saves=[]),
-        # 4. FlashAttention（saves 存 q/k/v 与 softmax lse，backward 所需）
+        # 4. FlashAttention（saves 存 q/k/v 与 softmax max/sum 统计——FlashAttentionScoreGrad
+        #    的输入，驻留至反向；workspace = 重算路径再物化瞬态，见 FLASH_LSE_WS 注释）
         OpSpec("flash",  OpType.FLASH_ATTN,  [qkv],        attn,
-               saves=[qkv, attn, lse],
+               saves=[qkv, attn, fa_st],
                workspace=fa_ws),
         # 5. Output 投影（列并行→行并行）
         OpSpec("o_proj", OpType.MATMUL,      [attn, o_w],  o,
@@ -120,9 +132,9 @@ def build_mla_attn_ops(d: DimTable) -> list:
     # linear_qb / linear_kvb 输出
     qb_out   = TensorRef("qb_out",   ("S", "B", QB_OUT),   shard={2: "tp"})
     kvb_out  = TensorRef("kvb_out",  ("S", "B", KVB_OUT),  shard={2: "tp"}, cp_kv=True)
-    # flash_attn 输出 + lse
+    # flash_attn 输出 + softmax 统计（P1-09）
     attn_out = TensorRef("attn",     ("S", "B", ATTN_OUT), shard={2: "tp"})
-    lse      = TensorRef("lse",      ("S", "B", "n_heads"), shard={2: "tp"})
+    fa_st    = _fa_stats()
     # o_proj 输出（行并行，待 all-reduce / reduce-scatter）
     o        = TensorRef("o",        ("S", "B", "H"),       partial="tp")
     # add1 输出（reshard 后回到 SP 分布）
@@ -160,9 +172,9 @@ def build_mla_attn_ops(d: DimTable) -> list:
         # 7. RoPE（作用于 qb_out 的 rope 部分，in-place，复用同名引用）
         OpSpec("rope",       OpType.ROPE,        [qb_out],          qb_out,
                saves=[]),
-        # 8. FlashAttention（q=qb_out, kv=kvb_out；输出 attn + lse）
+        # 8. FlashAttention（q=qb_out, kv=kvb_out；saves 含 softmax max/sum 统计，驻留至反向）
         OpSpec("flash",      OpType.FLASH_ATTN,  [qb_out, kvb_out], attn_out,
-               saves=[qb_out, kvb_out, attn_out, lse],
+               saves=[qb_out, kvb_out, attn_out, fa_st],
                workspace=fa_ws),
         # 9. o_proj（行并行：n_heads*v_head_dim → H，partial=tp）
         OpSpec("o_proj",     OpType.MATMUL,      [attn_out, o_w],   o,
