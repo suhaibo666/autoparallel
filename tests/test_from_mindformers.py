@@ -212,6 +212,38 @@ def test_pp1_layers_per_stage_none():
     assert from_mindformers_dict(_dsv3_mf()).parallel.layers_per_stage is None
 
 
+# ── P0.3（2026-07-14 review）：data_parallel_replicate（纯数据并行,权重逐 rank 复制）──
+def test_parallelism_data_parallel_replicate_maps():
+    """`parallelism.data_parallel_replicate` → ParallelConfig.dp_replicate（与 dp_shard 正交）。"""
+    mf = _dsv3_mf()
+    mf["parallelism"].update(data_parallel_replicate=4, data_parallel_shard=2)
+    pc = from_mindformers_dict(mf).parallel
+    assert pc.dp_replicate == 4 and pc.dp_shard == 2
+
+
+def test_data_parallel_replicate_absent_defaults_one():
+    assert from_mindformers_dict(_dsv3_mf()).parallel.dp_replicate == 1
+
+
+def test_auto_dp_shard_divides_by_replicate():
+    """auto dp_shard（=-1）时 global = dp_shard·dp_replicate·local·mbs → shard = global//(local·mbs·repl)。"""
+    mf = _dsv3_mf()
+    mf["training"]["global_batch_size"] = 8
+    mf["parallelism"].update(data_parallel_replicate=4)   # data_parallel_shard 保持 -1（auto）
+    pc = from_mindformers_dict(mf).parallel
+    assert pc.dp_replicate == 4 and pc.dp_shard == 2
+
+
+def test_dp_replicate_does_not_shard_persistent_same_peak():
+    """锁定评估器口径：纯数据并行(dp_replicate)权重/优化器逐 rank **复制**——单卡峰值与 dp=1
+    逐字节相同（持久态只 ÷fsdp_degree=dp_shard·cp，绝不 ÷dp_replicate；static_mem.py:31）。"""
+    base = _dsv3_mf()
+    base["parallelism"]["data_parallel_shard"] = 1
+    repl = _dsv3_mf()
+    repl["parallelism"].update(data_parallel_shard=1, data_parallel_replicate=4)
+    assert _peak(from_mindformers_dict(repl)) == _peak(from_mindformers_dict(base))
+
+
 def test_optimizer_params_fp32_from_dtype():
     opt = from_mindformers_dict(_dsv3_mf()).optimizer
     assert opt.type == "AdamW" and opt.state_bytes_per_param == 12  # fp32 master+m+v
@@ -251,6 +283,50 @@ def test_fail_loud_on_contradictory_fusion_flags():
     mf["model"]["force_unfused_dsa"] = True          # 二者都 True → 自相矛盾
     with pytest.raises(NotImplementedError, match="互反"):
         from_mindformers_dict(mf)
+
+
+# ── P0.4（2026-07-14 review）：fp32_residual_connection × layernorm dtype 组合守卫 ────
+def test_fp32_residual_with_bf16_layernorm_fails_loud():
+    """fp32_residual=True 的"内存中性"论证依赖 norm-fp32 建模覆盖；ln=bf16 时 fp32 残差驻留
+    无人建模 → 必须 fail-loud（不静默低估 ~S·B·H·2 字节/层）。"""
+    mf = _dsv3_mf()
+    mf["model"]["fp32_residual_connection"] = True
+    mf["model"]["layernorm_compute_dtype"] = "bfloat16"
+    with pytest.raises(NotImplementedError, match="fp32_residual_connection"):
+        from_mindformers_dict(mf)
+
+
+def test_fp32_residual_glm4_alias_bf16_fails_loud():
+    """glm4 旧名 layernorm_compute_type 经别名规范化后同受守卫。"""
+    mf = _dsv3_mf()
+    mf["model"]["fp32_residual_connection"] = True
+    mf["model"]["layernorm_compute_type"] = "bfloat16"
+    with pytest.raises(NotImplementedError, match="fp32_residual_connection"):
+        from_mindformers_dict(mf)
+
+
+def test_fp32_residual_with_fp32_layernorm_passes():
+    """fp32_residual + ln=fp32（当前语料全部如此,qwen3/telechat3）→ 守卫不触发,norm-fp32 建模覆盖。"""
+    mf = _dsv3_mf()
+    mf["model"]["fp32_residual_connection"] = True
+    mf["model"]["layernorm_compute_dtype"] = "float32"
+    bundle = from_mindformers_dict(mf)
+    assert bundle.llm.layernorm_compute_dtype_bytes == 4
+
+
+def test_fp32_residual_with_default_layernorm_passes():
+    """layernorm_compute_dtype 缺省 → 默认按 fp32 建模（LLMConfig 默认一致）→ 守卫不触发。"""
+    mf = _dsv3_mf()
+    mf["model"]["fp32_residual_connection"] = True
+    from_mindformers_dict(mf)   # 不抛
+
+
+def test_fp32_residual_false_with_bf16_layernorm_passes():
+    """fp32_residual 关（或缺省）+ ln=bf16：无 fp32 残差驻留主张 → 不触发守卫。"""
+    mf = _dsv3_mf()
+    mf["model"]["fp32_residual_connection"] = False
+    mf["model"]["layernorm_compute_dtype"] = "bfloat16"
+    from_mindformers_dict(mf)   # 不抛
 
 
 def test_fail_loud_on_add_bias_linear_via_build():

@@ -546,12 +546,20 @@ def _mf_adapt(mf):
         mf["model"] = mc
     if "parallelism" not in mf and isinstance(mf.get("parallel_config"), dict):
         pcfg = mf["parallel_config"]
+        # P0.3(2026-07-14 review):老式 `data_parallel` 语义随 `parallel.enable_parallel_optimizer`
+        # (epo,mindformers/mindspore 默认 **False**)分流:epo=True → 权重/优化器沿 dp 切分(zero 类)
+        # = data_parallel_shard;epo=False → 纯数据并行,权重逐 dp rank **复制** = data_parallel_replicate
+        # (评估器持久态只 ÷fsdp_degree=dp_shard·cp,不 ÷dp_replicate,static_mem.py:31——建模正确)。
+        # 此前无条件映射 dp_shard 会把 epo=False + dp>1 的持久内存静默低估 ~dp 倍。
+        epo = bool((mf.get("parallel") or {}).get("enable_parallel_optimizer", False))
+        dp = int(pcfg.get("data_parallel", 1) or 1)
         mf["parallelism"] = {
             "tensor_parallel": pcfg.get("model_parallel", 1),
             "pipeline_parallel": pcfg.get("pipeline_stage", 1),
             "expert_parallel": pcfg.get("expert_parallel", 1),
             "context_parallel": pcfg.get("context_parallel", 1),
-            "data_parallel_shard": pcfg.get("data_parallel", 1),
+            "data_parallel_shard": dp if epo else 1,
+            "data_parallel_replicate": 1 if epo else dp,
             "sequence_parallel": bool(pcfg.get("use_seq_parallel", False)),
             "pipeline_parallel_microbatch_size": pcfg.get("micro_batch_num", 1),
         }
@@ -645,7 +653,16 @@ class H(BaseHTTPRequestHandler):
                             warnings.append(f"{mk} 缺失(yaml 依赖类内默认)→ 用页面当前值 {defaults[uik]} 兜底,请核对")
                     mf = dict(mf); mf["model"] = m
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
-                fields = _bundle_to_fields(from_mindformers_dict(mf))
+                bundle = from_mindformers_dict(mf)
+                fields = _bundle_to_fields(bundle)
+                if bundle.parallel.dp_replicate > 1:
+                    # P0.3:epo=False 的纯数据并行——权重/优化器逐 dp rank 复制不切分,评估器按
+                    # dp_replicate 建模(持久态不 ÷dp,单卡峰值与 dp=1 相同)。页面无 dp_replicate
+                    # 输入,dp 字段(=dp_shard)回填为 1,内存口径不受影响,仅 world/HCCL 域数少算。
+                    warnings.append(
+                        f"enable_parallel_optimizer=False 的纯数据并行(dp={bundle.parallel.dp_replicate}):"
+                        "权重/优化器逐 dp rank 复制不切分,评估器按 dp_replicate 建模(单卡峰值与 dp=1 "
+                        "相同);页面 dp 字段(=dp_shard)已置 1,请勿手动改回 dp——那会错按 FSDP 切分")
                 if vpp > 1:
                     fields["vpp"] = vpp
                 self._send(json.dumps({"ok": True, "fields": fields, "warnings": warnings},

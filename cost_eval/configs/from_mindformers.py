@@ -100,7 +100,9 @@ _IGNORED_MODEL_KEYS = {
     # 合并建模,内存等量。
     "qkv_concat",
     # fp32 残差链:其**驻留**副本已由 norm-fp32 建模覆盖(ln 存 fp32 输入=残差张量的 fp32 副本,
-    # layernorm_compute_dtype 驱动);残差 add 反向直传不存 → 无额外驻留。
+    # layernorm_compute_dtype 驱动);残差 add 反向直传不存 → 无额外驻留。**该论证仅在
+    # layernorm_compute_dtype=fp32 时成立**——fp32_residual=True + ln 非 fp32 的组合由
+    # _build_llm_config 值守卫 fail-loud(P0.4,2026-07-14 review)。
     "fp32_residual_connection",
     # router 计算顺序/融合 kernel:logits [S,B,E] 微小且已建,顺序/融合不改驻留。
     "moe_router_pre_softmax", "moe_router_fusion", "use_fused_ops_permute",
@@ -318,6 +320,20 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "use_flash_attention=False 暂未建 op 图：非 flash 注意力会物化 [S,S] 分数矩阵"
             "（评估器只建 flash 路径，saves=Q/K/V/O+lse，不物化 [S,S]）——请用 flash 或补 op 图。")
 
+    # 值守卫（P0.4，2026-07-14 review）：fp32_residual_connection 的「内存中性」忽略论证依赖
+    # norm-fp32 建模覆盖——layernorm_compute_dtype=fp32 时 norm 保存的 fp32 输入**就是**残差张量的
+    # fp32 副本，故 fp32 残差的驻留已被计入。若 fp32_residual=True 而 layernorm dtype 非 fp32
+    # （如 bf16），该覆盖不成立：fp32 残差驻留（每层 ~S·B·H·2 额外字节）无人建模 → fail-loud，
+    # 不静默低估。当前语料所有 fp32_residual=True 的 yaml（qwen3/telechat3）均配 ln=fp32，不触发。
+    if (model.get("fp32_residual_connection")
+            and _dtype_bytes(model.get("layernorm_compute_dtype"), 4) < 4):
+        raise NotImplementedError(
+            "fp32_residual_connection=True 且 layernorm_compute_dtype 非 float32：该组合的 fp32 残差"
+            "驻留（每层 ~S·B·H·2 额外字节）未建模。评估器对 fp32 残差的覆盖论证依赖 norm-fp32 建模"
+            "（layernorm_compute_dtype=float32 时 norm 保存的 fp32 输入即残差的 fp32 副本），"
+            "ln=bf16 时不成立——请把 layernorm_compute_dtype 设为 float32（当前语料均如此），"
+            "或为该组合补建模。")
+
     attn_type = _infer_attn_type(model)
     # n_routed_experts（deepseek 系）/ num_experts（qwen3_moe/general 模板同义字段）
     num_moe_experts = model.get("n_routed_experts") or model.get("num_experts")
@@ -455,16 +471,22 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     # （对齐 validate_dsv3.main 的 `mbs = PP if PP>1 else 1`，且 P4:57 pipeline_parallel_microbatch_size=1）。
     ppm = int(par.get("pipeline_parallel_microbatch_size", 1) or 1)
     num_microbatches = ppm if pp > 1 else 1
-    # dp_shard：显式 >0 直取；<=0（auto，P4:55=-1）→ global // (local·num_microbatches)（FSDP-only, dp_replicate=1）。
+    # dp_replicate（P0.3，2026-07-14 review）：纯数据并行度——权重/优化器逐 rank **复制**不切分。
+    # 评估器正确建模该语义：持久态只 ÷fsdp_degree=dp_shard·cp（static_mem.py:31），dp_replicate 仅进
+    # world size（report.py:53）与通信域数（framework.py:52，reserved 池）。老式 yaml 的
+    # `parallel_config.data_parallel` + enable_parallel_optimizer=False 由 _mf_adapt 映射到此键。
+    dp_repl = int(par.get("data_parallel_replicate", 1) or 1)
+    # dp_shard：显式 >0 直取；<=0（auto，P4:55=-1）→ global // (local·num_microbatches·dp_replicate)
+    # （global = dp_shard·dp_replicate·local·num_microbatches）。
     dp_cfg = int(par.get("data_parallel_shard", -1))
     if dp_cfg > 0:
         dp_shard = dp_cfg
     elif global_bs is not None:
-        dp_shard = max(1, int(global_bs) // (local_bs * num_microbatches))
+        dp_shard = max(1, int(global_bs) // (local_bs * num_microbatches * dp_repl))
     else:
         dp_shard = 1
     return ParallelConfig(
-        dp_replicate=1,
+        dp_replicate=dp_repl,
         dp_shard=dp_shard,
         cp=cp, tp=tp, pp=pp, ep=ep,
         sequence_parallel=bool(par.get("sequence_parallel", False)),
