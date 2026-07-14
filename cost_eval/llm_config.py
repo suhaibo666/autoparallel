@@ -29,7 +29,7 @@ class LLMConfig:
     head_dim: int | None = None             # 默认 H // n_heads
 
     # ---- ① 注意力 ----
-    attn_type: str = "gqa"                  # mha | gqa | mla | dsv4_hybrid
+    attn_type: str = "gqa"                  # mha | gqa | mla | dsa | dsv4_hybrid
     num_query_groups: int | None = None     # GQA 的 KV 组数（None→=n_heads）
     window_size: int | None = None          # None=全注意力；int=滑窗宽度（SWA）
     window_pattern: tuple | None = None      # 每层 0=全/1=SWA；None=全层同 window_size
@@ -39,7 +39,8 @@ class LLMConfig:
     qk_rope_head_dim: int = 0               # = qk_pos_emb_head_dim
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
-    # dsv4_hybrid（DSA 索引器 + 压缩器 + 稀疏注意力）专用
+    # dsv4_hybrid（DSA 索引器 + 压缩器 + 稀疏注意力）专用；dsa_indexer_* 三维同时被
+    # attn_type="dsa"（DSv3.2/GLM-5 lightning indexer，layers/dsa.py 预估计）使用（须 >0）。
     csa_compress_ratios: tuple | None = None    # 每层 ∈ {0/1, 4=CSA, 128=HCA}
     csa_window_size: int = 128
     dsa_indexer_n_heads: int = 0

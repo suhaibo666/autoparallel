@@ -68,13 +68,15 @@ PRESETS = {
     },
     "dsv32_exp": {
         "label": "DeepSeek-V3.2-Exp", "base": "v3",
-        "source": "HF deepseek-ai/DeepSeek-V3.2-Exp config.json;DSA indexer(64/128/topk2048) 未建模→按 full-attention 上界",
+        "source": "HF deepseek-ai/DeepSeek-V3.2-Exp config.json;DSA indexer(64/128/topk2048) 预估计——"
+                  "op 图基于 mindformers training_graph 静态图 DSA 代码,无真机锚点,待 pynative DSA 落地重校准",
         "ui": {"attn": "dsa", "layers": 61, "dense_k": 3, "experts": 256, "topk": 8,
                "heads": 128, "kv_groups": 128, "seq": 4096, "batch": 1, "mtp": 1,
                "hidden": 7168, "ffn": 18432, "moe_ffn": 2048, "q_lora": 1536, "kv_lora": 512, "qk_nope": 128, "qk_rope": 64, "v_head": 128, "vocab": 129280},
         "dims": {"hidden_size": 7168, "ffn_hidden_size": 18432, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
                  "qk_rope_head_dim": 64, "v_head_dim": 128, "head_dim": 192,
+                 "dsa_indexer_n_heads": 64, "dsa_indexer_head_dim": 128, "dsa_indexer_topk": 2048,
                  "vocab_size": 129280, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 2048},
     },
     "dsv4_flash": {
@@ -101,13 +103,15 @@ PRESETS = {
     },
     "glm5": {
         "label": "GLM-5 (zai-org)", "base": "v3",
-        "source": "HF zai-org/GLM-5 config.json(glm_moe_dsa);DSA indexer(32/128/topk2048) 未建模→按 full-attention 上界",
+        "source": "HF zai-org/GLM-5 config.json(glm_moe_dsa);DSA indexer(32/128/topk2048) 预估计——"
+                  "op 图基于 mindformers training_graph 静态图 DSA 代码,无真机锚点,待 pynative DSA 落地重校准",
         "ui": {"attn": "dsa", "layers": 78, "dense_k": 3, "experts": 256, "topk": 8,
                "heads": 64, "kv_groups": 64, "seq": 4096, "batch": 1, "mtp": 0,
                "hidden": 6144, "ffn": 12288, "moe_ffn": 2048, "q_lora": 2048, "kv_lora": 512, "qk_nope": 192, "qk_rope": 64, "v_head": 256, "vocab": 154880},
         "dims": {"hidden_size": 6144, "ffn_hidden_size": 12288, "moe_ffn_hidden_size": 2048,
                  "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_head_dim": 192,
                  "qk_rope_head_dim": 64, "v_head_dim": 256, "head_dim": 256,
+                 "dsa_indexer_n_heads": 32, "dsa_indexer_head_dim": 128, "dsa_indexer_topk": 2048,
                  "vocab_size": 154880, "moe_shared_expert_num": 1, "moe_shared_ffn_hidden_size": 2048},
     },
 }
@@ -342,12 +346,22 @@ def parse_and_validate(p):
         base = dataclasses.replace(base, **pr["dims"])
     if dim_over:                               # UI 维度最终覆盖（custom / 预设微调）
         base = dataclasses.replace(base, **dim_over)
-    # dsa（DSv3.2/GLM-5 的 MLA+lightning indexer 稀疏注意力）:结构=MLA,稀疏 topk 不建模 →
-    # FA/saves 按 full-attention **上界**（OOM 安全侧;indexer 小激活忽略,已标注）。
-    _attn_map = {"mha": "gqa", "dsa": "mla"}
+    # dsa（DSv3.2/GLM-5 的 MLA+lightning indexer 稀疏注意力）:真实 attn_type=dsa（layers/dsa.py，
+    # **预估计**——基于 training_graph 静态图 DSA 代码,无真机锚点,待 pynative DSA 落地重校准）。
+    # indexer 三维未由预设/UI 提供时按 DSv3.2-Exp 默认(64/128/2048)补齐,避免 fail-loud 拦住 custom。
+    _attn_map = {"mha": "gqa"}
+    dsa_fill = {}
+    if attn == "dsa":
+        if base.dsa_indexer_n_heads <= 0:
+            dsa_fill["dsa_indexer_n_heads"] = 64
+        if base.dsa_indexer_head_dim <= 0:
+            dsa_fill["dsa_indexer_head_dim"] = 128
+        if base.dsa_indexer_topk <= 0:
+            dsa_fill["dsa_indexer_topk"] = 2048
     cfg = dataclasses.replace(
         base, num_layers=N, batch_size=B, seq_length=S,
         attn_type=_attn_map.get(attn, attn),
+        **dsa_fill,
         num_attention_heads=heads,
         # dsv4_hybrid 的 num_query_groups 用基座值（MLA 系惰性=1）;mla/mha/dsa=heads;gqa=kv_groups。
         num_query_groups=(base.num_query_groups if attn == "dsv4_hybrid"
@@ -772,7 +786,7 @@ h1{font-size:19px;margin:5px 0 8px}
       <option value="glm5">GLM-5 (zai-org)</option>
     </select></div>
     <div class="fld"><label>yaml 导入</label><input type="file" id="yamlfile" accept=".yaml,.yml" style="font-size:11px;width:170px" title="选 mindformers 训练 yaml → 解析回填到对话框(不改动 yaml 文件本身)"></div>
-    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsa">DSA(MLA+indexer,上界)</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
+    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsa">DSA(预估计)</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
     <div class="fld"><label>layers</label><input name="layers" type="number" min="1" value="8"></div>
     <div class="fld"><label>dense 层数</label><input name="dense_k" type="number" min="0" value="1" title="前 K 层 dense,其余 MoE(first_k_dense_replace);=layers 则纯 dense"></div>
     <div class="fld"><label>experts</label><input name="experts" type="number" min="0" value="8"></div>

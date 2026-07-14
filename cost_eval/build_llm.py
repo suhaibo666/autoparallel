@@ -59,6 +59,13 @@ def _check_implemented_dispatch(cfg: LLMConfig) -> None:
         raise NotImplementedError(
             "qk_layernorm=True 暂未建 op 图：Q/K 上的 2 个 RMSNorm 未建为 op（Qwen3 变体）——"
             "内存可忽略但未建模；如需忠实建模请在 attn builder 补 q/k norm op。")
+    if cfg.attn_type == "dsa" and not (cfg.dsa_indexer_n_heads > 0
+                                       and cfg.dsa_indexer_head_dim > 0
+                                       and cfg.dsa_indexer_topk > 0):
+        raise NotImplementedError(
+            "attn_type='dsa' 需 dsa_indexer_n_heads/dsa_indexer_head_dim/dsa_indexer_topk 三维"
+            "均 >0（DSv3.2-Exp: 64/128/2048，GLM-5: 32/128/2048）——indexer 是 DSA op 图的组成"
+            "部分（layers/dsa.py，预估计），缺维会静默产错图，故报错。")
     # window_size / window_pattern：**故意不 raise**（见本函数 docstring「内存中性字段」）。
 
 

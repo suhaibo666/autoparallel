@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 
 from .attention import build_gqa_attn_ops, build_mla_attn_ops
+from .dsa import build_dsa_attn_ops
 from .dsv4_hybrid import build_dsv4_hybrid_attn_ops
 from .ffn import build_dense_ffn_ops, build_moe_ffn_ops
 
@@ -53,11 +54,13 @@ def _dsv4_hybrid_entry(dims, ctx=None):
 
 
 # ① 注意力派发轴（统一 (dims, ctx)）。mha == 对称 GQA（KV 组数 = n_heads），复用同一 adapter 实例。
+# dsa = DSv3.2/GLM-5 稀疏注意力（**预估计**，基于 training_graph 静态图 DSA 代码，见 layers/dsa.py）。
 _gqa_entry = _dims_only(build_gqa_attn_ops)
 ATTN_REGISTRY = {
     "mha": _gqa_entry,
     "gqa": _gqa_entry,
     "mla": _dims_only(build_mla_attn_ops),
+    "dsa": _dims_only(build_dsa_attn_ops),
     "dsv4_hybrid": _dsv4_hybrid_entry,
 }
 
