@@ -4,10 +4,14 @@ from .specs import ParallelConfig
 
 
 class ParallelModel:
-    def __init__(self, pc: ParallelConfig, n_layers: int, world_size: int):
+    def __init__(self, pc: ParallelConfig, n_layers: int, world_size: int,
+                 edge_pseudo: tuple = (1, 1)):
         self.pc = pc
         self.n_layers = n_layers
         self.world_size = world_size
+        # (首伪层数, 末伪层数):生产 pattern 恒 [embedding]+decoder*+[lm_head] → 默认 (1,1),
+        # 伪层不占均匀切/round-robin 配额。无伪层的裸 ModelSpec(toy/单测)显式传 (0,0)。
+        self.edge_pseudo = edge_pseudo
         region = pc.dp_shard * pc.cp * pc.tp
         if region % pc.ep != 0:
             raise ValueError(
@@ -71,11 +75,69 @@ class ParallelModel:
             return mapping
         if pp <= 1:
             return [0] * self.n_layers
-        mid = self.n_layers - 2                      # 中间层数（transformer + mtp）
+        hp, tp_ = self.edge_pseudo
+        mid = self.n_layers - hp - tp_               # 中间层数（transformer + mtp）
+        v = max(1, getattr(self.pc, "interleave", 1))
+        if v > 1:
+            # VPP round-robin 放置（2026-07-14 修,源:mindformers pynative
+            # `pynative/distributed/pipeline_parallel.py:258` `chunk_id*pp_size+pp_rank`）:
+            # 中间层均匀切成 pp·v 个**虚拟 stage**（余数前置）,虚拟段 s_virt 归物理 rank
+            # `s_virt % pp`——rank r 持虚拟 stage {r, r+pp, ...} 的**非连续**层段。层结构
+            # 不均匀（dense/moe 混布/逐层 compress_ratio）时与旧「连续块再切 chunk」近似不同。
+            nvirt = pp * v
+            base, rem = divmod(mid, nvirt)
+            mid_map = []
+            for sv in range(nvirt):
+                mid_map += [sv % pp] * (base + (1 if sv < rem else 0))
+            return [0] * hp + mid_map + [pp - 1] * tp_
         # 标准均匀切（2026-07-14 修:此前 remainder 全堆末 stage,N=8 pp=3 切成 2,2,4 不均匀）:
-        # 前 rem 个 stage 各多 1 层 → N=8 pp=3 = 3,3,2。整除时逐层不变（锚点安全）。
+        # 前 rem 个 stage 各多 1 层 → N=8 pp=3 = 3,3,2。整除时逐字节不变（锚点安全）。
         base, rem = divmod(mid, pp)
         mid_map = []
         for s in range(pp):
             mid_map += [s] * (base + (1 if s < rem else 0))
-        return [0] + mid_map + [pp - 1]              # embedding→stage0,head→末 stage
+        return [0] * hp + mid_map + [pp - 1] * tp_   # embedding→stage0,head→末 stage
+
+    def stage_chunks(self, stage: int) -> list:
+        """该物理 stage 的 **per-chunk 层组**（VPP,v 个 chunk;v<=1 → 单 chunk=全部层）。
+
+        round-robin 语义（`pipeline_parallel.py:258`）:chunk c = 虚拟 stage `c*pp+stage` 的层。
+        embedding 伪层附加到 stage0 的 chunk0、head 伪层附加到末 stage 的末 chunk（与
+        1F1B 事件序一致:embedding 最先前向、loss 最后反向）。显式 layers_per_stage 下退化为
+        「stage 内连续均衡切 v 段」（mindformers 显式 per-chunk ranges 暂不支持,文档化近似）。"""
+        v = max(1, getattr(self.pc, "interleave", 1))
+        lids = self.stage_layers(stage)
+        if v <= 1:
+            return [lids]
+        pp = self.pc.pp
+        hp, tp_ = self.edge_pseudo
+        pseudo_first = [l for l in lids if l < hp]                            # embedding
+        pseudo_last = [l for l in lids if l >= self.n_layers - tp_]           # head
+        mids = [l for l in lids if hp <= l < self.n_layers - tp_]
+        if self.pc.layers_per_stage:
+            # 显式物理配额:stage 内连续均衡切 v 段（近似,见 docstring）。
+            base, rem = divmod(len(mids), v)
+            chunks, i = [], 0
+            for c in range(v):
+                n = base + (1 if c < rem else 0)
+                chunks.append(mids[i:i + n]); i += n
+        else:
+            # round-robin:按虚拟 stage 归组（_layer_to_stage 的 v>1 分支已按此放置,
+            # 此处按层 id 段重建各 chunk——虚拟段连续、chunk 间非连续）。
+            mid_total = self.n_layers - hp - tp_
+            nvirt = pp * v
+            base, rem = divmod(mid_total, nvirt)
+            bounds, acc = [], hp                      # 中间层 id 从 hp 开始
+            for sv in range(nvirt):
+                n = base + (1 if sv < rem else 0)
+                bounds.append((sv, acc, acc + n)); acc += n
+            chunks = []
+            for c in range(v):
+                sv = c * pp + stage
+                lo, hi = next((a, b) for s, a, b in bounds if s == sv)
+                chunks.append([l for l in mids if lo <= l < hi])
+        if pseudo_first:
+            chunks[0] = pseudo_first + chunks[0]
+        if pseudo_last:
+            chunks[-1] = chunks[-1] + pseudo_last
+        return chunks

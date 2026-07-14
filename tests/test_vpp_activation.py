@@ -24,7 +24,7 @@ def _sim(pp, m, v, n_layers=4, stage=0):
     """toy dense 栈的 stage 峰值仿真（无重算/无 swap，record_timeline 以便取 max act_live）。"""
     spec = ModelSpec("toy", D, ["dense"] * n_layers, {"dense": build_dense_decoder(D)})
     pm = ParallelModel(ParallelConfig(pp=pp, num_microbatches=m, interleave=v),
-                       n_layers=n_layers, world_size=pp)
+                       n_layers=n_layers, world_size=pp, edge_pseudo=(0, 0))  # toy 栈无 embedding/head 伪层
     g = ShapeEval().resolve(spec, pm)
     per = StaticMem().compute(g, OptimizerSpec.adamw(), pm, False)
     return MemTimeline().simulate(g, RecomputeSpec("None"), SwapSpec(), pm, per,
@@ -149,3 +149,20 @@ def test_peak_bulges_at_v2_then_falls():
     assert a[1] == 8 * s and a[2] == 10 * s and a[4] == 9 * s     # 手算三点
     assert a[2] > a[4] > a[1]                                     # bulge：非单调
     assert a[2] < 2 * a[1] and a[4] < 4 * a[1]                    # 每个 v>1 均 < V×plain
+
+
+def test_vpp_round_robin_chunk_placement_real_pattern():
+    """VPP round-robin 放置锁定（2026-07-14,源:mindformers pynative pipeline_parallel.py:258
+    `chunk_id*pp+rank`）:真实 pattern(含 embedding/head 伪层)下 rank 持**非连续**层段。
+    DSv3 8L pp2 v2:8 中间层切 4 虚拟段(各 2 层),rank0 持 sv0{1,2}+sv2{5,6},rank1 持 sv1{3,4}+sv3{7,8};
+    embedding→stage0 chunk0、head→stage1 末 chunk。"""
+    from validate_dsv3 import build_dsv3_spec
+    spec, d, _ = build_dsv3_spec(8)
+    pm = ParallelModel(ParallelConfig(pp=2, num_microbatches=2, interleave=2),
+                       n_layers=d.n_layers, world_size=2)
+    c0, c1 = pm.stage_chunks(0), pm.stage_chunks(1)
+    assert c0 == [[0, 1, 2], [5, 6]], c0          # emb+sv0 | sv2（非连续!）
+    assert c1 == [[3, 4], [7, 8, 9]], c1          # sv1 | sv3+head
+    # 全层恰好覆盖一次
+    all_l = sorted(sum(c0 + c1, []))
+    assert all_l == list(range(10))

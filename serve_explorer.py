@@ -258,6 +258,10 @@ def parse_and_validate(p):
     dp = _i(p, "dp", 2); tp = _i(p, "tp", 1); ep = _i(p, "ep", 1)
     pp = _i(p, "pp", 1); cp = _i(p, "cp", 1); vpp = _i(p, "vpp", 1)
     mtp = _i(p, "mtp", 0)
+    mbs_raw = (p.get("mbs") or "").strip()
+    mbs = _i(p, "mbs", 0) if mbs_raw else 0          # 0=auto(=pp)
+    if mbs_raw and mbs < 1:
+        errs.append("microbatch 数必须是 ≥1 的整数(或留空=auto)")
     if vpp < 1:
         errs.append("vpp 必须是 ≥1 的整数")
     if mtp < 0:
@@ -389,7 +393,7 @@ def parse_and_validate(p):
         pp_split = tuple(full)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
                    rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b),
-                   sel_cfg=sel_cfg, pp_split=pp_split, vpp=vpp)
+                   sel_cfg=sel_cfg, pp_split=pp_split, vpp=vpp, mbs=mbs)
     return [], cfg, pc_args
 
 
@@ -493,7 +497,7 @@ def eval_config(p):
         rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in range(a, b + 1)})
     else:
         rc = RecomputeSpec("None")
-    mbs = pa["pp"] if pa["pp"] > 1 else 1
+    mbs = pa["mbs"] or (pa["pp"] if pa["pp"] > 1 else 1)   # 用户显式 or auto=pp
     pc = ParallelConfig(dp_shard=pa["dp"], tp=pa["tp"], ep=pa["ep"], pp=pa["pp"], cp=pa["cp"],
                         sequence_parallel=(pa["dp"] > 1 or pa["tp"] > 1), num_microbatches=mbs,
                         context_parallel_method=pa["method"], interleave=pa["vpp"],
@@ -815,6 +819,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
     <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的 transformer 层数(mindformers num_layer_list 口径),段数=pp、和=layers;embedding/head 自动归 stage0/末 stage"></div>
     <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num)"></div>
+    <div class="fld"><label>microbatch</label><input name="mbs" placeholder="auto(=pp)" style="width:76px" title="流水微批数 num_microbatches;空=auto(pp>1 时取 pp)。m>pp 时 1F1B warmup/在飞深度随 m 分化"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>

@@ -42,6 +42,12 @@ def build_1f1b(stage: int, pp: int, m: int):
     return _1f1b_from_warmup(min(pp - 1 - stage, m), m)
 
 
+# ── m==pp 特例（2026-07-14 检视 P2.9 裁决）────────────────────────────────────────────
+# Megatron 在 num_microbatches==pp 时特判 all-warmup（全前向先行,schedules.py）;mindformers
+# pynative 的调度器在 hyper_parallel.core.pipeline_parallel（外部库,本地无源码）,经与
+# mindformers 侧确认其行为**非全前向先行** → 本库**不移植** Megatron 该特例,统一走通式
+# warmup（下函数）。待 hyper_parallel 源码可得/真机 VPP 验证（pp_select_vpp_validation.md
+# §4 清单）后再确证。
 def interleaved_warmup(stage: int, pp: int, m: int, v: int) -> int:
     """交错式 1F1B（VPP / 虚拟流水）某 stage 的 warmup（先行前向）微批数。
 
@@ -481,7 +487,10 @@ class MemTimeline:
             #     不再是「每在飞微批整 stage L 层」的 ~V× 过估（旧 build_interleaved_1f1b 物理粒度）。
             #   v<=1：ev_layers 恒 = 整个 layer_ids，逐字节复现旧 build_interleaved_1f1b→build_1f1b。
             if v > 1:
-                chunks = chunk_layer_ids(layer_ids, v)
+                # round-robin chunk 放置（2026-07-14 修,源:mindformers pynative
+                # pipeline_parallel.py:258 chunk_id*pp+rank）——由 ParallelModel.stage_chunks
+                # 提供 per-chunk 层组（此前 chunk_layer_ids 连续切为文档化近似,层不均匀时有偏）。
+                chunks = pm.stage_chunks(stage)
                 steps = [(kind, mb, chunks[c])
                          for kind, mb, c in interleaved_virtual_order(stage, pp, m, v, pp)]
             else:
