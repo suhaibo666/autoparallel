@@ -1,5 +1,7 @@
 # 功能检视报告（7 项声明 × 7 并发对抗式 review，2026-07-14）
 
+> **归档说明：** 本文是早期静态审查快照；功能问题、代码缺陷、后续修复状态和 NPU 证据已统一汇总到 `analysis/final_code_review_2026-07-14.md`，请以后者为最终结论。
+
 > 方法：每项声明一个独立 reviewer agent，对抗式审查（读代码 + 实测复现 + 找声明与现实的差距），
 > 全部基于 `feat/unified-llm-modelspec` @ b4e3ecb。综合判定：**4 项 CONFIRMED，3 项 PARTIALLY**。
 
