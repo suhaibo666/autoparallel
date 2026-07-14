@@ -119,11 +119,24 @@ zero_grad 后 current_alloc=5676.6   → 差 1889.5 MiB ≡ grad 3778.9/2（FSDP
 ```
 → P0-01 累计梯度公式（grad_accum = Σ shard，DSv4 =1887.6 预测 vs 1889.5 真机 = 0.999）**真机再确认**；且梯度采样含 `input_layernorm.weight (1792,) Float32` → 佐证 P1-01 norm gamma 是 fp32 独立参数（此前欠建）。DSv4 总峰锚点 15415.5 不变（评估器 14929.8 → 0.968，累计梯度非该配置的全局峰）。
 
-**Job B — TP=2 vocab 栈差分**（P0-04）：见 §3.5（结果回填）。
+**Job B — TP=2 vocab 栈差分**（P0-04）：见 §3.5。
 
-### 3.5 TP=2 vocab 栈真机结果
-（待 Job B 完成回填 embedding/output_layer 的 local_shape。预期：word_embeddings.weight 从
-[129280,1792] → [64640,1792]（vocab 维 ÷2），output_layer 同——若成立则 P0-04 修复方向真机确认。）
+### 3.5 TP=2 vocab 栈真机结果（P0-04 决定性确认）
+DSv4 4L TP=2，DTensor 分片探针（`param.shape` 报逻辑全局 shape，故读 `to_local()`/placements）：
+```
+embedding.word_embeddings.weight: global (129280,1792), placements (StridedShard(dim=0,split=2), Shard(dim=0)),
+                                  local_shape (64640,1792)  local_numel 115834880
+output_layer.weight:              global (129280,1792), placements (StridedShard(dim=0,split=2), Shard(dim=0)),
+                                  local_shape (64640,1792)  local_numel 115834880
+```
+- 两权重均 **`Shard(dim=0)`（vocab 维）÷tp**，local_numel = 115834880 = 全量 231669760 / 2 ——
+  **与检视报告预测的"期望值 115834880"逐字节吻合**；`StridedShard(split=2)` 是其上叠的 FSDP 层。
+- 日志明确打印 `vocab_emb_dp is not supported in MCore, converted to False`——印证 `vocab_emb_dp`
+  是静态图 legacy 键、pynative/MCore 路径忽略它（旧建模依据过时，检视方向正确）。
+- **评估器修后同口径逐字节一致**：`tp=1 → emb_w/head_w local_numel 231669760；tp=2 → 115834880`。
+- 注：TP=2 训练步因 fork 的 DSA+TP kernel 自身 bug（`int - tuple`，与 vocab 栈无关）崩溃，故未取
+  TP=2 运行时峰值；但**权重分片这一 P0-04 靶心已由 DTensor placements 决定性确认**（init 即定，
+  不依赖训练步）。
 
 ## 4. 未修项与残留（诚实边界）
 
