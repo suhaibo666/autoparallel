@@ -6,6 +6,15 @@
 
 $$\text{自动并行} = \text{搜索器(optimizer)} \circ \underbrace{\text{评估器(evaluator)}}_{\text{本仓库}}$$
 
+## 快速上手：交互式内存实验台
+
+```bash
+python serve_explorer.py     # → http://127.0.0.1:8765
+```
+
+改模型结构/并行切分/重算 → 实时重算峰值显存；逐层 op-DAG + 全 stage 内存时间线 + 各桶分解。
+**完整使用说明见 [README_explorer.md](README_explorer.md)**。
+
 ## 状态
 
 - ✅ 设计定稿（4 份 spec）
