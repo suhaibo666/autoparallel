@@ -198,12 +198,13 @@ class Buckets:
     optstep: int = 0          # 优化器-step 瞬态（②，真机 profiler）：AdamW 更新最大权重时物化的 k_opt 个 fp32 [weight] 临时（Square/sqrt/m̂/update；grad 已拆去 grad_accum 桶，P0-01 重标 K_OPT 6→4）；step 在反向后、激活已释，故与激活互斥
     kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）
     grad_accum: int = 0       # **已规约梯度累计驻留**（P0-01，2026-07-14）：真机证实 step-scoped cumulative——每层首次反向后其 reduced 本地分片常驻，至 optimizer 后 zero_grad 释放（两卡探针 1889.5 MiB 吻合）。与 grad_buf（当前层 reduce-scatter 前 full 瞬态）正交
+    p2p_buf: int = 0          # **PP stage 间 P2P send 激活缓冲**（P1-15，Task A）：非末 stage 前向把本 stage 输出激活 [S,B,H] send 给下 stage，send 通信期间驻留（1 份；overlap_p2p 时 2 份双缓冲）。recv 侧（非首 stage 首层输入）已隐含在 act_live 首层 pin → 不双算。pp=1 恒 0。仅 FWD 事件驻留、BWD/optstep 清零（pp2 峰在 BWD，不移锚点）
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
                 + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
                 + self.swap_buf + self.workspace + self.optstep + self.kept_frag
-                + self.grad_accum)
+                + self.grad_accum + self.p2p_buf)
 
 
 @dataclass(frozen=True)
@@ -222,6 +223,7 @@ class MemBreakdown:
     framework: int
     kept_frag: int = 0
     grad_accum: int = 0       # P0-01 尾部追加（default=0，序不破，照 kept_frag 先例）
+    p2p_buf: int = 0          # P1-15 尾部追加（default=0，序不破，照 grad_accum 先例）
 
 
 @dataclass(frozen=True)
@@ -276,6 +278,25 @@ def _checkpoint_input_bytes(layer) -> int:
 def _layer_param_bytes(layer) -> int:
     """该层 full-unsharded 参数（compute dtype）——FSDP all-gather 缓冲（按名去重）。"""
     return estimate_structure_memory(layer.ops).param_full_bytes
+
+
+def _layer_expert_param_bytes(layer, blk: int = 1) -> int:
+    """该层去重后 **专家权重** full-unsharded 字节（compute dtype，逐权重块对齐）。
+
+    P1-14（Task B）：`layer.mlp.experts` 是**独立 FSDP 单元**（efsdp mesh，忠实 mindformers
+    pynative `base_models/gpt/parallelize.py:1108-1112` `fully_shard(layer.mlp.experts, **efsdp_config)`
+    ——"small module first"，与整层 wrap `:1155-1161`「large module」分开），其 all-gather/reshard
+    生命周期 ≠ 整层：experts 在层中段（dispatch 前）才 gather、combine 后 reshard，**不在 attn 段
+    驻留**。此函数取该层专家权重字节（= `param_full_bytes` 的专家分量），供前向 gather 两段拆分。
+    非 MoE 层返回 0。与 `estimate_structure_memory.param_full_bytes` 逐权重块对齐口径一致（按名去重）。"""
+    def _align(n: int) -> int:                # 与 structure_mem 逐张量块对齐同口径（自含，不依赖其私有符号）
+        return ((n + blk - 1) // blk) * blk if blk > 1 else n
+    params: dict = {}
+    for op in layer.ops:
+        for w in op.params:
+            params[w.name] = w
+    return sum(_align(w.local_numel * w.dtype_bytes)
+               for w in params.values() if getattr(w, "is_expert", False))
 
 
 def _layer_grad_bytes(layer, grad_dtype_bytes: int) -> int:
@@ -483,6 +504,32 @@ class MemTimeline:
                         total += sm_by_id[order[j]].param_full_bytes
                 return total
 
+            # ── P1-15（Task A）：PP stage 间 P2P send 激活缓冲 ─────────────────────────────
+            # 非末 stage（stage<pp-1）前向把本 stage 输出激活 [S,B,H] send 给下 stage。send 量级 =
+            # 本 stage 最后一层的层入口 [S,B,H]（残差流跨层同形 → = 该层 checkpoint_input，已按
+            # sp/tp/cp 切分，与激活口径一致）。overlap_p2p（`pipeline_parallel.py:396`
+            # pipeline_parallel_overlap_p2p，默认 False）时双缓冲 2 份。**recv 侧**（非首 stage 首层
+            # 输入）已隐含在 act_live 首层 pin（首层 saves 的 checkpoint_input 即 recv 回来那块）→ 不
+            # 双算。pp=1 → p2p_send_bytes=0（全惰性，单 stage 锚点不动）。仅 FWD 事件驻留、BWD/optstep
+            # 清零——pp2 两 stage 峰均在 BWD（stage0 bwd@4 / stage1 loss），send 只叠 FWD 峰（远低于
+            # BWD 峰）→ 锚点峰值/峰事件逐字节不变；backward 方向的 grad-P2P 未建（量级同 [S,B,H]，已
+            # 在 pp2-stage0 现有 580MiB 过预测余量内，OOM 安全，文档化为保守残差）。
+            p2p_send_bytes = 0
+            if pp > 1 and stage < pp - 1 and layer_ids:
+                _overlap = 2 if getattr(pm.pc, "pipeline_parallel_overlap_p2p", False) else 1
+                p2p_send_bytes = sm_by_id[max(layer_ids)].checkpoint_input * _overlap
+
+            # ── P1-14（Task B）：experts 子模块独立 wrap 的 gather 两段生命周期 ────────────────
+            # 有真实专家分片（efsdp>1）且非 resident（reshard 态）的 MoE 层，前向 gather 拆成
+            # 「attn+router 段（层入口）」与「experts 段（dispatch 前 gather、combine 后 reshard）」。
+            # experts 段事件逐字节复现旧单事件（gather 含全部权重 + 层 max workspace），attn 段是**新增
+            # 更小事件**（不含专家权重）→ 峰值口径不变、时间线粒度闭合。expert_pf=0（dense）/efsdp<=1
+            # （ep 全覆盖或未分片）/resident → 不拆（走原单事件路径，byte-identical）。
+            expert_pf_by_id = {
+                lid: _layer_expert_param_bytes(by_id[lid], alloc_block_bytes)
+                for lid in layer_ids
+            }
+
             B = Buckets(persistent=static_persistent.get(stage, 0))
             peak: int = -1
             peak_ev: str = ""
@@ -502,7 +549,7 @@ class MemTimeline:
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
                         B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
                         B.swap_buf, B.workspace, B.optstep,
-                        framework_reserve, B.kept_frag, B.grad_accum,
+                        framework_reserve, B.kept_frag, B.grad_accum, B.p2p_buf,
                     )
                 if record_timeline:
                     series.append(TimelineSample(len(series), lbl, t, bd, mb, chunk))
@@ -560,16 +607,38 @@ class MemTimeline:
                         # 1. FSDP all-gather 整层参数(compute dtype) + 预取下 depth 层双缓冲
                         #    （FSDP2 前向隐式 depth-1 overlap）+ workspace → 采样。
                         #    no-reshard 层（P0-03）：本层 gather 进 resident（驻留到其 post_backward）。
-                        if lid in no_reshard:
-                            resident_gather[lid] = sm.param_full_bytes
-                            B.gather_buf = _res() + _prefetch_nonres(ev_layers, idx, depth)
-                        else:
+                        _exp_pf = expert_pf_by_id[lid]
+                        _split_experts = (efsdp_d > 1 and _exp_pf > 0
+                                          and lid not in no_reshard)
+                        if _split_experts:
+                            # P1-14（Task B）：experts 独立 wrap → 前向 gather 两段生命周期。
+                            #   attn+router 段（层入口）：gather = 非专家权重 + 预取（experts 未 gather，
+                            #     不在 attn 段驻留——parallelize.py:1155-1161 整层 wrap 只含非专家残余）。
+                            _non_exp = sm.param_full_bytes - _exp_pf
+                            B.gather_buf = _res() + _non_exp + _prefetch_nonres(
+                                ev_layers, idx, depth)
+                            B.workspace = 0                # attn 段（flash-ws 小），层 max-ws 归 experts 段
+                            rec(f"fwd:{lid}", ev_mb, ev_chunk)
+                            #   experts 段（dispatch 前 gather、combine 后 reshard）：gather = 非专家
+                            #     （驻留）+ 专家权重 + 预取 = 整层 param_full + 预取；workspace = 层 max
+                            #     （dispatch/combine MoE-staging，属 expert 段）→ **逐字节复现旧单事件**。
                             B.gather_buf = _res() + sm.param_full_bytes + _prefetch_nonres(
                                 ev_layers, idx, depth)
-                        B.workspace = sm.workspace
-                        rec(f"fwd:{lid}", ev_mb, ev_chunk)
-                        B.workspace = 0
-                        B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
+                            B.workspace = sm.workspace
+                            rec(f"fwd:{lid}#experts", ev_mb, ev_chunk)
+                            B.workspace = 0
+                            B.gather_buf = _res()   # experts + 非专家 combine/层末 reshard
+                        else:
+                            if lid in no_reshard:
+                                resident_gather[lid] = sm.param_full_bytes
+                                B.gather_buf = _res() + _prefetch_nonres(ev_layers, idx, depth)
+                            else:
+                                B.gather_buf = _res() + sm.param_full_bytes + _prefetch_nonres(
+                                    ev_layers, idx, depth)
+                            B.workspace = sm.workspace
+                            rec(f"fwd:{lid}", ev_mb, ev_chunk)
+                            B.workspace = 0
+                            B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
                             saved = sm.checkpoint_input               # 仅保留层入口
@@ -585,10 +654,15 @@ class MemTimeline:
                         B.act_live += saved
                         if _is_kept(lid):
                             kept_act += saved
-                    # 该虚拟步(v>1: 一个 chunk / v<=1: 整 stage)所有层 pin 完毕 → FWD 峰
+                    # 该虚拟步(v>1: 一个 chunk / v<=1: 整 stage)所有层 pin 完毕 → FWD 峰。
+                    # P1-15（Task A）：本 stage 输出激活已产出 → send buffer 驻留（非末 stage）。
+                    B.p2p_buf = p2p_send_bytes
                     rec("fwd_end", ev_mb, ev_chunk)
 
                 else:  # BWD（逆序层）—— FSDP gather + full grad + recompute + bwd_scratch 共存
+                    # P1-15（Task A）：反向进入 → 前向 send buffer 已释（本 stage 峰在 BWD，
+                    # 清零使 send buffer 不叠加 BWD 峰 → pp2 锚点逐字节不动）。
+                    B.p2p_buf = 0
                     bwd_order = list(reversed(ev_layers))
                     for idx, lid in enumerate(bwd_order):
                         sm = sm_by_id[lid]
@@ -701,6 +775,7 @@ class MemTimeline:
             if max_w > 0:
                 B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
                 B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
+                B.p2p_buf = 0                          # P1-15：step 在所有反向后、P2P 已收尾
                 B.optstep = K_OPT * max_w * 4          # fp32 瞬态（grad_accum 保持驻留，与之共存）
                 rec("optstep")
                 B.optstep = 0

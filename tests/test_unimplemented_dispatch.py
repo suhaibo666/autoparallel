@@ -26,12 +26,27 @@ from cost_eval.build_llm import build_llm_spec
     # Task 3：补齐此前 set-but-ignored 的 op-图相关字段（不再静默忽略）
     ("add_bias_linear", True),      # linear bias 未建为 param
     ("add_qkv_bias", True),         # QKV bias 未建为 param（Qwen）
-    ("qk_layernorm", True),         # Q/K RMSNorm 未建为 op（Qwen3 变体）
+    # 注：qk_layernorm=True 已由 X3（closure-v4 P1-13/F2，2026-07-15）为 gqa/mha **建 q/k norm op**
+    #   → 不再 fail-loud（llama 是 gqa）。移至下方正向测试 test_qk_layernorm_gqa_builds_norm_ops。
 ])
 def test_unimplemented_dispatch_raises(field, value):
     cfg = dataclasses.replace(llama(4), **{field: value})
     with pytest.raises(NotImplementedError):
         build_llm_spec(cfg)
+
+
+def test_qk_layernorm_gqa_builds_norm_ops():
+    """qk_layernorm=True（gqa/mha）：X3 已建 q_norm/k_norm op（Qwen3 变体，per-head head_dim
+    RMSNorm）→ 正常 build 且 op 图含两个 norm；此前 fail-loud 是缺陷（静默丢 4.5-9 GiB）。"""
+    base = llama(4)
+    qk = dataclasses.replace(base, qk_layernorm=True)
+    spec = build_llm_spec(qk)
+    names = {n for ops in _op_graph(spec).values() for n in ops}
+    assert "q_norm" in names and "k_norm" in names
+    # mla 仍 fail-loud（其 qk norm 由 latent/per-head norm 已覆盖，不重复建）
+    import pytest as _pt
+    with _pt.raises(NotImplementedError):
+        build_llm_spec(dataclasses.replace(deepseek_v3(4), qk_layernorm=True))
 
 
 def _op_graph(spec):

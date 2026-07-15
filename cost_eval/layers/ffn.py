@@ -29,6 +29,51 @@ TLOCAL = "S*B*topk*capacity_factor"
 MOE_STAGING_WS = "2*S*B*topk*capacity_factor*H"
 
 
+def _moe_dispatch_token_expr(d: "DimTable") -> str:
+    """MoE 每卡 dispatched-token 数的**全局符号表达式**（shard={0:"ep"} 再 ÷ep 得 per-rank）。
+
+    多口径（P1-12，2026-07-15）——均值（balanced）适合**吞吐**估计，但真实 MoE 受路由倾斜、
+    capacity ceil、padding、最忙 rank 影响，均值不足以做 **OOM 安全边界** → 按 `d.moe_dispatch_mode`
+    产出不同全局 token 口径：
+
+      - "balanced"（默认，DSv3/DSv4 锚点）：`S·B·topk·C` —— **逐字节等旧 TLOCAL**。物理含义：所有
+        expert 收到等量 token 的理想均值（每卡 = /ep），带宽/吞吐估计用。
+      - "capacity"：`ceil(S·B·topk·C / n_experts)·n_experts` —— 每 expert 按 capacity 上取整
+        （drop-and-pad 到 ceil）后 ×n_experts；shard ÷ep → `ceil(...)·experts_per_rank`。物理含义：
+        capacity 丢弃/padding 前的**最忙口径**，OOM 安全边界用（真机 drop-and-pad）。
+        `eval_expr` 只有 `+ - * //`（无 `ceil()`）→ 以 `ceil(a/b)=(a+b-1)//b` 表达。divisibility：
+        `ceil(...)·n_experts` 恒被 ep 整除（合法 EP 要求 n_experts 被 ep 整除）。
+      - "skew"：`S·B·topk·C·moe_skew_factor` —— 均值 × 倾斜因子（percentile 倾斜，≥1）。物理含义：
+        路由倾斜下**最忙 rank** 相对均值的放大，OOM 边界用。
+
+    **均值适合吞吐、capacity/skew 适合 OOM 边界**（审计 P1-12 原话）。默认 balanced，新口径经
+    `DimTable.moe_dispatch_mode`/`moe_skew_factor` 开启，锚点（gate off + C=1 + balanced）不动。
+    """
+    mode = getattr(d, "moe_dispatch_mode", "balanced")
+    if mode == "balanced":
+        return TLOCAL                                    # 逐字节等旧值
+    if mode == "capacity":
+        # ceil(A/n)·n，A=S·B·topk·C；ceil(a/b)=(a+b-1)//b（受限 eval_expr 无 ceil()）。
+        return ("((S*B*topk*capacity_factor + n_experts - 1) // n_experts)"
+                " * n_experts")
+    if mode == "skew":
+        return "S*B*topk*capacity_factor*moe_skew_factor"
+    raise ValueError(
+        f"未知 moe_dispatch_mode: {mode!r}（应为 balanced|capacity|skew）")
+
+
+def _moe_staging_ws_expr(d: "DimTable") -> str:
+    """MoE all-to-all permute/scatter staging 符号（2×dispatched_tokens×H，compute dtype）。
+
+    随 dispatched-token 口径缩放（同 `_moe_dispatch_token_expr`）。balanced 时返回 `MOE_STAGING_WS`
+    常量本身 → **逐字节等旧值**（守 test_framework_decomposition 的字符串断言）。
+    """
+    tok = _moe_dispatch_token_expr(d)
+    if tok == TLOCAL:
+        return MOE_STAGING_WS                            # 逐字节等旧值
+    return f"2*{tok}*H"
+
+
 def build_dense_ffn_ops(d: DimTable) -> list:
     """构造 dense SwiGLU MLP FFN 段的 op 列表（5 个 OpSpec）。
 
@@ -98,19 +143,24 @@ def build_moe_ffn_ops(d: DimTable) -> list:
     e_fc1_out = "2*moe_F" if gated else "moe_F"
     e_act_name = "e_swiglu" if gated else "e_gelu"
 
+    # dispatched-token 全局口径（P1-12，2026-07-15）：balanced（默认，=TLOCAL 逐字节不变）/
+    # capacity（ceil 最忙）/ skew（均值×倾斜）。见 `_moe_dispatch_token_expr`。
+    tlocal = _moe_dispatch_token_expr(d)
+    staging = _moe_staging_ws_expr(d)
+
     # ── MoE FFN 激活张量 ────────────────────────────────────────────────────
     # add1 输出（h1）作为 router 与 dispatch 的输入
     hin  = TensorRef("h1",    ("S", "B", "H"),                  shard={0: "sp"})
     # router logits（全 token × 全专家，无切分）
     logits = TensorRef("logits", ("S", "B", "n_experts"))
     # dispatch 后 token 按 ep 分片（all-to-all）
-    disp = TensorRef("disp",  (TLOCAL, "H"),                    shard={0: "ep"})
+    disp = TensorRef("disp",  (tlocal, "H"),                    shard={0: "ep"})
     # 专家 fc1 输出（gated=2·moe_F gate+up；ungated=moe_F）
-    g    = TensorRef("e_g",   (TLOCAL, e_fc1_out),              shard={0: "ep"})
+    g    = TensorRef("e_g",   (tlocal, e_fc1_out),              shard={0: "ep"})
     # 激活后（moe_F 维）
-    act  = TensorRef("e_act", (TLOCAL, "moe_F"),                shard={0: "ep"})
+    act  = TensorRef("e_act", (tlocal, "moe_F"),                shard={0: "ep"})
     # 专家 fc2 输出（H 维，仍按 ep 分片）
-    eo   = TensorRef("e_o",   (TLOCAL, "H"),                    shard={0: "ep"})
+    eo   = TensorRef("e_o",   (tlocal, "H"),                    shard={0: "ep"})
     # combine 输出（all-to-all 还原到原始 token 序列）
     comb = TensorRef("comb",  ("S", "B", "H"),                  shard={0: "sp"})
 
@@ -134,7 +184,7 @@ def build_moe_ffn_ops(d: DimTable) -> list:
         #    inputs 含 logits = 路由索引的**数据流依赖**（router→dispatch 边;dispatch 按 topk 选路,
         #    字节/saves 不变——此前缺此边致 router 成孤立叶节点）。
         OpSpec("dispatch", OpType.DISPATCH,   [hin, logits], disp,
-               saves=[disp], workspace=MOE_STAGING_WS),
+               saves=[disp], workspace=staging),
         # 3. 专家 fc1（grouped GEMM，按 ep 切分的专家矩阵）
         OpSpec("e_fc1",    OpType.MOE_GEMM,   [disp, w1], g,
                params=[w1], saves=[disp]),
@@ -147,7 +197,7 @@ def build_moe_ffn_ops(d: DimTable) -> list:
         # 6. Combine（all-to-all；把 expert 输出还原到 token 序列）
         #    workspace = 反向散射 staging 缓冲（experts.py unpermute，:149-173）
         OpSpec("combine",  OpType.COMBINE,    [eo],        comb,
-               saves=[comb], workspace=MOE_STAGING_WS),
+               saves=[comb], workspace=staging),
     ]
 
 
@@ -215,7 +265,9 @@ def build_shared_expert_ops(d: DimTable) -> list:
     # 真机 `shared_out_gated = sigmoid(gate_logits)·shared_expert_out`，`gate_logits = Linear(H→1)(hidden)`
     # （shared_experts.py:56-64）。此前只建了门权重 [H,1]、门激活 [S,B,1] 却**无消费者**（孤立叶节点），
     # 真正合流仍用未乘 gate 的裸 sh_o。此处让门真正进入数据流：
-    #   ① shared_gate  (MATMUL)     : Linear(H→1) 产 gate logits `sh_gate [S,B,1]`。
+    #   ① shared_gate  (MATMUL)     : Linear(H→1) 产 gate logits `sh_gate [S,B,1]`；输入是把完整
+    #       hidden cast 到 router dtype(fp32) 的 [S,B,H] fp32 副本，存活到 gate 反向 → 建为其 saved
+    #       激活 `sh_gate_hin_fp32`（任务 A，见下方 if 块内注释）。
     #   ② shared_gate_mul (ELEMENTWISE): `sh_o_gated = sigmoid(sh_gate)·sh_o`；合流 op(moe_add) 改吃它。
     # backward 生命周期（sigmoid·mul 反向）：d/d(sh_o)=sigmoid(sh_gate)、
     #   d/d(sh_gate)=sh_o·sigmoid'(sh_gate) → 须保存 shared 输出 sh_o 与门 logits sh_gate（[S,B,1] 极小；
@@ -226,13 +278,22 @@ def build_shared_expert_ops(d: DimTable) -> list:
         # Dense(H→1, dtype=moe_router_dtype)（shared_experts.py:58-62），moe_router_dtype 默认
         # float32（transformer_config.py:1791-1796）——与本文件 router_w 同为 fp32。此前未指定
         # dtype_bytes → 解析后默认 2B/BF16（[H,1] 极小、字节可忽略，但 dtype 应正确）。
-        # 注：更深的「gate Dense 前把 hidden cast→router dtype、sigmoid 后 cast 回 compute dtype」
-        # FP32 hidden cast 生命周期（shared_experts.py:70-71 self.cast）未建模，留 partial（超本次范围）。
         sh_gate_w = TensorRef("sh_gate_w", ("H", "1"), is_weight=True, dtype_bytes=4)
         sh_gate_o = TensorRef("sh_gate", ("S", "B", "1"))
         sh_o_gated = TensorRef("sh_o_gated", ("S", "B", "H"), partial="tp")
+        # ── P1-01（任务 A，2026-07-15）：gate 输入的 **FP32 hidden cast 瞬态** ─────────────
+        # 真机 `gate = sigmoid(shared_experts_gate(self.cast(hidden_states, router_dense_type)))`
+        # （shared_experts.py:70-71 pynative / :82-83 training_graph）：gate Dense **之前**把
+        # **完整 hidden** `[S,B,H]` cast 到 router dtype(fp32)，产生一份 `[S,B,H]` fp32 副本
+        # （每 token 全 hidden，非小张量）。gate Dense(matmul) 反向需其输入（= 该 fp32 cast）算
+        # 权重梯度 `dW = x^T @ dy` → 该 fp32 hidden **存活到 gate 反向** → 建为 `shared_gate` 的
+        # saved 激活（dtype=4B，区别于 shared_fc1 已 save 的 bf16 `h1`；独立张量名，否则 act_live
+        # 按名去重不计这份额外显存）。shard/cp 同 `hin_sh`（[S,B,H]{sp}，SP 下随序列切）。
+        # gate off（DSv3）完全不进本分支 → 不建此瞬态、op 序列/saves 逐字节不变（golden 守卫）。
+        sh_gate_hin_fp32 = TensorRef("sh_gate_hin_fp32", ("S", "B", "H"),
+                                     shard={0: "sp"}, dtype_bytes=4)
         ops.append(OpSpec("shared_gate", OpType.MATMUL, [hin_sh, sh_gate_w], sh_gate_o,
-                          params=[sh_gate_w], saves=[]))
+                          params=[sh_gate_w], saves=[sh_gate_hin_fp32]))
         ops.append(OpSpec("shared_gate_mul", OpType.ELEMENTWISE, [sh_o, sh_gate_o], sh_o_gated,
                           saves=[sh_o, sh_gate_o]))
     return ops

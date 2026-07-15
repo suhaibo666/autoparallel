@@ -31,7 +31,11 @@ class StructureMemory:
       其 reduced shard 常驻至 optimizer、zero_grad 释放。divisor 与 persistent 完全同口径
       （dense÷fsdp、expert÷efsdp）+ 逐权重块对齐；公式经 DSv4 FSDP-2 真机 0.999 交叉验证
       （1887.6 vs 1889.5，review_evidence_2026-07-14.md）。需传 fsdp/efsdp，默认 1=全量。
-    - `bwd_scratch`：该结构各 op 反向临时物化之和（如 loss probs/grad_log_softmax fp32）。
+    - `bwd_scratch`：该结构反向临时物化的 **max-live 峰值**（P1-08，如 loss probs/grad_log_softmax
+      fp32）。旧口径是各 op 求和（隐含同时存活、保守高估）；现按 op 时序取 backward max-live
+      （逆序滑窗 window=2，见 `_backward_max_live`）——**单 scratch op 层**（loss `nll` / DSA·dsv4
+      `indexer`，唯一大 scratch）逐字节 == 旧 sum（K_CE/golden 不破），**多 scratch op 层**取更紧
+      的相邻对峰（分离的 mHC sinkhorn 退化为纯 max）。恒有 max-live ≤ sum（OOM 安全）。
     - `workspace`：该结构各 op workspace 的最大值（FWD 逐层瞬时）。
     - `checkpoint_input`：full 重算时保留的层入口激活（首个有 saves 的 op 的首个 save）字节。
     - `forward_max_live`：**该结构 forward 的峰值工作集**——mini-forward 时间线上同时存活激活
@@ -123,6 +127,41 @@ def _forward_max_live(resolved_ops, blk: int, norm_names: set = frozenset(), nor
     return peak
 
 
+def _backward_max_live(resolved_ops) -> int:
+    """反向瞬态 `bwd_scratch` 的 **max-live** 峰值（P1-08，`_forward_max_live` 的反向镜像）。
+
+    旧口径 `Σ op.bwd_scratch_bytes` 把一层所有 op 的反向临时物化**直接求和**，隐含它们同时存活
+    → 保守高估（OOM 安全但不准，审计判「开放（接受的保守上界）」）。真机上 `bwd_scratch` 是
+    **op 内瞬态**：在各自 op 的反向步物化、步末即释（loss 链 probs+grad 的真实共存已编码进**单个**
+    `nll` op 的 `8·S·B·vocab`=2 份里，跨 op 之间并不共存）。故按 op 时序取 max-live 更准。
+
+    **模型：逆序滑窗（window=2）——OOM 安全侧。** 反向按 forward 逆序执行（op n-1, …, 0）。
+    forward-index 坐标下，op i 的反向 scratch 活性区间取 ``[i-1, i]``：在它自身反向步 i 物化，并
+    **保守地**延续一步到其反向消费者（前一 forward op i-1 = 后一 backward 步）——bound 住「本 op 的
+    反向 scratch 未在其消费者反向开始前释放」的握手情形。于是 backward 时间点 t 的存活和 =
+    ``bwd_scratch[t] + bwd_scratch[t+1]``，峰 = **相邻两 op 之和的最大值**。
+
+    为何选这个而非纯 max（各 op 完全独立、只取单 op 最大）：严格说 op 内 scratch 在其反向步末即释、
+    跨 op 不叠加（纯 max 更紧、且理论上精确），但「宁可略保守也不欠估破 OOM 门」——window=2 对**相邻**
+    scratch 保留一步握手余量（比纯 max 保守、比求和紧），且物理可辩护。三档退化：
+      - **单 scratch op**（loss 的 `nll` / DSA·dsv4 的 `indexer`，唯一大 scratch）→ 无相邻非零 →
+        = 该 op 值 = **sum**（**逐字节不变**：K_CE fat 锚点、DSv3/DSv4 golden 不破的机理根因）。
+      - **分离的多 scratch op**（真实 mHC：`attn_hc`/`ffn_hc` sinkhorn 隔着整段 body，非相邻）→
+        各自与零邻居配对 → 退化为**纯 max**（= max 单 op），< 求和。
+      - **相邻的多 scratch op**（合成/极端）→ 相邻对和峰 < 全体求和。
+    单调性：任意非负向量下 ``max_i(v_i+v_{i+1}) ≤ Σ v_i`` 且 ``≥ max_i v_i`` 恒成立 → OOM 安全、
+    不塌到单峰以下。（未来可从 op 数据依赖判真实存活区间做区间并进一步收紧；当前 positional
+    window=2 已足够安全且对全部真实模型退化为纯 max。）
+    """
+    vals = [getattr(op, "bwd_scratch_bytes", 0) for op in resolved_ops]
+    n = len(vals)
+    if n == 0:
+        return 0
+    if n == 1:
+        return vals[0]
+    return max(vals[i] + vals[i + 1] for i in range(n - 1))
+
+
 def estimate_structure_memory(
     resolved_ops,
     *,
@@ -185,7 +224,10 @@ def estimate_structure_memory(
                 f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
                 f"（grad shard 切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
         grad_shard_bytes += _align_up((w.local_numel // divisor) * grad_dtype_bytes, blk)
-    bwd_scratch = sum(getattr(op, "bwd_scratch_bytes", 0) for op in resolved_ops)
+    # P1-08：bwd_scratch 由「求和上界」精化为 backward **max-live**（逆序滑窗 window=2）。
+    # 单 scratch op 层（loss 的 nll / DSA·dsv4 的 indexer）逐字节不变 == 旧 sum；分离/相邻的多
+    # scratch op 层取更紧的 max-live（OOM 安全，≤ sum 恒成立）。见 `_backward_max_live` docstring。
+    bwd_scratch = _backward_max_live(resolved_ops)
     workspace = max((op.workspace_bytes for op in resolved_ops), default=0)
 
     checkpoint_input = 0

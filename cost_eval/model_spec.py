@@ -33,6 +33,10 @@ class DimTable:
     # 融合 DSA kernel（生产默认 True）：稀疏中间量 kv_gathered/attn_weights 走 kernel scratch、
     # 不物化成张量（真机 15415 已证）；unfused 小算子路径才逐个物化（False）。仅 dsv4 用。
     dsa_fused: bool = True
+    # Q/K layernorm（GQA q/k norm，2026-07-15 协调补充）：True 时 attention 段在 Q/K 上加 norm
+    # （builder 侧 attention.py 用 `getattr(d, "qk_layernorm")` 读取）。默认 False（DSv3/DSv4
+    # qk_layernorm=False）→ 惰性，锚点不动。此前仅 LLMConfig 有此字段、DimTable 缺 → 直通补齐。
+    qk_layernorm: bool = False
     # Shared expert intermediate size (MoE + MLA combined layers)
     moe_shared_F: int = 0
     # shared-expert 门控（closure-audit C3，2026-07-15）：use_shared_expert_gating=True 时有
@@ -40,6 +44,16 @@ class DimTable:
     # （DSv3 不用 → golden 不变、惰性）。
     moe_shared_gate: bool = False
     capacity_factor: float = 1.0
+    # MoE dispatched-token 口径（P1-12，2026-07-15）：控制 disp/e_* 张量 dim0（每卡 token 数）与
+    # all-to-all staging 的**符号表达式**。均值（balanced）适合吞吐估计，但真实 MoE 受路由倾斜/
+    # capacity ceil/padding/最忙 rank 影响，均值不足以做 OOM 安全边界 → 提供 3 口径（见 ffn.py
+    #   `_moe_dispatch_token_expr`）：
+    #   - "balanced"（默认）：S·B·topk·C —— 逐字节等旧 TLOCAL（理想均分；DSv3/DSv4 锚点口径）。
+    #   - "capacity"：ceil(S·B·topk·C/n_experts)·n_experts —— capacity 上取整的**最忙口径**。
+    #   - "skew"：S·B·topk·C·moe_skew_factor —— 均值 × 倾斜因子（percentile 倾斜）。
+    # 默认 balanced + moe_skew_factor=1.0 → 完全惰性，现有 spec 逐字节不变。
+    moe_dispatch_mode: str = "balanced"
+    moe_skew_factor: float = 1.0
     # mHC residual streams (设计 §9)：hidden 打包为 n 条残差流 [S,B,n*H]。
     # 默认 1 → 完全惰性（plain 残差，n*H==H），不影响任何现有 spec。
     num_residual_streams: int = 1

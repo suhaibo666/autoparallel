@@ -194,10 +194,18 @@ def _check_implemented_dispatch(cfg: LLMConfig) -> None:
         raise NotImplementedError(
             "add_qkv_bias=True 暂未建 op 图：QKV 投影 bias 未建为 param（Qwen 系）——内存可忽略"
             "但未建模；preset 若仅想标注该架构，请用 add_qkv_bias=False + 注释（见 presets.qwen2）。")
-    if cfg.qk_layernorm:
+    # qk_layernorm dispatch（X3 任务 A，2026-07-15）：gqa/mha 的 attn builder 已建 q/k RMSNorm op
+    # （attention.py build_gqa_attn_ops 在 getattr(d,"qk_layernorm") 为真时插入 q_norm/k_norm，
+    # 字段由 to_dimtable 从 cfg.qk_layernorm 直通）→ **放行**（op 图已建，不再 fail-loud）。**仅当
+    # attn builder 确实没建 q/k norm 时才 fail-loud**：mla/dsv4/dsa 的 attn builder 不据 qk_layernorm
+    # 建 q/k norm（其 latent/per-head norm 由自身 op 图覆盖，qk_layernorm 对它们语义惰性）→ 若显式置
+    # True 则报错，不静默产「设了却没建」的错图。
+    if cfg.qk_layernorm and cfg.attn_type not in ("gqa", "mha"):
         raise NotImplementedError(
-            "qk_layernorm=True 暂未建 op 图：Q/K 上的 2 个 RMSNorm 未建为 op（Qwen3 变体）——"
-            "内存可忽略但未建模；如需忠实建模请在 attn builder 补 q/k norm op。")
+            f"qk_layernorm=True 仅 gqa/mha 已建 op 图（attention.py build_gqa_attn_ops 补 Q/K "
+            f"per-head RMSNorm）；attn_type={cfg.attn_type!r} 的 attn builder 未据 qk_layernorm 建 "
+            "q/k norm op（mla/dsv4/dsa 的 latent/per-head norm 已由自身 op 图覆盖、qk_layernorm 对其"
+            "惰性）——如需对该注意力忠实建模请在对应 builder 补 q/k norm op，勿静默产错图。")
     if cfg.attn_type == "dsa" and not (cfg.dsa_indexer_n_heads > 0
                                        and cfg.dsa_indexer_head_dim > 0
                                        and cfg.dsa_indexer_topk > 0):

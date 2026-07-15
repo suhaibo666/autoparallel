@@ -62,6 +62,11 @@ class LLMConfig:
     first_k_dense_replace: int | None = None    # 前 K 层 dense；或用下面的 freq
     moe_layer_freq: tuple | int | None = None   # 每层 0=dense/1=MoE（覆盖 first_k）
     moe_capacity_factor: float = 1.0        # 影响 dispatched token 数（内存相关）
+    # MoE dispatched-token 口径（P1-12）：balanced（默认，均值）/ capacity（ceil 最忙口径）/
+    #   skew（均值 × moe_skew_factor）。均值适合吞吐、capacity/skew 适合 OOM 边界（审计 P1-12）。
+    #   默认 balanced + 1.0 → 惰性，不影响现有 to_dimtable 路径（DSv3/DSv4 锚点不动）。
+    moe_dispatch_mode: str = "balanced"     # balanced | capacity | skew
+    moe_skew_factor: float = 1.0            # skew 口径的倾斜因子（percentile 倾斜，≥1）
 
     # ---- 归一化 / 位置编码（结构相关部分）----
     normalization: str = "RMSNorm"          # RMSNorm | LayerNorm
@@ -152,6 +157,11 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         moe_shared_F=cfg.moe_shared_ffn_hidden_size,
         moe_shared_gate=cfg.moe_shared_expert_gating,
         capacity_factor=cfg.moe_capacity_factor,
+        # MoE dispatched-token 多口径（P1-12）：默认 balanced/1.0 惰性直通。
+        moe_dispatch_mode=cfg.moe_dispatch_mode,
+        moe_skew_factor=cfg.moe_skew_factor,
+        # Q/K layernorm 直通（2026-07-15 协调补充，供 attention.py 建 GQA q/k norm 读取）。
+        qk_layernorm=cfg.qk_layernorm,
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
         num_residual_streams=cfg.num_residual_streams,
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）

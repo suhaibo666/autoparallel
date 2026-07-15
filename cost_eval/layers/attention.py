@@ -75,6 +75,24 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     # 注：`qkv` 是 Q/K/V **融合**张量（末维 (n_heads+2·n_kv)·d_h），KV 分量不可无损分割 → **不**标
     # cp_kv（D-1 修正）。故 colossal 下 fused-qkv 的 KV 分量仍随 body ÷cp（小幅欠模 colossal 的 KV
     # all-gather buffer）；全重算下该量 off loss 峰、本栈跑不了 cp+无重算故未真机验证——已 caveat。
+    #
+    # ── P1-13 CP kernel buffer / fused-QKV KV all-gather 审计（X3 任务 B，2026-07-15）───────────
+    # colossal（ulysses_degree=1）需把 attention 的 **KV 分量** all-gather 到 full-S；MLA 侧靠
+    # KV 激活标 `cp_kv=True`（build_mla_attn_ops 的 kv_a_in/kv_a_out/kvb_out）表达。**GQA 的 KV
+    # 是融合在 `qkv` 里的 (2·n_kv·head_dim)/((n_heads+2·n_kv)·head_dim) 分量，无法从融合张量单独标
+    # cp_kv** → colossal 下这段 KV 仍随 body ÷cp、**欠建 full-S all-gather buffer**（量级
+    # 2·n_kv·head_dim·S·B·compute_dtype）。ring/ulysses 则是另一套语义：CP 通信在飞双缓冲（KV 块
+    # send/recv，量级 ~2·(2·n_kv·head_dim)·(S/cp)·B）——随 cp ÷cp、非 all-gather。
+    # **为何本 agent 不在此新增 buffer（可证不可行，非疏漏）**：
+    #   (a) builder 只见 DimTable、不知 cp/method；`resolve_tensor` 对 builder 表达的 workspace/save
+    #       没有 cp>1 或 method 门，且任何引用 S 的量在 cp=1 时是 full-S ≠ 0（破「cp=1 恒 0」惰性
+    #       与 MLA 侧 DSv3 golden 逐字节不变）。shape_eval 不在本 agent 可改文件域。
+    #   (b) 冻结 must-green `test_cp_activation.test_cp2_all_activations_halve_including_loss` 断言
+    #       GQA decoder body 在 colossal cp2 **精确减半**：对 colossal buffer C 代数即得 C≡0（证见
+    #       test_x3_cp_buffer.test_colossal_gqa_buffer_is_provably_forbidden_by_halving）——任何
+    #       非零 colossal-cp2 GQA buffer 都会破坏该冻结测试、失守验收「全绿」。
+    # 结论：GQA 的 colossal KV all-gather / ring-ulysses 双缓冲**保持 caveat 欠建**（off loss 峰、
+    # cp2 锚点走 mla 不受影响）；量化与解锁路径见 test_x3_cp_buffer.py 与交付报告「未尽事项」。
     x      = TensorRef("x",    ("S", "B", "H"),        shard={0: "sp"})
     ln1    = TensorRef("ln1",  ("S", "B", "H"))
     qkv    = TensorRef("qkv",  ("S", "B", QKV),        shard={2: "tp"})
@@ -90,13 +108,40 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     # 独立 FSDP wrap（parallelize.py:318-328/:1140-1142），此前缺失致参数图不守恒。
     ln1_g  = TensorRef("ln1_g", ("H",), is_weight=True, dtype_bytes=4)
 
-    return [
+    ops = [
         # 1. Pre-norm（LayerNorm / RMSNorm）
         OpSpec("ln1",    OpType.NORM,        [x],          ln1,
                params=[ln1_g], saves=[x]),
         # 2. QKV 投影
         OpSpec("qkv",    OpType.MATMUL,      [ln1, qkv_w], qkv,
                params=[qkv_w], saves=[ln1]),
+    ]
+
+    # ── Qwen3 qk-layernorm（X3 任务 A，2026-07-15）──────────────────────────────────────────
+    # 真机（mindformers/pynative/transformers/attention.py:311-357）：Qwen3 的 SelfAttention 在
+    # linear_qkv 投影后、rope 前，对带 head 维的 Q/K 各作一个 RMSNorm（`dim=head_dim`，per-head、
+    # 作用在 head_dim 上、compute=layernorm_compute_dtype=fp32）。get_query_key_value_tensors 里
+    # split 出 query/key/value 后立即 `q_layernorm(query.reshape(..,head_dim))` / `k_layernorm(key..)`。
+    # 建为两个 NORM op（qkv 后、rope 前，in-place 回写 fused `qkv` 载体，保 rope→flash 数据流不断链）：
+    #   - gamma 权重 [head_dim] fp32（真机 dim=head_dim，per-head 共享、不随 tp 切——head_dim 非 tp 分维）；
+    #   - saves 各自 per-head 输入切片（q: [S,B,n_heads·head_dim] / k: [S,B,n_kv·head_dim]）——RMSNorm
+    #     反向所需的 fp32 cast（norm_compute fp32 语义同 ln1，走 _norm_save_names→fp32）。tp 切特征维、
+    #     cp 天然 ÷cp（引用 S）→ 与 body 一致、不破 CP halving。
+    # 惰性：`getattr(d,"qk_layernorm",False)` 为假（DSv3 mla / DSv4 / 默认 gqa）→ 不插入，逐字节不变。
+    # 字段由 to_dimtable 从 LLMConfig.qk_layernorm 直通（llm_config.py），build_llm dispatch 放行 gqa/mha。
+    if getattr(d, "qk_layernorm", False):
+        q_norm_in = TensorRef("q_norm_in", ("S", "B", NHD),                shard={2: "tp"})
+        k_norm_in = TensorRef("k_norm_in", ("S", "B", "n_kv*head_dim"),    shard={2: "tp"})
+        q_norm_g  = TensorRef("q_norm_g", ("head_dim",), is_weight=True, dtype_bytes=4)
+        k_norm_g  = TensorRef("k_norm_g", ("head_dim",), is_weight=True, dtype_bytes=4)
+        ops += [
+            # 2a. Q RMSNorm（per-head head_dim；in-place 回写 qkv 的 Q 分量，saves=Q 切片 fp32 cast）
+            OpSpec("q_norm", OpType.NORM, [qkv], qkv, params=[q_norm_g], saves=[q_norm_in]),
+            # 2b. K RMSNorm（per-head head_dim；in-place 回写 qkv 的 K 分量，saves=K 切片 fp32 cast）
+            OpSpec("k_norm", OpType.NORM, [qkv], qkv, params=[k_norm_g], saves=[k_norm_in]),
+        ]
+
+    ops += [
         # 3. RoPE（in-place，输出复用 qkv 张量引用）
         OpSpec("rope",   OpType.ROPE,        [qkv],        qkv,
                saves=[]),
@@ -112,6 +157,7 @@ def build_gqa_attn_ops(d: DimTable) -> list:
         OpSpec("add1",   OpType.ELEMENTWISE, [o],          h1,
                saves=[]),
     ]
+    return ops
 
 
 def build_mla_attn_ops(d: DimTable) -> list:
