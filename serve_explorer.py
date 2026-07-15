@@ -169,6 +169,32 @@ def stage_decoder_layers(pp, N, mtp, pp_split):
     return out
 
 
+def _parse_layer_ranges(text, lo, hi):
+    """把「具体层数」文本解析为层号**集合**（闭区间并集）。用户报告 2026-07-15：每个配置具体层数
+    的地方都要支持 `1-8;12-13;23-25` 这类多段不连续范围。
+
+    - 段分隔：`,` / `;` / 全角 `，`/`；` 皆可（混用亦可）。
+    - 单段：`a-b`（闭区间，含端点）或单个 `a`。
+    - 校验：每段须满足 `lo ≤ a ≤ b ≤ hi`（越界/倒序/非整数即报错，不静默）。
+    返回 `(errors:list, set|None)`；空串 → `([], None)`。"""
+    text = (text or "").replace("；", ";").replace("，", ",").strip()
+    if not text:
+        return [], None
+    out = set()
+    for seg in text.replace(";", ",").split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            a, b = (int(x) for x in seg.split("-")) if "-" in seg else (int(seg), int(seg))
+        except ValueError:
+            return [f"层范围段 {seg!r} 解析失败（应为 a-b 或单层号）"], None
+        if not (lo <= a <= b <= hi):
+            return [f"层范围段 {seg!r} 越界或倒序（应在 {lo}..{hi} 内、a≤b）"], None
+        out.update(range(a, b + 1))
+    return [], (out or None)
+
+
 def parse_stage_select(s, pp, N, mtp, pp_split):
     """「per-stage 选重」文本 → {layer_id: set(op 子串)}（2026-07-14,用户口径:按 stage 配置）。
     语法 `s<i>[-<j>]: 模式; ...`,模式 = none | self_attention | mlp | both(≈full,真机退化端 0.991)
@@ -188,13 +214,10 @@ def parse_stage_select(s, pp, N, mtp, pp_split):
         rng, mode = (x.strip() for x in part.split(":", 1))
         if not rng.startswith("s"):
             return [f"per-stage 选重段 {rng!r} 须以 s 开头（如 s0 / s2-5）"], None
-        body = rng[1:]
-        try:
-            a, b = (int(x) for x in body.split("-")) if "-" in body else (int(body), int(body))
-        except ValueError:
-            return [f"per-stage 选重 stage 范围 {rng!r} 解析失败"], None
-        if not (0 <= a <= b < pp):
-            return [f"per-stage 选重 stage 范围 {rng!r} 越界（0..{pp-1}）"], None
+        body = rng[1:]      # stage 号，支持多段 `s0,2-3` / `s0;2-3`（0..pp-1，闭区间并集）
+        e_st, stset = _parse_layer_ranges(body, 0, pp - 1)
+        if e_st:
+            return [f"per-stage 选重 stage {rng!r}：{e_st[0]}"], None
         ml = mode.strip().lower()
         if ml in ("none", "no", ""):
             continue
@@ -206,7 +229,7 @@ def parse_stage_select(s, pp, N, mtp, pp_split):
             ops = set(_SEL_MLP)
         else:
             ops = {x.strip() for x in mode.replace("，", ",").split(",") if x.strip()}
-        for st in range(a, b + 1):
+        for st in (stset or ()):
             for lid in smap[st]:
                 out.setdefault(lid, set()).update(ops)
     return [], (out or None)
@@ -234,28 +257,22 @@ def parse_select_cfg(s, N):
                (_SEL_MLP if pat == "mlp" else {pat}))
         if not pat:
             return ["细粒度选重 pattern 为空"], None
-        for seg in rng.replace("，", ",").split(","):
-            seg = seg.strip()
-            if not seg:
-                continue
-            try:
-                a, b = (int(x) for x in seg.split("-")) if "-" in seg else (int(seg), int(seg))
-            except ValueError:
-                return [f"细粒度选重层范围 {seg!r} 解析失败（a-b 或单层号,0-indexed）"], None
-            if not (0 <= a <= b < N):
-                return [f"细粒度选重层范围 {seg!r} 越界（0-indexed decoder 层,0..{N-1}）"], None
-            for l0 in range(a, b + 1):
-                out.setdefault(l0 + 1, set()).update(ops)   # +1: 评估器层 id(embedding=0)
+        # pattern 内层范围：0-indexed decoder 层，支持多段（`0-3,6` / `0-3;6`，闭区间并集）。
+        e_r, l0set = _parse_layer_ranges(rng, 0, N - 1)
+        if e_r:
+            return [f"细粒度选重 pattern {pat!r} 的{e_r[0]}"], None
+        for l0 in (l0set or ()):
+            out.setdefault(l0 + 1, set()).update(ops)       # +1: 评估器层 id(embedding=0)
     return [], (out or None)
 
 
 def _is_stage_seg_key(k):
-    """段 key 是否为 stage 定位（s0 / s1-2）——'s' 后接 数字 或 数字-数字。统一入口据此自动识别坐标系。"""
+    """段 key 是否为 stage 定位（`s0` / `s1-2` / 多段 `s0,2-3`）——'s' 后 body 只含 数字/`-`/`,`
+    且至少一个数字。统一入口据此自动识别坐标系（cell/op 名如 self_attention/mlp/flash 含字母 → 非 stage）。"""
     if not k.startswith("s"):
         return False
     b = k[1:]
-    parts = b.split("-")
-    return b != "" and len(parts) in (1, 2) and all(pt.isdigit() for pt in parts)
+    return b != "" and any(c.isdigit() for c in b) and all(c.isdigit() or c in "-," for c in b)
 
 
 def parse_recompute_cfg(s, pp, N, mtp, pp_split):
@@ -354,15 +371,12 @@ def parse_and_validate(p):
         errs.append(f"ep({ep}) 必须整除 dp_shard·cp·tp={dp*cp*tp}（专家在该区内分片,ParallelModel 规则）")
     if rmode not in ("None", "full", "select", "custom"):
         errs.append(f"recompute {rmode!r} 不支持")
-    # 重算层范围（sel_layers, a-b）：对 **full/select/custom 均生效**（空=全部层 1-N）。
-    # 此前仅 custom 消费 → full/select 改层范围结构图不变（用户报告 #1，2026-07-15 修）。
+    # 重算层范围（sel_layers）：对 **full/select/custom 均生效**（空=全部层 1-N）。
+    #   - full/select 生效（用户报告 #1，2026-07-15）；此前仅 custom 消费。
+    #   - **多段不连续**：`1-8;12-13;23-25`（`,`/`;`/全角均可，用户报告 2026-07-15）→ 层号并集。
     sel_ops_raw = [s.strip() for s in p.get("sel_ops", "").split(",") if s.strip()]
     lr_raw = p.get("sel_layers", "").strip()
-    lr = lr_raw or f"1-{N}"
-    try:
-        a, b = (int(x) for x in lr.split("-")) if "-" in lr else (int(lr), int(lr))
-    except ValueError:
-        a = b = -1
+    e_lr, sel_layer_set = _parse_layer_ranges(lr_raw, 1, N)   # 1-indexed 1..N；空→None
     # pp 层分配（mindformers num_layer_list 口径）——提前解析：细粒度重算按 stage 写法需其做 stage→层映射。
     e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, T)
     errs += e_pp
@@ -371,9 +385,11 @@ def parse_and_validate(p):
     e_sel, sel_cfg = parse_recompute_cfg(
         p.get("sel_cfg", "").strip() or p.get("sel_stage", ""), pp, N, mtp, pp_split)
     errs += e_sel
-    # 非空层范围：full/select/custom 均校验（越界/倒序即报错，不静默忽略）
-    if lr_raw and rmode in ("full", "select", "custom") and not (1 <= a <= b <= N):
-        errs.append(f"重算层范围 {lr_raw!r} 非法（1-{N} 内的 a-b）")
+    # 非空层范围：full/select/custom 均校验（多段解析报错透传，越界/倒序/非整数即报错，不静默忽略）。
+    if lr_raw and rmode in ("full", "select", "custom"):
+        errs += [f"重算层范围：{m}" for m in e_lr]
+    if not sel_layer_set:                       # 空/缺省 → 全部层 1..N
+        sel_layer_set = set(range(1, N + 1))
     if rmode == "custom" and sel_cfg is None and not sel_ops_raw:
         errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度重算」文本")
     if errs:
@@ -421,7 +437,8 @@ def parse_and_validate(p):
         full[-1] += 1
         pp_split = tuple(full)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
-                   rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw, sel_range=(a, b),
+                   rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw,
+                   sel_layers=sorted(sel_layer_set),   # 重算层范围层号集（多段并集；空→全部 1..N）
                    sel_cfg=sel_cfg, pp_split=pp_split, vpp=vpp, mbs=mbs)
     return [], cfg, pc_args
 
@@ -626,18 +643,18 @@ def eval_config(p):
     spec = build_llm_spec(cfg)
     d = spec.dims
     N = pa["N"]
-    a, b = pa["sel_range"]   # 重算层范围（空 sel_layers → 1-N，见 parse_and_validate；full/select 亦生效）
+    lset = pa["sel_layers"]   # 重算层范围层号集（多段并集；空 sel_layers → 全部 1..N，见 parse_and_validate）
     if pa["rmode"] == "full":
-        rc = RecomputeSpec("full", full_layers=set(range(a, b + 1)))
+        rc = RecomputeSpec("full", full_layers=set(lset))
     elif pa["rmode"] == "select":
         selset = _SEL_ATTN if pa["sel"] == "attn" else (_SEL_MLP if pa["sel"] == "mlp" else _SEL_ATTN | _SEL_MLP)
-        rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in range(a, b + 1)})
+        rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in lset})
     elif pa["sel_cfg"]:
         # 细粒度文本（mindformers select_module 口径,每 pattern 可不同层集）——非空即优先。
         rc = RecomputeSpec("select", select_ops=pa["sel_cfg"])
     elif pa["rmode"] == "custom":
-        # 图上勾选:任意 op 名 × 单一层范围 —— 与 mindformers select_recompute（op 位置级）同口径。
-        rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in range(a, b + 1)})
+        # 图上勾选:任意 op 名 × 层号集（多段）—— 与 mindformers select_recompute（op 位置级）同口径。
+        rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in lset})
     else:
         rc = RecomputeSpec("None")
     # P1-02④（2026-07-14 review）：select 选择器**命中数校验**——错拼 op 子串此前静默空转
@@ -1051,8 +1068,8 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
-    <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="重算作用的层范围 a-b（1-N,含端点）——对 full / select / custom 均生效;空=全部层。例:full+「1-2」= 只前 2 层整层重算"></div>
-    <div class="fld"><label>细粒度重算</label><input name="sel_cfg" placeholder="s0:both; s2-3:mlp   或   self_attention:0-3; flash:4-7" style="width:340px" title="统一入口,按段自动识别两种写法(不可混用),非空即优先于图上勾选/select 模块:&#10;① 按 PP stage —— s0:both; s1-2:self_attention; s3:none (stage→层跟当前 pp 切分)&#10;② 按绝对层号(mf select_module,0-indexed) —— self_attention:0-3; flash:4-7&#10;模式/pattern = none | self_attention | mlp | both(≈full) | 任意 op 名子串;分号分隔多条"></div>
+    <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8;12-13;23-25" style="width:150px" title="重算作用的层（1..N,含端点）——对 full / select / custom 均生效;空=全部层。&#10;**支持多段不连续**:1-8;12-13;23-25(分隔符 , 或 ; 皆可,全角亦可)。&#10;例:full+「1-2」=只前 2 层整层重算;select+「1-8;23-25」=这 11 层按 select 模块重算"></div>
+    <div class="fld"><label>细粒度重算</label><input name="sel_cfg" placeholder="s0:both; s2-3:mlp   或   self_attention:0-7,11-12,22-24" style="width:360px" title="统一入口,按段自动识别两种写法(不可混用),非空即优先于图上勾选/select 模块:&#10;① 按 PP stage —— s0:both; s1-2:self_attention; s3:none (stage 号支持多段 s0,2-3;stage→层跟当前 pp 切分)&#10;② 按绝对层号(mf select_module,0-indexed) —— self_attention:0-7,11-12,22-24; flash:4-7 (**每 pattern 的层范围支持多段不连续**,逗号分隔)&#10;模式/pattern = none | self_attention | mlp | both(≈full) | 任意 op 名子串;分号分隔多条 pattern"></div>
     <input type="hidden" name="sel_ops" value="">
     <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
   </div>

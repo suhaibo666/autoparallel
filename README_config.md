@@ -81,9 +81,10 @@ usage/页面布局/口径与诚实边界见 README_explorer；本文件只讲「
 
 ### 5.2 `重算层范围`（`sel_layers`）
 
-`a-b`（1-indexed，含端点），**对 full / select / custom 均生效**，**空 = 全部层 1-N**。
-例：`recompute=full` + `重算层范围=1-2` → 只前 2 层整层重算，其余层保留全量激活。
-> 2026-07-15 修：此前该框仅 custom 消费，full/select 恒全层重算 → 改层范围结构图不更新（用户报告 #1）。
+层号（1-indexed，含端点），**对 full / select / custom 均生效**，**空 = 全部层 1-N**。
+**支持多段不连续**：`1-8;12-13;23-25`（分隔符 `,` / `;` / 全角皆可）→ 取这些层的并集。
+例：`recompute=full` + `1-2` → 只前 2 层整层重算；`select` + `1-8;23-25` → 这 11 层按 select 模块重算，其余层保留全量激活。
+> 2026-07-15：① 该框对 full/select 生效（此前仅 custom 消费，用户报告 #1）；② 支持多段不连续层（用户报告，此前仅单个 `a-b`）。
 
 ### 5.3 `细粒度重算`（`sel_cfg`）—— 统一入口
 
@@ -91,11 +92,11 @@ usage/页面布局/口径与诚实边界见 README_explorer；本文件只讲「
 
 | 写法 | key 形态 | 语义 | 示例 |
 |---|---|---|---|
-| **按 PP stage** | `s0` / `s1-2` | stage→层映射跟当前 pp 切分（含 pp 层分配 / mtp） | `s0:both; s1-2:self_attention; s3:none` |
-| **按绝对层号** | cell/op 名 | mindformers `select_module` 口径，层范围 **0-indexed**，每 pattern 可不同层集 | `self_attention:0-3; flash:4-7,9` |
+| **按 PP stage** | `s0` / `s1-2` | stage→层映射跟当前 pp 切分（含 pp 层分配 / mtp）；**stage 号支持多段** `s0,2-3` | `s0:both; s1-2:self_attention; s3:none` |
+| **按绝对层号** | cell/op 名 | mindformers `select_module` 口径，层范围 **0-indexed**，**每 pattern 层范围支持多段不连续** | `self_attention:0-7,11-12,22-24; flash:4-7,9` |
 
 - **模式 / pattern**：`none` / `self_attention` / `mlp` / `both`（≈full）/ 任意 op 名子串（`flash`/`e_fc1`/`ln2`…）。
-- 分号 `;` 分隔多条；层范围支持 `a-b` 与逗号分段 `0-3,6`。
+- 分号 `;` 分隔多条 pattern；**每 pattern 的层范围支持多段不连续**（逗号分段）`0-3,6,10-12`；stage 号同理支持多段 `s0,2-3`。
 - 2026-07-15 合并：旧「per-stage 选重」与「细粒度选重(mf 口径)」两个框归一（本就产出同一 `select_ops`、且互斥）。旧字段 `sel_stage` 保留为**隐藏兼容别名**（`sel_cfg` 为空时回落读取）。
 
 ## 6. 运行时 / 硬件（非 UI 子集，yaml 导入 round-trip 落点）

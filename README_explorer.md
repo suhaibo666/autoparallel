@@ -76,10 +76,10 @@ world = dp_replicate·dp_shard·tp·pp·cp（显示在 KPI 下；手配默认 dp
 | 无 | 下拉「无」 | 全激活保存（act_live 最大） |
 | full | 下拉「full」；`重算层范围` 限定作用层 | 层整层重算（仅存层入口锚点） |
 | select(模块) | 下拉「select」+ 模块选 `self_attn`/`mlp`/`both`；`重算层范围` 限定作用层 | 按 cell 重算（`both`≈full，真机退化端 0.991） |
-| custom（图上选） | 下拉「custom」或直接**在左图 op 节点点 ↻**（自动切 custom）；`重算层范围` 限定 a-b | 任意 op 集合 × 单一层范围；chips 行可移除 |
-| 细粒度重算（统一入口） | `细粒度重算` 输入框，**一个框、两种写法自动识别、互斥**：① 按 PP stage `s0:both; s1-2:self_attention; s3:none`（stage→层跟当前 pp 切分）；② 按绝对层号（mf `select_module`，0-indexed）`self_attention:0-3; flash:4-7,9` | 非空即优先于图上勾选/select 模块；模式/pattern = `none`/`self_attention`/`mlp`/`both`/op 名子串 |
+| custom（图上选） | 下拉「custom」或直接**在左图 op 节点点 ↻**（自动切 custom）；`重算层范围` 限定层 | 任意 op 集合 × 层号集；chips 行可移除 |
+| 细粒度重算（统一入口） | `细粒度重算` 输入框，**一个框、两种写法自动识别、互斥**：① 按 PP stage `s0:both; s1-2:self_attention; s3:none`（stage→层跟当前 pp 切分）；② 按绝对层号（mf `select_module`，0-indexed）`self_attention:0-7,11-12,22-24; flash:4-7` | 非空即优先于图上勾选/select 模块；模式/pattern = `none`/`self_attention`/`mlp`/`both`/op 名子串；**每 pattern 层范围支持多段不连续** |
 
-> - **`重算层范围`**（`a-b`）对 **full / select / custom 均生效**（空 = 全部层 1-N）——2026-07-15 修：此前仅 custom 消费，改 full/select 层范围无效。
+> - **`重算层范围`**（`sel_layers`）对 **full / select / custom 均生效**（空 = 全部层 1-N），**支持多段不连续** `1-8;12-13;23-25`（`,`/`;`/全角皆可）——2026-07-15：① 改 full/select 生效（此前仅 custom）；② 支持多段（此前仅单个 `a-b`）。
 > - **细粒度重算**合并了旧「per-stage 选重」与「细粒度选重(mf 口径)」两个框（2026-07-15）：二者本就产出同一 `select_ops`、且互斥；旧 `sel_stage` 保留为隐藏兼容别名。stage 写法的"full"用 `both` 表达（评估器 full/select 为全局互斥模式，`both` 真机退化端 ≈full）。
 
 ### 3.6 运行时 / 硬件（非 UI 子集，yaml 导入 round-trip 的落点）
