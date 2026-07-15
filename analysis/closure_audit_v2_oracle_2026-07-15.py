@@ -51,13 +51,15 @@ def _ev(rc):
 
 
 CASES = {
-    # F1 dense_fsdp_shard_size（按完整 FSDP 域判定）
-    "F1 dense=1 with fsdp=8 (subdomain unmodeled) → REJECT":
-        lambda: _rejected(lambda: _build_parallel({"parallelism": {"data_parallel_shard": 8, "dense_fsdp_shard_size": 1}}, 0, 4)),
+    # F1 dense_fsdp_shard_size（按完整 FSDP 域判定；closure-wave3a Z3 后：1≤v<fsdp 整除**已建模**、不再拒）
+    "F1 dense=1 with fsdp=8 (subdomain NOW MODELED, Z3) → ACCEPT":
+        lambda: _accepted(lambda: _build_parallel({"parallelism": {"data_parallel_shard": 8, "dense_fsdp_shard_size": 1}}, 0, 4)),
     "F1 dense=8 with fsdp=8 (==fsdp neutral) → ACCEPT":
         lambda: _accepted(lambda: _build_parallel({"parallelism": {"data_parallel_shard": 8, "dense_fsdp_shard_size": 8}}, 0, 4)),
     "F1 dense=0 (non-positive) → REJECT":
         lambda: _rejected(lambda: _build_parallel({"parallelism": {"data_parallel_shard": 8, "dense_fsdp_shard_size": 0}}, 0, 4)),
+    "F1 dense=3 with fsdp=8 (non-divisor) → REJECT":
+        lambda: _rejected(lambda: _build_parallel({"parallelism": {"data_parallel_shard": 8, "dense_fsdp_shard_size": 3}}, 0, 4)),
     # F6 ulysses_degree_in_cp
     "F6 colossal degree=1 (was false-reject) → ACCEPT":
         lambda: _accepted(lambda: from_mindformers_dict({**_mf(), "parallelism": {"context_parallel_method": "colossal", "ulysses_degree_in_cp": 1}})),
