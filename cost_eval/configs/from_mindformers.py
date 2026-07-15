@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from dataclasses import dataclass
 
 from ..llm_config import LLMConfig
@@ -68,7 +69,10 @@ _MAPPED_MODEL_KEYS = {
 }
 # ② 已知「内存中性」忽略集：均**不改内存 op 图**，刻意复现手写映射的省略（如 dsv4_align_config()
 #    docstring「qk_layernorm/add_bias omitted（memory-negligible; would fail-loud in build_llm）」——
-#    但 qk_layernorm 归到 ① 由 build_llm 原生守卫，见 _build_llm_config）。新增不在 ①∪② 的 model
+#    qk_layernorm 就在**本忽略集（②）**里（P2-08 订正 2026-07-15）：adapter **刻意不映射它**，
+#    故 yaml 里 `qk_layernorm=true` 不会传到 `LLMConfig`（保持默认 False，见 _build_llm_config 的
+#    kwargs 无 qk_layernorm 项）。旧注释误称「归到 ① 由 build_llm 守卫」——那是错的：它既不在 ①
+#    _MAPPED，adapter 也不透传，故 build_llm 根本收不到 True、无从守卫。新增不在 ①∪② 的 model
 #    key → fail-loud（不静默吞）。
 _IGNORED_MODEL_KEYS = {
     "model_type", "architectures", "max_position_embeddings", "hidden_act", "rms_norm_eps",
@@ -328,15 +332,17 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "已映射见 _MAPPED_MODEL_KEYS，已知内存中性忽略见 _IGNORED_MODEL_KEYS；"
             "如该字段确改内存请在转换器补映射，否则加入忽略集（附‘不改 op 图’论证）。")
 
-    # 值守卫（closure-audit C2，2026-07-15）：非零 dropout 会物化 dropout mask（bool/uint8，与
-    # 激活同形，saved 供反向）——当前未建模。=0 中性放行（DSv3/V4 生产均 0）；>0 fail-loud，
-    # 不静默把 0.1 当 0.0。
+    # 值守卫（closure-audit C2 → V1 §4.1.4，2026-07-15）：非零 dropout 会物化 dropout mask
+    # （bool/uint8，与激活同形，saved 供反向）——当前未建模。=0 中性放行（DSv3/V4 生产均 0）；
+    # **一切非零** fail-loud，不静默把 0.1 当 0.0。判据由 `>0` 收紧为 `!=0`：负 dropout 无意义
+    # （概率∈[0,1)），此前 `-0.1` 这类非法非零值被静默接受（暴露校验不全）→ 亦拒。
     for _dk in ("attention_dropout", "hidden_dropout"):
         _dv = model.get(_dk)
-        if _dv is not None and float(_dv) > 0:
+        if _dv is not None and float(_dv) != 0:
             raise NotImplementedError(
-                f"{_dk}={_dv} >0：dropout mask（与激活同形，saved 供反向）未建模——"
-                "静默忽略会低估。请设为 0（生产常态）或补 mask 建模。")
+                f"{_dk}={_dv} 非零：dropout mask（与激活同形，saved 供反向）未建模——"
+                "静默忽略会低估显存；负值更是非法（dropout 概率∈[0,1)）。"
+                "请设为 0（生产常态）或补 mask 建模。")
     # 值守卫：flash=False 会物化 [S,S] 分数、改 op 图（评估器只建 flash 路径）。
     if model.get("use_flash_attention", True) is False:
         raise NotImplementedError(
@@ -451,14 +457,26 @@ def _build_llm_config(model: dict) -> LLMConfig:
     #   依据（V1 源码核查）：pynative LM CE 恒 unfused 小算子，lean/fat 差异实为 loss 区中间量
     #   共存份数；DSv4 fork 的 loss.py 用 chunked-fused backward → lean。故 CE lean-ness 由
     #   **CE 自身配置**决定，与 attention kernel 正交：
-    #     ① 显式 model 键 `cross_entropy_fused` 优先（可追溯）；
+    #     ① 显式 model 键 `cross_entropy_fused` 优先（用户直接声明 → 完全可追溯，不发警告）；
     #     ② 否则 dsv4_hybrid → True（该 fork lean-CE 标定，真机锚 15415.5 背书，**独立于** DSA
     #        融合开关：apply_dsa_kernel_fusion=False 的 DSv4 仍 lean-CE）；
     #     ③ 其余模型 → False（pynative 常态 unfused-fat）。
+    # provenance 订正（closure-audit V1 §4.4，2026-07-15）：②这条**是架构启发式、非独立可追溯的
+    #   loss 配置来源**——相同 DSv4 attention 若换普通 CE 实现，本默认会误判 lean。故保留该兼容默认
+    #   （锚点不动），但落入它时**发 warning**，让「无显式配置时的默认」可追溯、提示用户显式配置。
+    #   注：`chunk_loss_num` 不作为此处的 loss-配置推断信号——它在本评估器里独立驱动
+    #   `loss_type="chunked"`（head.py:108-111，bwd_scratch÷k），而 `cross_entropy_fused` 在此
+    #   specifically 只 gate DSv4-fork 的 kept-frag margin（mem_timeline.py:443 loss_lids）——两者
+    #   机制正交，混用会引入未经核实的内存效应，故不推断（宁缺毋滥，见 V1 §7.3 关闭门槛）。
     _ce_explicit = model.get("cross_entropy_fused")
     if _ce_explicit is not None:
-        kwargs["cross_entropy_fused"] = bool(_ce_explicit)
+        kwargs["cross_entropy_fused"] = bool(_ce_explicit)   # ① 显式键 → 可追溯，不发警告
     elif attn_type == "dsv4_hybrid":
+        # ② 架构兼容默认：发 provenance 警告（stacklevel=2 指向调用方，便于定位）。
+        warnings.warn(
+            "cross_entropy_fused 未显式配置,按 dsv4_hybrid 架构兼容默认取 True(lean CE)——"
+            "真机锚 15415.5 背书;如需精确请显式配 cross_entropy_fused 或提供 loss 实现标识",
+            stacklevel=2)
         kwargs["cross_entropy_fused"] = True
     return LLMConfig(**kwargs)
 
@@ -528,15 +546,22 @@ _PAR_NEUTRAL = {
     "enable_loss_parallel",             # 死键：pynative 无消费者（config.py:444-449 旧 DTensor 流残留;
                                         # TP>1 恒 vocab-parallel、无开关，loss.py:326-336）
 }
-# 影响内存但未建模 → 出现（真值/非默认值）即 fail-loud：
+# 影响内存但未建模 → 出现即 fail-loud。**分两类**（closure-audit V1 §4.1.1，2026-07-15）：
+# ① 布尔开关类：任何**真值**都拒（True/1/任意非零/非空串）——此前允许集含 `1`，而 Python
+#    `True==1`，致 `pipeline_parallel_overlap_p2p=True` 被静默接受（探针实证）。判据改为
+#    `v not in (None, False, 0, "")`，让 True 与 1 都落入拒绝。
 _PAR_UNSUPPORTED_TRUTHY = {
     "context_parallel_async": "cp 通信异步 overlap 的在飞双缓冲未建模（二阶内存效应）",
     "pipeline_parallel_overlap_p2p": "PP p2p overlap 的 send/recv 双缓冲未建模",
     "pipeline_parallel_overlap_b_f": "PP B/F overlap 的额外在飞激活未建模",
     "pipeline_parallel_enable_dxdw_split": "dx/dw 拆分使 dw 图延迟释放，生命周期未建模",
     "expert_parallel_async_d2h": "EP 异步 D2H 的 staging 缓冲未建模",
-    "dense_fsdp_shard_size": "分组 FSDP 域（dense 权重按子域切）改变每卡持久/gather 字节，未建模",
     "ulysses_degree_in_cp": "hybrid CP（ulysses×ring 二维）未建模（仅 colossal/ulysses 全域）",
+}
+# ② 数值类：=1（或缺省）= 不切分/单域，**合法**；>1 才 fail-loud——区别于布尔键，`1` 是合法的
+#    「不分组」值、不是真值泄漏（此前把 dense_fsdp_shard_size=1 也误拒）。
+_PAR_UNSUPPORTED_NUMERIC_GT1 = {
+    "dense_fsdp_shard_size": "分组 FSDP 域（dense 权重按子域切）改变每卡持久/gather 字节，未建模",
 }
 
 
@@ -571,15 +596,23 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     par = mf.get("parallelism", {}) or {}
     train = mf.get("training", {}) or {}
     # P0-02：schema fail-loud——未知键（含拼错）不静默丢弃。
-    unknown = set(par) - _PAR_MAPPED - _PAR_NEUTRAL - set(_PAR_UNSUPPORTED_TRUTHY)
+    unknown = (set(par) - _PAR_MAPPED - _PAR_NEUTRAL
+               - set(_PAR_UNSUPPORTED_TRUTHY) - set(_PAR_UNSUPPORTED_NUMERIC_GT1))
     if unknown:
         raise NotImplementedError(
             f"未识别的 parallelism 字段（可能改变内存但未映射/拼错）：{sorted(unknown)}。"
-            "已映射见 _PAR_MAPPED，内存中性忽略见 _PAR_NEUTRAL，已知未建模见 _PAR_UNSUPPORTED_TRUTHY。")
+            "已映射见 _PAR_MAPPED，内存中性忽略见 _PAR_NEUTRAL，"
+            "已知未建模见 _PAR_UNSUPPORTED_TRUTHY / _PAR_UNSUPPORTED_NUMERIC_GT1。")
+    # ① 布尔开关类未建模键：任何真值即 fail-loud（V1 §4.1.1：`1` 从允许集剔除 → True/1 皆拒）。
     for k, why in _PAR_UNSUPPORTED_TRUTHY.items():
         v = par.get(k)
-        if v not in (None, False, 0, "", 1) or (k == "dense_fsdp_shard_size" and v == 1):
+        if v not in (None, False, 0, ""):
             raise NotImplementedError(f"parallelism.{k}={v!r} 未建模：{why}——拒绝静默近似导入。")
+    # ② 数值类未建模键：=1/缺省=不切分（合法），>1 才 fail-loud（与布尔键分开处理）。
+    for k, why in _PAR_UNSUPPORTED_NUMERIC_GT1.items():
+        v = par.get(k)
+        if v is not None and int(v) > 1:
+            raise NotImplementedError(f"parallelism.{k}={v!r}（>1）未建模：{why}——拒绝静默近似导入。")
     sched = par.get("pipeline_parallel_schedule")
     if sched not in (None, "", "1f1b", "interleaved_1f1b"):
         raise NotImplementedError(
@@ -744,6 +777,54 @@ _CONTEXT_KEYS = {
     "runtime_num_threads", "op_timeout", "jit_level",
 }
 _SWAP_KEYS = {"enable", "default_prefetch", "layer_swap", "op_swap"}
+# optimizer 段已知键（V1 §4.1.2）：本地 configs/ 全量扫描（type/betas/eps/weight_decay/
+# learning_rate/swap）+ mindformers optim 常见键。未知键（如 typo `tyep`）fail-loud，不静默
+# 回落 AdamW（此前 _build_optimizer 只读 `type`，其余键——含拼错的 `tyep`——被无声丢弃）。
+_OPTIMIZER_KEYS = {
+    "type", "betas", "eps", "weight_decay", "learning_rate", "lr", "swap",
+    "warmup_ratio", "warmup_steps", "warmup_lr_init", "min_lr", "lr_end",
+    "lr_decay_style", "decay_steps", "total_steps", "momentum", "use_nesterov",
+    "loss_scale", "amsgrad", "maximize", "weight_decay_kwargs",
+    "apply_decay_param_filter", "param_groups",
+}
+# 顶层段白名单（V1 §4.1.2）：mindformers **顶层已知段**——新式 pynative 段 + 老式 legacy 顶层键
+# （本地 mindformers/configs/**/*.yaml 全量扫描收集）。顶层未知段（如整段拼错 `optimzier`）会让
+# 该段被静默忽略、回落默认值（评错另一份配置）→ fail-loud。**宁可白名单偏宽也不误伤合法段**（重点
+# 是抓明显 typo）；注意 `_mf_adapt`（serve_explorer.py）把老式 yaml 转新式段时**保留**原 legacy
+# 顶层键在 dict 里，故这些 legacy 键必须全在白名单内，否则老式 yaml 导入回归。
+_TOP_LEVEL_SEGMENTS = {
+    # ── 新式 pynative 段（本转换器实际消费/校验）──
+    "model", "parallelism", "training", "context", "swap", "optimizer",
+    "recompute", "recompute_comm",
+    # ── 老式 legacy 顶层键（configs/ 扫描 + mindformers 惯用）──
+    "auto_trans_ckpt", "auto_tune", "autotune_per_step", "blip", "callbacks",
+    "do_eval", "eval_dataset", "eval_dataset_task", "eval_epoch_interval",
+    "eval_step_interval", "eval_callbacks", "filepath_prefix", "generation_config",
+    "glm", "glm2", "gpt", "grouped_lr_schedule", "init_start_profile", "internlm",
+    "layer_decay", "layer_scale", "llama", "load_checkpoint", "load_ckpt_format",
+    "lr_scale", "lr_scale_factor", "lr_schedule", "metric", "micro_batch_interleave_num",
+    "moe_config", "monitor_config", "only_save_strategy", "output_dir", "parallel",
+    "parallel_config", "pretrained_model_dir", "print_separate_loss", "processor",
+    "profile", "profile_communication", "profile_memory", "profile_start_step",
+    "profile_stop_step", "profiler_level", "qwen", "recompute_config", "remote_save_url",
+    "remove_redundancy", "resume_training", "run_mode", "runner_config", "runner_wrapper",
+    "seed", "src_strategy_path_or_dir", "train_dataset", "train_dataset_task",
+    "train_precision_sync", "trainer", "transform_process_num", "use_legacy", "use_parallel",
+    # ── 其它 mindformers 惯用顶层键（未必在本地 26 份 configs 出现但真实存在，宽松保留防回归）──
+    "boost_config", "swap_config", "mem_reuse", "data_loader", "dataset_task",
+    "moe", "context_config",
+}
+
+
+def _check_top_level_segments(mf: dict) -> None:
+    """顶层段白名单校验（V1 §4.1.2）：未知顶层段（含整段拼错，如 `optimzier`）fail-loud——
+    否则该段被静默忽略、回落默认值，用户以为评的是自己的配置。"""
+    unknown = set(mf) - _TOP_LEVEL_SEGMENTS
+    if unknown:
+        raise NotImplementedError(
+            f"未识别的顶层配置段：{sorted(unknown)}——可能是段名拼错（如 `optimzier`→`optimizer`）。"
+            "typo 会让整段被静默忽略、回落到默认值（评错另一份配置），故 fail-loud。"
+            "已知顶层段见 _TOP_LEVEL_SEGMENTS（如确为合法新段请补入白名单）。")
 
 
 def _check_segment_keys(mf: dict, seg: str, allowed: set) -> None:
@@ -785,10 +866,14 @@ def from_mindformers_dict(mf: dict) -> EvaluatorConfigBundle:
     """
     if "model" not in mf:
         raise ValueError("mindformers config 缺 `model` 段——无法构建 LLMConfig。")
-    # C2：段级 schema——training/context/swap 未知键（含 typo）fail-loud，不静默回落默认。
+    # V1 §4.1.2：顶层段 schema——整段拼错（如 `optimzier`）不静默丢失、回落默认。
+    _check_top_level_segments(mf)
+    # C2 → V1 §4.1.2：段级 schema——training/context/swap/optimizer 未知键（含 typo，如
+    # optimizer 段的 `tyep`）fail-loud，不静默回落默认。
     _check_segment_keys(mf, "training", _TRAINING_KEYS)
     _check_segment_keys(mf, "context", _CONTEXT_KEYS)
     _check_segment_keys(mf, "swap", _SWAP_KEYS)
+    _check_segment_keys(mf, "optimizer", _OPTIMIZER_KEYS)
     model = mf["model"] or {}
     train = mf.get("training", {}) or {}
 

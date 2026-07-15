@@ -23,9 +23,13 @@ NHD = "n_heads*head_dim"            # o_proj 输入维 = n_heads·head_dim
 # 修前误建为 fwd-only workspace + lse [S,B,n_heads] 2B saves（仅真值 1/32，且 workspace 不 ÷tp）。
 # 修后：`_fa_stats(...)` TensorRef（2×[B,N,S,8] fp32 = 64·B·n_heads·S 字节，head 维 ÷tp、S 维
 # 天然 ÷cp）进 flash op 的 **saves**——无重算层驻留至反向（act_live），重算层随 saves 丢弃重物化。
-# 下方 workspace 表达式**保留**的残余职责：重算路径反向重跑 forward 时再物化统计量的瞬态
-# （进 forward_max_live → recomp_scratch，full 重算锚点 12409.5 依赖此项）；已知限制：workspace
-# 字符串只 ÷cp 不 ÷tp（shape_eval:224-229），tp>1 时重算瞬态偏保守（OOM-安全侧，无锚点覆盖）。
+# flash 前向/重算瞬态 workspace 现由 `_fa_workspace()` **TensorRef 型 workspace_ref** 承载（见下方
+# :39-45 与 GQA/MLA flash op :101-103/:187-189）：同为 [2,B,n_heads,S,8] fp32，经 resolve_tensor
+# 的 shard/cp 机制**按 TP 切（head 维 ÷tp）+ 按 CP 切（S 维 ÷cp）**——已闭合旧字符串 workspace「只
+# ÷cp 不 ÷tp、tp>1 重算瞬态高估 8×」的缺口（closure-audit P1-09/§4.10.1，2026-07-15）。
+# 下方 `FLASH_LSE_WS` 字符串常量**不再接入任何 flash op 的 workspace**（各 flash op 已改用
+# workspace_ref）：保留仅作 (a) 文档/口径参考值（TP=1/CP=1 时 = _fa_workspace 的 numel×4B），
+# (b) test_framework_decomposition 对 `_fa_stats`/`_fa_workspace` numel 的数值交叉校验基准。
 FLASH_LSE_WS = "64*B*n_heads*S"
 
 

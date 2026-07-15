@@ -48,6 +48,24 @@ class ParallelConfig:
             raise ValueError(
                 f"reshard_after_forward={self.reshard_after_forward!r} 非法"
                 "（仅 always|never|default）——typo 静默回落会评错 gather 生命周期。")
+        # closure-audit P1-16（2026-07-15）：并行/调度标量正值校验——同属本字段自身不变量，在核心
+        # 构造处 fail-loud（此前 interleave=0 / prefetch_depth=-1 / num_microbatches=0 被接受，
+        # 令调度退化、空循环或产无意义峰值）。默认构造（全 1）与所有合法值必须继续通过。
+        _at_least_1 = {
+            "dp_replicate": self.dp_replicate, "dp_shard": self.dp_shard,
+            "cp": self.cp, "tp": self.tp, "pp": self.pp, "ep": self.ep,
+            "interleave": self.interleave, "microbatch": self.microbatch,
+            "num_microbatches": self.num_microbatches,
+        }
+        for _name, _val in _at_least_1.items():
+            if not isinstance(_val, int) or _val < 1:
+                raise ValueError(
+                    f"ParallelConfig.{_name}={_val!r} 非法——须为 >=1 的整数"
+                    "（并行度/VPP 交错/microbatch 至少 1，<1 会令调度退化/空循环/无意义峰）。")
+        if not isinstance(self.prefetch_depth, int) or self.prefetch_depth < 0:
+            raise ValueError(
+                f"ParallelConfig.prefetch_depth={self.prefetch_depth!r} 非法——须为 >=0 的整数"
+                "（0=无预取合法，负数无意义）。")
 
 
 @dataclass

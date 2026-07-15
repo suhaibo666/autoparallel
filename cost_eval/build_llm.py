@@ -24,8 +24,38 @@ from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
 
 
 def _validate_structure(cfg: LLMConfig) -> None:
-    """结构合法性统一校验（P1-10/P1-11，2026-07-14 review）：非法/不自洽配置 fail-loud，
-    不静默 floor/近似产错图。"""
+    """结构合法性统一校验（P1-10/P1-11，2026-07-14 review + closure-audit v2 2026-07-15）：
+    非法/不自洽配置 fail-loud，不静默 floor/近似产错图。"""
+    # ── 核心维度正值校验（P1-11，closure-audit v2 §4.6）─────────────────────────────
+    # 探针实证：负/零核心维度此前静默产**负参数 numel**（hidden_size=-1792）/**零激活**
+    # （seq_length=0）/**零 vocab 张量**（vocab_size=0）/**退化 2 层图**（num_layers=-1）。
+    # 整数维度须 ≥1（≥1 而非 >0 因是整数计数）。**放在最前**：保证下方 `H % n_heads` 等取模
+    # 的除数为正（n_heads=0 会裸 ZeroDivisionError / n_heads<0 会错算 head_dim）。
+    for _f, _v in (("num_layers", cfg.num_layers), ("hidden_size", cfg.hidden_size),
+                   ("num_attention_heads", cfg.num_attention_heads),
+                   ("vocab_size", cfg.vocab_size), ("seq_length", cfg.seq_length),
+                   ("batch_size", cfg.batch_size)):
+        if _v < 1:
+            raise ValueError(
+                f"{_f}({_v}) 必须 ≥1（负/零核心维度会静默产负参数 numel / 零激活 / 退化层图，"
+                "见 closure-audit v2 §4.6）。")
+    if cfg.ffn_hidden_size is not None and cfg.ffn_hidden_size < 1:
+        raise ValueError(
+            f"ffn_hidden_size({cfg.ffn_hidden_size}) 必须 ≥1（FFN 隐藏维；≤0 会产负/零 dense-FFN "
+            "numel）——留 None 取默认 4·hidden_size。")
+    # MLA 家族维度正值校验：仅 attn_type ∈ {mla, dsv4_hybrid, dsa} 施加（这三条注意力的
+    # op 图用 q_lora_rank/kv_lora_rank/qk_rope/qk_nope/v_head_dim 做低秩/头维——见 layers/
+    # {attention.py build_mla_attn_ops, dsv4_hybrid.py, dsa.py} 符号表达式；≤0 会静默产负/零
+    # numel）。**gqa/mha 的 MLA 维默认 0 惰性、从不进 op 图 → 不查**（否则误伤合法 GQA 预设）。
+    if cfg.attn_type in ("mla", "dsv4_hybrid", "dsa"):
+        for _f, _v in (("q_lora_rank", cfg.q_lora_rank), ("kv_lora_rank", cfg.kv_lora_rank),
+                       ("qk_rope_head_dim", cfg.qk_rope_head_dim),
+                       ("qk_nope_head_dim", cfg.qk_nope_head_dim),
+                       ("v_head_dim", cfg.v_head_dim)):
+            if _v <= 0:
+                raise ValueError(
+                    f"attn_type={cfg.attn_type!r} 需 {_f}>0（当前 {_v}）：MLA 低秩/头维进入 attn "
+                    "op 图（linear_qkv/qb/kvb/o_proj 等的符号维），≤0 会静默产负/零 numel。")
     # head_dim 静默 floor（P1-11）：H 不被 n_heads 整除且未显式给 head_dim → 此前 to_dimtable
     # 直接 `H // n_heads` 截断（错维产错图）。
     if cfg.head_dim is None and cfg.hidden_size % cfg.num_attention_heads != 0:
@@ -56,7 +86,18 @@ def _validate_structure(cfg: LLMConfig) -> None:
     if isinstance(cfg.moe_layer_freq, (list, tuple)) and len(cfg.moe_layer_freq) != cfg.num_layers:
         raise ValueError(
             f"moe_layer_freq 长度({len(cfg.moe_layer_freq)}) 必须 == num_layers({cfg.num_layers})。")
+    # moe_ffn_hidden_size（若显式设）须 ≥1（P1-11）：≤0 会产负/零专家 FFN numel。留 None 惰性。
+    if cfg.moe_ffn_hidden_size is not None and cfg.moe_ffn_hidden_size < 1:
+        raise ValueError(
+            f"moe_ffn_hidden_size({cfg.moe_ffn_hidden_size}) 必须 ≥1（专家 FFN 隐藏维；≤0 产负/零 "
+            "MoE numel）。")
     if cfg.num_moe_experts:
+        # num_moe_experts 正值校验（P1-11）：`if cfg.num_moe_experts:` 对负数为真 → 会走 MoE 路径
+        # 产负专家 numel；0/None 视作纯 dense（_is_moe_layer 语义）跳过。故此处只需拒负数。
+        if cfg.num_moe_experts < 1:
+            raise ValueError(
+                f"num_moe_experts({cfg.num_moe_experts}) 必须 ≥1（MoE 专家数；负数会走 MoE 路径产"
+                "负专家 numel）——纯 dense 请用 None 或 0。")
         if cfg.moe_router_topk > cfg.num_moe_experts:
             raise ValueError(
                 f"moe_router_topk({cfg.moe_router_topk}) > num_moe_experts({cfg.num_moe_experts})。")
@@ -73,19 +114,22 @@ def _validate_structure(cfg: LLMConfig) -> None:
     if isinstance(cfg.window_pattern, (list, tuple)) and len(cfg.window_pattern) != cfg.num_layers:
         raise ValueError(
             f"window_pattern 长度({len(cfg.window_pattern)}) 必须 == num_layers({cfg.num_layers})。")
-    if cfg.o_groups:
+    # closure-audit v2 §4.5（2026-07-15）：dsv4_hybrid 的分组输出投影**依赖** o_groups>0
+    # （O_GROUP_OUT=o_groups·o_lora_rank / O_CHUNK=n_heads·v_head_dim//o_groups）。此前用
+    # `not cfg.o_groups` 只拒 0——`o_groups=-1` 为 truthy 绕过、最终解析出 o_group_out.local_numel
+    # =-4194304 / o_w=-1835008（探针）。改**严格 >0**：负数（产负 numel）与 0（裸除零）都 fail-loud。
+    # **须先于整除检查**：保证进入整除分支时 o_groups 已是正数。
+    if cfg.attn_type == "dsv4_hybrid" and cfg.o_groups <= 0:
+        raise ValueError(
+            f"attn_type='dsv4_hybrid' 需 o_groups>0（当前 {cfg.o_groups}）：分组输出投影 "
+            "linear_o_group_proj 用它做 O_GROUP_OUT=o_groups·o_lora_rank / "
+            "O_CHUNK=n_heads·v_head_dim//o_groups——≤0 会产负 numel 或在 shape 求值裸除零。")
+    if cfg.o_groups and cfg.o_groups > 0:      # 整除检查仅对正 o_groups 有意义（负已在上方拒）
         nvd = cfg.num_attention_heads * (cfg.v_head_dim or 0)
         if nvd and nvd % cfg.o_groups != 0:
             raise ValueError(
                 f"n_heads·v_head_dim({nvd}) 不被 o_groups({cfg.o_groups}) 整除"
                 "（分组输出投影 O_CHUNK 需整除）。")
-    # closure-audit C1（2026-07-15）：dsv4_hybrid 的分组输出投影**依赖** o_groups（O_GROUP_OUT/
-    # O_CHUNK 表达式除以它）——o_groups=0 会在 shape resolve 裸抛 ZeroDivisionError，改提前 fail-loud。
-    if cfg.attn_type == "dsv4_hybrid" and not cfg.o_groups:
-        raise ValueError(
-            "attn_type='dsv4_hybrid' 需 o_groups>0（分组输出投影 linear_o_group_proj 用它做 "
-            "O_GROUP_OUT=o_groups·o_lora_rank / O_CHUNK=n_heads·v_head_dim//o_groups）——"
-            "缺省 0 会在 shape 求值裸除零。")
 
 
 def _check_implemented_dispatch(cfg: LLMConfig) -> None:

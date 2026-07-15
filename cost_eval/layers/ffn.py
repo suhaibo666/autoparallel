@@ -152,17 +152,25 @@ def build_moe_ffn_ops(d: DimTable) -> list:
 
 
 def build_moe_merge_op(d: DimTable) -> "OpSpec":
-    """MoE 层尾合流 op（2026-07-11 补边）：routed 输出(comb) + shared 输出(sh_o) 相加 → h2。
+    """MoE 层尾合流 op（2026-07-11 补边）：routed 输出(comb) + shared 输出 相加 → h2。
 
     真机语义:`moe_layer construct: output = routed + shared` + transformer_layer 残差。此前 moe 层
     未建此 op（dense 层有 add2、moe 层没有,不对称）→ combine/shared_fc2 成 op 图孤立叶节点。
     线性 elementwise:saves=[]（反向直传）→ **激活字节零变化**;仅 forward_max_live 尾部多一个
     live 输出（若动锚点即回退）。
+
+    **shared-expert 门（P1-01，closure-audit §4.2，2026-07-15）**：`moe_shared_gate=True` 时
+    shared 分支尾部已产出 gated 输出 `sh_o_gated = sigmoid(sh_gate)·sh_o`（build_shared_expert_ops
+    的 shared_gate_mul，源 `shared_experts.py:56-64`），合流须消费 **gated 输出**——否则 gate 只补了
+    参数、其数据流成孤立叶节点。gate off（DSv3 默认）走原路径消费裸 `sh_o`，输入/saves 逐字节不变。
     """
     comb = TensorRef("comb", ("S", "B", "H"), shard={0: "sp"})
-    sh_o = TensorRef("sh_o", ("S", "B", "H"), partial="tp")
     h2   = TensorRef("h2",   ("S", "B", "H"), shard={0: "sp"})
-    return OpSpec("moe_add", OpType.ELEMENTWISE, [comb, sh_o], h2, saves=[])
+    if getattr(d, "moe_shared_gate", False):
+        shared_in = TensorRef("sh_o_gated", ("S", "B", "H"), partial="tp")
+    else:
+        shared_in = TensorRef("sh_o", ("S", "B", "H"), partial="tp")
+    return OpSpec("moe_add", OpType.ELEMENTWISE, [comb, shared_in], h2, saves=[])
 
 
 def build_shared_expert_ops(d: DimTable) -> list:
@@ -203,12 +211,22 @@ def build_shared_expert_ops(d: DimTable) -> list:
         OpSpec("shared_fc2",    OpType.MATMUL,      [sh_act, sh_fc2_w], sh_o,
                params=[sh_fc2_w], saves=[sh_act]),
     ]
-    # shared-expert 门（closure-audit C3）：use_shared_expert_gating=True 时的 [H,1] Dense
-    # （shared_experts.py:56-64）——字节可忽略、门激活 [S,B,1] 极小、saves 空（sigmoid 线性直传）。
-    # 仅为参数守恒完整性建其权重；DSv3（moe_shared_gate=False）不建 → golden 不变。
+    # shared-expert 门（P1-01，closure-audit §4.2，2026-07-15）：use_shared_expert_gating=True 时
+    # 真机 `shared_out_gated = sigmoid(gate_logits)·shared_expert_out`，`gate_logits = Linear(H→1)(hidden)`
+    # （shared_experts.py:56-64）。此前只建了门权重 [H,1]、门激活 [S,B,1] 却**无消费者**（孤立叶节点），
+    # 真正合流仍用未乘 gate 的裸 sh_o。此处让门真正进入数据流：
+    #   ① shared_gate  (MATMUL)     : Linear(H→1) 产 gate logits `sh_gate [S,B,1]`。
+    #   ② shared_gate_mul (ELEMENTWISE): `sh_o_gated = sigmoid(sh_gate)·sh_o`；合流 op(moe_add) 改吃它。
+    # backward 生命周期（sigmoid·mul 反向）：d/d(sh_o)=sigmoid(sh_gate)、
+    #   d/d(sh_gate)=sh_o·sigmoid'(sh_gate) → 须保存 shared 输出 sh_o 与门 logits sh_gate（[S,B,1] 极小；
+    #   sigmoid 输出由 sh_gate 重算）。门权重字节可忽略但为参数守恒完整性建。
+    # DSv3（moe_shared_gate=False）完全不建这两个 op → op 序列/saves/参数逐字节不变（golden 守卫）。
     if getattr(d, "moe_shared_gate", False):
         sh_gate_w = TensorRef("sh_gate_w", ("H", "1"), is_weight=True)
         sh_gate_o = TensorRef("sh_gate", ("S", "B", "1"))
+        sh_o_gated = TensorRef("sh_o_gated", ("S", "B", "H"), partial="tp")
         ops.append(OpSpec("shared_gate", OpType.MATMUL, [hin_sh, sh_gate_w], sh_gate_o,
                           params=[sh_gate_w], saves=[]))
+        ops.append(OpSpec("shared_gate_mul", OpType.ELEMENTWISE, [sh_o, sh_gate_o], sh_o_gated,
+                          saves=[sh_o, sh_gate_o]))
     return ops

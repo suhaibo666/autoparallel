@@ -532,24 +532,37 @@ def eval_config(p):
     # head→末 stage），**不计入** stage 层数——用户配的 pp_split 只含可切分层（transformer+mtp），
     # 故显示数必须与配置一致（此前 len(lys) 把伪层也数进去，stage0/末 stage 各虚增 1，对不上配置）。
     _PSEUDO = {"embedding", "lm_head"}
+    # P2-01 双 OOM 口径（closure-audit v5, 2026-07-15 §4.8）：除 allocated（`.oom`，真机 OOM 主判据）
+    # 外，同时输出 reserved 口径。设备 HBM 真实约束是 reserved（allocated + HCCL 通信缓冲，见
+    # report.reserved_estimate_bytes 的口径边界说明）。MAXDEV = eval_config 里 HardwareSpec 硬编码的
+    # 64GiB 容量（rep 已按此值构造，其 reserved_oom/allocated_oom 亦用它，故逐 stage 判定与顶层一致）。
+    MAXDEV = rep.max_device_memory   # = 64 * 2**30
     stages = []
     for sp in rep.per_stage:
         lys = g.stages.get(sp.stage, [])
         split_lys = [l for l in lys if l.layer_type not in _PSEUDO]   # 可切分层（=用户配额口径）
         rng = f"{lys[0].layer_type}(L{lys[0].layer_id})…{lys[-1].layer_type}(L{lys[-1].layer_id})" if lys else ""
         extras = [l.layer_type for l in lys if l.layer_type in _PSEUDO]   # 附着的伪层（embedding/head）
+        resv_bytes = rep.reserved_estimate_bytes(sp.stage)   # 该 stage: allocated 峰值 + HCCL 缓冲
         stages.append({
             "stage": sp.stage, "peak": round(sp.peak_bytes / MiB, 1), "peak_event": sp.peak_event,
-            "oom": sp.oom, "layers_desc": rng, "n_layers": len(split_lys),
+            "oom": sp.oom,   # allocated 口径（保留旧名兼容）
+            "reserved_oom": resv_bytes > MAXDEV,   # reserved 口径：该 stage 的 reserved 估计超容
+            "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（MiB）
+            "layers_desc": rng, "n_layers": len(split_lys),
             "extras": extras,   # 该 stage 附着的伪层（不计入 n_layers；embedding→stage0/head→末 stage）
             "graph": graph_json(lys, norm_dtype, spec, d),
             "timeline": [{"event": s.event, "total": round(s.total_bytes / MiB, 1),
                           "buckets": {k: round(getattr(s.breakdown, k, 0) / MiB, 1) for k in BK
                                       if getattr(s.breakdown, k, 0)}} for s in sp.timeline],
         })
+    worst_reserved = max(rep.reserved_estimate_bytes(sp.stage) for sp in rep.per_stage)   # 最紧 stage
     return {"ok": True, "world": world, "tightest": rep.tightest_stage,
             "device_peak": round(max(s["peak"] for s in stages), 1), "stages": stages,
-            "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0)}
+            "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0),
+            "allocated_oom": rep.allocated_oom,   # P2-01 顶层：任一 stage allocated 峰值超容
+            "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容
+            "reserved_margin_mib": round((MAXDEV - worst_reserved) / MiB, 1)}   # 容量−最紧 stage reserved（可负）
 
 
 def _sel_ops_to_text(select_ops):
@@ -779,7 +792,7 @@ h1{font-size:19px;margin:5px 0 8px}
 .wrap{padding:12px 20px 40px}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .tab{padding:5px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;font:600 12px var(--mono)}
-.tab.on{background:var(--blue);color:#fff;border-color:var(--blue)}.tab.oom{border-color:#c0392b;color:#c0392b}.tab.on.oom{background:#c0392b;color:#fff}
+.tab.on{background:var(--blue);color:#fff;border-color:var(--blue)}.tab.oom{border-color:#c0392b;color:#c0392b}.tab.on.oom{background:#c0392b;color:#fff}.tab.rsv{border-color:#e67e22;color:#e67e22}.tab.on.rsv{background:#e67e22;color:#fff}
 .grid{display:grid;grid-template-columns:1fr 340px;gap:14px;align-items:start}
 .maincol{display:flex;flex-direction:column;gap:14px;min-width:0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
@@ -920,8 +933,8 @@ async function refresh(){
   eb.style.display="none";
   cur=d;curStage=d.tightest;openLayers=new Set();
   document.getElementById("kpeak").textContent=fmib(d.device_peak);
-  document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · hccl(reserved)+${d.hccl_mib}M`;
-  document.getElementById("tabs").innerHTML=d.stages.map(s=>`<div class="tab ${s.stage===curStage?"on":""} ${s.oom?"oom":""}" data-s="${s.stage}">Stage ${s.stage} · ${fmib(s.peak)}${s.oom?" ⚠OOM":""}<span style="color:${s.stage===curStage?'#dde':'#999'};font-weight:400"> · ${s.n_layers}层${s.extras&&s.extras.length?" +"+s.extras.map(e=>e==="embedding"?"emb":e==="lm_head"?"head":e).join("+"):""}</span></div>`).join("");
+  document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · hccl(reserved)+${d.hccl_mib}M · reserved余量 ${d.reserved_margin_mib}M`;
+  document.getElementById("tabs").innerHTML=d.stages.map(s=>`<div class="tab ${s.stage===curStage?"on":""} ${s.oom?"oom":(s.reserved_oom?"rsv":"")}" data-s="${s.stage}">Stage ${s.stage} · ${fmib(s.peak)}${s.oom?" ⚠OOM":(s.reserved_oom?" ⚠reserved":"")}<span style="color:${s.stage===curStage?'#dde':'#999'};font-weight:400"> · ${s.n_layers}层${s.extras&&s.extras.length?" +"+s.extras.map(e=>e==="embedding"?"emb":e==="lm_head"?"head":e).join("+"):""}</span></div>`).join("");
   document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{curStage=+t.dataset.s;openLayers=new Set();drawStage();}));
   drawStage();
 }
@@ -1039,7 +1052,7 @@ function drawTimeline(_){
   document.getElementById("tldesc").innerHTML=cur.stages.length>1?`蓝框 = 当前选中 stage（与左侧结构图联动;点任一块标题切换）`:``;
   document.getElementById("tl").innerHTML=cur.stages.map(st=>{
     return `<div class="tlblock ${st.stage===curStage?"on":""}" data-s="${st.stage}">
-      <div class="th" data-s="${st.stage}">Stage ${st.stage} <span style="color:#888;font-weight:400">${esc(st.layers_desc)}</span><span class="pk">峰值 ${fmib(st.peak)} @ ${esc(st.peak_event)}${st.oom?" ⚠OOM":""}</span></div>
+      <div class="th" data-s="${st.stage}">Stage ${st.stage} <span style="color:#888;font-weight:400">${esc(st.layers_desc)}</span><span class="pk">峰值 ${fmib(st.peak)} @ ${esc(st.peak_event)}${st.oom?" ⚠OOM":(st.reserved_oom?" ⚠reserved":"")}</span></div>
       <div class="tbody">${tlSvg(st)}</div></div>`;
   }).join("");
   cur.stages.forEach(st=>bindTl(st));

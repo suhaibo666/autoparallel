@@ -125,3 +125,71 @@ def test_dsv3_per_module_exact_roster_and_count():
         assert set(got[lt]) == set(exp), (lt, "roster", sorted(got[lt]), sorted(exp))
         for name, numel in exp.items():
             assert got[lt][name] == numel, (lt, name, got[lt][name], numel)
+
+
+# ── closure-audit v2 §4.9（2026-07-15）：§4.9 指出「exact 对账只比 numel、不比 dtype_bytes」——
+#    把 router_w 从 4B 改 2B 时 numel roster 不变、字节已变却检测不到。本组补**逐字节**（numel×
+#    dtype_bytes）对账 + shared-gate on/off 覆盖（此前只测默认 gate-off DSv3）。
+
+
+def _per_module_bytes(spec):
+    """按 (layer_type, param_name) → local_numel×dtype_bytes（单层基）——逐字节口径。"""
+    from collections import defaultdict
+    pm = ParallelModel(ParallelConfig(sequence_parallel=False), spec.dims.n_layers, world_size=1)
+    g = ShapeEval().resolve(spec, pm)
+    agg = defaultdict(lambda: defaultdict(int))
+    cnt = defaultdict(int)
+    seen = defaultdict(set)
+    for layers in g.stages.values():
+        for l in layers:
+            if l.layer_id not in seen[l.layer_type]:
+                cnt[l.layer_type] += 1
+                seen[l.layer_type].add(l.layer_id)
+            for op in l.ops:
+                for w in op.params:
+                    agg[l.layer_type][w.name] += w.local_numel * w.dtype_bytes
+    return {lt: {n: v // cnt[lt] for n, v in d.items()} for lt, d in agg.items()}
+
+
+def test_dsv3_per_module_exact_bytes_catches_dtype_change():
+    """逐字节对账：router_w/norm gamma 是 **fp32(4B)**、matmul 权重 **bf16(2B)**——把 router_w
+    改成 2B 后逐字节 roster 必须变化（numel roster 不变，故 numel-only 对账检测不到，§4.9）。"""
+    import copy
+    from cost_eval.presets import deepseek_v3 as _v3
+    spec = build_llm_spec(_v3(4))
+    ref = _per_module_bytes(spec)
+    # router_w 与 norm gamma 应为 fp32：4 × numel
+    assert ref["mla_moe"]["router_w"] == 8 * 1792 * 4          # n_exp·H · 4B
+    assert ref["mla_dense"]["ln1_g"] == 1792 * 4               # H · 4B (fp32 gamma)
+    # matmul 权重 bf16：2 × numel
+    assert ref["mla_dense"]["fc1_w"] == 1792 * 2 * 3072 * 2    # H·2F · 2B
+    # 腐蚀 router_w dtype → 逐字节 roster 变（numel 不变）
+    corrupted = copy.deepcopy(spec)
+    for ls in corrupted.layer_specs.values():
+        for op in ls.ops:
+            for w in op.params:
+                if w.name == "router_w":
+                    w.dtype_bytes = 2
+    assert _per_module_bytes(corrupted)["mla_moe"]["router_w"] != ref["mla_moe"]["router_w"]
+    assert _per_module_params(corrupted)["mla_moe"]["router_w"] == \
+        _per_module_params(spec)["mla_moe"]["router_w"]        # numel 不变（证明只有字节口径能抓）
+
+
+def test_shared_gate_param_and_dataflow_on_off():
+    """shared-gate on/off 覆盖（§4.9：exact 测试只测默认 gate-off）：
+    - gate OFF（DSv3 默认）：无 sh_gate_w / shared_gate op（roster 不含）。
+    - gate ON：sh_gate_w [H,1] 入 params，且 shared_gate 输出被下游消费（非孤立叶，P1-01）。"""
+    import dataclasses
+    from cost_eval.presets import deepseek_v3 as _v3
+    off = _per_module_params(build_llm_spec(_v3(4)))
+    assert "sh_gate_w" not in off["mla_moe"]                   # gate off 无门权重
+
+    gated = build_llm_spec(dataclasses.replace(_v3(4), moe_shared_expert_gating=True))
+    on = _per_module_params(gated)
+    assert on["mla_moe"].get("sh_gate_w") == 1792 * 1          # [H,1] 门权重入 params
+    # 数据流闭合：shared_gate 输出有消费者（否则孤立叶，审计原缺陷）
+    for lt, ls in gated.layer_specs.items():
+        gate_ops = [op for op in ls.ops if op.name == "shared_gate"]
+        for gop in gate_ops:
+            consumers = [o.name for o in ls.ops if any(i.name == gop.output.name for i in o.inputs)]
+            assert consumers, (lt, "shared_gate 输出无消费者（孤立叶）")

@@ -41,25 +41,56 @@ def feasibility_errors(pc, optimizer, swap) -> list:
 
 
 def _validate_recompute_against_graph(recompute, g) -> None:
-    """针对已解析 op 图校验重算配置（closure-audit C1，2026-07-15）——需要图才能判定，故在 evaluate
-    时做（非 RecomputeSpec 构造时）。核心入口统一 fail-loud，不只 UI 封口：
+    """针对已解析 op 图校验重算配置（closure-audit C1，2026-07-15；越界/空转封口 P1-02，2026-07-15）
+    ——需要图才能判定，故在 evaluate 时做（非 RecomputeSpec 构造时）。核心入口统一 fail-loud，不只
+    UI 封口。**合法层号范围 = 实际 resolved 图的 layer_id 并集**：这里的 `g` 是**全图**（evaluate 里
+    `ShapeEval().resolve` 遍历整个 layer_pattern、按 `stage_of` 分组，`g.stages` 含所有 stage/层），
+    故并集 = 全模型 layer id（0=embedding、1..N decoder、head、mtp）——即便 pp>1 也不会误判某 stage
+    图不含的层为越界。评估器 select/full 口径用 1..N decoder（+1 偏移，见 from_mindformers `_build_recompute`）。
+    捕获的空转反例（此前静默接受、与无重算逐字节相同）：
     - mode=full 但 full_layers 空 → 等效不重算、与配置意图相反。
-    - select 某层选择器在该层 op 图**零命中** → 静默空转（层仍标 select、kept_frag 生效，「越错越贵」）。
+    - mode=full 但 full_layers 含**越界层号**（不在图 layer id 集）→ 等效不重算。
+    - mode=select 但**无任何层配非空选择器**（select_ops 全空 / 全 set()）→ 等效 None、配置空转。
+    - mode=select 某层号**越界**（不在图 layer id 集）→ 等效不重算（此前对 by_id 缺失直接 continue）。
+    - mode=select 某层选择器在该层 op 图**零命中** → 静默空转（层仍标 select、kept_frag 生效，「越错越贵」）。
     """
-    if getattr(recompute, "mode", "None") == "full" and not recompute.full_layers:
-        raise ValueError(
-            "RecomputeSpec(mode='full') 但 full_layers 为空——等效不重算、与配置意图相反，"
-            "请显式给层号（不重算请用 mode='None'）。")
-    if getattr(recompute, "mode", "None") != "select":
+    mode = getattr(recompute, "mode", "None")
+    if mode not in ("full", "select"):
         return
     layers = [l for lys in g.stages.values() for l in lys]
+    valid_ids = {l.layer_id for l in layers}
+
+    def _range_hint() -> str:
+        if not valid_ids:
+            return "（当前图无层）"
+        return f"（合法层号 {min(valid_ids)}..{max(valid_ids)}，含 embedding/head/mtp 伪层）"
+
+    if mode == "full":
+        if not recompute.full_layers:
+            raise ValueError(
+                "RecomputeSpec(mode='full') 但 full_layers 为空——等效不重算、与配置意图相反，"
+                "请显式给层号（不重算请用 mode='None'）。")
+        oob = sorted(l for l in recompute.full_layers if l not in valid_ids)
+        if oob:
+            raise ValueError(
+                f"RecomputeSpec(mode='full') full_layers 含越界层号 {oob}——不在图 layer id 集内、"
+                f"等效不重算 {_range_hint()}。")
+        return
+
+    # mode == "select"
     by_id = {l.layer_id: l for l in layers}
+    if not any(sels for sels in recompute.select_ops.values()):
+        raise ValueError(
+            "RecomputeSpec(mode='select') 但没有任何层配置非空选择器（select_ops 全空 / 全 set()）"
+            "——等效不重算、配置空转，请显式给 {layer_id: {op 选择器}}（不重算请用 mode='None'）。")
     for lid, sels in sorted(recompute.select_ops.items()):
         if not sels:
             continue
         layer = by_id.get(lid)
         if layer is None:
-            continue
+            raise ValueError(
+                f"select 选择器 {sorted(sels)} 配在越界层号 {lid}——不在图 layer id 集内、"
+                f"等效不重算 {_range_hint()}。")
         hit = any(recompute.op_matches(lid, op.name, getattr(op.type, "value", op.type))
                   for op in layer.ops)
         if not hit:
@@ -89,7 +120,12 @@ class PeakMemoryReport:
     max_device_memory: int = 0     # P2-01（C4）：设备容量，供 reserved 口径 OOM 判定
 
     def reserved_estimate_bytes(self, stage: int) -> int:
-        """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲（reserved 口径上界）。"""
+        """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲。
+
+        **口径边界（P2-01 文档订正，closure-audit 2026-07-15）**：当前**只加 HCCL 通信缓冲**，
+        **未含** allocator pool 碎片。真机 reserved − allocated ≈ 658-680 MiB 里，除 HCCL 外还有
+        分配器池碎片（当前未建模）——故本值是 reserved 的**下界近似**，不是精确上界。
+        """
         return self.per_stage[stage].peak_bytes + self.hccl_reserved_bytes
 
     @property

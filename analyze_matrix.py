@@ -80,7 +80,9 @@ def evaluate(N=4, dp_shard=1, tp=1, ep=1, pp=1, stage=0):
         "swap_buf": b.swap_buf / MiB,
         "workspace": b.workspace / MiB,
         "hccl": num_distinct_communicators(pc),
-        "oom": rep.oom,
+        "oom": rep.oom,                       # = allocated_oom（保留旧名兼容）
+        "allocated_oom": rep.allocated_oom,   # P2-01 双口径：allocated（真机 OOM 主判据）
+        "reserved_oom": rep.reserved_oom,     # P2-01 双口径：reserved（allocated + HCCL 缓冲超容）
         "peak_event": p.peak_event,
         "device_peak": rep.per_stage[rep.tightest_stage].peak_bytes / MiB,
         "tightest_stage": rep.tightest_stage,
@@ -115,7 +117,7 @@ def print_pp_per_stage(title, N, dp_shard, pp, tp=1, ep=1):
 _COLS = ["pred_peak", "struct_peak", "persistent", "act_live", "gather_buf",
          "grad_buf", "recomp_scratch", "bwd_scratch", "workspace", "hccl"]
 _HDR = ["config"] + ["pred_peak", "struct_peak", "persistent", "act_live", "gather_buf",
-                     "grad_buf", "recomp", "bwd_scr", "workspc", "hccl"]
+                     "grad_buf", "recomp", "bwd_scr", "workspc", "hccl", "oom(A/R)"]
 
 
 def _fmt(label, r):
@@ -123,6 +125,9 @@ def _fmt(label, r):
     for c in _COLS:
         v = r[c]
         cells.append(str(int(v)) if c == "hccl" else f"{v:.1f}")
+    # P2-01 双口径：A=allocated 超容、R=reserved 超容（reserved = allocated + HCCL 缓冲）
+    flag = ("A" if r["allocated_oom"] else "") + ("R" if r["reserved_oom"] else "")
+    cells.append(flag or "—")
     return "| " + " | ".join(cells) + " |"
 
 
