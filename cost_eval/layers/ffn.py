@@ -222,7 +222,13 @@ def build_shared_expert_ops(d: DimTable) -> list:
     #   sigmoid 输出由 sh_gate 重算）。门权重字节可忽略但为参数守恒完整性建。
     # DSv3（moe_shared_gate=False）完全不建这两个 op → op 序列/saves/参数逐字节不变（golden 守卫）。
     if getattr(d, "moe_shared_gate", False):
-        sh_gate_w = TensorRef("sh_gate_w", ("H", "1"), is_weight=True)
+        # 门权重 dtype=fp32（F3，closure-audit v2 §F3，2026-07-15）：真机 shared_experts_gate =
+        # Dense(H→1, dtype=moe_router_dtype)（shared_experts.py:58-62），moe_router_dtype 默认
+        # float32（transformer_config.py:1791-1796）——与本文件 router_w 同为 fp32。此前未指定
+        # dtype_bytes → 解析后默认 2B/BF16（[H,1] 极小、字节可忽略，但 dtype 应正确）。
+        # 注：更深的「gate Dense 前把 hidden cast→router dtype、sigmoid 后 cast 回 compute dtype」
+        # FP32 hidden cast 生命周期（shared_experts.py:70-71 self.cast）未建模，留 partial（超本次范围）。
+        sh_gate_w = TensorRef("sh_gate_w", ("H", "1"), is_weight=True, dtype_bytes=4)
         sh_gate_o = TensorRef("sh_gate", ("S", "B", "1"))
         sh_o_gated = TensorRef("sh_o_gated", ("S", "B", "H"), partial="tp")
         ops.append(OpSpec("shared_gate", OpType.MATMUL, [hin_sh, sh_gate_w], sh_gate_o,

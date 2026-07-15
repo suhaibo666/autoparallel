@@ -4,16 +4,18 @@
 
 ① P0-02 adapter 静默丢语义（§4.1）：
    1. bool True 泄漏（§4.1.1）——`_PAR_UNSUPPORTED_TRUTHY` 允许集含 `1`,而 Python `True==1`,
-      致 `pipeline_parallel_overlap_p2p=True` 静默放行；数值键 `dense_fsdp_shard_size` 需与布尔键分开
-      （=1 合法、>1 才拒）。
+      致 `pipeline_parallel_overlap_p2p=True` 静默放行。
+      （`dense_fsdp_shard_size` 的旧「=1 合法、>1 拒」规则已被 closure-audit F1 推翻——改按完整 FSDP
+      域 fsdp=dp_shard·cp 判定,见 test_closure_w1_adapter_regression.py 与下方订正锚点。）
    2. optimizer 段无 schema（§4.1.2）——`tyep` 键typo / `optimzier` 顶层段typo 静默回落 AdamW。
    3. dropout 只拒 >0（§4.1.4）——`attention_dropout=-0.1` 非法非零被接受。
 
 ② P1-06 CE provenance（§4.4）：无显式键时 dsv4_hybrid→True 的架构默认须**可追溯**（发 warning）、
    可被显式键覆盖；DSv4 锚点 lean=True 不破。
 
-③ P2-08 qk_layernorm（§4.10.2）：qk_layernorm 在忽略集（内存中性、刻意不建），adapter 不映射它
-   → yaml qk_layernorm=true 不传到 LLMConfig（保持默认 False）。
+③ qk_layernorm（closure-audit F2 订正）：**非内存中性**（mindformers 真构造 q/k_layernorm）。按
+   attn_type 条件——gqa/mha 真值 → fail-loud；mla/dsv4_hybrid/dsa → subsumed（已建 norm 覆盖）。
+   下方两测试订正了旧「静默保持 False」的错误 oracle。
 """
 import warnings
 
@@ -75,15 +77,25 @@ def test_par_unsupported_bool_false_accepted():
     assert from_mindformers_dict(_mf(parallelism={"context_parallel_async": 0}))
 
 
-# ── ① P0-02.1 数值键 dense_fsdp_shard_size（=1 合法、>1 拒）────────────────────────────
-def test_dense_fsdp_shard_size_gt1_rejected():
-    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
+# ── ① dense_fsdp_shard_size 按完整 FSDP 域判定（closure-audit F1 订正 2026-07-15）──────────
+# 旧 oracle「=1 合法、>1 拒」是**上下文无关的错误规则**（忽略 fsdp=dp_shard·cp）：真实约束
+# （parallel_dims.py:443-470）是只有 ==fsdp 才中性；1<=value<fsdp 是分组子域（未建模）。详见
+# tests/test_closure_w1_adapter_regression.py。这里保留最小锚点,断言订正后的语义。
+def test_dense_fsdp_shard_size_gt_fsdp_rejected():
+    """无 FSDP（fsdp=1）时 shard=2 > fsdp → 超域,runtime 拒（ValueError,非旧 oracle 的 NotImplementedError）。"""
+    with pytest.raises(ValueError, match="dense_fsdp_shard_size"):
         from_mindformers_dict(_mf(parallelism={"dense_fsdp_shard_size": 2}))
 
 
-def test_dense_fsdp_shard_size_one_accepted():
-    """=1 = 不分组切分,合法（数值键,区别于布尔真值泄漏）——此前被误拒。"""
+def test_dense_fsdp_shard_size_equals_fsdp_accepted():
+    """无 FSDP（fsdp=1）时 shard=1 == fsdp → 复用完整 mesh、中性 → 接受（此前恰好也接受,但理由订正）。"""
     assert from_mindformers_dict(_mf(parallelism={"dense_fsdp_shard_size": 1}))
+
+
+def test_dense_fsdp_shard_size_below_fsdp_failloud():
+    """dp_shard=4 时 shard=1（1<=1<fsdp=4,整除）= 分组子域,显存语义改变 → fail-loud（旧 oracle 误接受）。"""
+    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
+        from_mindformers_dict(_mf(parallelism={"data_parallel_shard": 4, "dense_fsdp_shard_size": 1}))
 
 
 # ── ① P0-02.2 optimizer 段 schema（§4.1.2）────────────────────────────────────────────
@@ -180,17 +192,31 @@ def test_non_dsv4_ce_false_no_warning():
     assert not any("cross_entropy_fused" in str(w.message) for w in caught)
 
 
-# ── ③ P2-08 qk_layernorm 分类订正（§4.10.2）──────────────────────────────────────────
+# ── ③ qk_layernorm 按 attn_type 条件（closure-audit F2 订正 2026-07-15）──────────────────
+# 旧 oracle 断言「qk_layernorm=True→LLMConfig 静默保持 False」——把**静默丢语义**固化成期望行为,错。
+# 真实实现：mindformers 真构造 q/k_layernorm（attention.py:311-357）,非内存中性。订正后按 attn_type：
+#   gqa/mha 真值 → fail-loud；mla/dsv4_hybrid/dsa → subsumed（q_a_norm/kv_a_norm/q_hnorm 已建覆盖）。
+# 详尽覆盖见 tests/test_closure_w1_adapter_regression.py;此处保留最小锚点。
 def test_qk_layernorm_in_ignored_not_mapped():
-    """qk_layernorm 归**忽略集**（内存中性,刻意不建）,不在已映射集——校正 P2-08 文档漂移。"""
+    """qk_layernorm 仍在忽略集（**仅为不触发 unknown-key fail-loud**,非「中性」）、不在已映射集。
+    真正判定在 _build_llm_config 的 attn_type 条件（见下）。"""
     assert "qk_layernorm" in _IGNORED_MODEL_KEYS
     assert "qk_layernorm" not in _MAPPED_MODEL_KEYS
 
 
-def test_qk_layernorm_true_not_propagated_to_llmconfig():
-    """yaml qk_layernorm=True 不映射 → LLMConfig.qk_layernorm 保持默认 False（adapter 刻意丢弃）。
-    这正是订正后注释描述的真实不变量（旧注释误称由 build_llm 守卫）。"""
+def test_qk_layernorm_true_mha_failloud():
+    """gqa/mha + qk_layernorm=True → **fail-loud**（Q/K 上 2 个 RMSNorm 未建 op）——订正旧「静默 False」oracle。
+    `_mf()` 是 mha（num_attention_heads=8、无 kv_heads）。"""
     m = _mf()
     m["model"]["qk_layernorm"] = True
-    bundle = from_mindformers_dict(m)
+    with pytest.raises(NotImplementedError, match="qk_layernorm"):
+        from_mindformers_dict(m)
+
+
+def test_qk_layernorm_true_dsv4_subsumed():
+    """dsv4_hybrid + qk_layernorm=True → subsumed（q_a_norm/kv_a_norm/q_hnorm 已建覆盖）→ 可 build,
+    LLMConfig.qk_layernorm 保持 False（DSv4align round-trip 不破）。"""
+    mf = _dsv4_mf()
+    mf["model"]["qk_layernorm"] = True
+    bundle = from_mindformers_dict(mf)
     assert bundle.llm.qk_layernorm is False

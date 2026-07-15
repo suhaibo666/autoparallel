@@ -70,7 +70,11 @@ def test_parallel_adapter_rejects_unknown_and_unmodeled_keys():
     with pytest.raises(NotImplementedError, match="context_parallel_methd"):
         _build_parallel(bad, mtp=0, num_layers=4)
 
-    bad = {**base, "parallelism": {**base["parallelism"], "dense_fsdp_shard_size": 8}}
+    # closure-audit v2 §F1（2026-07-15）：dense_fsdp_shard_size 按完整 FSDP 域（dp_shard·cp）判定，
+    # 不再是旧的「blanket >1 拒」。1<value<fsdp 且整除 = 分组子域未建模 → NotImplementedError。
+    # （data_parallel_shard=8 → fsdp=8；shard_size=2<8 整除 → 未建模 fail-loud。）
+    bad = {**base, "parallelism": {**base["parallelism"],
+                                   "data_parallel_shard": 8, "dense_fsdp_shard_size": 2}}
     with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
         _build_parallel(bad, mtp=0, num_layers=4)
 

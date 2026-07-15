@@ -57,15 +57,22 @@ class ParallelConfig:
             "interleave": self.interleave, "microbatch": self.microbatch,
             "num_microbatches": self.num_microbatches,
         }
+        # closure-audit v2 §F5a（2026-07-15）：**排除 bool**。Python `bool` 是 `int` 子类
+        # （`True==1`/`False==0`），故 `isinstance(True,int)` 为真且 `True>=1` 通过——旧校验
+        # 会把 `tp=True`/`num_microbatches=True` 当整数并行度接受。判据须**严格整数**：先拒 bool，
+        # 再拒非 int，再拒 <1。报错含字段名/值/类型。
         for _name, _val in _at_least_1.items():
-            if not isinstance(_val, int) or _val < 1:
+            if isinstance(_val, bool) or not isinstance(_val, int) or _val < 1:
                 raise ValueError(
-                    f"ParallelConfig.{_name}={_val!r} 非法——须为 >=1 的整数"
-                    "（并行度/VPP 交错/microbatch 至少 1，<1 会令调度退化/空循环/无意义峰）。")
-        if not isinstance(self.prefetch_depth, int) or self.prefetch_depth < 0:
+                    f"ParallelConfig.{_name}={_val!r}（类型 {type(_val).__name__}）非法——须为 >=1 "
+                    "的严格整数（bool 不算整数；并行度/VPP 交错/microbatch 至少 1，<1 会令调度退化/"
+                    "空循环/无意义峰）。")
+        if (isinstance(self.prefetch_depth, bool) or not isinstance(self.prefetch_depth, int)
+                or self.prefetch_depth < 0):
             raise ValueError(
-                f"ParallelConfig.prefetch_depth={self.prefetch_depth!r} 非法——须为 >=0 的整数"
-                "（0=无预取合法，负数无意义）。")
+                f"ParallelConfig.prefetch_depth={self.prefetch_depth!r}"
+                f"（类型 {type(self.prefetch_depth).__name__}）非法——须为 >=0 的严格整数"
+                "（bool 不算整数；0=无预取合法，负数无意义）。")
 
 
 @dataclass

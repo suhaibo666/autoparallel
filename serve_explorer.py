@@ -536,6 +536,11 @@ def eval_config(p):
     # 外，同时输出 reserved 口径。设备 HBM 真实约束是 reserved（allocated + HCCL 通信缓冲，见
     # report.reserved_estimate_bytes 的口径边界说明）。MAXDEV = eval_config 里 HardwareSpec 硬编码的
     # 64GiB 容量（rep 已按此值构造，其 reserved_oom/allocated_oom 亦用它，故逐 stage 判定与顶层一致）。
+    # **口径边界（closure-audit v2 §F7，2026-07-15）**：reserved_oom 是**下界判定**——reserved 估计
+    # 只含 allocated + HCCL，**不含 allocator pool 碎片**（真机 DSv4 reserved−allocated≈676-680 MiB
+    # 里 HCCL 之外还有 ~277-281 MiB pool 分量未建模）。故 `reserved_oom=True` 是确定超容，但
+    # `reserved_oom=False` **不保证**真实 reserved 不超（临界区可能已超）——字段名后附 `_lb`(lower-bound)
+    # 语义供前端标注，勿把 False 当"安全"。
     MAXDEV = rep.max_device_memory   # = 64 * 2**30
     stages = []
     for sp in rep.per_stage:
@@ -548,7 +553,8 @@ def eval_config(p):
             "stage": sp.stage, "peak": round(sp.peak_bytes / MiB, 1), "peak_event": sp.peak_event,
             "oom": sp.oom,   # allocated 口径（保留旧名兼容）
             "reserved_oom": resv_bytes > MAXDEV,   # reserved 口径：该 stage 的 reserved 估计超容
-            "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（MiB）
+            "reserved_oom_is_lower_bound": True,   # F7：reserved 估计不含 pool 碎片 → False 不保证安全
+            "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（下界，MiB）
             "layers_desc": rng, "n_layers": len(split_lys),
             "extras": extras,   # 该 stage 附着的伪层（不计入 n_layers；embedding→stage0/head→末 stage）
             "graph": graph_json(lys, norm_dtype, spec, d),
@@ -561,8 +567,9 @@ def eval_config(p):
             "device_peak": round(max(s["peak"] for s in stages), 1), "stages": stages,
             "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0),
             "allocated_oom": rep.allocated_oom,   # P2-01 顶层：任一 stage allocated 峰值超容
-            "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容
-            "reserved_margin_mib": round((MAXDEV - worst_reserved) / MiB, 1)}   # 容量−最紧 stage reserved（可负）
+            "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容（下界判定）
+            "reserved_oom_is_lower_bound": True,  # F7：reserved 未含 pool 碎片,False≠真实安全
+            "reserved_margin_mib": round((MAXDEV - worst_reserved) / MiB, 1)}   # 容量−最紧 stage reserved（下界,可负）
 
 
 def _sel_ops_to_text(select_ops):

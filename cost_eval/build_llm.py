@@ -23,6 +23,19 @@ from .layers.head import build_embedding_ops, build_head_and_loss_ops, build_mtp
 from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
 
 
+def _reject_non_strict_int(name: str, val) -> None:
+    """维度/计数字段须为**严格整数**（排除 bool、浮点、其它类型）——否则 fail-loud（含字段/值/类型）。
+
+    closure-audit v2 §F5b（2026-07-15）：Python `bool` 是 `int` 子类（`True==1`），故仅比
+    `<1` 的旧校验会放行 `hidden_size=True`，产 `DimTable(H=True)` 类错图。此守卫**先于**数值
+    范围检查调用；仅对**非 None** 值调用（None=惰性默认，由调用方跳过）。
+    """
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(
+            f"{name}={val!r}（类型 {type(val).__name__}）必须是严格整数——"
+            "bool/浮点/其它类型会静默产错图（如 DimTable(H=True)），closure-audit v2 §F5b 拒绝。")
+
+
 def _validate_structure(cfg: LLMConfig) -> None:
     """结构合法性统一校验（P1-10/P1-11，2026-07-14 review + closure-audit v2 2026-07-15）：
     非法/不自洽配置 fail-loud，不静默 floor/近似产错图。"""
@@ -35,14 +48,17 @@ def _validate_structure(cfg: LLMConfig) -> None:
                    ("num_attention_heads", cfg.num_attention_heads),
                    ("vocab_size", cfg.vocab_size), ("seq_length", cfg.seq_length),
                    ("batch_size", cfg.batch_size)):
+        _reject_non_strict_int(_f, _v)       # §F5b：先排除 bool/非整数，再比 <1
         if _v < 1:
             raise ValueError(
                 f"{_f}({_v}) 必须 ≥1（负/零核心维度会静默产负参数 numel / 零激活 / 退化层图，"
                 "见 closure-audit v2 §4.6）。")
-    if cfg.ffn_hidden_size is not None and cfg.ffn_hidden_size < 1:
-        raise ValueError(
-            f"ffn_hidden_size({cfg.ffn_hidden_size}) 必须 ≥1（FFN 隐藏维；≤0 会产负/零 dense-FFN "
-            "numel）——留 None 取默认 4·hidden_size。")
+    if cfg.ffn_hidden_size is not None:
+        _reject_non_strict_int("ffn_hidden_size", cfg.ffn_hidden_size)   # §F5b（None 惰性跳过）
+        if cfg.ffn_hidden_size < 1:
+            raise ValueError(
+                f"ffn_hidden_size({cfg.ffn_hidden_size}) 必须 ≥1（FFN 隐藏维；≤0 会产负/零 dense-FFN "
+                "numel）——留 None 取默认 4·hidden_size。")
     # MLA 家族维度正值校验：仅 attn_type ∈ {mla, dsv4_hybrid, dsa} 施加（这三条注意力的
     # op 图用 q_lora_rank/kv_lora_rank/qk_rope/qk_nope/v_head_dim 做低秩/头维——见 layers/
     # {attention.py build_mla_attn_ops, dsv4_hybrid.py, dsa.py} 符号表达式；≤0 会静默产负/零
@@ -52,6 +68,7 @@ def _validate_structure(cfg: LLMConfig) -> None:
                        ("qk_rope_head_dim", cfg.qk_rope_head_dim),
                        ("qk_nope_head_dim", cfg.qk_nope_head_dim),
                        ("v_head_dim", cfg.v_head_dim)):
+            _reject_non_strict_int(_f, _v)   # §F5b：MLA 低秩/头维亦须严格整数（bool 放行会产错图）
             if _v <= 0:
                 raise ValueError(
                     f"attn_type={cfg.attn_type!r} 需 {_f}>0（当前 {_v}）：MLA 低秩/头维进入 attn "
@@ -75,11 +92,19 @@ def _validate_structure(cfg: LLMConfig) -> None:
                 f"csa_compress_ratios 长度({len(cfg.csa_compress_ratios)}) 必须 == "
                 f"num_layers({cfg.num_layers})（每层一个压缩比）。")
         for r in cfg.csa_compress_ratios:
-            if int(r) not in (0, 1, 4, 128):
+            # §F5c（2026-07-15）：**先拒非整数值**（bool / 非整数浮点）——旧校验 `int(r)` 会把
+            # 4.9 静默截断成 4、错走 dsv4hyb_r4_* 图。整数值（含 4.0 这类整数浮点）才继续档位判定。
+            if isinstance(r, bool) or not (isinstance(r, int)
+                                           or (isinstance(r, float) and float(r).is_integer())):
+                raise ValueError(
+                    f"csa_compress_ratios 含非整数压缩比 {r!r}（类型 {type(r).__name__}）——拒绝静默 "
+                    "int() 截断（如 4.9→4 会错走 dsv4hyb_r4_* 图）；须为整数值 0/1（滑窗）/4（CSA）/128（HCA）。")
+            ri = int(r)                        # 此处 r 已确认整数值：4.0→4 无损，4.9 已在上方拒
+            if ri not in (0, 1, 4, 128):
                 raise NotImplementedError(
                     f"csa_compress_ratios 含非法压缩比 {r}（实现取值：0/1=滑窗、4=CSA、128=HCA；"
                     "其它值会被误当稀疏路径接受、产错图——拒绝）。")
-            if int(r) not in (0, 1) and cfg.seq_length % int(r) != 0:
+            if ri not in (0, 1) and cfg.seq_length % ri != 0:
                 raise ValueError(
                     f"seq_length({cfg.seq_length}) 不被压缩比 {r} 整除（compressor n_compressed "
                     "= S//ratio 需整除，静默 floor 会错算 compressed KV 字节）。")
@@ -87,11 +112,16 @@ def _validate_structure(cfg: LLMConfig) -> None:
         raise ValueError(
             f"moe_layer_freq 长度({len(cfg.moe_layer_freq)}) 必须 == num_layers({cfg.num_layers})。")
     # moe_ffn_hidden_size（若显式设）须 ≥1（P1-11）：≤0 会产负/零专家 FFN numel。留 None 惰性。
-    if cfg.moe_ffn_hidden_size is not None and cfg.moe_ffn_hidden_size < 1:
-        raise ValueError(
-            f"moe_ffn_hidden_size({cfg.moe_ffn_hidden_size}) 必须 ≥1（专家 FFN 隐藏维；≤0 产负/零 "
-            "MoE numel）。")
+    if cfg.moe_ffn_hidden_size is not None:
+        _reject_non_strict_int("moe_ffn_hidden_size", cfg.moe_ffn_hidden_size)   # §F5b（None 惰性跳过）
+        if cfg.moe_ffn_hidden_size < 1:
+            raise ValueError(
+                f"moe_ffn_hidden_size({cfg.moe_ffn_hidden_size}) 必须 ≥1（专家 FFN 隐藏维；≤0 产负/零 "
+                "MoE numel）。")
     if cfg.num_moe_experts:
+        # §F5b：先拒 bool（`num_moe_experts=True` 是 truthy 会进 MoE 路径当「True 个专家」）——须
+        # 先于下方 topk/负数检查，保证 bool 以类型语义而非数值语义 fail-loud。
+        _reject_non_strict_int("num_moe_experts", cfg.num_moe_experts)
         # num_moe_experts 正值校验（P1-11）：`if cfg.num_moe_experts:` 对负数为真 → 会走 MoE 路径
         # 产负专家 numel；0/None 视作纯 dense（_is_moe_layer 语义）跳过。故此处只需拒负数。
         if cfg.num_moe_experts < 1:

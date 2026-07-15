@@ -67,22 +67,19 @@ _MAPPED_MODEL_KEYS = {
     "chunk_loss_num",   # P1-06（2026-07-14）：分块 CE（loss.py chunked 变体）→ llm.chunk_loss_num
     "cross_entropy_fused",   # C3（2026-07-15）：显式 CE 融合键（与 DSA 融合解耦，可追溯）
 }
-# ② 已知「内存中性」忽略集：均**不改内存 op 图**，刻意复现手写映射的省略（如 dsv4_align_config()
-#    docstring「qk_layernorm/add_bias omitted（memory-negligible; would fail-loud in build_llm）」——
-#    qk_layernorm 就在**本忽略集（②）**里（P2-08 订正 2026-07-15）：adapter **刻意不映射它**，
-#    故 yaml 里 `qk_layernorm=true` 不会传到 `LLMConfig`（保持默认 False，见 _build_llm_config 的
-#    kwargs 无 qk_layernorm 项）。旧注释误称「归到 ① 由 build_llm 守卫」——那是错的：它既不在 ①
-#    _MAPPED，adapter 也不透传，故 build_llm 根本收不到 True、无从守卫。新增不在 ①∪② 的 model
-#    key → fail-loud（不静默吞）。
+# ② 已知「内存中性」忽略集：均**不改内存 op 图**，刻意复现手写映射的省略。新增不在 ①∪② 的 model
+#    key → fail-loud（不静默吞）。**特例 qk_layernorm 不是无条件中性**——见下方逐条说明。
 _IGNORED_MODEL_KEYS = {
     "model_type", "architectures", "max_position_embeddings", "hidden_act", "rms_norm_eps",
-    # qk_layernorm：**刻意省略**（内存中性，直接照抄 dsv4_align_config() 的选择——见其 docstring
-    # 「qk_layernorm/add_bias omitted（memory-negligible; would fail-loud in build_llm）」）。这是
-    # round-trip 到 dsv4_align_config()（qk_layernorm=False）的**必要**条件：P4:88 有 qk_layernorm=True，
-    # 若映射到 LLMConfig.qk_layernorm=True 会既破坏字段相等、又触发 build_llm fail-loud。
-    # qk_layernorm：内存**真·可忽略**（2 个 [S,B,head_dim] 的小 RMSNorm 激活，远小于主激活）——
-    #   刻意不建 op（照抄 dsv4_align_config 的选择），非静默丢失关键内存。build_llm 对 LLMConfig.
-    #   qk_layernorm=True 仍原生 fail-loud（若显式想建模）。closure-audit C2 复核：保留为「已知可忽略」。
+    # qk_layernorm（closure-audit F2 订正 2026-07-15）：**并非「真·可忽略」**。mindformers 真构造
+    #   q_layernorm/k_layernorm 作用于带 head 维的 Q/K（attention.py:311-357）,Qwen3-32B 每层 BF16
+    #   72 MiB、64 层累计 4.5-9 GiB——非中性。**放在忽略集只是为不触发 unknown-key fail-loud**,真正的
+    #   语义判定在 `_build_llm_config`（attn_type 条件）：
+    #     · gqa/mha 且真值 → **fail-loud**（Q/K 上 2 个 RMSNorm 未建 op；不静默评另一份模型）；
+    #     · mla/dsv4_hybrid/dsa → **subsumed**——这三条注意力 op 图**已含** q_a_norm/kv_a_norm（MLA 潜
+    #       空间 norm）与 q_hnorm（DSv4 per-head Q RMSNorm）,qk norm 语义被已建 norm 覆盖 → 刻意不额外建。
+    #   故 DSv4align round-trip（P4:88 qk_layernorm=True,attn_type=dsv4_hybrid）走 subsumed 分支,
+    #   LLMConfig.qk_layernorm 仍保持默认 False → 与 dsv4_align_config() 字段相等、不触发 build_llm fail-loud。
     "qk_layernorm",
     "mla_qkv_concat",
     # attention_dropout/hidden_dropout：**值守卫**下方（=0 中性、>0 fail-loud，见 _build_llm_config）——
@@ -364,6 +361,23 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "或为该组合补建模。")
 
     attn_type = _infer_attn_type(model)
+    # qk_layernorm 分类订正（closure-audit F2，2026-07-15）：mindformers **真构造** q_layernorm/
+    # k_layernorm,作用于带 head 维的 Q/K（attention.py:311-357），Qwen3 PyNative 强制 qk_layernorm=True
+    # （modeling_qwen3_train_pynative.py:47-50）；Qwen3-32B（S=4096、64+8 heads、head_dim=128、64 层）
+    # 每层 BF16 72 MiB / FP32 144 MiB、64 层累计 4.5-9 GiB——**非内存中性**。按 attn_type 条件：
+    #   ① gqa/mha：Q/K 上 2 个 RMSNorm 未建 op（评估器 attn 图无对应 norm）→ **fail-loud**。此处直接
+    #      raise（比映射到 LLMConfig 让 build_llm.py:167-170 兜底更早、信息更清）——绝不静默丢弃后
+    #      评「另一份模型」（qk=True/False 得同图）。
+    #   ② mla/dsv4_hybrid/dsa：**subsumed**——这三条注意力 op 图**已含** q_a_norm/kv_a_norm（MLA 潜空间
+    #      norm,attention.py/dsa.py）与 q_hnorm（DSv4 per-head Q RMSNorm,dsv4_hybrid.py:124）,qk_layernorm
+    #      语义被这些已建 norm 覆盖 → 刻意不额外建（保持 LLMConfig.qk_layernorm=False）。DSv4align
+    #      round-trip 的 qk_layernorm=True 走此分支 → 仍 ignore，锚点不破。
+    if model.get("qk_layernorm") and attn_type in ("gqa", "mha"):
+        raise NotImplementedError(
+            f"qk_layernorm=True 且 attn_type={attn_type!r}（gqa/mha）暂未建 op 图：Q/K 上的 2 个 RMSNorm"
+            "未建为 op（评估器 attn 图无对应 norm；Qwen3 系每层 BF16 72 MiB、64 层累计 4.5-9 GiB,"
+            "非可忽略）——静默丢弃会绕过 build_llm.py:167-170 的原生 fail-loud、评估另一份模型。"
+            "请补 q/k norm op 建模,或改用 MLA 家族（q_a_norm/kv_a_norm/q_hnorm 已覆盖 qk norm）。")
     # n_routed_experts（deepseek 系）/ num_experts（qwen3_moe/general 模板同义字段）
     num_moe_experts = model.get("n_routed_experts") or model.get("num_experts")
 
@@ -401,8 +415,8 @@ def _build_llm_config(model: dict) -> LLMConfig:
         # 归一化 / 位置编码（结构相关）
         normalization=model.get("normalization", "RMSNorm"),
         norm_placement=model.get("norm_placement", "pre"),
-        # qk_layernorm **刻意不映射**（留默认 False）：内存中性、复现 dsv4_align_config() 的省略
-        # （见 _IGNORED_MODEL_KEYS 注释）——round-trip 必要条件。
+        # qk_layernorm **不透传**（留默认 False）：gqa/mha 真值已在上方 fail-loud;mla 家族下 qk norm
+        # 由已建 q_a_norm/kv_a_norm/q_hnorm 覆盖（subsumed，见 _IGNORED_MODEL_KEYS / 上方 F2 注释）。
         position_embedding_type=_position_embedding(model),
         # 装配
         # tie:qwen3 系用反义字段 untie_embeddings_and_output_weights（True=不 tie）
@@ -546,23 +560,119 @@ _PAR_NEUTRAL = {
     "enable_loss_parallel",             # 死键：pynative 无消费者（config.py:444-449 旧 DTensor 流残留;
                                         # TP>1 恒 vocab-parallel、无开关，loss.py:326-336）
 }
-# 影响内存但未建模 → 出现即 fail-loud。**分两类**（closure-audit V1 §4.1.1，2026-07-15）：
-# ① 布尔开关类：任何**真值**都拒（True/1/任意非零/非空串）——此前允许集含 `1`，而 Python
-#    `True==1`，致 `pipeline_parallel_overlap_p2p=True` 被静默接受（探针实证）。判据改为
-#    `v not in (None, False, 0, "")`，让 True 与 1 都落入拒绝。
+# 影响内存但未建模 → 出现即 fail-loud。**布尔开关类**：任何**真值**都拒（True/1/任意非零/非空串）——
+# 此前允许集含 `1`，而 Python `True==1`，致 `pipeline_parallel_overlap_p2p=True` 被静默接受（探针
+# 实证）。判据 `v not in (None, False, 0, "")`，让 True 与 1 都落入拒绝。
+# 注（closure-audit F6，2026-07-15）：`ulysses_degree_in_cp` 曾误入本集——它 `=1` 是**合法中性值**
+# （colossal 有效度恒 1），被当布尔真值假拒。已移出，改由 `_check_ulysses_degree_in_cp` 按 method+cp
+# 联合判定（见下）。`dense_fsdp_shard_size` 同理曾用「=1 合法、>1 拒」的上下文无关规则（F1），亦
+# 错——已移出，改由 `_check_dense_fsdp_shard_size` 按完整 FSDP 域 `fsdp=dp_shard·cp` 判定。
 _PAR_UNSUPPORTED_TRUTHY = {
     "context_parallel_async": "cp 通信异步 overlap 的在飞双缓冲未建模（二阶内存效应）",
     "pipeline_parallel_overlap_p2p": "PP p2p overlap 的 send/recv 双缓冲未建模",
     "pipeline_parallel_overlap_b_f": "PP B/F overlap 的额外在飞激活未建模",
     "pipeline_parallel_enable_dxdw_split": "dx/dw 拆分使 dw 图延迟释放，生命周期未建模",
     "expert_parallel_async_d2h": "EP 异步 D2H 的 staging 缓冲未建模",
-    "ulysses_degree_in_cp": "hybrid CP（ulysses×ring 二维）未建模（仅 colossal/ulysses 全域）",
 }
-# ② 数值类：=1（或缺省）= 不切分/单域，**合法**；>1 才 fail-loud——区别于布尔键，`1` 是合法的
-#    「不分组」值、不是真值泄漏（此前把 dense_fsdp_shard_size=1 也误拒）。
-_PAR_UNSUPPORTED_NUMERIC_GT1 = {
-    "dense_fsdp_shard_size": "分组 FSDP 域（dense 权重按子域切）改变每卡持久/gather 字节，未建模",
+# **上下文相关键**（closure-audit F1/F6，2026-07-15）：合法性依赖 dp_shard/cp/method——不能在这里
+# 静态分流，必须在 `_build_parallel` 里等这些量确定后由专门函数联合判定。此集只用于 unknown-key
+# 白名单（让这些键不落入「未识别」fail-loud）。
+_PAR_CONTEXT_DEPENDENT = {
+    "dense_fsdp_shard_size",   # 依 fsdp=dp_shard·cp 域判定（parallel_dims.py:443-470）
+    "ulysses_degree_in_cp",    # 依 context_parallel_method + cp 判定（context_parallel.py:248-266）
 }
+
+
+def _check_dense_fsdp_shard_size(value, fsdp: int) -> None:
+    """`dense_fsdp_shard_size` 按**完整 FSDP 域** `fsdp=dp_shard·cp` 联合判定（closure-audit F1）。
+
+    源码依据 `../mindformers/mindformers/pynative/distributed/parallel_dims.py:443-470`
+    （`get_fsdp_shard_mesh`）：shard_size 须正整数、∈[1,fsdp]、整除 fsdp；**只有 == fsdp 才复用完整
+    FSDP(1D)/HSDP(2D) mesh**（parallel_dims.py:469-475），与评估器默认「dense 全域分片（÷fsdp）」语义
+    一致（中性）；`1<=value<fsdp` 走 [replicate,shard] 二维 sub-mesh（parallel_dims.py:476+），dense
+    权重只在子域分片 → 每卡持久/gather 字节改变（评估器只建全域）→ 未建模。
+
+    - None（未配）→ 默认全域 FSDP，跳过；
+    - value == fsdp → 中性，接受；
+    - `1 <= value < fsdp` 且整除 → 合法但分组 FSDP 子域未建模 → fail-loud（NotImplementedError）；
+    - 非正 / 非整除 / 超域 / 类型错（含 bool，int 子类）→ runtime 约束拒（ValueError）。
+    """
+    if value is None:
+        return
+    # bool 是 int 子类,会溜过整除检查（parallel_dims.py:455-462 显式先排除 bool/非 int）。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"parallelism.dense_fsdp_shard_size 须正整数,got {value!r} ({type(value).__name__})"
+            "（parallel_dims.py:458-462）。")
+    if value < 1 or value > fsdp or fsdp % value != 0:
+        raise ValueError(
+            f"parallelism.dense_fsdp_shard_size={value} 非法：须 ∈[1,{fsdp}] 且整除 "
+            f"fsdp=dp_shard·cp={fsdp}（parallel_dims.py:464-468）。")
+    if value == fsdp:
+        return   # 复用完整 FSDP mesh,与默认全域分片语义一致 → 中性,接受。
+    raise NotImplementedError(
+        f"parallelism.dense_fsdp_shard_size={value}（<fsdp={fsdp}）未建模：分组 FSDP 子域"
+        "（[replicate,shard] 2D sub-mesh,parallel_dims.py:476+）使 dense 权重只在子域分片,"
+        "改变每卡持久/gather 字节；评估器只建完整 FSDP 全域（÷fsdp,static_mem.py）——"
+        "拒绝静默按全域近似（会低估 dense 持久/聚合峰值）。")
+
+
+def _check_ulysses_degree_in_cp(cp_method: str, cp: int, value) -> None:
+    """`ulysses_degree_in_cp` 按 **method + cp + value** 联合判定（closure-audit F6）。
+
+    源码依据 `../mindformers/mindformers/pynative/distributed/context_parallel.py:248-266`
+    （`_validate_cp_method`）：
+    - colossal → 有效度恒 1（:253-254），ulysses_degree_in_cp 被忽略；单一全域 ring CP,评估器已建。
+    - ulysses → 要求 degree == cp_size（:256-258）;单一全域 all-to-all,评估器已建。
+    - hybrid → 要求 `1 < degree < cp_size` 且整除（:261-265）;这是 ulysses×ring **二维 CP**——评估器
+      未建（只建单一全域 CP）→ fail-loud。
+
+    - None（未配）→ colossal:1 / ulysses:cp,均全域,跳过；
+    - colossal → 任意正整数皆全域（degree 被 runtime 忽略）→ 接受；仅正整数守卫；
+    - ulysses → degree==cp 接受,否则 ValueError；
+    - hybrid → 合法 hybrid 区间（1<degree<cp 且整除）→ NotImplementedError（二维未建）;越界/非整除 → ValueError；
+      缺 degree → ValueError（:261-262）。
+    """
+    method = (str(cp_method) if cp_method else "colossal").lower()
+
+    def _guard_positive_int(v):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                f"parallelism.ulysses_degree_in_cp 须正整数,got {v!r} ({type(v).__name__})。")
+        if v < 1:
+            raise ValueError(
+                f"parallelism.ulysses_degree_in_cp={v} 非法:须正整数（runtime 约束）。")
+
+    if method == "colossal":
+        # 有效度恒 1（context_parallel.py:253-254）→ ulysses_degree_in_cp 无实际效果 → 全域,接受。
+        if value is not None:
+            _guard_positive_int(value)
+        return
+    if method == "ulysses":
+        if value is None:
+            return   # 缺省 → cp（context_parallel.py:256）,全域 all-to-all,已建。
+        _guard_positive_int(value)
+        if value != cp:
+            raise ValueError(
+                f"Ulysses CP 要求 ulysses_degree_in_cp({value}) == context_parallel({cp})"
+                "（context_parallel.py:257-258）。")
+        return   # 全域 all-to-all,评估器已建。
+    if method == "hybrid":
+        if value is None:
+            raise ValueError(
+                "Hybrid CP 要求显式 ulysses_degree_in_cp（context_parallel.py:261-262）。")
+        _guard_positive_int(value)
+        if value <= 1 or value >= cp or cp % value != 0:
+            raise ValueError(
+                f"Hybrid CP 要求 1 < ulysses_degree_in_cp({value}) < context_parallel({cp}) 且整除"
+                "（context_parallel.py:264-265）。")
+        raise NotImplementedError(
+            f"parallelism.ulysses_degree_in_cp={value}（1<degree<cp={cp},hybrid）未建模：这是 "
+            "ulysses×ring **二维 CP**（context_parallel.py:261-266）,评估器只建单一全域 CP"
+            "（colossal ring 全 cp / ulysses all-to-all degree==cp）——二维 CP 的在飞激活/通信双缓冲"
+            "语义不同,拒绝静默按全域近似。")
+    # 其它 method 值由 context_parallel_method 自身校验处理（此处不重复）。
+    return
 
 
 def _parse_pp_layers_per_stage(spec: str, pp: int) -> list:
@@ -597,22 +707,18 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     train = mf.get("training", {}) or {}
     # P0-02：schema fail-loud——未知键（含拼错）不静默丢弃。
     unknown = (set(par) - _PAR_MAPPED - _PAR_NEUTRAL
-               - set(_PAR_UNSUPPORTED_TRUTHY) - set(_PAR_UNSUPPORTED_NUMERIC_GT1))
+               - set(_PAR_UNSUPPORTED_TRUTHY) - _PAR_CONTEXT_DEPENDENT)
     if unknown:
         raise NotImplementedError(
             f"未识别的 parallelism 字段（可能改变内存但未映射/拼错）：{sorted(unknown)}。"
             "已映射见 _PAR_MAPPED，内存中性忽略见 _PAR_NEUTRAL，"
-            "已知未建模见 _PAR_UNSUPPORTED_TRUTHY / _PAR_UNSUPPORTED_NUMERIC_GT1。")
-    # ① 布尔开关类未建模键：任何真值即 fail-loud（V1 §4.1.1：`1` 从允许集剔除 → True/1 皆拒）。
+            "已知未建模见 _PAR_UNSUPPORTED_TRUTHY，上下文相关见 _PAR_CONTEXT_DEPENDENT。")
+    # 布尔开关类未建模键：任何真值即 fail-loud（V1 §4.1.1：`1` 从允许集剔除 → True/1 皆拒）。
+    # （dense_fsdp_shard_size / ulysses_degree_in_cp 已移出本集，改由下方上下文相关判定，见 F1/F6。）
     for k, why in _PAR_UNSUPPORTED_TRUTHY.items():
         v = par.get(k)
         if v not in (None, False, 0, ""):
             raise NotImplementedError(f"parallelism.{k}={v!r} 未建模：{why}——拒绝静默近似导入。")
-    # ② 数值类未建模键：=1/缺省=不切分（合法），>1 才 fail-loud（与布尔键分开处理）。
-    for k, why in _PAR_UNSUPPORTED_NUMERIC_GT1.items():
-        v = par.get(k)
-        if v is not None and int(v) > 1:
-            raise NotImplementedError(f"parallelism.{k}={v!r}（>1）未建模：{why}——拒绝静默近似导入。")
     sched = par.get("pipeline_parallel_schedule")
     if sched not in (None, "", "1f1b", "interleaved_1f1b"):
         raise NotImplementedError(
@@ -660,6 +766,11 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
         dp_shard = max(1, int(global_bs) // (local_bs * num_microbatches * dp_repl))
     else:
         dp_shard = 1
+    # 上下文相关键联合判定（closure-audit F1/F6，2026-07-15）——须在 dp_shard/cp/method 确定后：
+    #   dense_fsdp_shard_size 依完整 FSDP 域 fsdp=dp_shard·cp（parallel_dims.py:443-470）；
+    #   ulysses_degree_in_cp 依 context_parallel_method + cp（context_parallel.py:248-266）。
+    _check_dense_fsdp_shard_size(par.get("dense_fsdp_shard_size"), dp_shard * cp)
+    _check_ulysses_degree_in_cp(cp_method, cp, par.get("ulysses_degree_in_cp"))
     # microbatch 数的 trainer 覆盖语义（P0-02 补，trainer.py:472-475）：真机会把 yaml 的
     # pipeline_parallel_microbatch_size 重算为 global//(dp·local)——两者可推且不一致时按派生值
     # （yaml 值在真机上根本不生效，沿用会静默评错峰值）。

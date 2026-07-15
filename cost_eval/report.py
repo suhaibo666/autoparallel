@@ -56,7 +56,16 @@ def _validate_recompute_against_graph(recompute, g) -> None:
     """
     mode = getattr(recompute, "mode", "None")
     if mode not in ("full", "select"):
-        return
+        # mode 枚举 fail-loud（F4，closure-audit v2 §F4，2026-07-15）：合法「不重算」取值只有
+        # {None, "None", "none"}（RecomputeSpec 默认 mode="None"，specs.py:116；is_full/is_select
+        # 仅在 mode=="full"/"select" 触发）。其它任何串（typo "ful"/"selct"/"Full"）此前直接 return →
+        # 静默等效不重算、峰值与 RecomputeSpec("None") 逐字节相同（探针实证）。现拒；合法 None 放行。
+        if mode in (None, "None", "none"):
+            return
+        raise ValueError(
+            f"RecomputeSpec.mode={mode!r} 非法 mode——合法取值 None / 'None' / 'none'（不重算）、"
+            "'full'、'select'；疑似 typo（如 'ful'/'selct'/'Full'），此前会静默等效不重算"
+            "（与配置意图相反）。")
     layers = [l for lys in g.stages.values() for l in lys]
     valid_ids = {l.layer_id for l in layers}
 
@@ -86,6 +95,13 @@ def _validate_recompute_against_graph(recompute, g) -> None:
     for lid, sels in sorted(recompute.select_ops.items()):
         if not sels:
             continue
+        # 空/纯空白 selector fail-loud（F4，closure-audit v2 §F4，2026-07-15）：空串 "" 是所有 op
+        # 名/类型的子串，op_matches 会**意外命中整层**（真机同样不生效，是配置错误而非「重算整层」——
+        # 重算整层应显式 mode='full'）。此前静默接受、看似只选几个 op 实则整层重算。
+        if any(not s.strip() for s in sels):
+            raise ValueError(
+                f"select 层 {lid} 的选择器集含空串/纯空白 {sorted(sels)}——空串是所有 op 名/类型的"
+                "子串、会命中整层（配置错误；重算整层请显式 mode='full'）。")
         layer = by_id.get(lid)
         if layer is None:
             raise ValueError(
@@ -135,10 +151,16 @@ class PeakMemoryReport:
 
     @property
     def reserved_oom(self) -> bool:
-        """reserved 口径超容（P2-01，closure-audit C4，2026-07-15）：任一 stage 的 reserved 估计
-        （allocated + HCCL 缓冲 + 池碎片近似）> 设备容量。设备 HBM 真实约束是 reserved，故
-        `.oom=False`（allocated 未超）时 reserved 仍可能已超阈值——两口径**分开报告**，调用方
-        不应把单一 allocated 布尔当最终 OOM 结论。max_device_memory=0（未提供）时恒 False。"""
+        """reserved 口径超容判定（P2-01，closure-audit C4 / §F7 文档订正，2026-07-15）：任一 stage 的
+        reserved **下界估计** `reserved_estimate_bytes`（= allocated 峰值 + HCCL 缓冲，**不含**
+        allocator pool 碎片）> 设备容量。
+
+        **命名语义 = 下界判定**（勿误读为精确 OOM）：估计取下界，故 `reserved_oom=True` 是**确定超容**
+        （下界都已越阈）；但 `reserved_oom=False` **不保证**真实 reserved 不超——真机 reserved − allocated
+        里还有未建模的 allocator pool 碎片（DSv4 实测尚缺 ~277-281 MiB pool 分量，reserved_estimate_bytes
+        已如实标为下界）。设备 HBM 真实约束是 reserved，故 `.oom=False`（allocated 未超）时 reserved 仍
+        可能已超——两口径**分开报告**，调用方不应把单一 allocated 布尔当最终 OOM 结论。
+        max_device_memory=0（未提供）时恒 False。字段名 allocated_oom/reserved_oom 保持不变（下游依赖）。"""
         if not self.max_device_memory:
             return False
         return any(self.reserved_estimate_bytes(i) > self.max_device_memory
