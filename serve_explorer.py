@@ -528,13 +528,20 @@ def eval_config(p):
     world = pc.dp_replicate * pc.dp_shard * pc.cp * pc.tp * pc.pp
     g = ShapeEval().resolve(spec, ParallelModel(pc, d.n_layers, world))
     norm_dtype = getattr(d, "norm_compute_dtype_bytes", 0)
+    # 显示层数口径（2026-07-15 修）：embedding/lm_head 是**自动归置的伪层**（embedding→stage0、
+    # head→末 stage），**不计入** stage 层数——用户配的 pp_split 只含可切分层（transformer+mtp），
+    # 故显示数必须与配置一致（此前 len(lys) 把伪层也数进去，stage0/末 stage 各虚增 1，对不上配置）。
+    _PSEUDO = {"embedding", "lm_head"}
     stages = []
     for sp in rep.per_stage:
         lys = g.stages.get(sp.stage, [])
+        split_lys = [l for l in lys if l.layer_type not in _PSEUDO]   # 可切分层（=用户配额口径）
         rng = f"{lys[0].layer_type}(L{lys[0].layer_id})…{lys[-1].layer_type}(L{lys[-1].layer_id})" if lys else ""
+        extras = [l.layer_type for l in lys if l.layer_type in _PSEUDO]   # 附着的伪层（embedding/head）
         stages.append({
             "stage": sp.stage, "peak": round(sp.peak_bytes / MiB, 1), "peak_event": sp.peak_event,
-            "oom": sp.oom, "layers_desc": rng, "n_layers": len(lys),
+            "oom": sp.oom, "layers_desc": rng, "n_layers": len(split_lys),
+            "extras": extras,   # 该 stage 附着的伪层（不计入 n_layers；embedding→stage0/head→末 stage）
             "graph": graph_json(lys, norm_dtype, spec, d),
             "timeline": [{"event": s.event, "total": round(s.total_bytes / MiB, 1),
                           "buckets": {k: round(getattr(s.breakdown, k, 0) / MiB, 1) for k in BK
@@ -860,8 +867,8 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>tp</label><input name="tp" type="number" min="1" value="1"></div>
     <div class="fld"><label>ep</label><input name="ep" type="number" min="1" value="1"></div>
     <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
-    <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的 transformer 层数(mindformers num_layer_list 口径),段数=pp、和=layers;embedding/head 自动归 stage0/末 stage"></div>
-    <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num)"></div>
+    <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的可切分层数(transformer+mtp,mindformers num_layer_list 口径),段数=pp、和=layers+mtp;embedding/head 是伪层自动归 stage0/末 stage、不占配额也不计入显示层数"></div>
+    <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num);>1 时每个物理 stage 持 vpp 个非连续 chunk(round-robin: 虚拟 stage=chunk*pp+rank),微批数需≥pp,更深 warmup→更多在飞激活。例:pp=2,vpp=2,8 层→stage0 持 chunk0(L1,2)+chunk2(L5,6),stage1 持 chunk1(L3,4)+chunk3(L7,8)"></div>
     <div class="fld"><label>microbatch</label><input name="mbs" placeholder="auto(=pp)" style="width:76px" title="流水微批数 num_microbatches;空=auto(pp>1 时取 pp)。m>pp 时 1F1B warmup/在飞深度随 m 分化"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
@@ -914,7 +921,7 @@ async function refresh(){
   cur=d;curStage=d.tightest;openLayers=new Set();
   document.getElementById("kpeak").textContent=fmib(d.device_peak);
   document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · hccl(reserved)+${d.hccl_mib}M`;
-  document.getElementById("tabs").innerHTML=d.stages.map(s=>`<div class="tab ${s.stage===curStage?"on":""} ${s.oom?"oom":""}" data-s="${s.stage}">Stage ${s.stage} · ${fmib(s.peak)}${s.oom?" ⚠OOM":""}<span style="color:${s.stage===curStage?'#dde':'#999'};font-weight:400"> · ${s.n_layers}层</span></div>`).join("");
+  document.getElementById("tabs").innerHTML=d.stages.map(s=>`<div class="tab ${s.stage===curStage?"on":""} ${s.oom?"oom":""}" data-s="${s.stage}">Stage ${s.stage} · ${fmib(s.peak)}${s.oom?" ⚠OOM":""}<span style="color:${s.stage===curStage?'#dde':'#999'};font-weight:400"> · ${s.n_layers}层${s.extras&&s.extras.length?" +"+s.extras.map(e=>e==="embedding"?"emb":e==="lm_head"?"head":e).join("+"):""}</span></div>`).join("");
   document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{curStage=+t.dataset.s;openLayers=new Set();drawStage();}));
   drawStage();
 }
@@ -962,7 +969,7 @@ function cellSvg(L){
   return s+`</svg>`;
 }
 function drawGraph(st){
-  document.getElementById("ghdr").textContent=`模型结构 · Stage ${st.stage}（${st.n_layers} 层,点层展开 op-DAG）`;
+  document.getElementById("ghdr").textContent=`模型结构 · Stage ${st.stage}（${st.n_layers} 可切分层${st.extras&&st.extras.length?" + "+st.extras.map(e=>e==="embedding"?"embedding":e==="lm_head"?"head":e).join("/")+"(伪层,不占配额)":""},点层展开 op-DAG）`;
   if(openLayers.size===0){const seen=new Set();st.graph.forEach(L=>{if(!seen.has(L.type)){seen.add(L.type);openLayers.add(L.id);}});}
   document.getElementById("gpane").innerHTML=st.graph.map((L,idx)=>{
     const open=openLayers.has(L.id);
