@@ -32,6 +32,24 @@ NHD = "n_heads*head_dim"            # o_proj 输入维 = n_heads·head_dim
 # (b) test_framework_decomposition 对 `_fa_stats`/`_fa_workspace` numel 的数值交叉校验基准。
 FLASH_LSE_WS = "64*B*n_heads*S"
 
+# ── P1-13（Y1，2026-07-15）：GQA fused-qkv 的 colossal CP KV all-gather full-S buffer 字节表达式 ──
+# colossal（ulysses_degree=1）把 attention 的 **KV 分量** all-gather 到 full-S，产生额外 full-S KV
+# buffer。GQA 的 KV 是**融合**在 `qkv`（末维 (n_heads+2·n_kv)·head_dim）里的 (2·n_kv·head_dim) 分量，
+# **无法从融合张量单独标 `cp_kv`**（MLA 靠独立 KV 激活标；对照见 build_mla_attn_ops 的 kv_a/kvb_out）。
+# 故 builder 把该量作为 **method+cp 门控的 workspace 表达式** 挂进 flash op 的 attrs["colossal_kv_ws"]：
+# builder 不知 cp/method（只表达「若走 colossal all-gather，额外多这么多 full-S 字节」），实际是否计入由
+# shape_eval.resolve 的三重门决定（method==colossal 且 cp>1 且 spec.dims.cp_kv_allgather_buffer opt-in；
+# 缺一则 0，惰性）——见 shape_eval.py 的 P1-13 注释。
+#   公式（X3 已固化，test_x3_cp_buffer.test_underbuilt_colossal_kv_allgather_bytes_formula）：
+#     2·n_kv·head_dim · S · B · dtype  —— KV 列数 × **full-S**（不 ÷cp，all-gather 到 full-S）× B × dtype，
+#     占 fused qkv 的 (2·n_kv·head_dim)/((n_heads+2·n_kv)·head_dim) 比例。
+#   colossal vs ring/ulysses/hybrid 差异：后者是 CP 通信在飞的**双缓冲**（KV 块 send/recv，量级
+#     ~2·(2·n_kv·head_dim)·(S/cp)·B，随 cp ÷cp、非 all-gather buffer）→ shape_eval 的 method 门挡掉，
+#     其双缓冲尚未建（off loss 峰、本栈未验证），见交付报告「未尽事项」。
+# 与 flash 已有 `_fa_workspace()`（fa_ws）**共存相加**（gathered KV 须在 flash 计算期驻留 → 同 op
+# workspace_bytes SUM，非 max）。按全 n_kv 不 ÷tp（对齐 X3 固化公式；cp2 锚点 tp=1 时精确，tp>1 保守上界）。
+GQA_COLOSSAL_KV_WS = "2*n_kv*head_dim*S*B*dtype_bytes"
+
 
 def _fa_stats() -> TensorRef:
     """softmax_max+sum 的驻留张量：[2, B, n_heads, S, 8] fp32，head 维 ÷tp（本地头数），
@@ -147,9 +165,12 @@ def build_gqa_attn_ops(d: DimTable) -> list:
                saves=[]),
         # 4. FlashAttention（saves 存 q/k/v 与 softmax max/sum 统计——FlashAttentionScoreGrad
         #    的输入，驻留至反向；workspace = 重算路径再物化瞬态，见 FLASH_LSE_WS 注释）
+        #    attrs["colossal_kv_ws"]（P1-13/Y1，无条件挂）：GQA fused-qkv 的 colossal CP KV all-gather
+        #    full-S buffer 字节表达式；实际是否计入由 shape_eval 三重门决定（见 GQA_COLOSSAL_KV_WS 注释）。
         OpSpec("flash",  OpType.FLASH_ATTN,  [qkv],        attn,
                saves=[qkv, attn, fa_st],
-               workspace_ref=_fa_workspace()),
+               workspace_ref=_fa_workspace(),
+               attrs={"colossal_kv_ws": GQA_COLOSSAL_KV_WS}),
         # 5. Output 投影（列并行→行并行）
         OpSpec("o_proj", OpType.MATMUL,      [attn, o_w],  o,
                params=[o_w], saves=[attn]),

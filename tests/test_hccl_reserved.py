@@ -48,5 +48,11 @@ def test_hccl_not_in_allocated_peak():
 
 
 def test_reserved_estimate_adds_hccl():
+    # §F7 pool 碎片闭环（Y4，2026-07-15）：reserved 估计现 = allocated 峰值 + HCCL + allocator
+    # pool 碎片（此前只加 HCCL）。断言据此更新以含正的 pool 分量（allocated 侧 peak_bytes 不变）。
+    from cost_eval.framework import allocator_pool_fragmentation
     rep = _report(tp=2)
-    assert rep.reserved_estimate_bytes(0) == rep.per_stage[0].peak_bytes + rep.hccl_reserved_bytes
+    peak = rep.per_stage[0].peak_bytes
+    pool = allocator_pool_fragmentation(None, peak)
+    assert pool > 0
+    assert rep.reserved_estimate_bytes(0) == peak + rep.hccl_reserved_bytes + pool

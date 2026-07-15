@@ -32,7 +32,7 @@ python serve_explorer.py 9000       # 指定端口
 | 项 | 说明 |
 |---|---|
 | **模型预设** | `Custom` / `DSv3-mini`（仓库缩层锚点，真机验证 12473）/ `DeepSeek-V3 671B` / `DeepSeek-V3.2-Exp` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro` / `GLM-5`。结构字段抓自 **HF config.json**（2026-07，来源显示在 KPI 下方）。选中即填充全部字段；**手改任意结构字段自动跳回 Custom**（并行/重算字段不算偏离） |
-| **yaml 导入** | 选 mindformers 训练 yaml → 解析回填 **UI 支持的字段子集**（**不写回文件**;P1-17 措辞收窄，closure-audit C4 再订正 2026-07-15）。**页面点「评估」时用的是回填后的 UI 字段 + 固定假设**（设备容量 64 GiB、AdamW fp32、swap 关闭），**不是**完整解析结果:`data_parallel_replicate`/`reshard_after_forward_policy`/offload/prefetch 等解析到了但**不进对话框、也不影响页面重算**（页面黄条会列出这些固定假设与被丢字段）。如需按完整解析值评估请走 CLI（`from_mindformers_dict` → `Evaluator`）。支持新式段（`parallelism`/`recompute`）与老式段（`parallel_config`/`recompute_config`/`model.model_config` 嵌套、`offset`（含 VPP 嵌套列表）/`pp_interleave_num`）。glm4/qwen 系字段名自动别名映射。**缺必需结构字段**（yaml 依赖 mindformers 类内默认）→ 用页面当前值兜底 + 黄条警告逐字段列出，请核对。select 重算配置会逆向渲染成「细粒度选重」文本 |
+| **yaml 导入** | 选 mindformers 训练 yaml → 解析回填**完整字段**（**不写回文件**;P1-17/§4.8 **完整 round-trip**，closure-audit 2026-07-15）。**页面点「评估」时按解析出的完整 `EvaluatorConfigBundle` 算**——`data_parallel_replicate` 进 world/HCCL 域、`reshard_after_forward_policy` 改 gather 生命周期、`cpu_offload`、`prefetch`、**设备容量**（`context.max_device_memory`，缺省 54 GiB）、**优化器 dtype**（`model.params_dtype`）全部生效，**不再**固定假设 64 GiB/AdamW-fp32。这些非 UI 子集的解析值回填到「运行时/硬件」行（§3.6，可见可改）+ 隐藏字段（`sequence_parallel`），随页面评估请求一起回传。支持新式段（`parallelism`/`recompute`）与老式段（`parallel_config`/`recompute_config`/`model.model_config` 嵌套、`offset`（含 VPP 嵌套列表）/`pp_interleave_num`）。glm4/qwen 系字段名自动别名映射。**缺必需结构字段**（yaml 依赖 mindformers 类内默认）→ 用页面当前值兜底 + 黄条警告逐字段列出，请核对。select 重算配置会逆向渲染成「细粒度选重」文本。`swap` 段导入侧恒关（`swap.enable=True` 会 fail-loud，需在评估器侧手构 `SwapSpec`）。**手工配置路径**（不导入 yaml，从预设/Custom 起手）仍用页面字段 + 合理默认（64 GiB/AdamW-fp32/dp_replicate=1/reshard=default/offload 关），行为不变 |
 
 ### 3.2 模型结构
 
@@ -63,7 +63,7 @@ UI 值**最终覆盖**预设；`head_dim` 自动 = qk_nope + qk_rope。
 | `vpp` | 虚拟流水交错数（`pp_interleave_num`） | ≥1 |
 | `cp` / `cp 算法` | 上下文并行 / `colossal`（KV all-gather full-S）`ulysses` `ring` `hybrid` | `cp \| seq` |
 
-world = dp·tp·pp·cp（显示在 KPI 下）。
+world = dp_replicate·dp_shard·tp·pp·cp（显示在 KPI 下；手配默认 dp_replicate=1，yaml 导入按解析值）。
 
 ### 3.5 重算（recompute）
 
@@ -77,6 +77,21 @@ world = dp·tp·pp·cp（显示在 KPI 下）。
 | **per-stage 文本** | `per-stage 选重` 输入框：`s0:both; s1-2:self_attention; s3:none` | 按 stage 配置；stage→层映射与当前 pp 切分（含 pp 层分配/mtp）严格一致；模式 = `none`/`self_attention`/`mlp`/`both`/op 名子串；与细粒度文本互斥 |
 
 > per-stage 的"full"用 `both` 表达（评估器 full/select 为全局互斥模式，`both` 已被真机退化端验证 ≈full）。
+
+### 3.6 运行时 / 硬件（非 UI 子集，yaml 导入 round-trip 的落点）
+
+这些是 mindformers 训练配置里**非模型/非切分**、但影响每卡显存/OOM 判定的项。**手工配置**时用合理默认（下方「默认」列）；**yaml 导入**时按解析值回填、页面评估直接生效（P1-17/§4.8 闭环）。
+
+| 参数 | 含义 | 默认（手配） | yaml 来源 |
+|---|---|---|---|
+| `dp_replicate` | 纯数据并行度（权重/优化器逐 rank **复制**、不切分）——单卡峰值与 `dp_shard=1` 相同，进 world/HCCL 域 | 1 | `parallelism.data_parallel // data_parallel_shard`（或老式 `data_parallel` + `enable_parallel_optimizer=False`） |
+| `reshard` | `reshard_after_forward_policy`：`default`（PP 整体不 reshard；非 PP 除 output 均前向后即 reshard）/ `always`（前向后即 reshard、反向 re-gather）/ `never`（unsharded 权重驻留至本模块反向）——改 **gather 生命周期**（`fsdp=dp_shard·cp>1` 时生效） | default | `parallelism.reshard_after_forward_policy` |
+| `cpu_offload` | 参数/优化器状态卸载 CPU：开 → 该 stage 持久态=0、优化器 step 无设备瞬态 | 关 | `parallelism.cpu_offload` |
+| `prefetch` | FSDP 参数预取深度（`prefetch_depth`）：0=单缓冲，≥1=下 N 层双缓冲 | 1 | （当前 yaml 无对应键，恒 1；可手改建模更深预取） |
+| `设备容量(GiB)` | 设备 HBM 容量（`HardwareSpec.max_device_memory`）——**OOM/reserved 余量判据用它**，不再硬编 64 GiB | 64 | `context.max_device_memory`（缺省 54 GiB） |
+| `优化器 dtype` | AdamW params dtype：`fp32`（state=master+m+v=12 B/param）/ `bf16`（+compute 副本 2 B=14 B/param） | fp32 | `model.params_dtype` |
+
+> 另有隐藏字段 `sequence_parallel`（yaml 导入按 `parallelism.sequence_parallel` 解析值；手配缺省时按 `dp_shard>1 或 tp>1` 推导）。选任一模型预设 = 手配路径 → 这些 extra 复位为上表默认（不残留上次导入值）。
 
 ## 4. 口径与诚实边界
 

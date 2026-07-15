@@ -59,6 +59,50 @@ def hccl_reserved_buffer(pc) -> int:
     return HCCL_BYTES_PER_GROUP * num_distinct_communicators(pc)
 
 
+# ── Allocator pool 碎片（P2-01 §F7 闭环，2026-07-15）──────────────────────────────
+# MindSpore 设备内存池 `DynamicMemPoolBestFit`（best-fit 分配 + 块管理）里 **reserved > allocated**
+# 的差额由三部分组成：
+#   ① best-fit 分配在已占块内留下的**空洞**（碎片）——张量释放/重分配后留下无法立即复用的间隙；
+#   ② `mempool_block_size` 预分配的整块**尾部**（池按大块向设备申请，最后一块通常用不满）；
+#   ③ 512B 对齐（`kDynamicMemAlignSize`）——这一分量**已在** structure_mem 逐张量 roundup 建模
+#      （见本模块 docstring §5 / framework_reserve 「块对齐取整」项），故此处**不重复计**。
+# 剩余 ①②是**聚合碎片**，尺度上随驻留峰值放大，最简可辩护的物理模型是**碎片率 × allocated 峰值**。
+#
+# 单点标定（真机 DSv4 hybrid 4L，FSDP-2）：allocated 15415.5 MiB、reserved 16092-16096 MiB，
+# 差 676.5-680.5 MiB；扣除 HCCL 通信缓冲 ~400 MiB（world + FSDP 组 = 2×200MB）后，pool 分量
+# ≈ 277-281 MiB → 碎片率 ≈ 277/15415 ≈ 1.8%。取 1.8%：pool(15415.5)≈277.5 MiB，
+# reserved 估计 ≈ 15415.5+400+277.5 ≈ 16093 MiB，落在真机 16092-16096 区间内。
+#
+# ⚠ **单点标定、跨模型稳定性待验证**：realmachine profiler（memory_record_rank0.csv，另一 DSv3 run）
+# 在峰值 allocated 处 reserved−allocated ≈ 996 MiB（扣 HCCL 后 pool 分量 ~4-5%），与本 1.8% 不一致
+# ——碎片率随 batch/重算/分配序列显著波动。本模型仅取 DSv4 单点，是**近似**而非严格上界。
+POOL_FRAGMENTATION_RATE = 0.018   # 自 DSv4 单点标定的聚合 best-fit 碎片率（277 MiB / 15415.5 MiB）
+
+
+def allocator_pool_fragmentation(pc, allocated_bytes: int) -> int:
+    """DynamicMemPoolBestFit 聚合块级碎片估计（**reserved** 池分量，**不进** allocated 峰值）。
+
+    模型：`碎片率 × allocated 峰值`（碎片率 `POOL_FRAGMENTATION_RATE`=1.8%，自真机 DSv4 单点标定）。
+    覆盖 best-fit 空洞 + mempool_block_size 预留块尾部；512B 对齐分量已在 structure_mem 逐张量
+    roundup 单独建模，此处不重复计。
+
+    参数
+    ----
+    pc : ParallelConfig | None
+        并行配置。当前**纯碎片率模型不依赖** pc（保留形参供未来「按块数 / mempool_block_size
+        建块级模型」时细化——不同并行度下的分配块数不同）。允许传 None。
+    allocated_bytes : int
+        allocated 峰值字节（结构/激活/优化器等真实张量占用）。≤0 时返回 0（无分配即无碎片）。
+
+    返回
+    ----
+    int : pool 碎片字节数（**近似**，非严格上界；自 DSv4 单点标定，跨模型稳定性待验证）。
+    """
+    if allocated_bytes <= 0:
+        return 0
+    return int(POOL_FRAGMENTATION_RATE * allocated_bytes)
+
+
 def framework_reserve(pc, residual_calibrated: int = 0) -> int:
     """framework_reserve(**allocated 峰值**) —— **生产默认 0**（机理项已拆进 op 图，见模块 docstring）。
 

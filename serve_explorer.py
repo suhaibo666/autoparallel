@@ -476,6 +476,75 @@ def graph_json(layers, norm_dtype, spec, dims):
     return out
 
 
+# ── yaml 导入 round-trip:非 UI 可表达的 extra 键(P1-17/§4.8 闭环,2026-07-15)────────────
+# 手配路径这些键**缺省** → 复现历史固定假设(设备 64GiB / AdamW fp32 / swap 关 /
+# dp_replicate=1 / reshard=default / offload 关 / prefetch=1),eval_config 输出逐字节不变。
+# yaml 导入路径:`_bundle_to_fields` 把 bundle 的完整解析值(含这些 extra)回填成 UI/隐藏字段
+# → 随 qs() 回传 → `_build_eval_specs` 按解析值构造 → **页面评估用完整 bundle,不是固定假设**。
+def _x_int(p, k, default):
+    """extra 整数:键缺省/空串 → default;非法 → default(不阻断评估)。"""
+    v = p.get(k)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _x_flag(p, k, default):
+    """extra 布尔:键缺省/空串 → default;'1'/true/on/yes → True;'0'/false/off/no → False。"""
+    v = p.get(k)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "on", "yes"):
+        return True
+    if s in ("0", "false", "off", "no"):
+        return False
+    return default
+
+
+def _build_eval_specs(p, pa):
+    """query dict + parsed pa → (ParallelConfig, OptimizerSpec, HardwareSpec, SwapSpec)。
+
+    非 UI 可表达的 extra 键(dp_replicate/reshard/cpu_offload/prefetch/opt_dtype/maxdev_gib)
+    缺省=历史手配假设(见上方注释)→ 手配路径逐字节不变;yaml 导入回填后 → 页面评估用完整解析值。
+    仅这些 extra 影响并行 dp_replicate/reshard/offload/prefetch、优化器 dtype、设备容量;其余口径不变。
+    """
+    dp, tp = pa["dp"], pa["tp"]
+    mbs = pa["mbs"] or (pa["pp"] if pa["pp"] > 1 else 1)   # 用户显式 or auto=pp
+    # 并行 extra(缺省 = ParallelConfig 默认 → 手配不变)
+    dp_repl = _x_int(p, "dp_replicate", 1)
+    reshard = (p.get("reshard") or "default")
+    reshard = (reshard.strip() or "default") if isinstance(reshard, str) else "default"
+    offload = _x_flag(p, "cpu_offload", False)
+    prefetch = _x_int(p, "prefetch", 1)
+    sp_ext = _x_flag(p, "sp", None)      # 隐藏字段:导入回填 bundle.sequence_parallel;缺省→历史推导
+    seq_par = (dp > 1 or tp > 1) if sp_ext is None else sp_ext
+    pc = ParallelConfig(
+        dp_replicate=dp_repl, dp_shard=dp, tp=tp, ep=pa["ep"], pp=pa["pp"], cp=pa["cp"],
+        sequence_parallel=seq_par, num_microbatches=mbs,
+        context_parallel_method=pa["method"], interleave=pa["vpp"],
+        reshard_after_forward=reshard, cpu_offload=offload, prefetch_depth=prefetch,
+        layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None))
+    # 优化器 dtype(缺省 fp32,历史手配假设):bf16 params 多存一份 compute 副本(state 14 vs 12)。
+    opt_fp32 = str(p.get("opt_dtype", "fp32")).strip().lower() != "bf16"
+    opt = OptimizerSpec.adamw(params_fp32=opt_fp32, grad_dtype_bytes=_x_int(p, "grad_bytes", 4))
+    # 设备容量(缺省 64GiB,历史手配假设):UI 以 GiB 输入 → bytes。
+    mg = p.get("maxdev_gib")
+    if mg is None or (isinstance(mg, str) and not str(mg).strip()):
+        maxdev = 64 * 2 ** 30
+    else:
+        try:
+            maxdev = int(round(float(mg) * 2 ** 30))
+        except (TypeError, ValueError):
+            maxdev = 64 * 2 ** 30
+    hw = HardwareSpec(max_device_memory=maxdev, framework_reserve=0)
+    # swap:yaml 导入侧恒关(from_mindformers_dict 对 swap.enable fail-loud) → 手配同 SwapSpec()。
+    return pc, opt, hw, SwapSpec()
+
+
 def eval_config(p):
     errs, cfg, pa = parse_and_validate(p)
     if errs:
@@ -514,13 +583,10 @@ def eval_config(p):
                     f"选重 pattern {sorted(sels)} 在层 {lid}({spec.layer_pattern[lid]}) 的 op 图"
                     f"**零命中**——静默空转会错算(真机同样不生效)。该层可用 op 名: "
                     f"{', '.join(op.name for op in lops)}"]}
-    mbs = pa["mbs"] or (pa["pp"] if pa["pp"] > 1 else 1)   # 用户显式 or auto=pp
-    pc = ParallelConfig(dp_shard=pa["dp"], tp=pa["tp"], ep=pa["ep"], pp=pa["pp"], cp=pa["cp"],
-                        sequence_parallel=(pa["dp"] > 1 or pa["tp"] > 1), num_microbatches=mbs,
-                        context_parallel_method=pa["method"], interleave=pa["vpp"],
-                        layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None))
-    ev = Evaluator(spec, pc, OptimizerSpec.adamw(params_fp32=True, grad_dtype_bytes=4),
-                   HardwareSpec(max_device_memory=64 * 2 ** 30, framework_reserve=0), rc, SwapSpec())
+    # P1-17/§4.8 闭环:pc/opt/hw/swap 由 `_build_eval_specs` 统一构造——手配路径缺 extra 时
+    # 复现历史固定假设(逐字节不变);yaml 导入回填 extra 后页面评估用完整解析 bundle 值。
+    pc, opt, hw, swap = _build_eval_specs(p, pa)
+    ev = Evaluator(spec, pc, opt, hw, rc, swap)
     rep = ev.evaluate(record_timeline=True)
     # resolved 图（与 evaluate 同口径重解析一次,拿逐 op 切分后字节）
     from cost_eval.parallel_model import ParallelModel
@@ -553,8 +619,12 @@ def eval_config(p):
             "stage": sp.stage, "peak": round(sp.peak_bytes / MiB, 1), "peak_event": sp.peak_event,
             "oom": sp.oom,   # allocated 口径（保留旧名兼容）
             "reserved_oom": resv_bytes > MAXDEV,   # reserved 口径：该 stage 的 reserved 估计超容
-            "reserved_oom_is_lower_bound": True,   # F7：reserved 估计不含 pool 碎片 → False 不保证安全
-            "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（下界，MiB）
+            # P2-01（Y4，2026-07-15）：reserved 估计现 = allocated + HCCL + **pool 碎片**（1.8%
+            # 自 DSv4 单点标定，framework.allocator_pool_fragmentation）→ 已非纯下界、更接近真实
+            # reserved（DSv4 估 16093 vs 真机 16092-16096）。但碎片率跨模型波动（另一 DSv3 run ~4-5%）
+            # → 是**标定近似**、非严格上界：reserved_oom=False 仍不保证绝对安全（临界区留余量）。
+            "reserved_oom_is_calibrated_estimate": True,   # 含 pool 碎片近似,非严格上界(也非纯下界)
+            "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（含 pool，MiB）
             "layers_desc": rng, "n_layers": len(split_lys),
             "extras": extras,   # 该 stage 附着的伪层（不计入 n_layers；embedding→stage0/head→末 stage）
             "graph": graph_json(lys, norm_dtype, spec, d),
@@ -567,9 +637,9 @@ def eval_config(p):
             "device_peak": round(max(s["peak"] for s in stages), 1), "stages": stages,
             "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0),
             "allocated_oom": rep.allocated_oom,   # P2-01 顶层：任一 stage allocated 峰值超容
-            "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容（下界判定）
-            "reserved_oom_is_lower_bound": True,  # F7：reserved 未含 pool 碎片,False≠真实安全
-            "reserved_margin_mib": round((MAXDEV - worst_reserved) / MiB, 1)}   # 容量−最紧 stage reserved（下界,可负）
+            "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容（含 pool 近似）
+            "reserved_oom_is_calibrated_estimate": True,  # 含 pool 碎片近似(1.8% 单点标定),非严格上界
+            "reserved_margin_mib": round((MAXDEV - worst_reserved) / MiB, 1)}   # 容量−最紧 stage reserved（含 pool,可负）
 
 
 def _sel_ops_to_text(select_ops):
@@ -688,6 +758,17 @@ def _bundle_to_fields(b):
         lp = list(pc.layers_per_stage)
         lp[0] -= 1; lp[-1] -= 1        # 去 embedding/head 伪层(mtp 计入可切分层数,保留在配额里)
         f["pp_split"] = ",".join(str(x) for x in lp)
+    # P1-17/§4.8 闭环(2026-07-15):非 UI 子集的**完整解析值** → UI/隐藏字段,页面评估按这些值算
+    #（不再固定假设 64GiB/AdamW-fp32/dp_replicate=1/reshard=default/offload 关/prefetch=1）。
+    # 这些键随 qs() 回传给 eval_config → `_build_eval_specs` 消费 → 真 round-trip。
+    f["dp_replicate"] = pc.dp_replicate                       # 纯数据并行度(复制,不切分)
+    f["reshard"] = pc.reshard_after_forward                   # always|never|default(gather 生命周期)
+    f["cpu_offload"] = int(bool(pc.cpu_offload))              # 参数/优化器态卸载 CPU
+    f["prefetch"] = getattr(pc, "prefetch_depth", 1)          # FSDP 参数预取深度
+    f["sp"] = int(bool(pc.sequence_parallel))                 # 隐藏字段:序列并行(导入按解析值,不再推导)
+    f["maxdev_gib"] = round(b.hardware.max_device_memory / (2 ** 30), 4)   # 设备容量(GiB)
+    f["opt_dtype"] = "fp32" if b.optimizer.state_bytes_per_param == 12 else "bf16"   # 优化器 params dtype
+    f["grad_bytes"] = b.optimizer.grad_dtype_bytes            # 反向 grad dtype 字节
     return f
 
 
@@ -739,18 +820,20 @@ class H(BaseHTTPRequestHandler):
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
                 bundle = from_mindformers_dict(mf)
                 fields = _bundle_to_fields(bundle)
-                # P1-17（2026-07-14 review）：回填是 **UI 支持子集**——固定假设显式列出（一次性）。
+                # P1-17/§4.8 闭环（2026-07-15）：**完整 round-trip**——页面评估按解析出的完整
+                # bundle 算（dp_replicate/reshard/offload/prefetch、设备容量、优化器 dtype 均生效,
+                # 不再固定假设）。上轮「回填为 UI 子集/需走 CLI」的收窄措辞已废止:页面即可完整评估。
                 warnings.append(
-                    "回填为 UI 支持子集;固定假设:设备容量 64GiB、AdamW fp32、swap 关——"
-                    "dp_replicate/reshard/offload/prefetch 已解析但不进对话框")
+                    "已按完整解析值回填并评估:dp_replicate/reshard/offload/prefetch、设备容量、"
+                    "优化器 dtype 均生效(可在页面对应字段查看并覆盖);swap 段导入侧恒关")
                 if bundle.parallel.dp_replicate > 1:
                     # P0.3:epo=False 的纯数据并行——权重/优化器逐 dp rank 复制不切分,评估器按
-                    # dp_replicate 建模(持久态不 ÷dp,单卡峰值与 dp=1 相同)。页面无 dp_replicate
-                    # 输入,dp 字段(=dp_shard)回填为 1,内存口径不受影响,仅 world/HCCL 域数少算。
+                    # dp_replicate 建模(持久态不 ÷dp,单卡峰值与 dp_shard=1 相同)。dp_replicate 现
+                    # **随 round-trip 生效**(进 world/HCCL 域),页面 dp_replicate 字段单列、可见可改。
                     warnings.append(
-                        f"enable_parallel_optimizer=False 的纯数据并行(dp={bundle.parallel.dp_replicate}):"
-                        "权重/优化器逐 dp rank 复制不切分,评估器按 dp_replicate 建模(单卡峰值与 dp=1 "
-                        "相同);页面 dp 字段(=dp_shard)已置 1,请勿手动改回 dp——那会错按 FSDP 切分")
+                        f"纯数据并行 dp_replicate={bundle.parallel.dp_replicate}(权重/优化器逐 rank 复制"
+                        "不切分):单卡峰值与 dp_shard=1 相同,world/HCCL 域已计入 dp_replicate(round-trip "
+                        "生效);页面 dp 字段=dp_shard、dp_replicate 字段单列,勿混淆")
                 if vpp > 1:
                     fields["vpp"] = vpp
                 self._send(json.dumps({"ok": True, "fields": fields, "warnings": warnings},
@@ -899,6 +982,16 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>细粒度选重(mf 口径)</label><input name="sel_cfg" placeholder="self_attention:0-3; flash:4-7" style="width:210px" title="mindformers select_module 口径:pattern=cell 名(self_attention/mlp)或 op 名子串;层范围 0-indexed(a-b,逗号分段);分号分隔多条;非空即生效(优先于图上勾选)"></div>
     <input type="hidden" name="sel_ops" value="">
     <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
+  </div>
+  <div class="cfgrow"><span class="cap">运行时/硬件</span>
+    <div class="fld"><label>dp_replicate</label><input name="dp_replicate" type="number" min="1" value="1" title="纯数据并行度(权重/优化器逐 rank 复制、不切分);单卡峰值与 dp_shard=1 相同,进 world/HCCL 域。yaml 导入按解析值回填"></div>
+    <div class="fld"><label>reshard</label><select name="reshard" title="reshard_after_forward_policy:default(PP 整体不 reshard,非 PP 除 output 均前向后即 reshard) / always(前向后即 reshard,反向 re-gather) / never(unsharded 权重驻留至本模块反向) —— 改 gather 生命周期(fsdp=dp_shard·cp>1 时生效)"><option value="default" selected>default</option><option value="always">always</option><option value="never">never</option></select></div>
+    <div class="fld"><label>cpu_offload</label><select name="cpu_offload" title="参数/优化器状态卸载 CPU:开 → 该 stage 持久态=0、优化器 step 无设备瞬态"><option value="0" selected>关</option><option value="1">开</option></select></div>
+    <div class="fld"><label>prefetch</label><input name="prefetch" type="number" min="0" value="1" title="FSDP 参数预取深度(prefetch_depth);0=无预取(单缓冲),≥1=下 N 层双缓冲。yaml 导入按解析值回填"></div>
+    <div class="fld"><label>设备容量(GiB)</label><input name="maxdev_gib" type="number" min="1" step="1" value="64" title="设备 HBM 容量(HardwareSpec.max_device_memory);OOM 判据用它。yaml 导入按 context.max_device_memory 回填(缺省 54GiB),手配默认 64GiB"></div>
+    <div class="fld"><label>优化器 dtype</label><select name="opt_dtype" title="AdamW params dtype:fp32(state=master+m+v=12B/param) / bf16(+compute 副本 2B=14B/param)。yaml 导入按 model.params_dtype 回填"><option value="fp32" selected>fp32</option><option value="bf16">bf16</option></select></div>
+    <input type="hidden" name="sp" value="">
+    <input type="hidden" name="grad_bytes" value="4">
   </div>
   <div class="cfgrow" id="rcrow" style="display:none"><span class="cap">重算 op</span><div id="rcchips" style="font:11.5px var(--mono);color:var(--mut)">（在左图 op 节点上点 <b>↻</b> 勾选;再点取消）</div></div>
   <div class="errbox" id="err"></div>
@@ -1109,10 +1202,17 @@ function showBuckets(e){
     bs.map(([k,v])=>`<div class="barrow"><span class="bl">${k}</span><span class="bartrack"><span class="barfill" style="width:${v/mx*100}%;background:${BKC[k]||'#ccc'}"></span></span><span class="bv">${v.toFixed(0)}·${(v/e.total*100).toFixed(0)}%</span></div><div style="font-size:10px;color:#999;margin:-2px 0 3px 120px">${BKD[k]||""}</div>`).join("")+
     `<p style="color:#999;font-size:11px;margin-top:10px">悬停左侧算子可切回算子详情。</p>`;
 }
+/* 运行时/硬件 extra → 手配默认(64GiB/AdamW-fp32/dp_replicate=1/reshard=default/offload 关/prefetch=1)。
+   选模型预设=手配路径 → 复位这些 extra,不残留上次 yaml 导入的解析值(非导入路径保持现状)。*/
+const RT_DEFAULTS={dp_replicate:"1",reshard:"default",cpu_offload:"0",prefetch:"1",maxdev_gib:"64",opt_dtype:"fp32",sp:"",grad_bytes:"4"};
+function resetRuntimeExtras(){
+  Object.entries(RT_DEFAULTS).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el)el.value=v;});
+}
 /* 模型预设:选中即填充结构字段(HF config.json 值),用户仍可手改覆盖 */
 function applyPreset(key){
   const pr=PRESETS[key]; if(!pr)return;
   Object.entries(pr.ui).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el)el.value=v;});
+  resetRuntimeExtras();      // 手配路径 → extra 回到固定假设(64GiB/AdamW-fp32/...)
   document.getElementById("kmeta").textContent="来源: "+pr.source;
 }
 document.getElementById("preset").addEventListener("change",e=>{applyPreset(e.target.value);syncChips();refreshSoon();});
@@ -1128,7 +1228,7 @@ document.getElementById("yamlfile").addEventListener("change",async e=>{
   else eb.style.display="none";
   Object.entries(d.fields).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el&&v!==null&&v!==undefined)el.value=v;});
   document.getElementById("preset").value="custom";
-  document.getElementById("kmeta").textContent="来源: yaml 导入("+f.name+"),已回填可改(不写回文件)";
+  document.getElementById("kmeta").textContent="来源: yaml 导入("+f.name+"),已按完整解析值回填并评估(dp_replicate/reshard/offload/prefetch/设备容量/优化器 dtype 均生效,可改;不写回文件)";
   e.target.value="";       // 允许重选同一文件
   syncChips();refreshSoon();
 });

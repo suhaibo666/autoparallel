@@ -221,6 +221,7 @@ class ShapeEval:
                 # loss/head 区已按 Bug A 复核恢复 cp_shard=True（÷cp，head.py:59-64），全库当前无
                 # cp_shard=False 张量 → 此门对现有图空转；保留供未来真 full-S 语义 op 使用。
                 cp = pm.degree("cp")
+                method = getattr(pm.pc, "context_parallel_method", "colossal")
                 if cp > 1 and op.output.cp_shard:
                     if _refs_symbol(op.workspace, "S"):
                         ws //= cp
@@ -235,6 +236,34 @@ class ShapeEval:
                 if getattr(op, "bwd_scratch_ref", None) is not None:
                     br = resolve_tensor(op.bwd_scratch_ref, spec.dims, pm)
                     bws += br.local_numel * br.dtype_bytes
+                # ── P1-13（Y1，2026-07-15）：method+cp 门控 workspace —— GQA fused-qkv 的 colossal
+                # CP KV all-gather full-S buffer ─────────────────────────────────────────────────
+                # MLA 靠**独立 KV 激活**标 `cp_kv=True` 表达 colossal 下 KV all-gather 到 full-S；GQA 的
+                # KV **融合**在 `qkv`（末维 (n_heads+2·n_kv)·head_dim）里，无法从融合张量单独标 cp_kv →
+                # 需一条**只在 colossal cp>1 生效、否则 0**的 workspace 通道（TensorRef 的 cp_kv 做不到：
+                # 它让「已存在的激活」在 colossal 保持 full-S，而非凭空「只在 cp>1 出现」一个 buffer，
+                # 且 cp=1 时它是 full-S≠0，破惰性）。故走 OpSpec.attrs 携带 full-S 字节表达式、在此按门加进
+                # workspace_bytes（builder 无条件挂串、shape_eval 门控——**estimate_structure_memory 口径
+                # 无侵入**：它照常读 ResolvedOp.workspace_bytes 的 max）。
+                #
+                # **三重门**（缺一则贡献 0，惰性）：
+                #   ① `method=="colossal" 且 cp>1`：colossal（ulysses_degree=1）才 all-gather KV 到
+                #      full-S；ring/ulysses/hybrid 是 CP 通信在飞的**双缓冲**（KV 块 send/recv，量级
+                #      ~2·(2·n_kv·head_dim)·(S/cp)·B）——随 body ÷cp、**非** all-gather buffer，故此门挡掉
+                #      （ring/ulysses 双缓冲尚未建，见交付报告「未尽事项」）。
+                #   ② op.attrs 带 "colossal_kv_ws"（builder 无条件挂在 GQA flash op；MLA flash op 不挂）。
+                #   ③ `spec.dims.cp_kv_allgather_buffer`（modeling opt-in，**默认 False**）：本量 off loss
+                #      峰、本栈跑不了 cp+无重算故**未真机验证**；且 12 golden 锚点走 mla/dsv4 不经 GQA
+                #      builder。默认关 → golden 逐字节不变 + 守 X3 冻结不变量（未 opt-in 的 GQA colossal
+                #      cp2 仍精确减半）；开启即按公式计入。
+                # full-S 值（**不 ÷cp**，因 all-gather 到 full-S）= 2·n_kv·head_dim·S·B·dtype（X3 固化公式，
+                # 占 fused qkv 的 (2·n_kv·head_dim)/((n_heads+2·n_kv)·head_dim) 比例）；与 flash 已有
+                # fa_ws 共存**相加**（同 op workspace_bytes，物理上 gathered KV 须在 flash 计算期驻留）。
+                # 注：此串按全 n_kv 不 ÷tp（对齐 X3 固化公式；本量 cp2 锚点 tp=1 时精确，tp>1 为保守上界）。
+                ckv_ws = op.attrs.get("colossal_kv_ws") if getattr(op, "attrs", None) else None
+                if (ckv_ws and method == "colossal" and cp > 1
+                        and getattr(spec.dims, "cp_kv_allgather_buffer", False)):
+                    ws += eval_expr(ckv_ws, spec.dims)
                 comms = []
                 for t in op.inputs:
                     src = produced.get(t.name)

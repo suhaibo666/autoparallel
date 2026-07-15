@@ -49,32 +49,62 @@ def _D():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_cp2_all_activations_halve_including_loss():
+    """cp=2：body/loss 激活 saves ÷cp；body flash-ws ÷cp。
+
+    P1-13（Y1，2026-07-15）**拆分不变量**：加了 GQA fused-qkv 的 colossal KV all-gather full-S buffer
+    后，colossal-cp2 的 GQA flash workspace = **减半的 flash-ws + 不减半的 KV all-gather buffer** →
+    **不再精确 2×**。故把「body 精确减半（含 workspace）」拆为三条**物理正确**的不变量（非放松断言）：
+      ① body 激活 saves 仍**精确 ÷cp**（all-gather 只进 workspace、不进 saves）——colossal/ulysses 皆 True；
+      ② colossal 下 GQA flash workspace = 减半 flash-ws + **full-S KV buffer**（新增非减半项，值=公式）；
+      ③ **ulysses**（非 colossal，无 all-gather buffer，KV 随 body ÷cp）下 flash-ws 仍**精确减半**。
+    此处开启 opt-in `cp_kv_allgather_buffer`（默认关，见 shape_eval/attention 的 P1-13 注释）以触发 ②。
+    loss/head 层不经 GQA builder → 无此 buffer、saves+bwd_scratch 仍 ÷cp（Bug A 修正）。
+    """
     spec = build_llm_spec(_small_cfg())   # embedding + 2×(gqa+dense) + lm_head
-    l1, _ = _resolve_layers(spec, cp=1)
-    l2, _ = _resolve_layers(spec, cp=2)
-    saw_body_saves = saw_ws = saw_head = False
-    for a, b in zip(l1, l2):
+    d = spec.dims
+    d.cp_kv_allgather_buffer = True       # opt-in：把 GQA colossal KV all-gather buffer 计入
+    l1, _ = _resolve_layers(spec, cp=1)                                     # colossal(默认) cp1
+    l2, _ = _resolve_layers(spec, cp=2)                                     # colossal cp2（含 KV buffer）
+    l2u, _ = _resolve_layers(spec, cp=2, context_parallel_method="ulysses")  # ulysses cp2（无 buffer）
+    # colossal 下 fused-qkv 的 KV 分量 all-gather 到 full-S 的额外 buffer（不 ÷cp，X3 固化公式）
+    kv_buf = 2 * d.n_kv * d.head_dim * d.S * d.B * d.dtype_bytes
+    assert kv_buf > 0
+    saw_body_saves = saw_ws = saw_head = saw_kv_buf = saw_uly_halves = False
+    for a, b, bu in zip(l1, l2, l2u):
         sa = estimate_structure_memory(a.ops)
         sb = estimate_structure_memory(b.ops)
-        # 参数 full-gather / grad 缓冲（无 S、非本次路径）——所有层恒不变
-        assert sb.param_full_bytes == sa.param_full_bytes
-        assert sb.grad_full_bytes == sa.grad_full_bytes
+        sbu = estimate_structure_memory(bu.ops)
+        # 参数 full-gather / grad 缓冲（无 S、非本次路径）——所有层、所有 cp 算法恒不变
+        assert sb.param_full_bytes == sa.param_full_bytes == sbu.param_full_bytes
+        assert sb.grad_full_bytes == sa.grad_full_bytes == sbu.grad_full_bytes
         # loss/head 层 = 唯一带 bwd_scratch（loss 8·S·B·vocab）的层 → **也 ÷cp**（Bug A 修正）：
         #   activation_saves（h_final+logits+logsm）与 bwd_scratch 均随 cp ÷cp（真机 [S/cp,B,V]）。
+        #   不经 GQA builder → 无 colossal KV buffer（colossal/ulysses 同口径）。
         if sa.bwd_scratch:
             assert sb.activation_saves * 2 == sa.activation_saves   # loss/head saves ÷cp
             assert sb.bwd_scratch * 2 == sa.bwd_scratch             # nll bwd_scratch ÷cp
             saw_head = True
-        else:
-            # decoder body / embedding：激活 saves ÷cp、workspace（flash∝S）÷cp
-            assert sb.activation_saves * 2 == sa.activation_saves
-            if sa.activation_saves:
-                saw_body_saves = True
-            if sa.workspace:
+            continue
+        # ── 不变量①（仍 True）：decoder body / embedding 激活 saves 精确 ÷cp（colossal 与 ulysses 皆然）──
+        assert sb.activation_saves * 2 == sa.activation_saves
+        assert sbu.activation_saves * 2 == sa.activation_saves
+        if sa.activation_saves:
+            saw_body_saves = True
+        if sa.workspace:
+            is_flash = any(o.name == "flash" for o in a.ops)
+            # ── 不变量③：ulysses（非 colossal，无 all-gather buffer）workspace 仍精确 ÷cp ──────────
+            assert sbu.workspace * 2 == sa.workspace
+            saw_uly_halves = True
+            if is_flash:
+                # ── 不变量②：colossal 下 = 减半 flash-ws + full-S KV buffer（新增非减半项，值=公式）──
+                assert sb.workspace == sa.workspace // 2 + kv_buf
+                saw_kv_buf = True
+            else:
+                # 非 flash 的 body workspace（若有 MoE staging∝S 等）：colossal 也精确 ÷cp（无 KV buffer）
                 assert sb.workspace * 2 == sa.workspace
-                saw_ws = True
-    # 三条路径都被真实触发：body saves ÷cp、body flash-ws ÷cp、loss/head 亦 ÷cp
-    assert saw_body_saves and saw_ws and saw_head
+            saw_ws = True
+    # 各路径都被真实触发：body saves ÷cp、body flash-ws（ulysses 减半 / colossal 带 KV buffer）、loss/head ÷cp
+    assert saw_body_saves and saw_ws and saw_head and saw_kv_buf and saw_uly_halves
 
 
 # ─────────────────────────────────────────────────────────────────────────────

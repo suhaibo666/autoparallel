@@ -14,24 +14,81 @@ from .framework import framework_reserve, hccl_reserved_buffer
 
 
 def feasibility_errors(pc, optimizer, swap) -> list:
-    """运行时可行性检查（closure-audit C1，2026-07-15）：返回**真机跑不起来**的组合的错误串列表
-    （空=可行）。集中一处，供 Evaluator/adapter/搜索器统一调用，不各处零散封口。
+    """运行时可行性**约束矩阵**（closure-audit C1，2026-07-15；P1-16 完整化 2026-07-15）：返回
+    **真机跑不起来 / 会静默退化成另一份配置**的组合的错误串列表（空=可行）。集中一处，供
+    Evaluator/adapter/搜索器统一调用（搜索器接受一个组合前先判它真机能不能跑，无需先建模型）。
 
-    依据均为 mindformers pynative 运行时硬约束：
-    - PP>1 + activation swap 不支持（tests/test_swap_offload.py 源码核对）。
-    - tp>1 强制 sequence_parallel=True（config.py:471-477）——SP=false 时真机不物化序列切分，
-      当前评估器算的是另一份（无 SP）激活，属"评了个跑不了的配置"。
-    - 优化器仅建模 Adam/AdamW（K_OPT/state_bytes 均自 AdamW op 链导出）；非 Adam 的持久态
-      与 optstep 瞬态都不同 → fail-loud，不静默按 AdamW 近似（P1-19）。
+    **分工边界**：本函数只吃 `(pc, optimizer, swap)`——即只判**并行/调度组合**的可跑性；结构合法性
+    （维度正值/整除、pp≤可切分层数、S%cp、tp%heads、layers_per_stage 段数/和）需要模型维度，留在
+    `build_llm._validate_structure` / `ParallelModel.__init__`，**此处不重复**。ParallelConfig 标量
+    正值/枚举（degree≥1、interleave≥1、reshard 枚举等）已在 `ParallelConfig.__post_init__` 拦，故此处
+    入参已是「各字段自洽」的 pc，只需判**字段间**的并行组合约束。
+
+    约束矩阵（逐条 mindformers pynative 源码依据）：
+    - **[并行区一致性] ep 须整除 dp_shard·cp·tp**（`parallel_dims.py:140-148`）：EP 在单个
+      dp_replicate 组内的 `(dp_shard·cp·tp)` 区里切专家，`efsdp = dp_shard·cp·tp // ep`；ep 不整除该区
+      → efsdp 静默 floor 到错值（ep 超区时为 0），真机 sparse mesh 尺寸不匹配、跑不起来。
+      注：world = dp_replicate·dp_shard·cp·tp·pp 一致性在评估器里**由构造保证**（report:evaluate 用
+      各度之积当 world，`parallel_dims._validate:127` 的等式恒成立），无需另判。
+    - **[VPP] interleave>1 须 pp>1**：VPP（交错式 1F1B / 虚拟流水）是**流水线**上的技术——mindformers
+      仅在 `pp_enabled`（pp>1）时走 `apply_pp`（`parallelize.py:1805`），且 interleaved 调度要求
+      `interleave_num>1`（`pipeline_parallel.py:367-372`）；pp=1 时 interleave 被静默丢弃
+      （评估器 `parallel_model.py:76` `pp<=1 → 单 stage`），即"配了 VPP 却评了个非交错单 stage"。
+    - **[VPP] num_microbatches ≥ pp（交错 warmup 深度）**：交错式 1F1B 的 warmup =
+      `(pp-rank-1)*2 + (v-1)*group_size`（Megatron `schedules.py:877-878`，group_size 默认=pp；见
+      `mem_timeline.interleaved_warmup`），要填满 v·pp 个虚拟 stage 需要足够微批；m<pp 时交错流水无法
+      建立稳态（Megatron 交错调度要求 num_microbatches 是 pp 的正倍数）。**仅 VPP 施加**：plain 1F1B
+      （interleave=1）的 warmup=`min(pp-1-rank, m)`（`mem_timeline.build_1f1b`，clamp 到 m）——m<pp 真机
+      可跑（只是流水气泡），故不拦，避免误伤合法 plain 配置。
+    - **[swap] PP>1 + activation swap 不支持**（`activation_checkpoint.py:898-900` 直接 raise）。
+    - **[swap] swap 开启时 default_prefetch ≥ 1**（`config.py:300-307` `prefetch<1` → raise）：预取深度
+      <1 无双缓冲窗、真机报错。（上界 `<num_layers` 需模型层数，留结构侧/ParallelModel 校验。）
+    - **[tp] tp>1 强制 sequence_parallel=True**（`config.py:471-477` 直接 raise）——SP=false 时真机不
+      物化序列切分，评估器算的是另一份（无 SP）激活，属"评了个跑不了的配置"。
+    - **[优化器] 仅建模 Adam/AdamW**（K_OPT/state_bytes 均自 AdamW op 链导出）；非 Adam 的持久态与
+      optstep 瞬态都不同 → fail-loud，不静默按 AdamW 近似（P1-19）。
     """
     errs = []
+    # [并行区一致性] ep | dp_shard·cp·tp（parallel_dims.py:140-148）。
+    region = pc.dp_shard * pc.cp * pc.tp
+    if region % pc.ep != 0:
+        errs.append(
+            f"expert_parallel(ep={pc.ep}) 必须整除 dp_shard·cp·tp={region}"
+            f"（dp_shard={pc.dp_shard}·cp={pc.cp}·tp={pc.tp}）——EP 在该并行区内切专家"
+            f"（efsdp=region//ep，parallel_dims.py:140-148）；{region} 不被 {pc.ep} 整除会令 efsdp "
+            f"静默 floor 到错值（ep 超区时为 0），真机 sparse mesh 尺寸不匹配、跑不起来。合法 ep：能整除 "
+            f"{region} 的正整数（≤{region}）。")
+    # [VPP] interleave>1 须 pp>1（单 stage 交错无意义、会被静默丢弃）。
+    if pc.interleave > 1 and pc.pp <= 1:
+        errs.append(
+            f"interleave(VPP)={pc.interleave}>1 但 pp={pc.pp}≤1：VPP 是流水线上的交错技术，pp=1 无流水线"
+            "——mindformers 仅在 pp>1 走 apply_pp（parallelize.py:1805），pp=1 时 interleave 被静默丢弃"
+            "（评估器 parallel_model.py:76 pp≤1→单 stage），等于评了个非交错单 stage 配置。合法：VPP 需 "
+            "pp≥2，或设 interleave=1。")
+    # [VPP] num_microbatches ≥ pp（交错 warmup 深度；仅 VPP 施加，plain 1F1B 的 m<pp 由 warmup clamp 兜底可跑）。
+    if pc.interleave > 1 and pc.pp > 1 and pc.num_microbatches < pc.pp:
+        errs.append(
+            f"VPP(interleave={pc.interleave}) 下 num_microbatches={pc.num_microbatches} < pp={pc.pp}："
+            "交错式 1F1B 需足够微批填满 v·pp 个虚拟 stage 的 warmup（Megatron schedules.py:877-878；"
+            "num_microbatches 应为 pp 的正倍数），m<pp 无法建立交错稳态。合法：num_microbatches≥pp"
+            f"（≥{pc.pp}）。（plain 1F1B interleave=1 时 m<pp 合法、warmup 会 clamp，故本约束仅对 VPP。）")
+    # [swap] PP>1 + activation swap 不支持（activation_checkpoint.py:898-900）。
     if pc.pp > 1 and getattr(swap, "enable", False):
         errs.append("PP>1 + activation swap：mindformers 不支持该组合"
-                    "（tests/test_swap_offload.py）——真机跑不起来，拒绝评估。")
+                    "（activation_checkpoint.py:898-900 直接 raise；tests/test_swap_offload.py）"
+                    "——真机跑不起来，拒绝评估。")
+    # [swap] swap 开启时 default_prefetch ≥ 1（config.py:300-307）。
+    if getattr(swap, "enable", False) and getattr(swap, "default_prefetch", 1) < 1:
+        errs.append(
+            f"swap.enable=True 但 default_prefetch={getattr(swap, 'default_prefetch', None)} < 1："
+            "预取深度须 ≥1 才有双缓冲预取窗（config.py:300-307 `prefetch<1` 直接 raise）——<1 真机报错。"
+            "合法 default_prefetch：≥1 的整数（且 <num_layers，上界由结构侧校验）。")
+    # [tp] tp>1 强制 sequence_parallel=True（config.py:471-477）。
     if pc.tp > 1 and not pc.sequence_parallel:
         errs.append("tensor_parallel>1 强制 sequence_parallel=True（config.py:471-477）——"
                     "SP=false 时评的是跑不起来的无 SP 配置，拒绝评估（如确需绕过用 "
                     "Evaluator(..., check_feasibility=False)）。")
+    # [优化器] 仅 Adam/AdamW 已建模（P1-19）。
     otype = str(getattr(optimizer, "type", "AdamW")).lower()
     if otype not in ("adamw", "adam"):
         errs.append(f"optimizer.type={getattr(optimizer, 'type', None)!r} 未建模："
@@ -136,13 +193,20 @@ class PeakMemoryReport:
     max_device_memory: int = 0     # P2-01（C4）：设备容量，供 reserved 口径 OOM 判定
 
     def reserved_estimate_bytes(self, stage: int) -> int:
-        """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲。
+        """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲 + allocator pool 碎片。
 
-        **口径边界（P2-01 文档订正，closure-audit 2026-07-15）**：当前**只加 HCCL 通信缓冲**，
-        **未含** allocator pool 碎片。真机 reserved − allocated ≈ 658-680 MiB 里，除 HCCL 外还有
-        分配器池碎片（当前未建模）——故本值是 reserved 的**下界近似**，不是精确上界。
+        **口径演进（P2-01 §F7 闭环，2026-07-15）**：此前只加 HCCL、是 reserved 的纯**下界**；现补
+        `framework.allocator_pool_fragmentation`（DynamicMemPoolBestFit best-fit 空洞 + mempool 预留块
+        尾部，碎片率 1.8%×allocated），令估计**更接近真实 reserved 上界**、**不再是纯下界**。真机 DSv4：
+        allocated 15415.5 + HCCL ~400 + pool ~277 ≈ 16093 MiB，落在真机 reserved 16092-16096 区间内。
+
+        ⚠ pool 碎片模型**自 DSv4 单点标定、是近似**（非严格上界；跨模型碎片率稳定性待验证），故本值仍是
+        近似而非可证上界——见 `framework.POOL_FRAGMENTATION_RATE` 标定注记。
         """
-        return self.per_stage[stage].peak_bytes + self.hccl_reserved_bytes
+        from .framework import allocator_pool_fragmentation
+        peak = self.per_stage[stage].peak_bytes
+        pool = allocator_pool_fragmentation(None, peak)   # DynamicMemPoolBestFit 块级碎片近似
+        return peak + self.hccl_reserved_bytes + pool
 
     @property
     def allocated_oom(self) -> bool:
@@ -151,16 +215,17 @@ class PeakMemoryReport:
 
     @property
     def reserved_oom(self) -> bool:
-        """reserved 口径超容判定（P2-01，closure-audit C4 / §F7 文档订正，2026-07-15）：任一 stage 的
-        reserved **下界估计** `reserved_estimate_bytes`（= allocated 峰值 + HCCL 缓冲，**不含**
-        allocator pool 碎片）> 设备容量。
+        """reserved 口径超容判定（P2-01，§F7 pool 碎片闭环，2026-07-15）：任一 stage 的
+        `reserved_estimate_bytes`（= allocated 峰值 + HCCL 缓冲 + allocator pool 碎片近似）> 设备容量。
 
-        **命名语义 = 下界判定**（勿误读为精确 OOM）：估计取下界，故 `reserved_oom=True` 是**确定超容**
-        （下界都已越阈）；但 `reserved_oom=False` **不保证**真实 reserved 不超——真机 reserved − allocated
-        里还有未建模的 allocator pool 碎片（DSv4 实测尚缺 ~277-281 MiB pool 分量，reserved_estimate_bytes
-        已如实标为下界）。设备 HBM 真实约束是 reserved，故 `.oom=False`（allocated 未超）时 reserved 仍
-        可能已超——两口径**分开报告**，调用方不应把单一 allocated 布尔当最终 OOM 结论。
-        max_device_memory=0（未提供）时恒 False。字段名 allocated_oom/reserved_oom 保持不变（下游依赖）。"""
+        **语义演进**：此前 reserved 估计只含 allocated + HCCL、是纯**下界**，`reserved_oom=True` 曾是
+        「确定超容」；现估计已补 allocator pool 碎片近似分量（对应真机 DSv4 实测的 ~277-281 MiB pool
+        分量），**不再是纯下界**，而是更接近真实 reserved 的近似判定。代价：pool 碎片是**单点标定近似**
+        （非严格上界、跨模型稳定性待验证），故 `reserved_oom` 两侧都是近似——`reserved_oom=False` 仍
+        **不保证**真实 reserved 不超容，`reserved_oom=True` 也可能因高估而偏保守。设备 HBM 真实约束是
+        reserved，故 `.oom=False`（allocated 未超）时 reserved 仍可能已超——两口径**分开报告**，调用方
+        不应把单一 allocated 布尔当最终 OOM 结论。max_device_memory=0（未提供）时恒 False。字段名
+        allocated_oom/reserved_oom 保持不变（下游依赖）。"""
         if not self.max_device_memory:
             return False
         return any(self.reserved_estimate_bytes(i) > self.max_device_memory
