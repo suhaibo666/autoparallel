@@ -249,6 +249,38 @@ def parse_select_cfg(s, N):
     return [], (out or None)
 
 
+def _is_stage_seg_key(k):
+    """段 key 是否为 stage 定位（s0 / s1-2）——'s' 后接 数字 或 数字-数字。统一入口据此自动识别坐标系。"""
+    if not k.startswith("s"):
+        return False
+    b = k[1:]
+    parts = b.split("-")
+    return b != "" and len(parts) in (1, 2) and all(pt.isdigit() for pt in parts)
+
+
+def parse_recompute_cfg(s, pp, N, mtp, pp_split):
+    """统一「细粒度重算」入口（用户报告 #2：per-stage 与 mf 层号两框合一,自动识别、互斥）。
+    一个文本框、按每段 key 自动判定坐标系（两种写法**不可混用**）：
+      - key 形如 `s0` / `s1-2`（s+stage 号）→ **按 PP stage**（`parse_stage_select`，stage→层映射跟当前切分）。
+      - key 是 cell/op 名（self_attention/mlp/flash…）→ **按绝对层号 0-indexed**（`parse_select_cfg`，mf 口径）。
+    二者下游都产出同一个 `{layer_id: set(op 子串)}`（此前它们本就互斥、殊途同归）。空串→([], None)。"""
+    s = (s or "").strip()
+    if not s:
+        return [], None
+    segs = [x.strip() for x in s.replace("；", ";").split(";") if x.strip()]
+    keys = []
+    for seg in segs:
+        if ":" not in seg:
+            return [f"细粒度重算 {seg!r} 缺 `:`（按 stage：s0:both / 按层号：mlp:0-3）"], None
+        keys.append(seg.split(":", 1)[0].strip().lower())
+    stage_like = [_is_stage_seg_key(k) for k in keys]
+    if all(stage_like):
+        return parse_stage_select(s, pp, N, mtp, pp_split)      # 全 stage 写法
+    if any(stage_like):
+        return ["细粒度重算不可混用 stage(s0:…) 与层号(mlp:0-3) 两种写法——请统一为其中一种"], None
+    return parse_select_cfg(s, N)                                # 全层号写法（mf 口径）
+
+
 def parse_and_validate(p):
     """query dict → (errors:list[str], cfg:LLMConfig|None, pc_args:dict|None)。全部校验先行、报中文。"""
     errs = []
@@ -331,17 +363,19 @@ def parse_and_validate(p):
         a, b = (int(x) for x in lr.split("-")) if "-" in lr else (int(lr), int(lr))
     except ValueError:
         a = b = -1
-    # 细粒度选重文本（mindformers select_module 口径）:非空即优先于图上勾选
-    e_sel, sel_cfg = parse_select_cfg(p.get("sel_cfg", ""), N)
+    # pp 层分配（mindformers num_layer_list 口径）——提前解析：细粒度重算按 stage 写法需其做 stage→层映射。
+    e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, T)
+    errs += e_pp
+    # 细粒度重算（统一入口,用户报告 #2：per-stage 与层号两写法合一,自动识别、互斥）：非空即优先于
+    # 图上勾选/select 模块。`sel_stage` 保留为**隐藏兼容别名**（旧查询串/yaml）,sel_cfg 空时回落读取。
+    e_sel, sel_cfg = parse_recompute_cfg(
+        p.get("sel_cfg", "").strip() or p.get("sel_stage", ""), pp, N, mtp, pp_split)
     errs += e_sel
     # 非空层范围：full/select/custom 均校验（越界/倒序即报错，不静默忽略）
     if lr_raw and rmode in ("full", "select", "custom") and not (1 <= a <= b <= N):
         errs.append(f"重算层范围 {lr_raw!r} 非法（1-{N} 内的 a-b）")
     if rmode == "custom" and sel_cfg is None and not sel_ops_raw:
-        errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度选重」文本")
-    # pp 层分配（mindformers num_layer_list 口径）
-    e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, T)
-    errs += e_pp
+        errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度重算」文本")
     if errs:
         return errs, None, None
 
@@ -376,15 +410,8 @@ def parse_and_validate(p):
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk,
         mtp_num_layers=max(0, mtp))
-    # per-stage 选重（2026-07-14 用户口径）:与 sel_cfg 互斥,非空优先;基于**归置前**的配额算层映射。
-    e_ss, stage_sel = parse_stage_select(p.get("sel_stage", ""), pp, N, mtp, pp_split)
-    errs += e_ss
-    if stage_sel is not None and sel_cfg is not None:
-        errs.append("「细粒度选重」与「per-stage 选重」同时非空——请只用一个（per-stage 优先级更高易混淆）")
-    if errs:
-        return errs, None, None
-    if stage_sel is not None:
-        sel_cfg = stage_sel
+    # （细粒度重算已在上方统一入口 parse_recompute_cfg 解析,含 per-stage 写法——用户报告 #2 合并,
+    #   此处不再单独处理 per-stage；stage→层映射用的是**归置前**的用户配额 pp_split，口径不变。）
     # pp 层分配 → 含伪层的 layers_per_stage:embedding→stage0、head+MTP→末 stage（不占用户配额;
     # mtp 数只有 cfg 构建后可知——V4 预设 num_nextn_predict_layers=1）。
     if pp_split is not None:
@@ -1025,8 +1052,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
     <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="重算作用的层范围 a-b（1-N,含端点）——对 full / select / custom 均生效;空=全部层。例:full+「1-2」= 只前 2 层整层重算"></div>
-    <div class="fld"><label>per-stage 选重</label><input name="sel_stage" placeholder="s0:both; s1-2:self_attention; s3:none" style="width:200px" title="按 stage 配置选择重算(与当前 pp 切分一致):模式 = none | self_attention | mlp | both(≈full,真机退化端0.991) | 任意 op 名子串;非空即生效"></div>
-    <div class="fld"><label>细粒度选重(mf 口径)</label><input name="sel_cfg" placeholder="self_attention:0-3; flash:4-7" style="width:210px" title="mindformers select_module 口径:pattern=cell 名(self_attention/mlp)或 op 名子串;层范围 0-indexed(a-b,逗号分段);分号分隔多条;非空即生效(优先于图上勾选)"></div>
+    <div class="fld"><label>细粒度重算</label><input name="sel_cfg" placeholder="s0:both; s2-3:mlp   或   self_attention:0-3; flash:4-7" style="width:340px" title="统一入口,按段自动识别两种写法(不可混用),非空即优先于图上勾选/select 模块:&#10;① 按 PP stage —— s0:both; s1-2:self_attention; s3:none (stage→层跟当前 pp 切分)&#10;② 按绝对层号(mf select_module,0-indexed) —— self_attention:0-3; flash:4-7&#10;模式/pattern = none | self_attention | mlp | both(≈full) | 任意 op 名子串;分号分隔多条"></div>
     <input type="hidden" name="sel_ops" value="">
     <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
   </div>
