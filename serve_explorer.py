@@ -18,7 +18,7 @@ from urllib.parse import urlparse, parse_qs
 sys.stdout.reconfigure(encoding="utf-8")
 from cost_eval.presets import deepseek_v3, deepseek_v4
 from cost_eval.build_llm import build_llm_spec
-from cost_eval.structure_mem import estimate_structure_memory
+from cost_eval.structure_mem import estimate_structure_memory, estimate_select_memory
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
 from cost_eval.report import Evaluator
 
@@ -432,13 +432,46 @@ def _shape_info(tref, rt, dims, dtype_b):
     return calc
 
 
-def graph_json(layers, norm_dtype, spec, dims):
+def graph_json(layers, norm_dtype, spec, dims, recompute=None):
     """一个 stage 的 ResolvedLayer 列表 → 逐层 op-DAG JSON（含 shape 计算说明）。
-    per-op saves 按 norm-fp32 口径调整（与仿真器一致）;层头激活 = estimate_structure_memory 去重值。
+
+    per-op saves 按 norm-fp32 口径调整（与仿真器一致）。**重算感知**（2026-07-15 用户报告：
+    结构图激活此前无论重算如何都不变）：传入 `recompute`（RecomputeSpec）后，逐 op 按**仿真器
+    同口径**（`mem_timeline.py:651-660` 的 FWD pin）标注是否被重算（saves 反向重物化、前向不存）：
+      - 层头 `act_mib` = 该层 **stored 激活总量**（与仿真器逐字节同口径）：
+        None→`activation_saves`（全量存）/ full→`checkpoint_input`（仅层入口边界）/
+        select→`estimate_select_memory.act_live_pinned`（非选中 saves ∪ 层入口边界）。
+      - 每 op：`recomp`（bool，被重算=saves 不存）、stored `act_mib`（只计**存下**的 saves）、
+        `recomp_mib`（被重算省下的激活量）；每条 acts 明细带 `stored` 标志。
+      - `recompute=None`（缺省，如无重算路径）→ pinned_names=None → 全 stored、`recomp=none`，
+        `act_mib` == 旧 `activation_saves`，**逐字节复现旧行为**。
     原始 OpSpec（符号 shape/shard）与 resolved op 按序对齐——resolve 保序遍历,zip 安全。"""
+    from cost_eval.specs import RecomputeSpec
+    rc = recompute if recompute is not None else RecomputeSpec()
     out = []
     for l in layers:
+        lid = l.layer_id
         sm = estimate_structure_memory(l.ops, norm_compute_dtype_bytes=norm_dtype)
+        _optype = lambda op: getattr(op.type, "value", op.type)
+        # 该层重算态 → 层头 stored 总量（与 mem_timeline FWD `saved=...` 逐字节同口径）。
+        #   - none  ：`activation_saves`（全量 saves 常驻）。
+        #   - full  ：`checkpoint_input`（仅保层入口锚点，层内所有 op 反向重物化）。
+        #   - select：`act_live_pinned`（非选中 op saves ∪ 层入口锚点）。
+        # per-op stored 判定则更朴素——**被重算的 op 前向不存任何 saves**（stored=not op_recomp）；
+        # 层入口 checkpoint_input 是**层级重算锚点**（上一层输出，非本层某 op 的激活），单列 `entry_mib`
+        # 于层头解释 stored 总量与 per-op 之差，不摊到某个被重算 op（否则「此 op 重算却仍显 X MiB」易误读）。
+        if rc.is_full(lid):
+            recomp_state = "full"
+            layer_act = sm.checkpoint_input
+        elif rc.is_select(lid):
+            recomp_state = "select"
+            layer_act = estimate_select_memory(
+                l.ops, lambda op: rc.op_matches(lid, op.name, _optype(op)),
+                norm_compute_dtype_bytes=norm_dtype).act_live_pinned
+        else:
+            recomp_state = "none"
+            layer_act = sm.activation_saves
+        entry_mib = round(sm.checkpoint_input / MiB, 2) if recomp_state != "none" else 0
         orig_ops = spec.get_layer(l.layer_type).ops
         ops, edges = [], []
         eseen = set()
@@ -449,19 +482,28 @@ def graph_json(layers, norm_dtype, spec, dims):
                     eseen.add((produced[t.name], i))
                     edges.append([produced[t.name], i])
             produced[op.output.name] = i
+            op_recomp = (recomp_state == "full") or (
+                recomp_state == "select" and rc.op_matches(lid, op.name, _optype(op)))
             acts = []
-            act_b = 0
+            stored_b = recomp_b = 0
             for t, ot in zip(op.saves, oop.saves):
                 is_norm_fp32 = (op.type == "norm" and "softmax" not in op.name.lower()
                                 and norm_dtype > t.dtype_bytes)
                 eff_dtype = norm_dtype if is_norm_fp32 else t.dtype_bytes
                 b = t.local_numel * eff_dtype
-                acts.append({"name": t.name, "mib": round(b / MiB, 2),
+                # 被重算的 op 前向不存任何 saves（反向重物化）；否则常驻。
+                stored = not op_recomp
+                if stored:
+                    stored_b += b
+                else:
+                    recomp_b += b
+                acts.append({"name": t.name, "mib": round(b / MiB, 2), "stored": stored,
                              "calc": _shape_info(ot, t, dims, eff_dtype)
-                                     + (" ←norm 存 fp32 输入" if is_norm_fp32 else "")})
-                act_b += b
+                                     + (" ←norm 存 fp32 输入" if is_norm_fp32 else "")
+                                     + ("" if stored else " ←重算:反向重物化,前向不存")})
             ops.append({"i": i, "name": op.name, "type": op.type,
-                        "act_mib": round(act_b / MiB, 2), "acts": acts,
+                        "act_mib": round(stored_b / MiB, 2), "acts": acts,
+                        "recomp": op_recomp, "recomp_mib": round(recomp_b / MiB, 2),
                         "param_mib": round(sum(t.local_numel * t.dtype_bytes for t in op.params) / MiB, 2),
                         "out": {"name": op.output.name,
                                 "mib": round(op.output.local_numel * op.output.dtype_bytes / MiB, 2),
@@ -470,7 +512,10 @@ def graph_json(layers, norm_dtype, spec, dims):
                         "ins": [t.name for t in op.inputs],
                         "ws_mib": round(op.workspace_bytes / MiB, 1)})
         out.append({"id": l.layer_id, "type": l.layer_type,
-                    "act_mib": round(sm.activation_saves / MiB, 1),
+                    "act_mib": round(layer_act / MiB, 1),                   # stored 总量（仿真器口径）
+                    "full_act_mib": round(sm.activation_saves / MiB, 1),   # 无重算全量（对照）
+                    "recomp": recomp_state,                                 # none|full|select
+                    "entry_mib": entry_mib,                                 # 重算态层入口锚点（stored）
                     "param_mib": round(sum(o["param_mib"] for o in ops), 1),
                     "ops": ops, "edges": edges})
     return out
@@ -627,7 +672,7 @@ def eval_config(p):
             "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（含 pool，MiB）
             "layers_desc": rng, "n_layers": len(split_lys),
             "extras": extras,   # 该 stage 附着的伪层（不计入 n_layers；embedding→stage0/head→末 stage）
-            "graph": graph_json(lys, norm_dtype, spec, d),
+            "graph": graph_json(lys, norm_dtype, spec, d, rc),
             "timeline": [{"event": s.event, "total": round(s.total_bytes / MiB, 1),
                           "buckets": {k: round(getattr(s.breakdown, k, 0) / MiB, 1) for k in BK
                                       if getattr(s.breakdown, k, 0)}} for s in sp.timeline],
@@ -1069,16 +1114,20 @@ function cellSvg(L){
     const x1=X(a)+NW/2,y1=Y(a)+NH,x2=X(b)+NW/2,y2=Y(b);
     s+=`<path class="edge" id="ce_${L.id}_${a}_${b}" d="M${x1},${y1} C${x1},${y1+22} ${x2},${y2-22} ${x2},${y2}" marker-end="url(#ar${L.id})"/>`;});
   L.ops.forEach(o=>{
-    const c=OPC[o.type]||"#8b93a0", rcOn=customOps.has(o.name);
+    const c=OPC[o.type]||"#8b93a0";
+    const applied=o.recomp===true;                    // 后端权威:当前配置下此 op 被重算(saves 不存)
+    const rcOn=applied||customOps.has(o.name);         // 虚线标记:已生效重算 或 交互勾选(custom)
     const x=X(o.i),y=Y(o.i);
-    const tag=o.act_mib>0?`💾 ${o.act_mib}M`:(o.param_mib>0?`⚙ ${o.param_mib}M`:"↻ transient");
-    const tagc=o.act_mib>0?"#ffe08a":"#e8e8e8";
+    const tag=applied?`↻重算·不存${o.recomp_mib>0?" 省"+o.recomp_mib+"M":""}`
+             :(o.act_mib>0?`💾 ${o.act_mib}M`:(o.param_mib>0?`⚙ ${o.param_mib}M`:"↻ transient"));
+    const tagc=applied?"#e6c9f5":(o.act_mib>0?"#ffe08a":"#e8e8e8");
+    const stroke=applied?"#d9a7ec":(o.act_mib>0?"#c0392b":"#8d949e");
     s+=`<g class="cnode ${rcOn?"rc":""}" data-l="${L.id}" data-i="${o.i}">`;
-    s+=`<rect x="${x}" y="${y}" width="${NW}" height="${NH}" rx="7" fill="${c}" fill-opacity="0.88" stroke="${o.act_mib>0?"#c0392b":"#8d949e"}" stroke-width="${o.act_mib>0?2.5:1}"${rcOn?' stroke-dasharray="5 3"':''}/>`;
+    s+=`<rect x="${x}" y="${y}" width="${NW}" height="${NH}" rx="7" fill="${c}" fill-opacity="${applied?0.62:0.88}" stroke="${stroke}" stroke-width="${(applied||o.act_mib>0)?2.5:1}"${rcOn?' stroke-dasharray="5 3"':''}/>`;
     s+=`<text x="${x+8}" y="${y+15}" fill="#fff" font-weight="bold">${esc(o.name)} <tspan font-weight="normal" fill-opacity=".85">${esc(o.type)}</tspan></text>`;
     s+=`<text x="${x+8}" y="${y+29}" fill="#f0f0f0" font-size="9.5">→${esc(o.out.name)}:(${esc(o.out.sym)})</text>`;
-    s+=`<text x="${x+8}" y="${y+42}" fill="${tagc}" font-size="9.5">${esc(tag)}${rcOn?"  ↻重算":""}</text>`;
-    s+=`<g class="crcb" data-op="${esc(o.name)}"><circle cx="${x+NW-13}" cy="${y+13}" r="9" fill="${rcOn?"#fff":"rgba(255,255,255,.28)"}"/><text x="${x+NW-13}" y="${y+17}" text-anchor="middle" font-weight="bold" fill="${rcOn?"#c0392b":"#fff"}">↻</text></g></g>`;});
+    s+=`<text x="${x+8}" y="${y+42}" fill="${tagc}" font-size="9.5">${esc(tag)}</text>`;
+    s+=`<g class="crcb" data-op="${esc(o.name)}"><circle cx="${x+NW-13}" cy="${y+13}" r="9" fill="${customOps.has(o.name)?"#fff":"rgba(255,255,255,.28)"}"/><text x="${x+NW-13}" y="${y+17}" text-anchor="middle" font-weight="bold" fill="${customOps.has(o.name)?"#c0392b":"#fff"}">↻</text></g></g>`;});
   return s+`</svg>`;
 }
 function drawGraph(st){
@@ -1088,7 +1137,11 @@ function drawGraph(st){
     const open=openLayers.has(L.id);
     const opsH=open?`<div class="ops" style="display:block;overflow-x:auto">${cellSvg(L)}</div>`:"";
     const conn=idx<st.graph.length-1?`<div style="text-align:center;color:#9aa2ad;font:12px var(--mono);line-height:1">↓</div>`:"";
-    return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops · ${L.edges.length} edges</span><span class="am">激活 ${L.act_mib} MiB</span></div>${opsH}</div>${conn}`;
+    const rcOnL=(L.recomp&&L.recomp!=="none");
+    const amH=rcOnL
+      ? `<span class="am" style="color:#8e44ad" title="重算态:仅存下方标注为「存」的激活;被重算 op 的 saves 前向不存(反向重物化)。层入口锚点=上一层输出,重算必须保留">↻${L.recomp==="full"?"全重算":"选择性重算"} · 存 ${L.act_mib} MiB${L.entry_mib>0?"（层入口锚点 "+L.entry_mib+"M）":""} / 全量 ${L.full_act_mib}</span>`
+      : `<span class="am">激活 ${L.act_mib} MiB</span>`;
+    return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops · ${L.edges.length} edges</span>${amH}</div>${opsH}</div>${conn}`;
   }).join("");
   document.querySelectorAll(".lay>.hd").forEach(h=>h.addEventListener("click",()=>{const id=+h.dataset.l;openLayers.has(id)?openLayers.delete(id):openLayers.add(id);drawGraph(st);}));
   document.querySelectorAll(".cnode").forEach(el=>{
@@ -1129,13 +1182,16 @@ function hiOp(st,lid,i){
   L.edges.forEach(([a,b])=>{const e=document.getElementById(`ce_${lid}_${a}_${b}`);if(!e)return;
     if(b===i)e.classList.add("up"); else if(a===i)e.classList.add("down"); else e.classList.add("dim");});
   const c=OPC[o.type]||"#8b93a0";
-  const actsH=o.acts.length?o.acts.map(a=>`<div style="margin-bottom:4px"><span style="color:#c0392b;font-weight:700">💾 ${a.mib} MiB</span> = ${esc(a.name)} <span style="color:#555">${esc(a.calc)}</span></div>`).join(""):'<span style="color:#999">（反向不存激活）</span>';
+  const actsH=o.acts.length?o.acts.map(a=>a.stored===false
+      ?`<div style="margin-bottom:4px;opacity:.72"><span style="color:#8e44ad;font-weight:700">↻ ${a.mib} MiB 不存</span> = ${esc(a.name)} <span style="color:#555">${esc(a.calc)}</span></div>`
+      :`<div style="margin-bottom:4px"><span style="color:#c0392b;font-weight:700">💾 ${a.mib} MiB</span> = ${esc(a.name)} <span style="color:#555">${esc(a.calc)}</span></div>`).join(""):'<span style="color:#999">（反向不存激活）</span>';
+  const rcNote=o.recomp?`<div style="color:#8e44ad;margin-bottom:5px;font-weight:600">↻ 本 op 被重算：前向不存 saves、反向重物化${o.recomp_mib>0?"（省 "+o.recomp_mib+" MiB）":""}</div>`:"";
   const U=pred.length?pred.map(j=>`<li data-l="${lid}" data-g="${j}">↑ ${esc(L.ops[j].name)} (${esc(L.ops[j].type)})</li>`).join(""):'<li style="color:#999;cursor:default">（层输入）</li>';
   const D=succ.length?succ.map(j=>`<li data-l="${lid}" data-g="${j}">↓ ${esc(L.ops[j].name)} (${esc(L.ops[j].type)})</li>`).join(""):'<li style="color:#999;cursor:default">（层输出）</li>';
   document.getElementById("dhdr").textContent="算子详情";
   document.getElementById("detail").innerHTML=`<span class="badge" style="background:${c}">${esc(o.name)}</span> <span style="font:600 11px var(--mono);color:var(--blue)">${esc(o.type)} · L${lid} ${esc(L.type)}</span>
     <div class="kv">
-    <div class="k">要存的激活（切分后）</div><div class="v">${actsH}</div>
+    <div class="k">要存的激活（切分后）</div><div class="v">${rcNote}${actsH}</div>
     <div class="k">输出</div><div class="v">${esc(o.out.name)} · ${o.out.mib} MiB<br><span style="color:#555">${esc(o.out.calc)}</span></div>
     <div class="k">输入</div><div class="v">${o.ins.map(esc).join(", ")||"—"}</div>
     ${o.param_mib?`<div class="k">参数(持久,切分后)</div><div class="v">⚙ ${o.param_mib} MiB</div>`:""}
