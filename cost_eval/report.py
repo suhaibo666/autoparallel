@@ -13,6 +13,62 @@ from .mem_timeline import MemTimeline, StagePeak
 from .framework import framework_reserve, hccl_reserved_buffer
 
 
+def feasibility_errors(pc, optimizer, swap) -> list:
+    """运行时可行性检查（closure-audit C1，2026-07-15）：返回**真机跑不起来**的组合的错误串列表
+    （空=可行）。集中一处，供 Evaluator/adapter/搜索器统一调用，不各处零散封口。
+
+    依据均为 mindformers pynative 运行时硬约束：
+    - PP>1 + activation swap 不支持（tests/test_swap_offload.py 源码核对）。
+    - tp>1 强制 sequence_parallel=True（config.py:471-477）——SP=false 时真机不物化序列切分，
+      当前评估器算的是另一份（无 SP）激活，属"评了个跑不了的配置"。
+    - 优化器仅建模 Adam/AdamW（K_OPT/state_bytes 均自 AdamW op 链导出）；非 Adam 的持久态
+      与 optstep 瞬态都不同 → fail-loud，不静默按 AdamW 近似（P1-19）。
+    """
+    errs = []
+    if pc.pp > 1 and getattr(swap, "enable", False):
+        errs.append("PP>1 + activation swap：mindformers 不支持该组合"
+                    "（tests/test_swap_offload.py）——真机跑不起来，拒绝评估。")
+    if pc.tp > 1 and not pc.sequence_parallel:
+        errs.append("tensor_parallel>1 强制 sequence_parallel=True（config.py:471-477）——"
+                    "SP=false 时评的是跑不起来的无 SP 配置，拒绝评估（如确需绕过用 "
+                    "Evaluator(..., check_feasibility=False)）。")
+    otype = str(getattr(optimizer, "type", "AdamW")).lower()
+    if otype not in ("adamw", "adam"):
+        errs.append(f"optimizer.type={getattr(optimizer, 'type', None)!r} 未建模："
+                    "K_OPT/optstep 瞬态与 persistent 均自 AdamW 导出，非 Adam 会全错——"
+                    "请用 OptimizerSpec.adamw() 或补对应优化器建模。")
+    return errs
+
+
+def _validate_recompute_against_graph(recompute, g) -> None:
+    """针对已解析 op 图校验重算配置（closure-audit C1，2026-07-15）——需要图才能判定，故在 evaluate
+    时做（非 RecomputeSpec 构造时）。核心入口统一 fail-loud，不只 UI 封口：
+    - mode=full 但 full_layers 空 → 等效不重算、与配置意图相反。
+    - select 某层选择器在该层 op 图**零命中** → 静默空转（层仍标 select、kept_frag 生效，「越错越贵」）。
+    """
+    if getattr(recompute, "mode", "None") == "full" and not recompute.full_layers:
+        raise ValueError(
+            "RecomputeSpec(mode='full') 但 full_layers 为空——等效不重算、与配置意图相反，"
+            "请显式给层号（不重算请用 mode='None'）。")
+    if getattr(recompute, "mode", "None") != "select":
+        return
+    layers = [l for lys in g.stages.values() for l in lys]
+    by_id = {l.layer_id: l for l in layers}
+    for lid, sels in sorted(recompute.select_ops.items()):
+        if not sels:
+            continue
+        layer = by_id.get(lid)
+        if layer is None:
+            continue
+        hit = any(recompute.op_matches(lid, op.name, getattr(op.type, "value", op.type))
+                  for op in layer.ops)
+        if not hit:
+            raise ValueError(
+                f"select 选择器 {sorted(sels)} 在层 {lid}({layer.layer_type}) 的 op 图零命中——"
+                f"静默空转会错算（真机同样不生效）。该层可用 op: "
+                f"{', '.join(op.name for op in layer.ops)}")
+
+
 @dataclass(frozen=True)
 class PeakMemoryReport:
     """各 PP stage 峰值显存报告。
@@ -40,14 +96,13 @@ class Evaluator:
     """离线并行策略代价评估器门面（P0：内存）。"""
 
     def __init__(self, model_spec, parallel_config, optimizer, hardware,
-                 recompute, swap):
-        # P1-16（2026-07-14 review）：运行时可行性守卫——mindformers 不支持 PP>1 + activation
-        # swap（源码核对记录见 tests/test_swap_offload.py），评估器接受该组合会把真机跑不起来的
-        # 策略评为可行（搜索器排序污染）。fail-loud 而非静默评估。
-        if parallel_config.pp > 1 and getattr(swap, "enable", False):
-            raise ValueError(
-                "PP>1 + activation swap：mindformers 不支持该组合（tests/test_swap_offload.py "
-                "源码核对）——真机跑不起来的策略拒绝评估，请关 swap 或 pp=1。")
+                 recompute, swap, *, check_feasibility: bool = True):
+        # closure-audit C1（2026-07-15）：运行时可行性守卫集中在**核心评估入口** Evaluator，
+        # 不只在 adapter/UI 封口（此前直接核心 API 仍接受 tp>1+SP=false、非 Adam）。
+        # check_feasibility=False 供纯内存建模场景显式绕过（如只想要某不可跑组合的字节数）。
+        if check_feasibility:
+            for msg in feasibility_errors(parallel_config, optimizer, swap):
+                raise ValueError(msg)
         self.spec = model_spec
         self.pc = parallel_config
         self.opt = optimizer
@@ -64,6 +119,7 @@ class Evaluator:
                  * self.pc.tp * self.pc.pp)
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
         g = ShapeEval().resolve(self.spec, pm)
+        _validate_recompute_against_graph(self.recompute, g)     # C1：full 空集/select 零命中 fail-loud
         # 分配器块对齐（平台属性 HardwareSpec.alloc_block_bytes，默认 512）：逐张量 roundup —
         # 「分配器碎片」项的公式化落地（framework_reserve「块对齐取整」分量，取代经验常数）。
         block = getattr(self.hw, "alloc_block_bytes", 1)

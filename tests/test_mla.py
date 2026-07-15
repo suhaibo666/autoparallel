@@ -201,9 +201,13 @@ def test_mla_resolve_flash_workspace():
     Ascend FlashAttentionScore 返回 softmax_max+softmax_sum，各 [B,n_heads,S,8] fp32
     （flash_attention.py:136-196）→ 2×8×4B×B·n_heads·S。取代旧 S·B·n_heads·v_head_dim 近似。
     """
+    # C3（2026-07-15）：workspace 改 TensorRef 型 workspace_ref（按 TP 切）；TP=1 时值不变。
     from cost_eval.layers.mla import build_mla_attn_ops
-    from cost_eval.shape_eval import eval_expr
+    from cost_eval.shape_eval import resolve_tensor
+    from cost_eval.parallel_model import ParallelModel
+    from cost_eval.specs import ParallelConfig
     ops = build_mla_attn_ops(DM)
     flash = next(op for op in ops if op.type == OpType.FLASH_ATTN)
-    ws = eval_expr(flash.workspace, DM)
-    assert ws == 64 * DM.B * DM.n_heads * DM.S
+    pm = ParallelModel(ParallelConfig(), n_layers=DM.n_layers, world_size=1)
+    rt = resolve_tensor(flash.workspace_ref, DM, pm)
+    assert rt.local_numel * rt.dtype_bytes == 64 * DM.B * DM.n_heads * DM.S

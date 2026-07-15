@@ -114,11 +114,20 @@ DM = DimTable(
 
 
 def test_flash_workspace_is_softmax_lse_formula():
-    # GQA + MLA flash ops carry the mechanism LSE workspace (not the old fa_ws).
+    # C3（2026-07-15）：flash workspace 改 TensorRef 型 workspace_ref（按 TP 切）——检查它是
+    # [2,B,n_heads,S,8] fp32 = 64·B·n_heads·S 字节（TP=1/CP=1 时与旧 FLASH_LSE_WS 同值），
+    # 且 head 维标 tp shard（此前字符串 workspace 不按 TP 切，P1-09 audit）。
+    from cost_eval.shape_eval import resolve_tensor
+    from cost_eval.parallel_model import ParallelModel
+    from cost_eval.specs import ParallelConfig
+    pm = ParallelModel(ParallelConfig(), n_layers=DM.n_layers, world_size=1)
     for build in (build_gqa_attn_ops, build_mla_attn_ops):
         from cost_eval.model_spec import OpType
         flash = next(op for op in build(DM) if op.type == OpType.FLASH_ATTN)
-        assert flash.workspace == FLASH_LSE_WS == "64*B*n_heads*S"
+        assert flash.workspace is None and flash.workspace_ref is not None
+        assert flash.workspace_ref.shard == {2: "tp"}          # head 维按 TP 切
+        rt = resolve_tensor(flash.workspace_ref, DM, pm)
+        assert rt.local_numel * rt.dtype_bytes == 64 * DM.B * DM.n_heads * DM.S
 
 
 def test_flash_workspace_scales_with_seq():
@@ -134,7 +143,7 @@ def test_dsv4_sparse_attn_carries_flash_workspace():
     for ratio in (4, 128):
         ops = build_dsv4_hybrid_attn_ops(DM, ratio)
         sp = next(op for op in ops if op.name == "sparse_attn")
-        assert sp.workspace == FLASH_LSE_WS
+        assert sp.workspace_ref is not None and sp.workspace_ref.shard == {2: "tp"}   # C3: TP 切
 
 
 # ===========================================================================

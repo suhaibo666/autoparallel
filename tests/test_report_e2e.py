@@ -12,7 +12,7 @@ def test_e2e_dense_breakdown_and_oom():
                  S=4096, B=1, vocab=32000, n_layers=4)
     spec = ModelSpec("llama-ish", D, ["dense"] * 4, {"dense": build_dense_decoder(D)})
     ev = Evaluator(
-        spec, ParallelConfig(tp=8, dp_shard=8, num_microbatches=1),
+        spec, ParallelConfig(tp=8, dp_shard=8, num_microbatches=1, sequence_parallel=True),
         OptimizerSpec.adamw(), HardwareSpec(max_device_memory=60 * 2**30),
         RecomputeSpec("None"), SwapSpec())
     rep = ev.evaluate()
@@ -27,7 +27,8 @@ def test_e2e_moe_runs():
     DM = DimTable(H=512, F=1024, n_heads=8, n_kv=8, head_dim=64, S=512, B=1,
                   vocab=1000, n_layers=2, n_experts=8, topk=2, moe_F=1024)
     spec = ModelSpec("moe", DM, ["moe", "moe"], {"moe": build_moe_decoder(DM)})
-    ev = Evaluator(spec, ParallelConfig(ep=4, tp=2, dp_shard=2, num_microbatches=1),
+    ev = Evaluator(spec, ParallelConfig(ep=4, tp=2, dp_shard=2, num_microbatches=1,
+                                        sequence_parallel=True),   # C1: tp>1 强制 SP（真机约束）
                    OptimizerSpec.adamw(), HardwareSpec(max_device_memory=80 * 2**30),
                    RecomputeSpec("None"), SwapSpec())
     rep = ev.evaluate()

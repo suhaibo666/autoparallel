@@ -41,7 +41,7 @@ o_groups/o_lora_rank/csa_window_size`；`dsa_fused: bool`（融合开关，默�
 from __future__ import annotations
 
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
-from .attention import FLASH_LSE_WS
+from .attention import _fa_workspace
 
 __all__ = ["build_dsv4_hybrid_attn_ops"]
 
@@ -157,11 +157,11 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         sparse_ins = ([q_hnorm, kv_a_out, compressed_kv, topk_indices] if enable_indexer
                       else [q_hnorm, kv_a_out, compressed_kv])
         ops.append(OpSpec("sparse_attn", OpType.FLASH_ATTN, sparse_ins, core_out,
-                          params=[attn_sink], saves=sparse_saves, workspace=FLASH_LSE_WS))
+                          params=[attn_sink], saves=sparse_saves, workspace_ref=_fa_workspace()))
     else:
         # 滑窗（ratio 0/1）：纯 flash（sliding-window），saves Q(=q_hnorm)/O(core_out)+lse（[S,S] 从不物化，§7.4）
         ops.append(OpSpec("core_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out], core_out,
-                          saves=[q_hnorm, core_out], workspace=FLASH_LSE_WS))
+                          saves=[q_hnorm, core_out], workspace_ref=_fa_workspace()))
 
     # ── 分组输出：linear_o_group_proj（bmm，fp32 cg save）→ linear_proj → 残差 ────
     ops += [

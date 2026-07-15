@@ -35,6 +35,15 @@ def _fa_stats() -> TensorRef:
     return TensorRef("fa_stats", ("2", "B", "n_heads", "S", "8"),
                      shard={2: "tp"}, dtype_bytes=4)
 
+
+def _fa_workspace() -> TensorRef:
+    """FlashAttention fwd/重算瞬态 workspace（closure-audit C3，2026-07-15）：改字符串
+    `FLASH_LSE_WS` 为 TensorRef 型 workspace_ref，让它**按 TP 切**（head 维 ÷tp）——此前字符串
+    workspace 只 ÷cp 不 ÷tp（shape_eval:224-229），TP=8 时重算瞬态高估 8×。与 `_fa_stats` 同形
+    但独立 name（workspace_ref 不入 saves/act_live，不与驻留 stats 双计驻留窗）。"""
+    return TensorRef("fa_ws", ("2", "B", "n_heads", "S", "8"),
+                     shard={2: "tp"}, dtype_bytes=4)
+
 # ── MLA 符号维度表达式（与 DimTable 字段名一致，供 eval_expr 求值）──────────
 # linear_qkv 输出维（q_lora+kv_lora+k_pe）
 QKV_PROJ = "q_lora_rank+kv_lora_rank+qk_rope_head_dim"
@@ -77,9 +86,6 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     # 独立 FSDP wrap（parallelize.py:318-328/:1140-1142），此前缺失致参数图不守恒。
     ln1_g  = TensorRef("ln1_g", ("H",), is_weight=True, dtype_bytes=4)
 
-    # flash attention workspace = softmax LSE 机理公式（∝ S·n_heads，见 FLASH_LSE_WS）
-    fa_ws = FLASH_LSE_WS
-
     return [
         # 1. Pre-norm（LayerNorm / RMSNorm）
         OpSpec("ln1",    OpType.NORM,        [x],          ln1,
@@ -94,7 +100,7 @@ def build_gqa_attn_ops(d: DimTable) -> list:
         #    的输入，驻留至反向；workspace = 重算路径再物化瞬态，见 FLASH_LSE_WS 注释）
         OpSpec("flash",  OpType.FLASH_ATTN,  [qkv],        attn,
                saves=[qkv, attn, fa_st],
-               workspace=fa_ws),
+               workspace_ref=_fa_workspace()),
         # 5. Output 投影（列并行→行并行）
         OpSpec("o_proj", OpType.MATMUL,      [attn, o_w],  o,
                params=[o_w], saves=[attn]),
@@ -153,8 +159,6 @@ def build_mla_attn_ops(d: DimTable) -> list:
     qan_g  = TensorRef("q_a_norm_g",  ("q_lora_rank",),  is_weight=True, dtype_bytes=4)
     kvan_g = TensorRef("kv_a_norm_g", ("kv_lora_rank",), is_weight=True, dtype_bytes=4)
 
-    fa_ws = FLASH_LSE_WS   # softmax LSE 机理公式（∝ S·n_heads），MLA 与 GQA 同（不依赖 head_dim）
-
     return [
         # 1. Pre-norm
         OpSpec("ln1",        OpType.NORM,        [x],               ln1_out,
@@ -182,7 +186,7 @@ def build_mla_attn_ops(d: DimTable) -> list:
         # 8. FlashAttention（q=qb_out, kv=kvb_out；saves 含 softmax max/sum 统计，驻留至反向）
         OpSpec("flash",      OpType.FLASH_ATTN,  [qb_out, kvb_out], attn_out,
                saves=[qb_out, kvb_out, attn_out, fa_st],
-               workspace=fa_ws),
+               workspace_ref=_fa_workspace()),
         # 9. o_proj（行并行：n_heads*v_head_dim → H，partial=tp）
         OpSpec("o_proj",     OpType.MATMUL,      [attn_out, o_w],   o,
                params=[o_w], saves=[attn_out]),

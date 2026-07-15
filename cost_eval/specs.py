@@ -42,6 +42,12 @@ class ParallelConfig:
             raise ValueError(
                 f"context_parallel_method={self.context_parallel_method!r} 未实现"
                 f"（支持：{_CP_METHODS}）")
+        # closure-audit C1（2026-07-15）：reshard 枚举是**本字段自身不变量** → 在核心构造处校验，
+        # 不只靠 adapter 封口（此前 typo `nevver` 静默回落到 default，与配置意图相反）。
+        if self.reshard_after_forward not in ("always", "never", "default"):
+            raise ValueError(
+                f"reshard_after_forward={self.reshard_after_forward!r} 非法"
+                "（仅 always|never|default）——typo 静默回落会评错 gather 生命周期。")
 
 
 @dataclass

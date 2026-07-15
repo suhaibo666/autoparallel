@@ -57,12 +57,14 @@ _MAPPED_MODEL_KEYS = {
     "gated_linear_unit", "moe_intermediate_size", "moe_capacity_factor",
     "n_routed_experts", "num_experts", "num_experts_per_tok", "n_shared_experts",
     "untie_embeddings_and_output_weights",
-    "moe_shared_expert_intermediate_size", "first_k_dense_replace", "moe_layer_freq",
+    "moe_shared_expert_intermediate_size", "use_shared_expert_gating",   # C3：shared 门
+    "first_k_dense_replace", "moe_layer_freq",
     "enable_hyper_connections", "hc_mult", "num_nextn_predict_layers",
     "add_bias_linear", "add_qkv_bias",
     "normalization", "norm_placement",
     "compute_dtype", "params_dtype", "position_embedding_type", "tie_word_embeddings",
     "chunk_loss_num",   # P1-06（2026-07-14）：分块 CE（loss.py chunked 变体）→ llm.chunk_loss_num
+    "cross_entropy_fused",   # C3（2026-07-15）：显式 CE 融合键（与 DSA 融合解耦，可追溯）
 }
 # ② 已知「内存中性」忽略集：均**不改内存 op 图**，刻意复现手写映射的省略（如 dsv4_align_config()
 #    docstring「qk_layernorm/add_bias omitted（memory-negligible; would fail-loud in build_llm）」——
@@ -74,8 +76,14 @@ _IGNORED_MODEL_KEYS = {
     # 「qk_layernorm/add_bias omitted（memory-negligible; would fail-loud in build_llm）」）。这是
     # round-trip 到 dsv4_align_config()（qk_layernorm=False）的**必要**条件：P4:88 有 qk_layernorm=True，
     # 若映射到 LLMConfig.qk_layernorm=True 会既破坏字段相等、又触发 build_llm fail-loud。
+    # qk_layernorm：内存**真·可忽略**（2 个 [S,B,head_dim] 的小 RMSNorm 激活，远小于主激活）——
+    #   刻意不建 op（照抄 dsv4_align_config 的选择），非静默丢失关键内存。build_llm 对 LLMConfig.
+    #   qk_layernorm=True 仍原生 fail-loud（若显式想建模）。closure-audit C2 复核：保留为「已知可忽略」。
     "qk_layernorm",
-    "mla_qkv_concat", "attention_dropout", "hidden_dropout",
+    "mla_qkv_concat",
+    # attention_dropout/hidden_dropout：**值守卫**下方（=0 中性、>0 fail-loud，见 _build_llm_config）——
+    #   非零 dropout 会物化 mask（bool/uint8 同激活形），当前未建模；此前静默忽略致 0.1 与 0.0 同图。
+    "attention_dropout", "hidden_dropout",
     "layernorm_compute_dtype", "softmax_compute_dtype", "rotary_dtype", "initializer_range",
     "csa_compress_rotary_base", "csa_dense_mode",
     "dsa_indexer_loss_coeff", "dsa_indexer_use_sparse_loss",
@@ -320,6 +328,15 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "已映射见 _MAPPED_MODEL_KEYS，已知内存中性忽略见 _IGNORED_MODEL_KEYS；"
             "如该字段确改内存请在转换器补映射，否则加入忽略集（附‘不改 op 图’论证）。")
 
+    # 值守卫（closure-audit C2，2026-07-15）：非零 dropout 会物化 dropout mask（bool/uint8，与
+    # 激活同形，saved 供反向）——当前未建模。=0 中性放行（DSv3/V4 生产均 0）；>0 fail-loud，
+    # 不静默把 0.1 当 0.0。
+    for _dk in ("attention_dropout", "hidden_dropout"):
+        _dv = model.get(_dk)
+        if _dv is not None and float(_dv) > 0:
+            raise NotImplementedError(
+                f"{_dk}={_dv} >0：dropout mask（与激活同形，saved 供反向）未建模——"
+                "静默忽略会低估。请设为 0（生产常态）或补 mask 建模。")
     # 值守卫：flash=False 会物化 [S,S] 分数、改 op 图（评估器只建 flash 路径）。
     if model.get("use_flash_attention", True) is False:
         raise NotImplementedError(
@@ -371,6 +388,7 @@ def _build_llm_config(model: dict) -> LLMConfig:
                              if model.get("moe_intermediate_size") is not None else None),
         moe_shared_expert_num=int(model.get("n_shared_experts", 0) or 0),
         moe_shared_ffn_hidden_size=int(model.get("moe_shared_expert_intermediate_size", 0) or 0),
+        moe_shared_expert_gating=bool(model.get("use_shared_expert_gating", False)),
         moe_capacity_factor=float(model.get("moe_capacity_factor", 1.0)),
         first_k_dense_replace=model.get("first_k_dense_replace"),
         moe_layer_freq=model.get("moe_layer_freq"),
@@ -427,14 +445,21 @@ def _build_llm_config(model: dict) -> LLMConfig:
             o_groups=int(model.get("o_groups", 0)),
             o_lora_rank=int(model.get("o_lora_rank", 0)),
             dsa_fused=_dsa_fused(model),
-            # P1-06 澄清（2026-07-14 review，部分认可）：pynative 公共路径的 LM CE **恒为 unfused
-            # 小算子组合**（loss/loss.py 全文无 fused CE 开关）——但 DSv4 真机锚（deepseek_v4 fork
-            # dsv4_sim，15415.5）在 lean-CE 建模下 0.968、fat 会 +~2GiB 过冲，即 fork 的 loss 区
-            # 实测行为 lean（fork loss.py:378+ 有 chunked-fused backward 族）。此处保留
-            # 「fused-DSA 生产 → lean CE」作为**该 fork 的经验规则**（有真机锚背书），风险
-            # （attention fused + CE unfused 的组合会低估）已文档化；非 dsv4 模型恒 unfused（默认 False）。
-            cross_entropy_fused=_dsa_fused(model),
         )
+    # P1-06 真解耦（closure-audit C3，2026-07-15）：CE 形态**不再绑定 DSA kernel fusion**
+    # （此前 `cross_entropy_fused=_dsa_fused(model)`——切 DSA 融合就切 CE，provenance 错误）。
+    #   依据（V1 源码核查）：pynative LM CE 恒 unfused 小算子，lean/fat 差异实为 loss 区中间量
+    #   共存份数；DSv4 fork 的 loss.py 用 chunked-fused backward → lean。故 CE lean-ness 由
+    #   **CE 自身配置**决定，与 attention kernel 正交：
+    #     ① 显式 model 键 `cross_entropy_fused` 优先（可追溯）；
+    #     ② 否则 dsv4_hybrid → True（该 fork lean-CE 标定，真机锚 15415.5 背书，**独立于** DSA
+    #        融合开关：apply_dsa_kernel_fusion=False 的 DSv4 仍 lean-CE）；
+    #     ③ 其余模型 → False（pynative 常态 unfused-fat）。
+    _ce_explicit = model.get("cross_entropy_fused")
+    if _ce_explicit is not None:
+        kwargs["cross_entropy_fused"] = bool(_ce_explicit)
+    elif attn_type == "dsv4_hybrid":
+        kwargs["cross_entropy_fused"] = True
     return LLMConfig(**kwargs)
 
 
@@ -704,6 +729,34 @@ def _build_recompute(mf: dict) -> RecomputeSpec:
         f"recompute.mode={mode!r} 暂未映射（转换器支持 'full' / 'None' / 'select'）。")
 
 
+# ── 段级 schema（closure-audit C2，2026-07-15）：training/context/swap 未知键 fail-loud ────────
+# 此前只 model/parallelism 段有校验 → training 的 `local_batch_szie`、context 的 `max_device_memry`、
+# swap 的 `enablee` 等 typo 静默回落到 default（评了另一份配置）。键集自本地 configs/ 全量扫描
+# + pynative 新式段（training 来自容器 dsv4_sim/pynative_ds3，swap 来自 config.py:829-848）。
+_TRAINING_KEYS = {
+    "steps", "local_batch_size", "global_batch_size", "max_norm", "seed", "deterministic",
+    "epochs", "sink_size", "sink_mode",
+}
+_CONTEXT_KEYS = {
+    "affinity_cpu_list", "ascend_config", "device_id", "device_target", "enable_graph_kernel",
+    "jit_config", "max_call_depth", "max_device_memory", "memory_optimize_level",
+    "mempool_block_size", "mode", "save_graphs", "save_graphs_path", "deterministic",
+    "runtime_num_threads", "op_timeout", "jit_level",
+}
+_SWAP_KEYS = {"enable", "default_prefetch", "layer_swap", "op_swap"}
+
+
+def _check_segment_keys(mf: dict, seg: str, allowed: set) -> None:
+    d = mf.get(seg)
+    if not isinstance(d, dict):
+        return
+    unknown = set(d) - allowed
+    if unknown:
+        raise NotImplementedError(
+            f"未识别的 `{seg}` 段字段：{sorted(unknown)}（已知：{sorted(allowed)}）——"
+            "typo 静默回落到默认值会评错另一份配置，故 fail-loud。")
+
+
 def _build_optimizer(mf: dict) -> OptimizerSpec:
     """`optimizer` + `model.params_dtype` → `OptimizerSpec`。params_dtype=float32 → params_fp32（state=12）。"""
     opt = mf.get("optimizer", {}) or {}
@@ -732,6 +785,10 @@ def from_mindformers_dict(mf: dict) -> EvaluatorConfigBundle:
     """
     if "model" not in mf:
         raise ValueError("mindformers config 缺 `model` 段——无法构建 LLMConfig。")
+    # C2：段级 schema——training/context/swap 未知键（含 typo）fail-loud，不静默回落默认。
+    _check_segment_keys(mf, "training", _TRAINING_KEYS)
+    _check_segment_keys(mf, "context", _CONTEXT_KEYS)
+    _check_segment_keys(mf, "swap", _SWAP_KEYS)
     model = mf["model"] or {}
     train = mf.get("training", {}) or {}
 

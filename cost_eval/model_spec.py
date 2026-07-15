@@ -35,6 +35,10 @@ class DimTable:
     dsa_fused: bool = True
     # Shared expert intermediate size (MoE + MLA combined layers)
     moe_shared_F: int = 0
+    # shared-expert 门控（closure-audit C3，2026-07-15）：use_shared_expert_gating=True 时有
+    # [H,1] Dense 门（shared_experts.py:56-64）。字节可忽略但为参数守恒完整性建其权重。默认 False
+    # （DSv3 不用 → golden 不变、惰性）。
+    moe_shared_gate: bool = False
     capacity_factor: float = 1.0
     # mHC residual streams (设计 §9)：hidden 打包为 n 条残差流 [S,B,n*H]。
     # 默认 1 → 完全惰性（plain 残差，n*H==H），不影响任何现有 spec。

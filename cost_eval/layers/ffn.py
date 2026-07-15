@@ -192,7 +192,7 @@ def build_shared_expert_ops(d: DimTable) -> list:
     sh_fc2_w   = TensorRef("sh_w2",  ("moe_shared_F", "H"),
                             shard={0: "tp"}, is_weight=True)
 
-    return [
+    ops = [
         # shared fc1（列并行：H → gated 2*moe_shared_F / ungated moe_shared_F）
         OpSpec("shared_fc1",    OpType.MATMUL,      [hin_sh, sh_fc1_w], sh_g,
                params=[sh_fc1_w], saves=[hin_sh]),
@@ -203,3 +203,12 @@ def build_shared_expert_ops(d: DimTable) -> list:
         OpSpec("shared_fc2",    OpType.MATMUL,      [sh_act, sh_fc2_w], sh_o,
                params=[sh_fc2_w], saves=[sh_act]),
     ]
+    # shared-expert 门（closure-audit C3）：use_shared_expert_gating=True 时的 [H,1] Dense
+    # （shared_experts.py:56-64）——字节可忽略、门激活 [S,B,1] 极小、saves 空（sigmoid 线性直传）。
+    # 仅为参数守恒完整性建其权重；DSv3（moe_shared_gate=False）不建 → golden 不变。
+    if getattr(d, "moe_shared_gate", False):
+        sh_gate_w = TensorRef("sh_gate_w", ("H", "1"), is_weight=True)
+        sh_gate_o = TensorRef("sh_gate", ("S", "B", "1"))
+        ops.append(OpSpec("shared_gate", OpType.MATMUL, [hin_sh, sh_gate_w], sh_gate_o,
+                          params=[sh_gate_w], saves=[]))
+    return ops

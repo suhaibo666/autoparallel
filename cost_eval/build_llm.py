@@ -56,9 +56,20 @@ def _validate_structure(cfg: LLMConfig) -> None:
     if isinstance(cfg.moe_layer_freq, (list, tuple)) and len(cfg.moe_layer_freq) != cfg.num_layers:
         raise ValueError(
             f"moe_layer_freq 长度({len(cfg.moe_layer_freq)}) 必须 == num_layers({cfg.num_layers})。")
-    if cfg.num_moe_experts and cfg.moe_router_topk > cfg.num_moe_experts:
-        raise ValueError(
-            f"moe_router_topk({cfg.moe_router_topk}) > num_moe_experts({cfg.num_moe_experts})。")
+    if cfg.num_moe_experts:
+        if cfg.moe_router_topk > cfg.num_moe_experts:
+            raise ValueError(
+                f"moe_router_topk({cfg.moe_router_topk}) > num_moe_experts({cfg.num_moe_experts})。")
+        # closure-audit C1（2026-07-15）：topk≤0 会产生**负/零 numel**（TLOCAL=S·B·topk·C/ep），
+        # 此前 shape resolve 得 local_numel=-8388608 而不报错。
+        if cfg.moe_router_topk <= 0:
+            raise ValueError(
+                f"moe_router_topk({cfg.moe_router_topk}) 必须 ≥1（MoE 每 token 至少选 1 专家；"
+                "≤0 会产生负/零 dispatched-token numel）。")
+        if cfg.moe_capacity_factor <= 0:
+            raise ValueError(
+                f"moe_capacity_factor({cfg.moe_capacity_factor}) 必须 >0"
+                "（≤0 会产生零尺寸 dispatched 张量、错算 MoE 激活）。")
     if isinstance(cfg.window_pattern, (list, tuple)) and len(cfg.window_pattern) != cfg.num_layers:
         raise ValueError(
             f"window_pattern 长度({len(cfg.window_pattern)}) 必须 == num_layers({cfg.num_layers})。")
@@ -68,6 +79,13 @@ def _validate_structure(cfg: LLMConfig) -> None:
             raise ValueError(
                 f"n_heads·v_head_dim({nvd}) 不被 o_groups({cfg.o_groups}) 整除"
                 "（分组输出投影 O_CHUNK 需整除）。")
+    # closure-audit C1（2026-07-15）：dsv4_hybrid 的分组输出投影**依赖** o_groups（O_GROUP_OUT/
+    # O_CHUNK 表达式除以它）——o_groups=0 会在 shape resolve 裸抛 ZeroDivisionError，改提前 fail-loud。
+    if cfg.attn_type == "dsv4_hybrid" and not cfg.o_groups:
+        raise ValueError(
+            "attn_type='dsv4_hybrid' 需 o_groups>0（分组输出投影 linear_o_group_proj 用它做 "
+            "O_GROUP_OUT=o_groups·o_lora_rank / O_CHUNK=n_heads·v_head_dim//o_groups）——"
+            "缺省 0 会在 shape 求值裸除零。")
 
 
 def _check_implemented_dispatch(cfg: LLMConfig) -> None:

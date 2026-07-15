@@ -58,6 +58,7 @@ class LLMConfig:
     moe_ffn_hidden_size: int | None = None  # 专家 FFN 隐藏维
     moe_shared_expert_num: int = 0
     moe_shared_ffn_hidden_size: int = 0
+    moe_shared_expert_gating: bool = False   # C3：shared-expert [H,1] 门（默认关，DSv3 不用）
     first_k_dense_replace: int | None = None    # 前 K 层 dense；或用下面的 freq
     moe_layer_freq: tuple | int | None = None   # 每层 0=dense/1=MoE（覆盖 first_k）
     moe_capacity_factor: float = 1.0        # 影响 dispatched token 数（内存相关）
@@ -149,6 +150,7 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         csa_window_size=cfg.csa_window_size,
         dsa_fused=cfg.dsa_fused,
         moe_shared_F=cfg.moe_shared_ffn_hidden_size,
+        moe_shared_gate=cfg.moe_shared_expert_gating,
         capacity_factor=cfg.moe_capacity_factor,
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
         num_residual_streams=cfg.num_residual_streams,

@@ -16,6 +16,7 @@ def _report(**pcargs):
     cfg = LLMConfig(num_layers=2, hidden_size=16, num_attention_heads=2, num_query_groups=2,
                     vocab_size=32, seq_length=8, attn_type="gqa", ffn_hidden_size=32)
     spec = build_llm_spec(cfg)
+    pcargs.setdefault("sequence_parallel", pcargs.get("tp", 1) > 1)   # C1: tp>1 强制 SP（真机约束）
     pc = ParallelConfig(**pcargs)
     ev = Evaluator(spec, pc, OptimizerSpec.adamw(), HardwareSpec(max_device_memory=59 * GiB),
                    RecomputeSpec(), SwapSpec())
