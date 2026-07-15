@@ -1,8 +1,11 @@
 """① unfused CE 链 fat（无重算）+ ② optimizer-step 事件 —— 真机 profiler 标定（pp=2 8L 无重算 DSv3）。
 
-真机（`analysis/realmachine/pp2_norecomp/`）：stage0 峰 = AdamW 更新 embedding 的瞬态（②，
-7×883.8 MiB fp32），stage1 峰 = unfused CE 链 ~8 满 vocab fp32 共存（①）。估计器原欠计
-stage0 23%、stage1 3×。两 fix 后 stage0→1.006、stage1→0.956，锚点不动。
+真机（`analysis/realmachine/pp2_norecomp/`）：stage0 峰 = AdamW 更新 embedding 的瞬态（②），
+stage1 峰 = unfused CE 链 ~8 满 vocab fp32 共存（①）。
+
+P2-08 文档订正（2026-07-15）：stage0 的 optstep 瞬态**当前建模为 K_OPT=4 份 fp32 + 累计梯度桶
+grad_accum**（P0-01，2026-07-14：旧「7× / 6×883.8」是含累计梯度的混合常数，已拆分——K_OPT
+6→4，梯度独立进 grad_accum）。stage0→0.997、stage1→1.001（grad_accum 修后），锚点见各测试断言。
 """
 from validate_dsv3 import build_dsv3_spec
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec

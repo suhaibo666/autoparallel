@@ -62,3 +62,66 @@ def test_dsv4_param_conservation_no_phantom():
     # 直接守卫：vocab 权重只应计两次（emb + lm_head），不得混入 MTP 幻影。
     vocab_h = 129280 * 1792
     assert n < ref + vocab_h, "DSv4 param 疑似含 MTP 幻影 vocab 权重（C2 回归）"
+
+
+# ── closure-audit C5（2026-07-15）：**逐模块精确对账**（取代此前唯一的全局 ±2%，兑现 P2-07 ──
+#    的「逐模块 exact」表述——±2% 只保留为跨版本观察指标，精确性由本测试守）。
+
+
+def _per_module_params(spec):
+    """按 (layer_type, param_name) → local_numel（单层基，聚合层数除回）。"""
+    from collections import defaultdict
+    pc = ParallelConfig(sequence_parallel=False)
+    pm = ParallelModel(pc, spec.dims.n_layers, world_size=1)
+    g = ShapeEval().resolve(spec, pm)
+    agg = defaultdict(lambda: defaultdict(int))
+    cnt = defaultdict(int)
+    seen = defaultdict(set)
+    for layers in g.stages.values():
+        for l in layers:
+            key = l.layer_id
+            if key not in seen[l.layer_type]:
+                cnt[l.layer_type] += 1
+                seen[l.layer_type].add(key)
+            for op in l.ops:
+                for w in op.params:
+                    agg[l.layer_type][w.name] += w.local_numel
+    # 除回层数 → 单层
+    out = {}
+    for lt, d in agg.items():
+        out[lt] = {n: v // cnt[lt] for n, v in d.items()}
+    return out
+
+
+def test_dsv3_per_module_exact_roster_and_count():
+    """DSv3(4) **逐模块逐参数**精确对账：每层类型的参数名册 + 每个权重的 numel 从 dims 独立
+    重算，与 op 图**逐字节**相等（含 P1-01 补的 router fp32 / norm gamma / final_norm）。
+    """
+    H, vocab = 1792, 129280
+    q_lora, kv_lora, qk_rope, qk_nope, v_head = 1536, 512, 64, 128, 192
+    n_heads = 8                      # DSv3 preset head 数（用于 QKV_PROJ/o_w 维）
+    F, moe_F, n_exp = 3072, 1024, 8
+    QKV_PROJ = q_lora + kv_lora + qk_rope
+    QB_OUT = n_heads * (qk_nope + qk_rope)
+    KVB_OUT = n_heads * (qk_nope + v_head)
+    ATTN_OUT = n_heads * v_head
+    attn = {
+        "ln1_g": H, "q_a_norm_g": q_lora, "kv_a_norm_g": kv_lora,
+        "qkv_w": H * QKV_PROJ, "qb_w": q_lora * QB_OUT, "kvb_w": kv_lora * KVB_OUT,
+        "o_w": ATTN_OUT * H,
+    }
+    dense = {**attn, "ln2_g": H, "fc1_w": H * 2 * F, "fc2_w": F * H}
+    moe = {**attn, "router_w": n_exp * H,
+           "e_w1": n_exp * H * 2 * moe_F, "e_w2": n_exp * moe_F * H,
+           "sh_w1": H * 2 * moe_F, "sh_w2": moe_F * H}
+    expected = {
+        "embedding": {"emb_w": vocab * H},
+        "mla_dense": dense,
+        "mla_moe": moe,
+        "lm_head": {"final_norm_g": H, "head_w": H * vocab},
+    }
+    got = _per_module_params(build_llm_spec(deepseek_v3(4)))
+    for lt, exp in expected.items():
+        assert set(got[lt]) == set(exp), (lt, "roster", sorted(got[lt]), sorted(exp))
+        for name, numel in exp.items():
+            assert got[lt][name] == numel, (lt, name, got[lt][name], numel)

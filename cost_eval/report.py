@@ -84,12 +84,29 @@ class PeakMemoryReport:
     """
     per_stage: list        # list[StagePeak]，按 stage 升序
     tightest_stage: int    # peak_bytes 最大的 stage
-    oom: bool              # 任意 stage OOM（allocated 口径）
+    oom: bool              # 任意 stage OOM（allocated 口径）——= allocated_oom，保留旧名兼容
     hccl_reserved_bytes: int = 0   # D-2：HCCL 通信缓冲（reserved 池，按通信域数；world-level 同值）
+    max_device_memory: int = 0     # P2-01（C4）：设备容量，供 reserved 口径 OOM 判定
 
     def reserved_estimate_bytes(self, stage: int) -> int:
         """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲（reserved 口径上界）。"""
         return self.per_stage[stage].peak_bytes + self.hccl_reserved_bytes
+
+    @property
+    def allocated_oom(self) -> bool:
+        """allocated 口径 OOM（= `.oom`，max_memory_allocated > 容量）。"""
+        return self.oom
+
+    @property
+    def reserved_oom(self) -> bool:
+        """reserved 口径超容（P2-01，closure-audit C4，2026-07-15）：任一 stage 的 reserved 估计
+        （allocated + HCCL 缓冲 + 池碎片近似）> 设备容量。设备 HBM 真实约束是 reserved，故
+        `.oom=False`（allocated 未超）时 reserved 仍可能已超阈值——两口径**分开报告**，调用方
+        不应把单一 allocated 布尔当最终 OOM 结论。max_device_memory=0（未提供）时恒 False。"""
+        if not self.max_device_memory:
+            return False
+        return any(self.reserved_estimate_bytes(i) > self.max_device_memory
+                   for i in range(len(self.per_stage)))
 
 
 class Evaluator:
@@ -141,4 +158,5 @@ class Evaluator:
         # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。
         hccl = hccl_reserved_buffer(self.pc)
         return PeakMemoryReport(per_stage, tightest,
-                                any(p.oom for p in per_stage), hccl_reserved_bytes=hccl)
+                                any(p.oom for p in per_stage), hccl_reserved_bytes=hccl,
+                                max_device_memory=self.hw.max_device_memory)   # P2-01：reserved 口径判定

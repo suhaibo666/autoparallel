@@ -1,7 +1,8 @@
-"""Executable counterexamples for the 2026-07-14 memory-model review.
+"""Regression tests for the 2026-07-14 memory-model review.
 
-These are strict expected failures: the normal suite records known gaps as
-XFAIL, while ``pytest --runxfail`` exposes the concrete current values.
+P2-08 文档订正（2026-07-15）：这些**曾是** strict expected-failure；对应缺陷已在
+`5c247b1`/`f82fbf5`/`5e9bd31` 修复后，xfail 标记全部移除、转为**正向断言**（守卫修复不回退）。
+本文件不再含任何 xfail（旧 docstring 的 "strict expected failures" 已过时，此处更正）。
 """
 from __future__ import annotations
 

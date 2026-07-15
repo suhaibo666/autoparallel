@@ -226,12 +226,18 @@ class MemBreakdown:
 
 @dataclass(frozen=True)
 class TimelineSample:
-    """内存时间线上一个采样点（一次 rec() = 一个事件）。"""
+    """内存时间线上一个采样点（一次 rec() = 一个事件）。
+
+    P2-06 结构化身份（closure-audit C4，2026-07-15）：`(event, mb, chunk)` 三元组唯一标识
+    VPP 下的重复事件——此前 `(event, mb)` 在 v>1 时会重复（同 mb 不同 chunk），无法与 profiler
+    的 (microbatch, model-chunk) 序列对齐。`chunk` = VPP 虚拟模型块 id（v=1 时恒 -1）。
+    """
     idx: int              # 事件序号（0 起）
-    event: str            # 事件标签（如 fwd:3 / fwd_end / bwd@5）
+    event: str            # 事件标签（如 fwd:3 / fwd_end / bwd@5；VPP 下带 #c<chunk>）
     total_bytes: int      # 该事件时刻总占用（Σ桶 + framework_reserve）
     breakdown: MemBreakdown
-    mb: int = -1          # microbatch 序号（P2-06：与 profiler 对齐用；optstep 等非微批事件 = -1）
+    mb: int = -1          # microbatch 序号（optstep 等非微批事件 = -1）
+    chunk: int = -1       # VPP 虚拟模型块 id（v=1 或非微批事件 = -1）
 
 
 @dataclass(frozen=True)
@@ -484,11 +490,13 @@ class MemTimeline:
             peak_bd: MemBreakdown = None  # type: ignore[assignment]
             series: list = []
 
-            def rec(tag: str, mb: int = -1) -> None:
+            def rec(tag: str, mb: int = -1, chunk: int = -1) -> None:
                 nonlocal peak, peak_ev, peak_bd, peak_mb
                 t = B.total() + framework_reserve
                 is_peak = t > peak
                 bd = None
+                # P2-06（C4）：VPP 下事件标签带 #c<chunk> → (event,mb,chunk) 唯一，可与 profiler 对齐。
+                lbl = f"{tag}#c{chunk}" if chunk >= 0 else tag
                 if record_timeline or is_peak:
                     bd = MemBreakdown(
                         B.persistent, B.act_live, B.gather_buf, B.grad_buf,
@@ -497,10 +505,10 @@ class MemTimeline:
                         framework_reserve, B.kept_frag, B.grad_accum,
                     )
                 if record_timeline:
-                    series.append(TimelineSample(len(series), tag, t, bd, mb))
+                    series.append(TimelineSample(len(series), lbl, t, bd, mb, chunk))
                 if is_peak:
                     peak = t
-                    peak_ev = tag
+                    peak_ev = lbl
                     peak_mb = mb
                     peak_bd = bd
 
@@ -530,21 +538,22 @@ class MemTimeline:
             #     (get_schedule_table + convert_schedule_table_to_order) → 峰 = Σ_chunk n_c·(L/V)，
             #     不再是「每在飞微批整 stage L 层」的 ~V× 过估（旧 build_interleaved_1f1b 物理粒度）。
             #   v<=1：ev_layers 恒 = 整个 layer_ids，逐字节复现旧 build_interleaved_1f1b→build_1f1b。
+            # steps=[(kind, mb, ev_layers, chunk)]；chunk=-1 表示非 VPP（v<=1）。
             if v > 1:
                 # round-robin chunk 放置（2026-07-14 修,源:mindformers pynative
                 # pipeline_parallel.py:258 chunk_id*pp+rank）——由 ParallelModel.stage_chunks
                 # 提供 per-chunk 层组（此前 chunk_layer_ids 连续切为文档化近似,层不均匀时有偏）。
                 chunks = pm.stage_chunks(stage)
-                steps = [(kind, mb, chunks[c])
+                steps = [(kind, mb, chunks[c], c)                    # C4：保留 chunk id c
                          for kind, mb, c in interleaved_virtual_order(stage, pp, m, v, pp)]
             else:
-                steps = [(ev.kind, ev.mb, layer_ids)
+                steps = [(ev.kind, ev.mb, layer_ids, -1)
                          for ev in build_interleaved_1f1b(stage, pp, m, v)]
 
             # P0-01：已完成首次反向的层集（其 reduced grad shard 已常驻 grad_accum）。
             grad_done: set = set()
 
-            for ev_kind, ev_mb, ev_layers in steps:
+            for ev_kind, ev_mb, ev_layers, ev_chunk in steps:
                 if ev_kind == "FWD":
                     for idx, lid in enumerate(ev_layers):
                         sm = sm_by_id[lid]
@@ -558,7 +567,7 @@ class MemTimeline:
                             B.gather_buf = _res() + sm.param_full_bytes + _prefetch_nonres(
                                 ev_layers, idx, depth)
                         B.workspace = sm.workspace
-                        rec(f"fwd:{lid}", ev_mb)
+                        rec(f"fwd:{lid}", ev_mb, ev_chunk)
                         B.workspace = 0
                         B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
                         # 2. 决定该层 pin 多少 activation
@@ -577,7 +586,7 @@ class MemTimeline:
                         if _is_kept(lid):
                             kept_act += saved
                     # 该虚拟步(v>1: 一个 chunk / v<=1: 整 stage)所有层 pin 完毕 → FWD 峰
-                    rec("fwd_end", ev_mb)
+                    rec("fwd_end", ev_mb, ev_chunk)
 
                 else:  # BWD（逆序层）—— FSDP gather + full grad + recompute + bwd_scratch 共存
                     bwd_order = list(reversed(ev_layers))
@@ -651,7 +660,7 @@ class MemTimeline:
                         #   full 重算 kept_act=0 → 0（12409.5/cp-full 锚点不破）；无-loss stage 无 loss_lids → 不触发。
                         if kept_frag_factor and lid in loss_lids and kept_act > 0:
                             B.kept_frag = round(kept_frag_factor * kept_act)
-                        rec(f"bwd@{lid}", ev_mb)
+                        rec(f"bwd@{lid}", ev_mb, ev_chunk)
                         B.grad_buf = B.recomp_scratch = 0
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
                         # post_backward：resident 层此刻 reshard（reshard_after_backward 默认 True，
