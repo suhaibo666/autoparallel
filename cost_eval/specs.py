@@ -26,7 +26,18 @@ class ParallelConfig:
     # cp=1 时该字段无效（cp 分支不进入）→ DSv3 anchor 逐字节不变。
     context_parallel_method: str = "colossal"
     reshard_after_forward: str = "default"   # always|never|default
+    # ── CPU offload（P1-19，2026-07-15）：param / grad / optimizer **分离**卸载 ───────────────
+    # 真机 mindformers 可分项卸载（`CPUOffloadPolicy` 的 offload_params/offload_grads/
+    # offload_optimizer 语义）——旧 `cpu_offload` 单布尔无法表达三者独立。现拆为三分离标志：
+    #   - offload_params    → 持久里 **compute-dtype param 副本** 分量卸（bf16 2B/元素；fp32 无副本→0）。
+    #   - offload_grads     → 已规约梯度不驻设备（mem_timeline 的 grad_accum 桶=0）。
+    #   - offload_optimizer → 持久里 **优化器状态**（master+m+v）分量卸 + 优化器 step 在 CPU（optstep=0）。
+    # **向后兼容（全或无）**：`cpu_offload=True` 等价三者全 True（__post_init__ OR-派生，保留旧字段
+    # 语义与 yaml/UI 入口）；缺省三者全 False → 与旧「不卸」逐字节一致。
     cpu_offload: bool = False
+    offload_params: bool = False
+    offload_grads: bool = False
+    offload_optimizer: bool = False
     microbatch: int = 1
     interleave: int = 1
     # PP 每 stage 层数（含 embedding+head 两伪层，和==n_layers）：**首选显式配置**（忠实
@@ -92,6 +103,29 @@ class ParallelConfig:
                     f"ParallelConfig.dense_fsdp_shard_size={v!r}"
                     f"（类型 {type(v).__name__}）非法——须为 >=1 的严格整数、∈[1,{fsdp}] 且整除完整 "
                     f"fsdp=dp_shard·cp={fsdp}（bool 不算整数；0/None=惰性用完整 fsdp）。")
+        # ── CPU offload 分离标志（P1-19，2026-07-15）：类型守卫（仿上方 bool 守卫风格）+ 向后兼容派生 ──
+        # 四个 offload 旋钮均须为 bool（并行度是整数、offload 是开关；此前 cpu_offload 无类型校验，
+        # 借此顺带封口，避免 offload_params=1/"true" 这类静默错配走 mult 分支）。
+        for _name, _val in (("cpu_offload", self.cpu_offload),
+                            ("offload_params", self.offload_params),
+                            ("offload_grads", self.offload_grads),
+                            ("offload_optimizer", self.offload_optimizer)):
+            if not isinstance(_val, bool):
+                raise ValueError(
+                    f"ParallelConfig.{_name}={_val!r}（类型 {type(_val).__name__}）非法——"
+                    "offload 旋钮须为 bool（True/False；并行度才是整数）。")
+        # 向后兼容「全或无」：cpu_offload=True → OR-派生三分离标志全 True（保留旧单布尔入口语义）。
+        # cpu_offload=False 时各分离标志保持各自取值（缺省 False → 与旧「不卸」逐字节一致）。
+        if self.cpu_offload:
+            self.offload_params = True
+            self.offload_grads = True
+            self.offload_optimizer = True
+
+
+# AdamW 持久里**纯优化器状态**每元素字节：master fp32 4 + m fp32 4 + v fp32 4 = 12
+# （剔 param 副本与 grad）。fp32 params 时整个 state_bytes_per_param(12) 即此、无独立 param 副本；
+# bf16 params 时 state_bytes_per_param(14) = 2 param 副本 + 12 opt 状态。P1-19 分离卸载据此拆分。
+_ADAMW_OPT_STATE_BYTES = 12
 
 
 @dataclass
@@ -105,6 +139,21 @@ class OptimizerSpec:
     def adamw(cls, params_fp32: bool = False, grad_dtype_bytes: int = 4) -> "OptimizerSpec":
         # 持久(剔grad): fp32 params=master4+m4+v4=12; bf16 params=bf16 2+master4+m4+v4=14
         return cls("AdamW", 12 if params_fp32 else 14, grad_dtype_bytes)
+
+    def optimizer_state_bytes(self) -> int:
+        """持久里**纯优化器状态**每元素字节（AdamW master4+m4+v4=12；剔 param 副本/grad）。
+
+        P1-19 分离卸载：`offload_optimizer` 归零的正是这一分量。clamp 到 `state_bytes_per_param`
+        以保证 `param_persist_bytes() >= 0`（若某优化器 state<12 的极端配置也不产负 param 副本）。"""
+        return min(_ADAMW_OPT_STATE_BYTES, self.state_bytes_per_param)
+
+    def param_persist_bytes(self) -> int:
+        """持久里 **compute-dtype param 副本** 每元素字节 = state_bytes_per_param − 优化器状态。
+
+        bf16 params → 14−12 = 2（bf16 副本）；fp32 params → 12−12 = 0（master fp32 即 param，
+        无独立副本，故 offload_params 对 fp32 持久无效）。P1-19：`offload_params` 归零这一分量。
+        恒有 `param_persist_bytes() + optimizer_state_bytes() == state_bytes_per_param`。"""
+        return self.state_bytes_per_param - self.optimizer_state_bytes()
 
 
 @dataclass

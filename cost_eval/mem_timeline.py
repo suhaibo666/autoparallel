@@ -419,6 +419,11 @@ class MemTimeline:
         # （survey：mindformers config.py:826 默认 1 = 双缓冲；activation_checkpoint.py:807/:814）。
         # swap 关时 swaps() 恒 False → 下方 swap_buf 恒 0（与预取深度无关）。
         swap_depth = getattr(swap, "default_prefetch", 1)
+        # CPU offload 分离标志（P1-19，2026-07-15）：optstep 分量随 offload_optimizer、grad_accum 桶随
+        # offload_grads 分别归零（旧单布尔 cpu_offload 一次卸全部）。ParallelConfig.__post_init__ 已保证
+        # cpu_offload=True → 三标志全 True，故 fallback 到 cpu_offload 令旧构造的 pc 也逐字节复现旧行为。
+        offload_optimizer = getattr(pm.pc, "offload_optimizer", pm.pc.cpu_offload)
+        offload_grads = getattr(pm.pc, "offload_grads", pm.pc.cpu_offload)
 
         # dense 权重分母用 dense_fsdp_degree()（grouped-FSDP 子域，Z3；缺省==fsdp_degree() 逐字节不变）
         # —— grad_accum 累计梯度分片与 optstep 的 max_w//fsdp_d 都随子域变（配子域时每卡 dense 梯度/
@@ -753,10 +758,11 @@ class MemTimeline:
                         # 就地 AssignAdd/RS-accumulate 累加,不新增内存 → 只加一次）。当前层的 shard
                         # 在事件结束后才计入——fsdp=1 时 grad_buf 与驻留 grad 是同一缓冲,事件内不双计;
                         # mb≥2 时该层已在 done 集,full grad(新物化)与旧 shard 共存,如实计。
-                        # cpu_offload：梯度随优化器在 host 侧,不驻设备（与下方 max_w=0 门同口径,文档化假设）。
+                        # offload_grads（P1-19）：梯度在 host 侧、不驻设备 → grad_accum 桶不累计
+                        #   （旧 cpu_offload 一次卸全部；现独立于 param/optimizer 卸载）。
                         if lid not in grad_done:
                             grad_done.add(lid)
-                            if not pm.pc.cpu_offload:
+                            if not offload_grads:
                                 B.grad_accum += sm.grad_shard_bytes
 
             # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
@@ -769,9 +775,10 @@ class MemTimeline:
             #   (10246.2 − persistent 5008.5 − G 1669.5) / max_w 883.8 = 4.04 ≈ 4（重标后 0.997）。
             #   ★权重须按 FSDP 切（optim_grads_params：AdamW step 只跑本 rank 的 1/fsdp 分片）——
             #   dense÷fsdp、expert÷efsdp（与 static_mem.persistent 同口径，resolve 只切了 tp/ep）。
-            #   cpu_offload 时优化器 step 在 CPU、无设备瞬态 → 该项 0。
+            #   offload_optimizer（P1-19）时优化器 step 在 CPU、无设备瞬态 → 该项 0（旧 cpu_offload
+            #   一次卸全部；现独立于 param/grad 卸载）。
             K_OPT = 4
-            max_w = 0 if pm.pc.cpu_offload else max(
+            max_w = 0 if offload_optimizer else max(
                 (w.local_numel // (efsdp_d if getattr(w, "is_expert", False) else fsdp_d)
                  for l in layers for op in l.ops for w in op.params),
                 default=0)
