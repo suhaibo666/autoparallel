@@ -90,6 +90,41 @@ def test_recomp_op_exposes_saved_amount():
     assert saw, "full 模式下应有被重算 op 暴露 recomp_mib>0"
 
 
+def test_full_respects_layer_range():
+    """`重算层范围`（sel_layers）须对 full 生效：只有范围内层重算，范围外层保持 none。
+    此前 sel_layers 仅 custom 模式生效，full/select 恒全层重算 → 改层范围结构图不变（用户报告 #1）。"""
+    r = eval_config(_cfg(recompute="full", sel_layers="1-2"))
+    assert r["ok"], r
+    by = {L["id"]: L for L in _decoder_layers(r)}
+    assert by[1]["recomp"] == "full" and by[2]["recomp"] == "full", by
+    assert by[3]["recomp"] == "none" and by[4]["recomp"] == "none", by
+
+
+def test_select_respects_layer_range():
+    r = eval_config(_cfg(recompute="select", select="attn", sel_layers="2-3"))
+    assert r["ok"], r
+    by = {L["id"]: L for L in _decoder_layers(r)}
+    assert by[1]["recomp"] == "none", by
+    assert by[2]["recomp"] == "select" and by[3]["recomp"] == "select", by
+    assert by[4]["recomp"] == "none", by
+
+
+def test_empty_layer_range_means_all_and_bytewise_identical():
+    """空/缺省 sel_layers → 全层重算，与不填该字段逐字节一致（不破坏既有 full 锚点）。"""
+    r0 = eval_config(_cfg(recompute="full"))
+    r1 = eval_config(_cfg(recompute="full", sel_layers=""))
+    a0 = {L["id"]: L["act_mib"] for L in _decoder_layers(r0)}
+    a1 = {L["id"]: L["act_mib"] for L in _decoder_layers(r1)}
+    assert a0 == a1
+    assert all(L["recomp"] == "full" for L in _decoder_layers(r1))
+
+
+def test_invalid_layer_range_rejected_in_full():
+    """非法层范围（越界/倒序）在 full 模式也报错，不再静默忽略。"""
+    r = eval_config(_cfg(recompute="full", sel_layers="3-99"))
+    assert not r["ok"] and any("重算层范围" in e for e in r["errors"]), r
+
+
 def test_per_save_stored_flag_present():
     """每条 acts 明细带 stored 标志：None 全 True；full 下重算 op 的明细全 False（层入口除外）。"""
     rn = _decoder_layers(eval_config(_cfg(recompute="None")))

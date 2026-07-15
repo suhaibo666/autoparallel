@@ -322,9 +322,11 @@ def parse_and_validate(p):
         errs.append(f"ep({ep}) 必须整除 dp_shard·cp·tp={dp*cp*tp}（专家在该区内分片,ParallelModel 规则）")
     if rmode not in ("None", "full", "select", "custom"):
         errs.append(f"recompute {rmode!r} 不支持")
-    # custom（细粒度,mindformers select_recompute 口径）:sel_ops=逗号分隔 op 名;sel_layers=a-b 范围
+    # 重算层范围（sel_layers, a-b）：对 **full/select/custom 均生效**（空=全部层 1-N）。
+    # 此前仅 custom 消费 → full/select 改层范围结构图不变（用户报告 #1，2026-07-15 修）。
     sel_ops_raw = [s.strip() for s in p.get("sel_ops", "").split(",") if s.strip()]
-    lr = p.get("sel_layers", "").strip() or f"1-{N}"
+    lr_raw = p.get("sel_layers", "").strip()
+    lr = lr_raw or f"1-{N}"
     try:
         a, b = (int(x) for x in lr.split("-")) if "-" in lr else (int(lr), int(lr))
     except ValueError:
@@ -332,11 +334,11 @@ def parse_and_validate(p):
     # 细粒度选重文本（mindformers select_module 口径）:非空即优先于图上勾选
     e_sel, sel_cfg = parse_select_cfg(p.get("sel_cfg", ""), N)
     errs += e_sel
-    if rmode == "custom" and sel_cfg is None:
-        if not sel_ops_raw:
-            errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度选重」文本")
-        if not (1 <= a <= b <= N):
-            errs.append(f"重算层范围 {lr!r} 非法（1-{N} 内的 a-b）")
+    # 非空层范围：full/select/custom 均校验（越界/倒序即报错，不静默忽略）
+    if lr_raw and rmode in ("full", "select", "custom") and not (1 <= a <= b <= N):
+        errs.append(f"重算层范围 {lr_raw!r} 非法（1-{N} 内的 a-b）")
+    if rmode == "custom" and sel_cfg is None and not sel_ops_raw:
+        errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度选重」文本")
     # pp 层分配（mindformers num_layer_list 口径）
     e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, T)
     errs += e_pp
@@ -597,17 +599,17 @@ def eval_config(p):
     spec = build_llm_spec(cfg)
     d = spec.dims
     N = pa["N"]
+    a, b = pa["sel_range"]   # 重算层范围（空 sel_layers → 1-N，见 parse_and_validate；full/select 亦生效）
     if pa["rmode"] == "full":
-        rc = RecomputeSpec("full", full_layers=set(range(1, N + 1)))
+        rc = RecomputeSpec("full", full_layers=set(range(a, b + 1)))
     elif pa["rmode"] == "select":
         selset = _SEL_ATTN if pa["sel"] == "attn" else (_SEL_MLP if pa["sel"] == "mlp" else _SEL_ATTN | _SEL_MLP)
-        rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in range(1, N + 1)})
+        rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in range(a, b + 1)})
     elif pa["sel_cfg"]:
         # 细粒度文本（mindformers select_module 口径,每 pattern 可不同层集）——非空即优先。
         rc = RecomputeSpec("select", select_ops=pa["sel_cfg"])
     elif pa["rmode"] == "custom":
         # 图上勾选:任意 op 名 × 单一层范围 —— 与 mindformers select_recompute（op 位置级）同口径。
-        a, b = pa["sel_range"]
         rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in range(a, b + 1)})
     else:
         rc = RecomputeSpec("None")
@@ -1022,7 +1024,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
-    <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="custom 重算作用的层范围 a-b,空=全部"></div>
+    <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8" style="width:64px" title="重算作用的层范围 a-b（1-N,含端点）——对 full / select / custom 均生效;空=全部层。例:full+「1-2」= 只前 2 层整层重算"></div>
     <div class="fld"><label>per-stage 选重</label><input name="sel_stage" placeholder="s0:both; s1-2:self_attention; s3:none" style="width:200px" title="按 stage 配置选择重算(与当前 pp 切分一致):模式 = none | self_attention | mlp | both(≈full,真机退化端0.991) | 任意 op 名子串;非空即生效"></div>
     <div class="fld"><label>细粒度选重(mf 口径)</label><input name="sel_cfg" placeholder="self_attention:0-3; flash:4-7" style="width:210px" title="mindformers select_module 口径:pattern=cell 名(self_attention/mlp)或 op 名子串;层范围 0-indexed(a-b,逗号分段);分号分隔多条;非空即生效(优先于图上勾选)"></div>
     <input type="hidden" name="sel_ops" value="">
