@@ -6,8 +6,9 @@
     dense 权重   local_numel = global_numel // tp
     expert 权重  local_numel = global_numel // ep
 - M5 在此之上再除 FSDP 组：
-    dense 权重   再 // fsdp_degree()      （= dp_shard * cp）
-    expert 权重  再 // efsdp_degree()     （= dp_shard * cp * tp // ep，tp 已含其中）
+    dense 权重   再 // dense_fsdp_degree()（缺省 = fsdp_degree() = dp_shard * cp；配了 grouped-FSDP
+                 子域 dense_fsdp_shard_size 时 = 该子域 < 完整 fsdp → 每卡 dense 持久更大，Z3）
+    expert 权重  再 // efsdp_degree()     （= dp_shard * cp * tp // ep，tp 已含其中；**不受子域影响**）
 - cpu_offload=True 时该 stage 持久态 = 0。
 """
 from __future__ import annotations
@@ -30,7 +31,11 @@ class StaticMem:
         cpu_offload  : bool           — True 则该 stage 持久态全部卸载 CPU，返回 0。
         alloc_block_bytes : int       — 设备内存池分配对齐块（平台属性，默认 1=不取整）。
         """
-        fsdp = pm.fsdp_degree()
+        # dense（非专家）权重分母：grouped-FSDP 子域（Z3）——配了 dense_fsdp_shard_size 时用子域
+        # （< 完整 fsdp → 每卡 dense 持久更大），否则完整 fsdp。`estimate_structure_memory` 对**非专家**
+        # 权重统一用 `fsdp` 分母、对专家用 `efsdp`；故只需把 dense 分母作为 fsdp 传入即改到 dense、
+        # experts 仍走原 efsdp（structure_mem 不改）。缺省 dense_fsdp_degree()==fsdp_degree() → 逐字节不变。
+        fsdp = pm.dense_fsdp_degree()
         efsdp = pm.efsdp_degree()
         out: dict = {}
 

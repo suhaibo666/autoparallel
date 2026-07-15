@@ -236,7 +236,8 @@ class Evaluator:
     """离线并行策略代价评估器门面（P0：内存）。"""
 
     def __init__(self, model_spec, parallel_config, optimizer, hardware,
-                 recompute, swap, *, check_feasibility: bool = True):
+                 recompute, swap, *, check_feasibility: bool = True,
+                 validate_opdag: bool = False, opdag_strict: bool = False):
         # closure-audit C1（2026-07-15）：运行时可行性守卫集中在**核心评估入口** Evaluator，
         # 不只在 adapter/UI 封口（此前直接核心 API 仍接受 tp>1+SP=false、非 Adam）。
         # check_feasibility=False 供纯内存建模场景显式绕过（如只想要某不可跑组合的字节数）。
@@ -249,12 +250,25 @@ class Evaluator:
         self.hw = hardware
         self.recompute = recompute
         self.swap = swap
+        # P2-02（2026-07-15）：opdag 一致性交叉校验钩子——把 `cost_eval/opdag/` 从**离线工具**升级为
+        # **生产链路的可选约束**。开启后 evaluate() 会用 opdag 从真 mindformers 源抽出的重算子名册，
+        # 交叉校验手写 LayerSpec 的对应层段（MLA 注意力 / MoE 专家 grouped-GEMM），漂移即 warn
+        # （opdag_strict=True 则 fail）。**默认关（validate_opdag=False）→ 评估行为逐字节不变**、不接触
+        # opdag（连 import 都惰性），不破 12 锚点 / 全部测试。缺 mindformers 源时静默跳过（不 fail）。
+        self.validate_opdag = validate_opdag
+        self.opdag_strict = opdag_strict
 
     def evaluate(self, record_timeline: bool = False) -> PeakMemoryReport:
         """执行全链路评估，返回 PeakMemoryReport。
 
         record_timeline=True 时，每个 StagePeak.timeline 记录全事件内存序列（内存曲线）。
         """
+        # P2-02：opdag 一致性交叉校验（默认关，旁路——不改变下方任何评估计算）。开启时先跑校验，
+        # 让 opdag 从源码抽出的 op 名册真正**约束**手写 LayerSpec（漂移 warn / strict fail）。lazy import
+        # 保证默认路径不接触 opdag 模块。
+        if self.validate_opdag:
+            from .opdag.crosscheck import validate_against_opdag
+            validate_against_opdag(self.spec, strict=self.opdag_strict)
         world = (self.pc.dp_replicate * self.pc.dp_shard * self.pc.cp
                  * self.pc.tp * self.pc.pp)
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)

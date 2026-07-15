@@ -50,6 +50,17 @@ class ParallelModel:
     def fsdp_degree(self) -> int:
         return self.pc.dp_shard * self.pc.cp
 
+    def dense_fsdp_degree(self) -> int:
+        """dense（非专家）权重的**有效 FSDP 分母**（Z3，grouped-FSDP 子域）。
+
+        忠实 mindformers `pynative/distributed/parallel_dims.py:443-470`（`get_fsdp_shard_mesh`）：
+        `dense_fsdp_shard_size` 是 dense 权重分片的**子域**大小（须整除完整 fsdp=dp_shard·cp）。
+        配了子域（>0）→ 用该子域（<完整 fsdp）→ 每卡 dense 持久 = dense_global/子域（÷更小域 → 更大）；
+        未配（0/None）→ 完整 `fsdp_degree()`（缺省逐字节不变）。**专家权重不受影响**，仍用
+        `efsdp_degree()`；`fsdp_degree()` 本身（gather 全域口径）也不变。"""
+        s = getattr(self.pc, "dense_fsdp_shard_size", 0)
+        return s if s else self.fsdp_degree()
+
     def efsdp_degree(self) -> int:
         return self._efsdp
 

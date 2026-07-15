@@ -68,19 +68,20 @@ def test_dense_fsdp_equals_full_fsdp_accepted():
     assert bundle.parallel.dp_shard == 8
 
 
-def test_dense_fsdp_below_full_fsdp_failloud():
-    """1<=value<fsdp 且整除（dp_shard=8,shard=1）= 分组 FSDP 子域,显存语义改变、未建模 → fail-loud。
-    探针的 `dense_fsdp_1_with_full_fsdp_8` 静默低估案例（此前被误接受）。"""
-    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
-        from_mindformers_dict(_mf(parallelism={
-            "data_parallel_shard": 8, "dense_fsdp_shard_size": 1}))
+def test_dense_fsdp_below_full_fsdp_modeled():
+    """1<=value<fsdp 且整除（dp_shard=8,shard=1）= 分组 FSDP 子域 → **真建模**（Z3,2026-07-15）：
+    映射到 ParallelConfig.dense_fsdp_shard_size=1（此前 F1 fail-loud——「审计要么 fail-loud 要么建模」,
+    本轮选真建模：static_mem 用子域分母切 dense 持久,每卡 dense 驻留 ÷1=global 更大）。"""
+    bundle = from_mindformers_dict(_mf(parallelism={
+        "data_parallel_shard": 8, "dense_fsdp_shard_size": 1}))
+    assert bundle.parallel.dense_fsdp_shard_size == 1
 
 
-def test_dense_fsdp_below_full_fsdp_divisor_failloud():
-    """shard=2（整除 fsdp=8 但 <fsdp）同属分组子域 → fail-loud（非仅 =1 才拒）。"""
-    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
-        from_mindformers_dict(_mf(parallelism={
-            "data_parallel_shard": 8, "dense_fsdp_shard_size": 2}))
+def test_dense_fsdp_below_full_fsdp_divisor_modeled():
+    """shard=2（整除 fsdp=8 但 <fsdp）同属分组子域 → 建模映射为 2（dense 持久 ÷2,是完整域 ÷8 的 ×4）。"""
+    bundle = from_mindformers_dict(_mf(parallelism={
+        "data_parallel_shard": 8, "dense_fsdp_shard_size": 2}))
+    assert bundle.parallel.dense_fsdp_shard_size == 2
 
 
 def test_dense_fsdp_zero_rejected():
@@ -118,13 +119,14 @@ def test_dense_fsdp_absent_accepted():
 
 
 def test_dense_fsdp_domain_includes_cp():
-    """fsdp=dp_shard·cp 含 cp：dp_shard=2·cp=2 → fsdp=4；shard=4(==fsdp) 接受、shard=2(<fsdp) fail-loud。
+    """fsdp=dp_shard·cp 含 cp：dp_shard=2·cp=2 → fsdp=4；shard=4(==fsdp) 中性(0)、shard=2(<fsdp) 建模(2)。
     证明判定用的是**完整 FSDP 域**而非仅 dp_shard。"""
-    assert from_mindformers_dict(_mf(parallelism={
+    b_full = from_mindformers_dict(_mf(parallelism={
         "data_parallel_shard": 2, "context_parallel": 2, "dense_fsdp_shard_size": 4}))
-    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
-        from_mindformers_dict(_mf(parallelism={
-            "data_parallel_shard": 2, "context_parallel": 2, "dense_fsdp_shard_size": 2}))
+    assert b_full.parallel.dense_fsdp_shard_size == 0        # ==fsdp → 复用完整 mesh,中性
+    b_sub = from_mindformers_dict(_mf(parallelism={
+        "data_parallel_shard": 2, "context_parallel": 2, "dense_fsdp_shard_size": 2}))
+    assert b_sub.parallel.dense_fsdp_shard_size == 2         # <fsdp → 子域,建模
 
 
 def test_dense_fsdp_not_in_truthy_set():

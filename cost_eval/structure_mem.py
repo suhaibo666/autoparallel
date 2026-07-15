@@ -296,6 +296,34 @@ class SelectMemory:
     act_live_pinned: int = 0
     recomp_scratch: int = 0
     bwd_working_set: int = 0
+    # P1-07 checkpoint islands（Z1，2026-07-15）：选中 op 的**非连续区段**各是独立重算单元。
+    #   n_islands   — 连续选中区段数（全选=1、全不选=0）。
+    #   island_recomp — 每 island 的 recomp scratch（各扣**自己**的进入边界）；
+    #                   recomp_scratch = max(island_recomp)（反向逐 island 重物化、算完释放、不同时存活）。
+    n_islands: int = 0
+    island_recomp: tuple = ()
+
+
+def _checkpoint_islands(ops, is_selected) -> list:
+    """把一层 op 序列按**选中连续性**切成 checkpoint islands（P1-07，一等对象）。
+
+    island = 极大连续选中子段。非连续的选中区段（如选 {a,c} 跳 b）→ 多个 island，各是独立的重算
+    单元：反向逆序逐 island 重物化其内部激活、算完释放 → 各 island 的 recomp scratch **不同时存活**
+    → 峰取 max over islands（见 estimate_select_memory），而非把它们当一整块混算（旧式把某 island
+    的进入边界从另一 island 的峰值里错减 → 低估 → OOM 不安全）。
+
+    返回 `list[list[op]]`：全选→单 island（= 旧「一整块」，逐字节复现）；全不选→ `[]`。"""
+    islands: list = []
+    cur: list = []
+    for op in ops:
+        if is_selected(op):
+            cur.append(op)
+        elif cur:
+            islands.append(cur)
+            cur = []
+    if cur:
+        islands.append(cur)
+    return islands
 
 
 def _pinned_input_boundary(selected, pinned_names, blk: int) -> int:
@@ -363,13 +391,21 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
     nonsel_save_names = {s.name for op in nonselected for s in op.saves}
     act_live_pinned = sm_non.activation_saves + (ci_bytes if ci_name not in nonsel_save_names else 0)
 
-    # D-3：recomp = 选中集 forward_max_live − **进入边界里实际已 pin 的输入**（每 op 自估自身足迹），
-    # 不再无条件扣「选中段首个 save」（旧式对细粒度单 op 低估→OOM 不安全；见 §SelectMemory D-3）。
-    # pinned = 非选中 saves ∪ {层 ci}（ci 恒常驻）。模块/全选粒度边界=层入口(=ci)已 pin → 逐字节复现
-    # 旧公式；单 op 边界未 pin → 不扣 → 按 forward_max_live([op]) 全额计。
+    # ── P1-07 checkpoint islands（Z1，2026-07-15）：选中 op 按连续性切成独立重算单元 ──────────
+    # 反向逐 island 重物化其内部激活、算完释放 → 各 island recomp **不同时存活** → 峰 = max over
+    # islands。每 island 各扣**自己**的进入边界（已 pin 部分，避免与 act_live 双算；未 pin 的细粒度
+    # 单 op 边界保留在该 island recomp，OOM 安全）。
+    #   - 单 island（连续选中 / 模块 / 全选 / 单 op）：islands=[selected] → 逐字节复现旧「一整块」式
+    #     `forward_max_live(选中集) − pinned_boundary(选中集)`（→ 12 锚点连续 island 不动的机理根因）。
+    #   - 多 island（非连续）：旧式把某 island 的进入边界从**合并峰值**里错减 → 低估（OOM 不安全）；
+    #     新式各 island 只从**自身峰**减**自身边界** → 修正。
+    # pinned = 非选中 saves ∪ {层 ci}（ci 恒常驻）。
     pinned_names = nonsel_save_names | ({ci_name} if ci_name is not None else set())
-    recomp_scratch = max(
-        0, sm_sel.forward_max_live - _pinned_input_boundary(selected, pinned_names, blk))
+    islands = _checkpoint_islands(ops, is_selected)
+    island_recomp = tuple(
+        max(0, _forward_max_live(isl, blk) - _pinned_input_boundary(isl, pinned_names, blk))
+        for isl in islands)
+    recomp_scratch = max(island_recomp) if island_recomp else 0
     # bwd_working_set = 非选中段 forward_max_live − 非选中 bwd_scratch（与无重算同构，范围收窄）。
     bwd_working_set = max(0, sm_non.forward_max_live - sm_non.bwd_scratch)
 
@@ -377,4 +413,6 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
         act_live_pinned=act_live_pinned,
         recomp_scratch=recomp_scratch,
         bwd_working_set=bwd_working_set,
+        n_islands=len(islands),
+        island_recomp=island_recomp,
     )

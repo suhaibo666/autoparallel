@@ -34,6 +34,12 @@ class ParallelConfig:
     layers_per_stage: Optional[list] = None
     prefetch_depth: int = 1
     num_microbatches: int = 1                # m = global_batch/(dp*microbatch)，由 adapter 算好
+    # grouped-FSDP 子域大小（Z3，2026-07-15，忠实 mindformers `pynative/distributed/parallel_dims.py:443-470`
+    # `get_fsdp_shard_mesh`）：dense（非专家）权重在**子域**（size = dense_fsdp_shard_size）上分片,
+    # 而非完整 FSDP 域 `fsdp = dp_shard·cp`。子域外的 dp 维对 dense 是**复制** → 每卡 dense 持久 =
+    # `dense_global / dense_fsdp_shard_size`（÷更小域 → 更大）。expert 权重走独立 efsdp,**不受此字段影响**。
+    # **0/None = 惰性**（用完整 fsdp）→ 现有 spec/锚点逐字节不变。>0 时须整除 fsdp 且 ∈[1,fsdp]。
+    dense_fsdp_shard_size: int = 0
 
     def __post_init__(self):
         # cp 算法 fail-loud（仿 head.py:50 loss_type / build_llm._check_implemented_dispatch）：
@@ -73,6 +79,19 @@ class ParallelConfig:
                 f"ParallelConfig.prefetch_depth={self.prefetch_depth!r}"
                 f"（类型 {type(self.prefetch_depth).__name__}）非法——须为 >=0 的严格整数"
                 "（bool 不算整数；0=无预取合法，负数无意义）。")
+        # closure-audit Z3（2026-07-15）：grouped-FSDP 子域自身不变量——>0 时须**严格正整数**、
+        # 整除完整 fsdp=dp_shard·cp 且 ∈[1,fsdp]（仿上方 F5a 整数守卫 + parallel_dims.py:458-468：
+        # 先拒 bool 再拒非 int 再查整除/范围；bool 是 int 子类会溜过 `fsdp % True == 0`）。0/None=惰性,
+        # 跳过（缺省逐字节不变）。**只在核心构造处校验**——不整除会令 dense 子域切分低估每卡持久→OOM 不安全。
+        if self.dense_fsdp_shard_size not in (None, 0):
+            fsdp = self.dp_shard * self.cp
+            v = self.dense_fsdp_shard_size
+            if (isinstance(v, bool) or not isinstance(v, int)
+                    or v < 1 or v > fsdp or fsdp % v != 0):
+                raise ValueError(
+                    f"ParallelConfig.dense_fsdp_shard_size={v!r}"
+                    f"（类型 {type(v).__name__}）非法——须为 >=1 的严格整数、∈[1,{fsdp}] 且整除完整 "
+                    f"fsdp=dp_shard·cp={fsdp}（bool 不算整数；0/None=惰性用完整 fsdp）。")
 
 
 @dataclass

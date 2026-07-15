@@ -92,10 +92,11 @@ def test_dense_fsdp_shard_size_equals_fsdp_accepted():
     assert from_mindformers_dict(_mf(parallelism={"dense_fsdp_shard_size": 1}))
 
 
-def test_dense_fsdp_shard_size_below_fsdp_failloud():
-    """dp_shard=4 时 shard=1（1<=1<fsdp=4,整除）= 分组子域,显存语义改变 → fail-loud（旧 oracle 误接受）。"""
-    with pytest.raises(NotImplementedError, match="dense_fsdp_shard_size"):
-        from_mindformers_dict(_mf(parallelism={"data_parallel_shard": 4, "dense_fsdp_shard_size": 1}))
+def test_dense_fsdp_shard_size_below_fsdp_modeled():
+    """dp_shard=4 时 shard=1（1<=1<fsdp=4,整除）= 分组子域 → **真建模**（Z3,2026-07-15）：映射到
+    ParallelConfig.dense_fsdp_shard_size=1（此前 closure-w1 F1 fail-loud,本轮改建模）。"""
+    bundle = from_mindformers_dict(_mf(parallelism={"data_parallel_shard": 4, "dense_fsdp_shard_size": 1}))
+    assert bundle.parallel.dense_fsdp_shard_size == 1
 
 
 # ── ① P0-02.2 optimizer 段 schema（§4.1.2）────────────────────────────────────────────

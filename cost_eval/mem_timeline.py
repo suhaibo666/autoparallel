@@ -420,7 +420,10 @@ class MemTimeline:
         # swap 关时 swaps() 恒 False → 下方 swap_buf 恒 0（与预取深度无关）。
         swap_depth = getattr(swap, "default_prefetch", 1)
 
-        fsdp_d, efsdp_d = pm.fsdp_degree(), pm.efsdp_degree()
+        # dense 权重分母用 dense_fsdp_degree()（grouped-FSDP 子域，Z3；缺省==fsdp_degree() 逐字节不变）
+        # —— grad_accum 累计梯度分片与 optstep 的 max_w//fsdp_d 都随子域变（配子域时每卡 dense 梯度/
+        # 优化器瞬态更大，与 static_mem 持久态同口径，修 Z3 flag 的 timeline OOM 欠估）。experts 走 efsdp。
+        fsdp_d, efsdp_d = pm.dense_fsdp_degree(), pm.efsdp_degree()
         for stage, layers in g.stages.items():
             layer_ids = [l.layer_id for l in layers]
             by_id = {l.layer_id: l for l in layers}

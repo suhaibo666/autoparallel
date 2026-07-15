@@ -583,22 +583,25 @@ _PAR_CONTEXT_DEPENDENT = {
 }
 
 
-def _check_dense_fsdp_shard_size(value, fsdp: int) -> None:
-    """`dense_fsdp_shard_size` 按**完整 FSDP 域** `fsdp=dp_shard·cp` 联合判定（closure-audit F1）。
+def _check_dense_fsdp_shard_size(value, fsdp: int) -> int:
+    """`dense_fsdp_shard_size` 按**完整 FSDP 域** `fsdp=dp_shard·cp` 判定,返回 ParallelConfig 用的
+    **有效子域**（Z3 真建模；此前 closure-audit F1 对 `1<=v<fsdp` fail-loud，本轮改为建模）。
 
     源码依据 `../mindformers/mindformers/pynative/distributed/parallel_dims.py:443-470`
     （`get_fsdp_shard_mesh`）：shard_size 须正整数、∈[1,fsdp]、整除 fsdp；**只有 == fsdp 才复用完整
     FSDP(1D)/HSDP(2D) mesh**（parallel_dims.py:469-475），与评估器默认「dense 全域分片（÷fsdp）」语义
     一致（中性）；`1<=value<fsdp` 走 [replicate,shard] 二维 sub-mesh（parallel_dims.py:476+），dense
-    权重只在子域分片 → 每卡持久/gather 字节改变（评估器只建全域）→ 未建模。
+    权重只在**子域**分片 → 每卡 dense 持久 = dense_global/子域（÷更小域 → 更大）。**现已建模**
+    （static_mem 用 `ParallelModel.dense_fsdp_degree()` 切 dense 持久,experts 走独立 efsdp 不变）。
 
-    - None（未配）→ 默认全域 FSDP，跳过；
-    - value == fsdp → 中性，接受；
-    - `1 <= value < fsdp` 且整除 → 合法但分组 FSDP 子域未建模 → fail-loud（NotImplementedError）；
+    返回（→ `ParallelConfig.dense_fsdp_shard_size`）：
+    - None（未配）→ 0（完整 fsdp,惰性,逐字节不变）；
+    - value == fsdp → 0（复用完整 FSDP mesh,中性,与全域分片同）；
+    - `1 <= value < fsdp` 且整除 → value（分组 FSDP 子域,**建模**每卡 dense 持久 ÷value）；
     - 非正 / 非整除 / 超域 / 类型错（含 bool，int 子类）→ runtime 约束拒（ValueError）。
     """
     if value is None:
-        return
+        return 0
     # bool 是 int 子类,会溜过整除检查（parallel_dims.py:455-462 显式先排除 bool/非 int）。
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
@@ -609,12 +612,8 @@ def _check_dense_fsdp_shard_size(value, fsdp: int) -> None:
             f"parallelism.dense_fsdp_shard_size={value} 非法：须 ∈[1,{fsdp}] 且整除 "
             f"fsdp=dp_shard·cp={fsdp}（parallel_dims.py:464-468）。")
     if value == fsdp:
-        return   # 复用完整 FSDP mesh,与默认全域分片语义一致 → 中性,接受。
-    raise NotImplementedError(
-        f"parallelism.dense_fsdp_shard_size={value}（<fsdp={fsdp}）未建模：分组 FSDP 子域"
-        "（[replicate,shard] 2D sub-mesh,parallel_dims.py:476+）使 dense 权重只在子域分片,"
-        "改变每卡持久/gather 字节；评估器只建完整 FSDP 全域（÷fsdp,static_mem.py）——"
-        "拒绝静默按全域近似（会低估 dense 持久/聚合峰值）。")
+        return 0   # 复用完整 FSDP mesh,与默认全域分片语义一致 → 中性（0=惰性）。
+    return value   # 1<=value<fsdp：分组 FSDP 子域 → 映射到 ParallelConfig,static_mem 真建模。
 
 
 def _check_ulysses_degree_in_cp(cp_method: str, cp: int, value) -> None:
@@ -769,7 +768,7 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     # 上下文相关键联合判定（closure-audit F1/F6，2026-07-15）——须在 dp_shard/cp/method 确定后：
     #   dense_fsdp_shard_size 依完整 FSDP 域 fsdp=dp_shard·cp（parallel_dims.py:443-470）；
     #   ulysses_degree_in_cp 依 context_parallel_method + cp（context_parallel.py:248-266）。
-    _check_dense_fsdp_shard_size(par.get("dense_fsdp_shard_size"), dp_shard * cp)
+    dense_fsdp = _check_dense_fsdp_shard_size(par.get("dense_fsdp_shard_size"), dp_shard * cp)
     _check_ulysses_degree_in_cp(cp_method, cp, par.get("ulysses_degree_in_cp"))
     # microbatch 数的 trainer 覆盖语义（P0-02 补，trainer.py:472-475）：真机会把 yaml 的
     # pipeline_parallel_microbatch_size 重算为 global//(dp·local)——两者可推且不一致时按派生值
@@ -795,6 +794,7 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
         num_microbatches=num_microbatches,
         microbatch=ppm,
         layers_per_stage=_layers_per_stage(par, num_layers, pp, mtp),
+        dense_fsdp_shard_size=dense_fsdp,          # Z3：grouped-FSDP 子域（0=完整 fsdp,惰性）
     )
 
 
