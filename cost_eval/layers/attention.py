@@ -20,6 +20,10 @@ NHD = "n_heads*head_dim"            # o_proj 输入维 = n_heads·head_dim
 # `[B, n_heads, S, 8]` fp32（末维 8 = flash 内层 reduce 分块，CANN 固定），是
 # `FlashAttentionScoreGrad` 的**输入**（MindSpeed fusion_attention_v2.py:38-40
 # `ctx.save_for_backward(..., softmax_max, softmax_sum, ...)`）→ 必须**从前向驻留到该层反向**。
+# **真机算子探针坐实（2026-07-16，116/MindSpore2.10/CANN9.0）**：FlashAttentionScore 前向输出
+# softmax_max/softmax_sum 各 shape=(1,8,4096,8)=[B,N,S,8] Float32、softmax_out=(1,) **空(不物化 S×S)**、
+# attention_out=[B,N,S,D]bf16 → 保存集 = Q/K/V+O+(max,sum)，与本建模逐条一致。见
+# analysis/realmachine/flash_attn_activation_validation_2026-07-16.md、tests/test_flash_attn_saves_contract.py。
 # 修前误建为 fwd-only workspace + lse [S,B,n_heads] 2B saves（仅真值 1/32，且 workspace 不 ÷tp）。
 # 修后：`_fa_stats(...)` TensorRef（2×[B,N,S,8] fp32 = 64·B·n_heads·S 字节，head 维 ÷tp、S 维
 # 天然 ÷cp）进 flash op 的 **saves**——无重算层驻留至反向（act_live），重算层随 saves 丢弃重物化。
