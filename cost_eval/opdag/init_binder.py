@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 # 规范 op 类型映射(mindspore 类名 → 我们的 op 类型)。linear=反向是否线性。
 _CLS2OP = {
     "AddExt": ("Elementwise", {"linear": True}),  "Add": ("Elementwise", {"linear": True}),
-    "Sub":   ("Elementwise", {"linear": True}),
+    "Sub":   ("Elementwise", {"linear": True}), "SubExt": ("Elementwise", {"linear": True}),
     "Mul":   ("Elementwise", {"linear": False}),
     "Cast":  ("Cast", {}),
     # View 子类型用 attrs["view"] 标注(供 shape 推断按类型施变换:reshape/transpose/split/...)。
@@ -23,6 +23,17 @@ _CLS2OP = {
     # Swiglu(门控 SiLU):MoE experts 的融合激活(FFNGroupedGEMM.swiglu)。反向需存输入 → 归 Activation。
     "Swiglu": ("Activation", {"activation_type": "swiglu"}),
     # 具名 linear/attention/norm/activation 由 construct 调用点解析(build_module/get_activation),此处不绑。
+
+    # loss 段原语(T0-4 增补;语义=教科书 VJP 分类,与 bprop_rules 口径一致;类名取自
+    # loss_func.py 实际 import 的 mindspore.ops.auto_generate 算子,与旧版/其它模块的同名类
+    # 不同——ArgMaxWithValue(非 ReduceMax):max 归约,反向只回传 argmax 位置 → 非线性归约)。
+    "ArgMaxWithValue": ("Elementwise", {"linear": False, "reduce": True}),
+    "Exp": ("Elementwise", {"linear": False}),
+    "SumExt": ("Elementwise", {"linear": True, "reduce": True}),
+    "Log": ("Elementwise", {"linear": False}),
+    "OneHotExt": ("Elementwise", {"linear": True}),
+    "Neg": ("Elementwise", {"linear": True}),
+    "Div": ("Elementwise", {"linear": False}),
 }
 
 @dataclass

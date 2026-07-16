@@ -30,6 +30,9 @@ opaque_guards（fail-loud 恢复，spec review 裁决——被跳过的条件不
   每个未计入 guard 的不可识别外层 if 条件，按外→内顺序以 `ast.unparse(test)` 原文记录在
   `CommSite.opaque_guards`（orelse 支记 `"not (<原文>)"`）。消费方（producer）必须对
   opaque_guards 中不在已知冗余白名单（如 `self.tp != 1`）内的条目 fail-loud，不猜其真值。
+
+已知未建模形态（现源无此模式,出现时需重估）：elif-return 链只传播首条件；loop/with 体内的
+continue/break 与 raise 终结不做尾部取反。
 """
 from __future__ import annotations
 

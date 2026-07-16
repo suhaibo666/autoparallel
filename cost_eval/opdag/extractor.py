@@ -323,8 +323,15 @@ def _find_cell_file(mf_root: str, cell_name: str) -> str:
 def _make_subcell_resolver(
     mf_root: str, parent_spec: ResolvedSpec, config_flags: dict,
     subcell_specs: dict | None, stack_with_self: set,
+    parent_tree: ast.AST | None = None, parent_rel: str | None = None,
 ):
-    """构造给 walker 的 resolver:遇 SubCell 调用点 → 取子 spec、定位子文件、递归抽取,返回 SubExtract。"""
+    """构造给 walker 的 resolver:遇 SubCell 调用点 → 取子 spec、定位子文件、递归抽取,返回 SubExtract。
+
+    定位子文件优先同文件（parent_tree/parent_rel,惯用法B 典型——私有 helper Cell 与其使用者同源文件,
+    如 `_LogSoftmax`/`_NLLLoss` 与 `CrossEntropyLoss` 同在 loss_func.py）,避免 `_find_cell_file` 的
+    全树"首个命中"在类名跨模块重名时（下划线前缀名尤易重名,如 mindformers 另有
+    `core/loss/loss.py` / `pynative/loss/loss.py` 各自的同名旧实现）误定位到无关源文件。
+    """
     def resolver(cell_name: str, field: str, bare: bool) -> SubExtract:
         if bare:
             sub_spec = (subcell_specs or {}).get(cell_name)
@@ -338,7 +345,11 @@ def _make_subcell_resolver(
                 raise ValueError(
                     f"extractor: SubCell 字段 {field!r} 在父 spec 里非 ResolvedSpec（得到 {sub_spec!r}）—— fail-loud"
                 )
-        rel = _find_cell_file(mf_root, sub_spec.cell)
+        if (parent_tree is not None and parent_rel is not None
+                and _find_class(parent_tree, sub_spec.cell) is not None):
+            rel = parent_rel
+        else:
+            rel = _find_cell_file(mf_root, sub_spec.cell)
         dag, params, returns = _extract_meta(
             mf_root, rel, sub_spec.cell, sub_spec, config_flags,
             recurse=True, subcell_specs=subcell_specs, _stack=stack_with_self,
@@ -417,7 +428,8 @@ def _extract_meta(
     resolver = None
     if recurse:
         resolver = _make_subcell_resolver(
-            mf_root, spec, config_flags, subcell_specs, stack | {cls_name}
+            mf_root, spec, config_flags, subcell_specs, stack | {cls_name},
+            parent_tree=tree, parent_rel=cell_file_relpath,
         )
 
     # 1) 沿 __init__ 的 MRO 链(base→derived)做基础 + 具名绑定并合并(derived 覆盖 base)。
@@ -438,6 +450,29 @@ def _extract_meta(
         ))
         method_aliases.update(_morph_aliases(tree, cname))  # Morph(self.method) 别名
     combined = {**base_binds, **named}
+
+    # 1b) 直接实例化的子 Cell（惯用法B，spec §3.3a）：`self.X = <ClsName>(...)` 且
+    #     ClsName ∈ subcell_specs → SubCell(bare)。build_module 之外的第二种子 Cell 组合方式
+    #     （loss: `self._log_softmax = _LogSoftmax(config)`，loss_func.py:279）。
+    #     subcell_specs 未提供（内存侧全部既有调用）时零行为变化。
+    if recurse and subcell_specs:
+        from .init_binder import _base_call_name
+        for cname in reversed(init_classes):
+            cls_node = _find_class(tree, cname)
+            init_fn = _method_of(cls_node, "__init__")
+            if init_fn is None:
+                continue
+            for stmt in ast.walk(init_fn):
+                if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+                    continue
+                tgt = stmt.targets[0]
+                if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                        and tgt.value.id == "self" and isinstance(stmt.value, ast.Call)):
+                    continue
+                ctor = _base_call_name(stmt.value)
+                if ctor in subcell_specs and tgt.attr not in combined:
+                    combined[tgt.attr] = Binding(
+                        op="SubCell", attrs={"cell": ctor, "field": tgt.attr, "bare": True})
 
     # 2) walker 的 config_flags:透传 + 注入 activation_func 真值(由 activation_type 决定其是否为 None)。
     walker_flags = dict(config_flags)
