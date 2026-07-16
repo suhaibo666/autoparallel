@@ -50,13 +50,12 @@ DIRECT_OP_MAP = {
 }
 
 # 具名"自由函数调用"(非 self.<x>、非直接实例化,形如 `mod.sub.func(...)`)按完整点号路径匹配:
-# 点号路径 → (op 类型, attrs)。T0-5 增补(spec §3.3a embedding 段实测触发)——
-# VocabParallelEmbedding.embedding_func(layers.py):
+# 点号路径 → (op 类型, attrs)。表的纪律:**只收实测触发点**(勿预置未在真源命中的别名写法)。
+# T0-5 增补(spec §3.3a embedding 段实测触发)—— VocabParallelEmbedding.embedding_func(layers.py):
 #   `mint.nn.functional.embedding(masked_input, weight)`(:160)—— mint 查表 lookup,归 Gather;
 #   `ops.mul(output_parallel, input_mask)`(:165)—— TP mask 逐元素乘,归 Elementwise(linear=False)。
 FREE_CALL_MAP = {
     "mint.nn.functional.embedding": ("Gather", {"embedding": True}),
-    "F.embedding": ("Gather", {"embedding": True}),  # mindspore.ops.functional 别名等价写法
     "ops.mul": ("Elementwise", {"linear": False}),
 }
 
@@ -373,7 +372,9 @@ class _Walker:
             return
         # 形态二.五:具名自由函数调用 `mod.sub.func(...)`(非 self.<x>、非直接实例化)——按完整点号路径
         # 精确匹配 FREE_CALL_MAP(如 `mint.nn.functional.embedding(...)` / `ops.mul(...)`)。
-        # 须放在形态三(链式方法)之前判定的 fail-loud/静默丢弃分支之前,否则会被形态三/兜底静默吞掉。
+        # 与形态三互斥(形态三要求 func.value 是 Call/Subscript,而点号路径链首必为 Name——
+        # _dotted_path 对 Call/Subscript 链头返回 None):若此处不命中,这类调用不会被形态三吞,
+        # 而是落到本方法末尾的终端兜底被**静默丢弃**——故本分支是它们成为算子的唯一入口。
         if isinstance(func, ast.Attribute):
             path = _dotted_path(func)
             if path in FREE_CALL_MAP:

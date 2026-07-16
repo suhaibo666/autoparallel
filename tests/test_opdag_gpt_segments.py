@@ -46,8 +46,12 @@ def test_extract_embedding_walks_morph_func():
     _require_mf()
     from cost_eval.opdag.gpt_segments import extract_embedding
     dag = extract_embedding(MF_ROOT, {"compute_dtype": "bf16"})
-    ops = [n.op for n in dag.nodes]
-    assert "Gather" in ops or "Embedding" in ops          # mint embedding lookup
+    # 精确 census 钉死(仓库惯例;是 ReLU/Minimum/Equal _CLS2OP 与 FREE_CALL_MAP ops.mul 映射的唯一
+    # tripwire):reshape 铺平 → relu→minimum→equal(TP mask 三连,layers.py:153-155)→ mint embedding
+    # 查表(Gather,:160)→ ops.mul mask(:165)→ reshape 回 (bs,-1,hidden)(:167)。行号为 2026-07-16 基线。
+    assert [n.op for n in dag.nodes] == [
+        "View", "Activation", "Elementwise", "Elementwise", "Gather", "Elementwise", "View"]
+    assert [int(n.src.split(":")[1]) for n in dag.nodes] == [149, 153, 154, 155, 160, 165, 167]
     assert all(n.src.split(":")[0] == "layers.py" for n in dag.nodes)
 
 

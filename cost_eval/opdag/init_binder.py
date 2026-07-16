@@ -40,7 +40,7 @@ _CLS2OP = {
     # `self.relu`/`self.minimum`/`self.equal`,layers.py:99-101 __init__ 绑定,:153-155 调用)。
     "ReLU": ("Activation", {"activation_type": "relu"}),
     "Minimum": ("Elementwise", {"linear": False}),
-    "Equal": ("Elementwise", {"linear": True}),
+    "Equal": ("Elementwise", {"linear": True}),  # 不可微→反向不存(linear 语义按消费方 bprop_rules.py:47 口径)
 }
 
 @dataclass

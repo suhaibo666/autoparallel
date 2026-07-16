@@ -73,6 +73,8 @@ def extract_embedding(mf_root: str, config_flags: dict) -> OpDAG:
 
 def head_segment_dag() -> OpDAG:
     """lm_head 段（合成，逐节点钉真源行；结构由 verify_gpt_order 守护——见模块 docstring）。"""
+    # 注意:本合成段节点 id 从 0 起;walker 产的图 id 从 1 单调递增(test_opdag_walk_mlp.py:36 契约)
+    # ——Task 9 段拼接方须按各自 id 基准重编号,勿假定两者同基。
     nodes = [
         OpNode(id=0, op="MatMul", src="gpt_model.py:503", module="ColumnParallelLinear",
                ins=["h:S·B·H:bf16", "W_head:H·vocab:bf16"], out="logits:S·B·vocab:bf16"),
@@ -92,7 +94,8 @@ def head_segment_dag() -> OpDAG:
 def verify_gpt_order(mf_root: str) -> list[str]:
     """AST 读 GPTModel.construct，按**源序**（非 ast.walk 的 BFS 序——见下）返回 `self.X(...)`
     调用的 attr 名列表；language_model → output_layer → compute_language_model_loss 缺一或
-    错序 → fail-loud。
+    错序 → fail-loud；另守卫 head 合成的内部序（transpose→morphed_reshape_logits→cast 须为
+    output_layer→loss 间的有序子序列）。
 
     ast.walk 是 BFS，不保证按源码行序产出节点，故收集后按 lineno 排序还原真实调用序。
     """
@@ -118,4 +121,11 @@ def verify_gpt_order(mf_root: str) -> list[str]:
     if not (order.index("language_model") < order.index("output_layer")
             < order.index("compute_language_model_loss")):
         raise ValueError("gpt_segments: GPTModel 段序变化（fail-loud）")
+    # head 合成的内部结构守卫:transpose(:505)→morphed_reshape_logits(:506)→cast(:507,fp32 物化
+    # S·B·vocab 是成本承重项)须为 output_layer 与 loss 之间切片的**有序子序列**(子序列匹配而非
+    # order.index,抗 mtp 等分支里同名 cast/transpose 重复)。缺失/错序 → head_segment_dag 合成失效。
+    seg = iter(order[order.index("output_layer") + 1: order.index("compute_language_model_loss")])
+    if not all(name in seg for name in ("transpose", "morphed_reshape_logits", "cast")):
+        raise ValueError("gpt_segments: head 段内部序变化——transpose→morphed_reshape_logits→cast "
+                         "不再是 output_layer→loss 间的有序子序列,head_segment_dag 合成失效（fail-loud）")
     return order
