@@ -38,6 +38,11 @@ def test_vocab_parallel_embedding_sites():
     # 真源 :174：内联 ReduceScatter 只被 `if self.sequence_parallel:`（可识别）包围，
     # 无任何不可识别外层 → opaque_guards 为空。
     assert all(s.opaque_guards == () for s in rs)
+    # 真源 :179：sp 支提前 `return output`，故 :182 的 AllReduce 只在 !sequence_parallel
+    # 时可达（:144-145 docstring 明文两者互斥二选一）——early-return 互斥性建模钉住这一点，
+    # 否则 producer 在 sp=True 时会把 reduce_scatter 和 all_reduce 双注入。
+    assert ("all_reduce", "!sequence_parallel&enable_embedding_tp") in \
+        {(s.ctype, s.guard) for s in sites}
 
 
 def test_column_parallel_linear_has_no_explicit_comm():
