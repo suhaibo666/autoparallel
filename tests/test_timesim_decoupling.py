@@ -1,5 +1,5 @@
 # tests/test_timesim_decoupling.py
-"""解耦契约 §2.2-1（进回归门）：cost_eval/timesim/** 与内存仿真模块双向 import 禁令。
+"""解耦契约（进回归门）：§2.2-1 双向 import 禁令 + §2.2-2 timesim 侧 cost_eval 内部白名单强制。
 共享白名单只有 specs / schedule / opdag（上游 IR）——契约 §2.2-2。"""
 import ast
 import glob
@@ -22,6 +22,36 @@ def _imported_names(src: str) -> set[str]:
             for a in node.names:
                 toks.add(a.name)
     return toks
+
+
+def _cost_eval_targets(src: str) -> set[str]:
+    """timesim 文件 import 的 cost_eval 内部顶层模块名（绝对/相对归一化）。
+    已知盲区：不覆盖 importlib/__import__ 字符串动态导入（仓库生产代码零使用，YAGNI）。
+    timesim 平铺于 cost_eval/timesim/ 一层：level=1 相对 → timesim 包内；level=2 → cost_eval 顶层。"""
+    out: set[str] = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                parts = a.name.split(".")
+                if parts[0] == "cost_eval":
+                    out.add(parts[1] if len(parts) > 1 else "")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                parts = node.module.split(".")
+                if parts[0] == "cost_eval":
+                    if len(parts) > 1:
+                        out.add(parts[1])
+                    else:
+                        out.update(a.name for a in node.names)   # from cost_eval import X
+            elif node.level == 1:
+                out.add("timesim")                               # 包内相对
+            elif node.level == 2:
+                if node.module:
+                    out.add(node.module.split(".")[0])           # from ..X import y
+                else:
+                    out.update(a.name for a in node.names)       # from .. import X
+    out.discard("")
+    return out
 
 
 def _read(p):
@@ -48,3 +78,22 @@ def test_mem_simulator_never_imports_timesim():
     for mod in MEM_MODULES:
         p = os.path.join(ROOT, f"{mod}.py")
         assert "timesim" not in _imported_names(_read(p)), f"{p} 反向 import timesim"
+
+
+_ALLOWED = {"specs", "schedule", "opdag", "timesim"}   # 契约 §2.2-2 白名单
+
+
+def test_whitelist_helper_catches_transitive_route():
+    """自检：经 report 等非白名单模块的传递性走私要被抓到。"""
+    assert "report" in _cost_eval_targets("from cost_eval.report import Evaluator")
+    assert "report" in _cost_eval_targets("from ..report import Evaluator")
+    assert "specs" in _cost_eval_targets("from cost_eval import specs")
+    assert _cost_eval_targets("from .ir import TimedOp") == {"timesim"}
+
+
+def test_timesim_imports_only_whitelisted_cost_eval_modules():
+    files = glob.glob(os.path.join(ROOT, "timesim", "**", "*.py"), recursive=True)
+    assert files, "timesim 包不存在？"
+    for p in files:
+        bad = _cost_eval_targets(_read(p)) - _ALLOWED
+        assert not bad, f"{p} import 了白名单外的 cost_eval 模块: {bad}（契约 §2.2-2）"
