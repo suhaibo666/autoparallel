@@ -3,11 +3,16 @@
 import ast
 import inspect
 
+# 搬家名单（8 个定义全量，含私有 _1f1b_from_warmup——它也在 mem_timeline 的 re-export
+# 元组里，删掉即静默破坏兼容契约，故必须一并盯住）。两个测试共用，单点维护。
+_MOVED_NAMES = ("Event", "_1f1b_from_warmup", "build_1f1b", "interleaved_warmup",
+                "build_interleaved_1f1b", "get_schedule_table",
+                "interleaved_virtual_order", "chunk_layer_ids")
+
 
 def test_schedule_module_standalone():
     import cost_eval.schedule as sch
-    for name in ("Event", "build_1f1b", "interleaved_warmup", "build_interleaved_1f1b",
-                 "get_schedule_table", "interleaved_virtual_order", "chunk_layer_ids"):
+    for name in _MOVED_NAMES:
         assert hasattr(sch, name), name
 
 
@@ -28,8 +33,7 @@ def test_schedule_has_no_mem_imports():
 def test_mem_timeline_reexports_same_objects():
     import cost_eval.schedule as sch
     import cost_eval.mem_timeline as mt
-    for name in ("Event", "build_1f1b", "interleaved_warmup", "build_interleaved_1f1b",
-                 "get_schedule_table", "interleaved_virtual_order", "chunk_layer_ids"):
+    for name in _MOVED_NAMES:
         assert getattr(mt, name) is getattr(sch, name), name
 
 
