@@ -29,12 +29,13 @@ def _rep(N, *, B=1, pp=1, mode="None", ce_fused=False, mbs=1, dp=1):
 
 def test_pp2_8L_norecompute_matches_real_machine():
     # 真机：stage0=10246.2, stage1=45655.5（dp=1 pp=2 global_batch=2 → B=2）
-    # fp32 layernorm 后:stage0 峰移到 bwd@4（无重算逐层反向 + fp32 norm 略超 optstep,1.05 过预测、OOM 安全）；
-    # stage1 43899（0.962，较修前 0.956 提升）。
+    # 2026-07-16：pre-FFN norm(ln2) 补建 → 无重算下各 MoE 层 ln2 fp32-cast 常驻 → stage0 11162.1
+    #   (真机 10246 → 1.089 过预测、**OOM-安全**；bwd@4 无重算逐层反向峰的整体保守，非 ln2 缺陷)、
+    #   stage1 45991.4（1.007 精确）。
     r = _rep(8, B=2, pp=2, mode="None", mbs=2)
     s0, s1 = r.per_stage[0].peak_bytes / MiB, r.per_stage[1].peak_bytes / MiB
-    assert 10200 <= s0 <= 11000, s0            # 无重算逐层反向（含 fp32 norm）
-    assert 43000 <= s1 <= 47000, s1            # ① fat CE + ② + fp32 norm
+    assert 10200 <= s0 <= 11300, s0            # 无重算逐层反向（含 ln2/fp32 norm 常驻，OOM-安全过预测）
+    assert 43000 <= s1 <= 47000, s1            # ① fat CE + ② + fp32 norm + ln2
 
 
 def test_optstep_event_present_stage0():

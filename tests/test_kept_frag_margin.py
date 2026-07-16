@@ -1,7 +1,8 @@
 """B 标定 margin（2026-07-09）：select 重算下**保留-MoE**层 loss 峰的 fp32-cast + 小张量长尾
 （源码级 op-DAG 提取证实其在 op 图粒度之下，`analysis/realmachine/opdag_validation.md`）→ 明示为标定常数
-`kept_frag_factor`（DSv3 preset=1.9，自真机 select_attn 标定）。仅 select-kept-MoE 生效；full /
-no-recompute / select-keep-attn 不触发（锚点不破）。真机：select_attn(keepFFN)=18828。
+`kept_frag_factor`（DSv3 preset=**1.6**，2026-07-16 复标：pre-FFN norm ln2 补建后 MoE ln2 fp32-cast
+进显式 op 图，margin 只覆剩余碎片长尾）。仅 select-kept-MoE 生效；full / no-recompute /
+select-keep-attn 不触发（锚点不破）。真机：select_attn(keepFFN)=18828。
 """
 from validate_dsv3 import build_dsv3_spec
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
@@ -25,26 +26,29 @@ def _peak(rc, *, N=8, factor=None):
 
 
 def test_select_attn_keepFFN_margin_closes_residual():
-    # 靶心：真机 18828。无 margin 15488（0.823 欠预测）；1.9 标定 margin → ~18844（1.001，OOM-安全）。
+    # 靶心：真机 18828。无 margin 15712.5；1.6 标定 margin → ~18852（1.001，OOM-安全）。
     with_m = _peak(RecomputeSpec("select", select_ops=ATTN))
     assert 18000 <= with_m <= 19500, with_m          # ≥0.95 且 OOM-安全（≥真机）
     assert with_m / 18828 >= 0.95
 
 
 def test_margin_off_reproduces_pre_fix_underprediction():
-    # factor=0（关）→ 复现修前 15488（证明 margin 是唯一变量、可关）。
+    # factor=0（关 margin）→ 无 margin 基线（证明 margin 是唯一变量、可关）。
+    # 2026-07-16：pre-FFN norm(ln2) 补建后（build_transformer_layer），MoE 层 ln2 fp32-cast 进入
+    #   显式基线 → 15516.4 → 15712.5（+196.1=7 个 MoE 层各一份 [S,B,H] fp32 cast）。
     off = _peak(RecomputeSpec("select", select_ops=ATTN), factor=0.0)
-    assert abs(off - 15516.4) < 1.0, off
+    assert abs(off - 15712.5) < 1.0, off
 
 
 def test_select_mlp_keepattn_unchanged_moe_recomputed():
     # keep-attn（重算 FFN → MoE 被重算）：margin gate 关 → 与 factor=0 逐字节相同（不被推过头）。
-    # P1-09（2026-07-14）：14821.6 → 14865.9——attn 保留层的 fa_stats（softmax max/sum）
-    # 驻留至反向（+15.5 MiB，8 层），ratio 0.940→0.941（真机 15765，欠预测方向收窄）。
+    # P1-09（2026-07-14）：14821.6 → 14865.9（attn 保留层 fa_stats 驻留）。
+    # 2026-07-16：pre-FFN norm(ln2) 补建后 FFN 重算区含 ln2 → 14865.9 → 15062.0（真机 15765，
+    #   欠预测 0.943→0.955、进入 ±5% 安全带）。
     on = _peak(RecomputeSpec("select", select_ops=MLP))
     off = _peak(RecomputeSpec("select", select_ops=MLP), factor=0.0)
     assert abs(on - off) < 1e-6, (on, off)
-    assert abs(off - 14865.9) < 1.0, off
+    assert abs(off - 15062.0) < 1.0, off
 
 
 def test_full_recompute_hard_gate_unbroken():

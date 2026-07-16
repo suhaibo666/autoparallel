@@ -167,10 +167,11 @@ def test_mla_moe_decoder_has_shared_expert():
 
 
 def test_mla_moe_decoder_total_op_count():
-    """10 attn + 6 moe FFN + 3 shared expert + 1 moe_add(合流,2026-07-11 补边) = 20 ops total."""
+    """10 attn + 1 ln2(post_attention_layernorm,2026-07-16 前插) + 6 moe FFN + 3 shared expert
+    + 1 moe_add(合流,2026-07-11 补边) = 21 ops total."""
     from cost_eval.layers.mla import build_mla_moe_decoder
     layer = build_mla_moe_decoder(DM)
-    assert len(layer.ops) == 20
+    assert len(layer.ops) == 21
 
 
 # ---------------------------------------------------------------------------

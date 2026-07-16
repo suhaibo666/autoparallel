@@ -19,6 +19,7 @@ from ..model_spec import DimTable, LayerSpec
 from .attention import build_mla_attn_ops
 from .ffn import (build_dense_ffn_ops, build_moe_ffn_ops, build_shared_expert_ops,
                   build_moe_merge_op)
+from .transformer import build_transformer_layer
 
 # 向后兼容：旧代码从 mla 导入 MLA 符号维度别名 / attn builder
 from .attention import (  # noqa: F401
@@ -36,9 +37,10 @@ def build_mla_dense_decoder(d: DimTable) -> LayerSpec:
     """MLA attention + dense MLP FFN 组合的 decoder 层（15 op）。
 
     attn 段：``build_mla_attn_ops(d)``（10 op）
-    FFN 段：``build_dense_ffn_ops(d)``（5 op：ln2/fc1/swiglu/fc2/add2）
+    FFN 段：ln2（build_transformer_layer 前插）+ ``build_dense_ffn_ops(d)``（fc1/swiglu/fc2/add2）
     """
-    return LayerSpec(ops=build_mla_attn_ops(d) + build_dense_ffn_ops(d))
+    return LayerSpec(ops=build_transformer_layer(
+        d, build_mla_attn_ops(d), build_dense_ffn_ops(d), is_moe=False))
 
 
 def build_mla_moe_decoder(d: DimTable) -> LayerSpec:
@@ -53,7 +55,5 @@ def build_mla_moe_decoder(d: DimTable) -> LayerSpec:
     尾接 ``moe_add``（2026-07-11 补边）:routed(comb)+shared(sh_o) 合流 → h2（moe_layer 真实语义,
     线性 add saves=[] 零字节;修 op 图孤立叶节点,与 build_llm 装配保持逐字段一致）。
     """
-    return LayerSpec(
-        ops=build_mla_attn_ops(d) + build_moe_ffn_ops(d) + build_shared_expert_ops(d)
-        + [build_moe_merge_op(d)]
-    )
+    return LayerSpec(ops=build_transformer_layer(
+        d, build_mla_attn_ops(d), build_moe_ffn_ops(d), is_moe=True, has_shared=True))

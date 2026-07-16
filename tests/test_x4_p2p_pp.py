@@ -121,9 +121,13 @@ def test_pp2_anchors_peak_still_in_backward_and_p2p_zero_at_peak():
 
 
 def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
-    """pp2 锚点（真机 10246/45655）逐字节对照本次基线（10826.0/45767.3 MiB）——
-    加 P2P send buffer 后**峰值不变**（send 只叠 FWD 峰、远低于 BWD 峰）。
+    """pp2 锚点（真机 10246/45655）逐字节对照本次基线（**11162.1/45991.4 MiB**）——
+    加 P2P send buffer 后峰值不变（send 只叠 FWD 峰、远低于 BWD 峰）。
 
+    2026-07-16：pre-FFN norm(ln2) 补建 → 无重算下各 MoE 层 ln2 fp32-cast 常驻 → 基线
+    10826.0/45767.3 → 11162.1/45991.4。stage0 峰在 bwd@4（无重算逐层反向、forward 激活常驻），
+    对真机 10246 过预测 1.089（**OOM-安全**）——此过预测属「无重算全层 act_live 于 BWD 峰共存」的
+    整体保守（非 ln2 缺陷，ln2 是正确结构；与 P2-01/无重算聚合过预测同族），stage1 1.007 精确。
     走完整 Evaluator（与 sim_vs_real_report 同路径）取真锚点值。"""
     from cost_eval.report import Evaluator
     spec, d, fl = build_dsv3_spec(8)
@@ -134,8 +138,8 @@ def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
                   HardwareSpec(max_device_memory=64 * GiB, framework_reserve=0),
                   RecomputeSpec("None"), SwapSpec()).evaluate()
     s0, s1 = r.per_stage[0], r.per_stage[1]
-    assert abs(s0.peak_bytes / MiB - 10826.0) < 0.1
-    assert abs(s1.peak_bytes / MiB - 45767.3) < 0.1
+    assert abs(s0.peak_bytes / MiB - 11162.1) < 0.1
+    assert abs(s1.peak_bytes / MiB - 45991.4) < 0.1
     assert s0.peak_event.startswith("bwd") and s1.peak_event.startswith("bwd")
     # 仍 OOM 安全（预测 ≥ 真机）
     assert s0.peak_bytes / MiB >= 10246.0

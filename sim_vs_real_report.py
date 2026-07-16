@@ -41,6 +41,11 @@ rows.append(("cp2 ulysses full 4L (B2)",        "cp+full",    dsv3(4, FULL4, B=2
 rows.append(("pp2-stage0 (optstep)",            "pp+norecomp", dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=0),    10246.0))
 rows.append(("pp2-stage1 (loss,k_ce=8)",        "pp+norecomp", dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1),    45655.0))
 rows.append(("cp2-none (loss,k_ce=4)",          "cp+norecomp", dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"),  20119.4))
+# 2026-07-16 测试工程轮新采（run_axis.sh TAG=memval_none 卡6/7）：plain dp2 无重算锚点。
+# 复现并证实旧"feed_forward 19967 错名数据"实为真无重算测量（两次独立采样一致）。
+# 欠预测 ~1567 MiB 与 cp2-none 同族（无重算 MoE 保留态）；其中 ~196 MiB 已定性为
+# MoE decoder 缺 pre_mlp_layernorm op（F1，gpt_layer_specs.py:110/:129 真机源码确证）。
+rows.append(("DSv3 8L none (dp2)",              "norecomp",   dsv3(8, NONE),                                     19967.3))
 rows.append(("select self_attn (keep-FFN)",     "select",     dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2))
 rows.append(("select mlp (keep-attn)",          "select",     dsv3(8, RecomputeSpec("select", select_ops=MLP)),  15764.7))
 rows.append(("select both (=full,退化端)",       "select",     dsv3(8, RecomputeSpec("select", select_ops=BOTH)), 13953.3))

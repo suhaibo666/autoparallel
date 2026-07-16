@@ -129,9 +129,10 @@ def test_dsv4align_roundtrip_llmconfig_field_for_field():
 def test_dsv4align_roundtrip_same_peak():
     bundle = from_mindformers_dict(_dsv4align_mf())
     # 与 validate_dsv4align.evaluate 同 bundle（dp_shard=2 / no-recompute / SP）→ 逐字节同峰。
-    # 峰值 14929.8（fp32 layernorm 后,真机 15415 → 0.968，较修前 14336/0.930 提升）。
+    # 峰值 14971.8（2026-07-16 pre-FFN norm(ln2) 补建：无重算下 DSv4 MoE 各层 ln2 fp32-cast 常驻 →
+    #   14929.8→14971.8，真机 15415 → 0.968→0.971，欠预测收窄）。
     assert bundle.parallel.dp_shard == 2 and bundle.recompute.mode == "None"
-    assert abs(_peak(bundle) - 14929.8) < 1.0
+    assert abs(_peak(bundle) - 14971.8) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────

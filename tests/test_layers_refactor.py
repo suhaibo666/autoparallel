@@ -58,12 +58,17 @@ def test_gqa_attn_ops_equal_old_dense_prefix():
 
 
 def test_dense_ffn_ops_equal_old_suffix():
-    assert _names(build_dense_ffn_ops(D)) == _names(dense.build_dense_decoder(D).ops[6:])
+    # 2026-07-16: ln2(post_attention_layernorm) hoist 到 transformer 层（index 6），
+    # build_dense_ffn_ops 不再自建 ln2 → 全层后缀从 [6:] 变 [7:]（fc1/swiglu/fc2/add2）。
+    assert _names(build_dense_ffn_ops(D)) == _names(dense.build_dense_decoder(D).ops[7:])
 
 
 def test_mla_decoder_recomposed_equal():
     from cost_eval.layers.mla import build_mla_dense_decoder
-    recomposed = _names(build_mla_attn_ops(D)) + _names(build_dense_ffn_ops(D))
+    from cost_eval.layers.transformer import build_transformer_layer
+    # ln2 由 build_transformer_layer 统一前插 → 用它重组（attn + ln2 + dense_ffn）。
+    recomposed = _names(build_transformer_layer(
+        D, build_mla_attn_ops(D), build_dense_ffn_ops(D), is_moe=False))
     assert recomposed == _names(build_mla_dense_decoder(D).ops)
 
 
@@ -73,27 +78,35 @@ def test_gqa_attn_ops_fields_identical():
 
 
 def test_dense_ffn_ops_fields_identical():
-    _assert_ops_identical(build_dense_ffn_ops(D), dense.build_dense_decoder(D).ops[6:])
+    # ln2 hoist（index 6）→ 后缀 [6:] 变 [7:]（见 test_dense_ffn_ops_equal_old_suffix）。
+    _assert_ops_identical(build_dense_ffn_ops(D), dense.build_dense_decoder(D).ops[7:])
 
 
 def test_moe_ffn_ops_fields_identical():
-    _assert_ops_identical(build_moe_ffn_ops(DM), moe.build_moe_decoder(DM).ops[6:])
+    # ln2 hoist（index 6）→ MoE 全层后缀同样从 [6:] 变 [7:]（router…combine，6 op）。
+    _assert_ops_identical(build_moe_ffn_ops(DM), moe.build_moe_decoder(DM).ops[7:])
 
 
 def test_moe_decoder_recomposed_fields_identical():
-    recomposed = build_gqa_attn_ops(DM) + build_moe_ffn_ops(DM)
+    from cost_eval.layers.transformer import build_transformer_layer
+    # ln2 由 build_transformer_layer 前插（GQA MoE 无 shared）。
+    recomposed = build_transformer_layer(
+        DM, build_gqa_attn_ops(DM), build_moe_ffn_ops(DM), is_moe=True, has_shared=False)
     _assert_ops_identical(recomposed, moe.build_moe_decoder(DM).ops)
 
 
 def test_mla_dense_decoder_fields_identical():
-    recomposed = build_mla_attn_ops(DM) + build_dense_ffn_ops(DM)
+    from cost_eval.layers.transformer import build_transformer_layer
+    recomposed = build_transformer_layer(
+        DM, build_mla_attn_ops(DM), build_dense_ffn_ops(DM), is_moe=False)
     _assert_ops_identical(recomposed, mla.build_mla_dense_decoder(DM).ops)
 
 
 def test_mla_moe_decoder_fields_identical():
-    from cost_eval.layers.ffn import build_shared_expert_ops, build_moe_merge_op
-    recomposed = (build_mla_attn_ops(DM) + build_moe_ffn_ops(DM) + build_shared_expert_ops(DM)
-                  + [build_moe_merge_op(DM)])
+    from cost_eval.layers.transformer import build_transformer_layer
+    # ln2 前插 + shared expert + moe_add 合流，统一走 build_transformer_layer。
+    recomposed = build_transformer_layer(
+        DM, build_mla_attn_ops(DM), build_moe_ffn_ops(DM), is_moe=True, has_shared=True)
     _assert_ops_identical(recomposed, mla.build_mla_moe_decoder(DM).ops)
 
 

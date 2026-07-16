@@ -437,11 +437,12 @@ def _build_llm_config(model: dict) -> LLMConfig:
         # layernorm 计算 dtype（真机 layernorm_compute_dtype，一般 float32）→ norm 激活 fp32（保留 fp32 cast）
         layernorm_compute_dtype_bytes=_dtype_bytes(model.get("layernorm_compute_dtype"), 4),
         # B 标定 margin：select 重算下保留-MoE 层 loss 峰碎片长尾（op 图粒度之下，opdag_validation.md）。
-        #   仅 MoE 模型注入（dense 无此 regime）；标定自真机 DSv3 select_attn（1.9× kept-MoE 激活 → OOM-安全）。
+        #   仅 MoE 模型注入（dense 无此 regime）；标定自真机 DSv3 select_attn。**2026-07-16 复标 1.9→1.6**：
+        #   pre-FFN norm(ln2) 补建后（build_transformer_layer）MoE 层 ln2 fp32-cast 已进显式 op 图，
+        #   margin 只覆盖剩余碎片长尾 → 1.6×kept-MoE 激活（与 presets.deepseek_v3 同源，OOM-安全）。
         #   仅 select-kept-MoE 生效（mem_timeline._is_kept），full/no-recompute/dense 不触发（锚点不破）。
-        #   注：coarse 平台常数（自 DSv3 标定），非 yaml 字段——真机 select-kept-MoE 跑据此避免 18% 欠预测。
         #   融合-CE 模型（DSv4）loss_lids 空 → margin 永不触发 → 设 0（那是另一族融合 kernel 残差，D-5）。
-        kept_frag_factor=(1.9 if (num_moe_experts
+        kept_frag_factor=(1.6 if (num_moe_experts
                                   and not (attn_type == "dsv4_hybrid" and _dsa_fused(model)))
                           else 0.0),
     )

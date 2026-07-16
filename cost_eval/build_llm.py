@@ -21,6 +21,7 @@ from .llm_config import LLMConfig, to_dimtable
 from .model_spec import DimTable, LayerSpec, ModelSpec
 from .layers.registry import ATTN_REGISTRY, FFN_REGISTRY
 from .layers.ffn import build_shared_expert_ops, build_moe_merge_op
+from .layers.transformer import build_transformer_layer
 from .layers.head import build_embedding_ops, build_head_and_loss_ops, build_mtp_ops
 from .layers.residual import mhc_wrap, build_hc_expand_op, build_hc_collapse_op
 
@@ -314,12 +315,12 @@ def _build_decoder_body(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> li
     """
     attn_ops = list(ATTN_REGISTRY[ctx.attn_type](dims, ctx))
     ffn_ops = list(FFN_REGISTRY[ctx.ffn_type](dims, ctx))
-    if ctx.ffn_type == "moe" and cfg.moe_shared_expert_num > 0:
-        ffn_ops += build_shared_expert_ops(dims)
-        # 合流 op（2026-07-11 补边）:routed(comb)+shared(sh_o)→h2（moe_layer construct 真实语义;
-        # 线性 add,saves=[] 零激活字节;修 op 图 combine/shared_fc2 孤立叶节点）。
-        ffn_ops.append(build_moe_merge_op(dims))
-    return attn_ops + ffn_ops
+    is_moe = ctx.ffn_type == "moe"
+    has_shared = is_moe and cfg.moe_shared_expert_num > 0
+    # 统一 transformer 层：attn(ln1) → **ln2 前置归一(统一前插)** → dense|moe FFN(消费 ln2)
+    #   → [moe: shared(消费 ln2) + moe_add 合流]。2026-07-16 修 MoE 漏 ln2 的结构 bug（见
+    #   layers/transformer.py 与 build_pre_ffn_norm_op）。dense 全层拼接逐字节不变；MoE 补 ln2。
+    return build_transformer_layer(dims, attn_ops, ffn_ops, is_moe=is_moe, has_shared=has_shared)
 
 
 def _build_layer_ops(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> list:

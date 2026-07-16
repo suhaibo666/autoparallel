@@ -111,7 +111,9 @@ def test_dsv3_per_module_exact_roster_and_count():
         "o_w": ATTN_OUT * H,
     }
     dense = {**attn, "ln2_g": H, "fc1_w": H * 2 * F, "fc2_w": F * H}
-    moe = {**attn, "router_w": n_exp * H,
+    # 2026-07-16: MoE 层与 dense 对称补 ln2_g（post_attention_layernorm gamma [H] fp32），
+    # 由 build_transformer_layer 统一前插 —— MoE routed+shared 消费 ln2 而非裸 h1。
+    moe = {**attn, "ln2_g": H, "router_w": n_exp * H,
            "e_w1": n_exp * H * 2 * moe_F, "e_w2": n_exp * moe_F * H,
            "sh_w1": H * 2 * moe_F, "sh_w2": moe_F * H}
     expected = {

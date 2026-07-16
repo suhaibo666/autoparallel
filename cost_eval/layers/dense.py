@@ -32,4 +32,6 @@ def build_dense_decoder(d: DimTable) -> LayerSpec:
     LayerSpec
         包含 11 个 OpSpec 的层描述（6 GQA attn + 5 dense FFN），权重均已标注 tp 切分维。
     """
-    return LayerSpec(ops=build_gqa_attn_ops(d) + build_dense_ffn_ops(d))
+    from .transformer import build_transformer_layer
+    return LayerSpec(ops=build_transformer_layer(
+        d, build_gqa_attn_ops(d), build_dense_ffn_ops(d), is_moe=False))

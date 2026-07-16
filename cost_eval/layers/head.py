@@ -177,10 +177,12 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         attn_ops = list(ATTN_REGISTRY[cfg.attn_type](dims))
     ffn = "moe" if cfg.num_moe_experts else "dense"
     ffn_ops = list(FFN_REGISTRY[ffn](dims))
-    if ffn == "moe" and cfg.moe_shared_expert_num > 0:
-        ffn_ops += build_shared_expert_ops(dims)
-        from .ffn import build_moe_merge_op
-        ffn_ops.append(build_moe_merge_op(dims))   # 合流 op(2026-07-11 补边,与主干 _build_decoder_body 同构)
+    is_moe = ffn == "moe"
+    has_shared = is_moe and cfg.moe_shared_expert_num > 0
+    # 统一经 build_transformer_layer 前插 ln2（2026-07-16 修：MTP 内层 transformer_layer 的 MoE
+    # 同样漏 pre-FFN norm；与主干 _build_decoder_body 同构，含 shared+moe_add 合流）。
+    from .transformer import build_transformer_layer
+    body = build_transformer_layer(dims, attn_ops, ffn_ops, is_moe=is_moe, has_shared=has_shared)
     # mHC：MTP 的**内层 transformer_layer 同样跑在打包残差流上**（multi_token_prediction.py
     # :381-399：`expand_hyper_connection_streams` → transformer_layer → `collapse_...`，
     # `self.hc = config.enable_hyper_connections`）。故 mHC 开启时 MTP decoder 也要 ×n 包装
@@ -194,7 +196,7 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         collapse_out = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
         collapse = OpSpec("mtp_hc_collapse", OpType.ELEMENTWISE, [mtp_streams], collapse_out, saves=[])
         # collapse 的真实入流 = mhc 层尾更新后的残差流(wrapped 末 op 输出);此处先占位,wrap 后补依赖。
-        wrapped = mhc_wrap(attn_ops + ffn_ops, cfg.num_residual_streams, dims)
+        wrapped = mhc_wrap(body, cfg.num_residual_streams, dims)
         # expand→attn_hc_norm 补边(2026-07-11):expand 输出 mtp_hc_streams 即 mhc 段入口流
         # (名字断链;inputs 追加引用,saves 不变零字节)。
         w0 = wrapped[0]
@@ -210,7 +212,7 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
                           attrs=dict(collapse.attrs))
         ops += [expand] + wrapped + [collapse]
     else:
-        ops += attn_ops + ffn_ops
+        ops += body
 
     # ── 共享 head + loss（multi_token_prediction.py:393 `output_layer(hidden_states,
     #    weight=output_weight)` 用主模型 output_layer + 其权重）→ MTP head op **不携带 params**

@@ -78,11 +78,27 @@ def _moe_staging_ws_expr(d: "DimTable") -> str:
     return f"2*{tok}*H"
 
 
-def build_dense_ffn_ops(d: DimTable) -> list:
-    """构造 dense SwiGLU MLP FFN 段的 op 列表（5 个 OpSpec）。
+def build_pre_ffn_norm_op(d: DimTable) -> "OpSpec":
+    """**FFN 前置归一 ln2**（post_attention_layernorm）：`NORM(h1) → ln2`，`saves=[h1]`（fp32 cast）、
+    `ln2_g [H] fp32` gamma。**统一** 由 `build_transformer_layer` 前插到 dense/moe FFN 之前。
 
-    op 序列：ln2 → fc1 → swiglu → fc2 → add2
-    输入激活为 attn 段输出的 ``h1``（shard={0:'sp'}）。
+    2026-07-16 修（用户报告）：此前 ln2 只内嵌在 `build_dense_ffn_ops`，MoE FFN 段（`build_moe_ffn_ops`
+    / `build_shared_expert_ops`）直接吃裸 `h1`、**无 ln2** → 每 MoE 层漏建一份 `[S,B,H]` fp32 cast 常驻
+    （norm_compute=fp32），MoE 模型在无重算/select 下系统性欠预测。hoist 到统一 transformer 层后：
+    dense 全层逐字节不变（同一 ln2 op，只是产出方从 ffn builder 变为本函数）；MoE 层补上 ln2、routed+
+    shared 都消费 `ln2`（与真机 `mlp(post_attn_norm(hidden))` 一致）。"""
+    h1    = TensorRef("h1",   ("S", "B", "H"), shard={0: "sp"})   # attn 残差输出（sp 切）
+    ln2   = TensorRef("ln2",  ("S", "B", "H"))                    # 归一输出（全 S，进 FFN 列并行前 all-gather）
+    ln2_g = TensorRef("ln2_g", ("H",), is_weight=True, dtype_bytes=4)   # P1-01 norm gamma（fp32）
+    return OpSpec("ln2", OpType.NORM, [h1], ln2, params=[ln2_g], saves=[h1])
+
+
+def build_dense_ffn_ops(d: DimTable) -> list:
+    """构造 dense SwiGLU MLP FFN 段的 op 列表（4 个 OpSpec；**ln2 已 hoist 到 transformer 层**）。
+
+    op 序列：fc1 → swiglu → fc2 → add2（消费上游 `build_pre_ffn_norm_op` 产出的 ``ln2``）。
+    2026-07-16：ln2 前置归一由 `build_transformer_layer` 统一前插（见 `build_pre_ffn_norm_op`），
+    本段不再自建 ln2 op —— dense 全层拼接后逐字节不变。
 
     参数
     ----
@@ -95,8 +111,7 @@ def build_dense_ffn_ops(d: DimTable) -> list:
     act_name = "swiglu" if gated else "gelu"
 
     # ── 激活张量 ───────────────────────────────────────────────────────────────
-    h1     = TensorRef("h1",   ("S", "B", "H"),          shard={0: "sp"})
-    ln2    = TensorRef("ln2",  ("S", "B", "H"))
+    ln2    = TensorRef("ln2",  ("S", "B", "H"))          # 上游 ln2 op 产出（本段 fc1 的输入）
     g      = TensorRef("g",    ("S", "B", fc1_out),      shard={2: "tp"})
     act    = TensorRef("act",  ("S", "B", "F"),          shard={2: "tp"})
     o2     = TensorRef("o2",   ("S", "B", "H"),          partial="tp")
@@ -105,22 +120,18 @@ def build_dense_ffn_ops(d: DimTable) -> list:
     # ── 权重张量（is_weight=True，标注 tp 切分）──────────────────────────────
     fc1_w  = TensorRef("fc1_w", ("H", fc1_out), shard={1: "tp"}, is_weight=True)
     fc2_w  = TensorRef("fc2_w", ("F",  "H"),    shard={0: "tp"}, is_weight=True)
-    ln2_g  = TensorRef("ln2_g", ("H",), is_weight=True, dtype_bytes=4)   # P1-01 norm gamma
 
     return [
-        # 7. Pre-FFN norm
-        OpSpec("ln2",    OpType.NORM,        [h1],         ln2,
-               params=[ln2_g], saves=[h1]),
-        # 8. FFN 上投影（gated→2F gate+up；ungated→F）
+        # FFN 上投影（gated→2F gate+up；ungated→F）
         OpSpec("fc1",    OpType.MATMUL,      [ln2, fc1_w], g,
                params=[fc1_w], saves=[ln2]),
-        # 9. 激活（gated=SwiGLU 2F→F；ungated=gelu F→F）
+        # 激活（gated=SwiGLU 2F→F；ungated=gelu F→F）
         OpSpec(act_name, OpType.ELEMENTWISE, [g],          act,
                saves=[g]),
-        # 10. FFN down 投影（行并行）
+        # FFN down 投影（行并行）
         OpSpec("fc2",    OpType.MATMUL,      [act, fc2_w], o2,
                params=[fc2_w], saves=[act]),
-        # 11. Residual add
+        # Residual add
         OpSpec("add2",   OpType.ELEMENTWISE, [o2],         h2,
                saves=[]),
     ]
@@ -153,8 +164,9 @@ def build_moe_ffn_ops(d: DimTable) -> list:
     staging = _moe_staging_ws_expr(d)
 
     # ── MoE FFN 激活张量 ────────────────────────────────────────────────────
-    # add1 输出（h1）作为 router 与 dispatch 的输入
-    hin  = TensorRef("h1",    ("S", "B", "H"),                  shard={0: "sp"})
+    # **ln2 前置归一输出**（build_pre_ffn_norm_op 产出）作为 router 与 dispatch 的输入。
+    # 2026-07-16 修：此前直接吃裸 `h1`（无 pre-FFN norm）→ 漏 ln2；改吃 `ln2`（与 dense fc1 同源）。
+    hin  = TensorRef("ln2",   ("S", "B", "H"))
     # router logits（全 token × 全专家，无切分）
     logits = TensorRef("logits", ("S", "B", "n_experts"))
     # dispatch 后 token 按 ep 分片（all-to-all）
@@ -245,7 +257,8 @@ def build_shared_expert_ops(d: DimTable) -> list:
     sh_act_name = "shared_swiglu" if gated else "shared_gelu"
 
     # ── Shared expert 激活 / 权重 ─────────────────────────────────────────
-    hin_sh     = TensorRef("h1",     ("S", "B", "H"),            shard={0: "sp"})
+    # shared expert 与 routed 共同吃 **ln2**（pre-FFN norm 输出）——2026-07-16 修（此前吃裸 h1）。
+    hin_sh     = TensorRef("ln2",    ("S", "B", "H"))
     sh_g       = TensorRef("sh_g",   ("S", "B", sh_fc1_out),     shard={2: "tp"})
     sh_act     = TensorRef("sh_act", ("S", "B", "moe_shared_F"),  shard={2: "tp"})
     sh_o       = TensorRef("sh_o",   ("S", "B", "H"),             partial="tp")

@@ -20,10 +20,14 @@ GOLDEN_OPS = {
     "mla_dense": ["ln1", "linear_qkv", "q_a_norm", "kv_a_norm", "linear_qb", "linear_kvb",
                   "rope", "flash", "o_proj", "add1", "ln2", "fc1", "swiglu", "fc2", "add2"],
     "mla_moe": ["ln1", "linear_qkv", "q_a_norm", "kv_a_norm", "linear_qb", "linear_kvb",
-                "rope", "flash", "o_proj", "add1", "router", "dispatch", "e_fc1",
+                "rope", "flash", "o_proj", "add1",
+                # ln2(2026-07-16 补建):pre-FFN norm(post_attention_layernorm)。此前 MoE 层漏此 op
+                # （dense 有、moe 无），每 MoE 层欠一份 [S,B,H] fp32-cast 常驻 → 无重算/select 欠预测。
+                # build_transformer_layer 统一前插；routed(router/dispatch)+shared(shared_fc1) 都消费 ln2。
+                "ln2", "router", "dispatch", "e_fc1",
                 "e_swiglu", "e_fc2", "combine", "shared_fc1", "shared_swiglu", "shared_fc2",
                 # moe_add(2026-07-11 补边):routed+shared 合流(moe_layer 真实语义,线性 add saves=[]
-                # 零字节——下方字节 golden 全部不动即为证;修 op 图 combine/shared_fc2 孤立叶节点)。
+                # 零字节;修 op 图 combine/shared_fc2 孤立叶节点)。
                 "moe_add"],
     "lm_head": ["final_norm", "lm_head", "logsoftmax", "nll"],   # P1-01: 补 final_norm(真机实存)
 }
@@ -33,13 +37,16 @@ GOLDEN_OPS = {
 # P1-01（2026-07-14）：+router fp32 权重/norm gamma（persistent/gather/grad +371712 B 级）
 # + final_norm op（act_live + 其 fp32 保留输入）——真机实存、修前欠算；峰 12472.5 → 12500.9 MiB
 # （真机 12473.1 → 1.0022，0.2% 保守侧）。
+# 2026-07-16：pre-FFN norm(ln2) 补建 → 3 个 MoE 层各 +1 个 ln2_g([H]fp32) 参数 → persistent
+#   +32256 B（4016286720→4016318976）；full 重算下 ln2 saved 激活丢弃 → act_live/recomp/峰值事件
+#   逐字节不变；峰 +32256 B（仍 12500.9 MiB，真机 12473.1 → 1.0022 不变）。
 GOLDEN_BREAKDOWN = {
-    "persistent": 4016286720, "act_live": 3279945728, "gather_buf": 463346688,
+    "persistent": 4016318976, "act_live": 3279945728, "gather_buf": 463346688,
     "grad_buf": 926686208, "recomp_scratch": 0, "bwd_scratch": 4236247040,
     "swap_buf": 0, "workspace": 0, "framework": 185597952,
 }
 GOLDEN_PEAK_EVENT = "bwd@5"
-GOLDEN_PEAK_BYTES = 13108110336        # = 12500.9 MiB（真机 12473.1 → 1.0022）
+GOLDEN_PEAK_BYTES = 13108142592        # = 12500.9 MiB（真机 12473.1 → 1.0022）
 
 
 def _spec():
