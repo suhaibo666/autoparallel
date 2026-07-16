@@ -295,7 +295,8 @@ class Evaluator:
             record_timeline=record_timeline, alloc_block_bytes=block,
             cross_entropy_fused=getattr(self.spec.dims, "cross_entropy_fused", False),
             norm_compute_dtype_bytes=getattr(self.spec.dims, "norm_compute_dtype_bytes", 0),
-            kept_frag_factor=getattr(self.spec.dims, "kept_frag_factor", 0.0))
+            kept_frag_factor=getattr(self.spec.dims, "kept_frag_factor", 0.0),
+            nr_moe_frag_factor=getattr(self.spec.dims, "nr_moe_frag_factor", 0.0))
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。

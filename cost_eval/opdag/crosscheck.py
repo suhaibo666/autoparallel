@@ -37,6 +37,18 @@ grouped-GEMM 段），把手写 `LayerSpec` 的**重算子名册（op census）*
     边界 log，不比。
   - GQA/dense/embedding/lm_head/mtp 层**无 opdag 提取源** → 作为 uncovered 层 log。
 
+**第三族 `layer_norms`（层级 pre-norm 名册，Z1 修复 2026-07-16）**：前两族（MLA/MoE）的比较窗口
+把**层级两个强制 pre-norm** 漏在外——`moe_experts` 窗口是 `[首个 moe_gemm … 末个 moe_gemm]`，排除了
+`ln2`（pre_mlp_layernorm，位于 router 之前）；`mla_attn` 段以 `add1→h1` 收尾，`ln2` 落在 ffn 段，
+被两族都不 census。于是删掉某 MoE 层的 `ln2` 竟能 `ok==True`（F1 类漏建：少一个 pre-norm）。第三族补这个
+洞：对每个 decoder-body 层（`_split_decoder` 同时给出 attn/ffn 段者），用 `resolve_layer_spec` 从**真**
+`get_gpt_layer_local_spec` 静态解析 `TransformerLayerSubmodules` 的 `input_layernorm` / `pre_mlp_layernorm`
+两槽是否为**真归一类**（源码在 MLA 与非 MLA 两支**无条件** `= get_norm_cls(fused_norm)`，见
+`gpt_layer_specs.py:162/164`（MLA）与 `:172/183`（非 MLA）；`IdentityOp` 只用于**可选** q/k layernorm）——
+若为真 norm，则断言手写 attn 段含一个 pre-attn NORM（ln1）、ffn 段**首个重算子是 NORM**（ln2）；缺失即
+`LayerNormFinding`（让 `ok=False`、strict 下 raise）。**诚实边界**：本族只校验这两个 pre-norm 的**存在/
+位置**，**不**校验它们的 saves/shape/dtype（与全模块「类别 census、非内存契约验证器」的口径一致）。
+
 **校验口径的诚实边界（不可过度宣称）**：本模块是一个**算子类别 census 的一致性校验器**——它只比较
 两侧「重算子类别计数」（matmul/norm/linear_grouped/attention/activation…）之间的**逐类别 delta**，
 **不**比较每个张量的 `saves`（保存清单）、shape、dtype、workspace 或生命周期。因此它**无法**发现
@@ -84,11 +96,25 @@ class OpdagDriftWarning(UserWarning):
 
 
 def default_mf_root() -> str:
-    """mindformers 源根：环境变量 MINDFORMERS_ROOT 优先，否则本机默认路径。"""
-    return os.environ.get(
+    """mindformers 源根：环境变量 MINDFORMERS_ROOT 优先，否则本机默认路径。
+
+    **两级探测（Z3 健壮性，2026-07-16）**：抽取器要求根是**包目录**——含 `parallel_core` 的那层
+    （即 `…/mindformers/mindformers`），而非仓库根。常见误配是把 `MINDFORMERS_ROOT` 指到仓库根
+    `…/mindformers`（其下才是 `mindformers/parallel_core`）→ 抽取器找不到 `parallel_core` 而失败。
+    故：候选（env 或默认）若自身**不含** `parallel_core` 但 `<候选>/mindformers/parallel_core` 存在，
+    下降一层到 `mindformers`。**向后兼容**：候选已含 `parallel_core` → 原样返回（与当前默认逐字节一致）；
+    两级都不含（如 CI 缺源）→ 原样返回候选（`available` 判定照旧为 False，绝不因探测改变缺源行为）。
+    """
+    cand = os.environ.get(
         "MINDFORMERS_ROOT",
         r"E:\97-codes\torch_parallel\mindformers\mindformers",
     )
+    if os.path.isdir(os.path.join(cand, "parallel_core")):
+        return cand                                   # 已是包目录 → 逐字节不变
+    nested = os.path.join(cand, "mindformers")
+    if os.path.isdir(os.path.join(nested, "parallel_core")):
+        return nested                                 # 误指仓库根 → 下降一层到包目录
+    return cand                                       # 两级都无（缺源）→ 原样返回，行为不变
 
 
 # ── 类别映射 ──────────────────────────────────────────────────────────────────
@@ -206,6 +232,57 @@ _MOE_CORR = Correspondence(
 )
 
 
+# ── 第三族 layer_norms：层级 pre-norm 名册（Z1 修复 2026-07-16）─────────────────────────
+# 源侧解析复用 DSv3 MLA 的 spec flags（同一 `get_gpt_layer_local_spec` 入口、同一 `TransformerLayer`
+# 结构）。**源事实**：`input_layernorm`/`pre_mlp_layernorm` 在 MLA 与非 MLA 两支都**无条件**
+# `= get_norm_cls(fused_norm)`（`gpt_layer_specs.py:162/164` 与 `:172/183`），故用此单一解析代表所有
+# decoder 层是**源忠实**的；`IdentityOp` 只出现在**可选** q/k layernorm（qk_layernorm 门控）。
+_LAYER_NORMS_SPEC_FLAGS = _MLA_SPEC_FLAGS
+_LAYER_NORMS_SOURCE_DESC = (
+    "TransformerLayerSubmodules.input_layernorm / pre_mlp_layernorm "
+    "@ gpt_layer_specs.py get_gpt_layer_local_spec")
+_LAYER_NORMS_OPAQUE_NOTE = (
+    "只校验两个层级 pre-norm 的**存在/位置**（attn 段有 pre-attn NORM=ln1、ffn 段首个重算子是 "
+    "NORM=ln2）；不校验其 saves/shape/dtype（类别 census 边界，见模块 docstring）")
+
+
+def _is_real_norm(resolved) -> bool:
+    """判定 `resolve_layer_spec` 解出的一个 submodule 槽位是否为**真归一类**（vs IdentityOp/缺失）。
+
+    `resolve_layer_spec` 把 `get_norm_cls(...)` 归一为叶子字符串 `"Norm"`、`IdentityOp` 归一为
+    `"Identity"`（module_resolver `_NAME_ALIAS`）；也可能是嵌套 `ResolvedSpec`（取 `.cell`）。稳健起见对
+    str 叶子 / ResolvedSpec / 缺失都判：类名（不区分大小写）含 `"norm"` 且不含 `"identity"` → 真 norm。
+    """
+    if resolved is None:
+        return False
+    if isinstance(resolved, str):
+        name = resolved
+    elif isinstance(resolved, ResolvedSpec):
+        name = resolved.cell
+    else:  # 兜底：类对象 / 其它 → 取 __name__ 或字符串化
+        name = getattr(resolved, "__name__", None) or str(resolved)
+    if not name:
+        return False
+    low = name.lower()
+    return ("norm" in low) and ("identity" not in low)
+
+
+@functools.lru_cache(maxsize=None)
+def layer_norms_source_info(mf_root: str) -> dict:
+    """从真 `gpt_layer_specs.py` 静态解析 DSv3 `TransformerLayer` 的两个层级 pre-norm 槽位是否为真 norm。
+
+    返回 `{"input_layernorm": bool, "pre_mlp_layernorm": bool}`（True=真归一类；False=IdentityOp/缺失）。
+    **诚实边界**：只判「是不是真 norm」，不解析其具体归一类型/shape/dtype。解析失败照全模块 fail-loud
+    约定向上抛（由 `validate_against_opdag` 记 `extraction_failures`——已声明覆盖族无从验证 ≠ 合法无对应）。
+    """
+    top = resolve_layer_spec(mf_root, _LAYER_NORMS_SPEC_FLAGS)
+    subs = top.submodules
+    return {
+        "input_layernorm": _is_real_norm(subs.get("input_layernorm")),
+        "pre_mlp_layernorm": _is_real_norm(subs.get("pre_mlp_layernorm")),
+    }
+
+
 # ── 手写层段切分 + census ─────────────────────────────────────────────────────────
 def _split_decoder(ops):
     """把一个 decoder 层的 ops 按残差输出 `h1` 切成 (attn 段, ffn 段)。
@@ -241,6 +318,68 @@ def _moe_expert_window(ffn_ops):
     return ffn_ops[idx[0]:idx[-1] + 1]
 
 
+# ── 第三族 layer_norms：手写侧 pre-norm 在场判定（Z1 修复 2026-07-16）───────────────────
+def _has_pre_attn_norm(attn_ops) -> bool:
+    """attn 段是否含一个作为 **pre-attn 归一** 的 NORM（`ln1`）。
+
+    判据：段内存在一个 `hand_category == NORM` 的 op，其输入含该层的**输入残差流**——层输入取 attn 段
+    首个 op 的首个输入张量名（正常层 = `x`；`ln1` 即 `NORM(x)→ln1`，恒在场）。删掉 `ln1` 后，段首变
+    linear_qkv/qkv（其输入是 `ln1` 载体），已无 NORM 以层输入为输入 → False（被报出）。只判在场，不判
+    saves/shape/dtype（诚实边界）；MLA 段里的 q/kv_a_norm 输入是 lora 切片、非层输入，不误判为 pre-attn。
+    """
+    if not attn_ops:
+        return False
+    first_in = attn_ops[0].inputs[0] if attn_ops[0].inputs else None
+    layer_in = getattr(first_in, "name", None)
+    if layer_in is None:
+        return False
+    for op in attn_ops:
+        if hand_category(op) == NORM:
+            in_names = {getattr(t, "name", None) for t in (op.inputs or [])}
+            if layer_in in in_names:
+                return True
+    return False
+
+
+def _ffn_leads_with_norm(ffn_ops) -> bool:
+    """ffn 段是否以 **pre_mlp_layernorm**（`ln2`, NORM）打头。
+
+    判据：段内**首个重算子类别**（`hand_category` 非 None：LINEAR/LINEAR_GROUPED/NORM/ATTENTION/
+    ACTIVATION）的 op 必须是 NORM。router/dispatch/combine/residual 等结构/opaque op 类别为 None、跳过。
+    删掉 `ln2` 后，dense 段首个重算子变 `fc1`(MATMUL)、MoE 段变 `e_fc1`(MOE_GEMM) → 非 NORM → 报出
+    （正是 Z1 的删-ln2 突变）。只判位置在场，不判 saves/shape/dtype（诚实边界）。
+    """
+    for op in ffn_ops:
+        cat = hand_category(op)
+        if cat is None:
+            continue                     # 跳过 router/dispatch/combine/residual add（非重算子）
+        return cat == NORM               # 首个重算子必须是 NORM=ln2
+    return False
+
+
+def _check_layer_norms(layer_type, attn_ops, ffn_ops, source_info, report):
+    """第三族 **layer_norms** 的交叉校验：对一个 decoder-body 层，断言源码强制的两个层级 pre-norm
+    在手写 op 图里**存在且就位**——
+
+      - 源 `input_layernorm` 为真 norm → attn 段必须含一个 pre-attn NORM（`ln1`，输入为层输入残差流）；
+        缺失 → `LayerNormFinding`。（注：`_MLA_CORR` 的 NORM delta 是**总 NORM 计数**对账，此族专管两个
+        **层级 pre-norm 的在场**，语义正交、不重复报同一 finding。）
+      - 源 `pre_mlp_layernorm` 为真 norm → ffn 段**首个重算子是 NORM**（`ln2`）；否则 → `LayerNormFinding`
+        （这正是 `moe_experts`/`mla_attn` 两族都 census 不到的删-ln2 突变）。
+
+    **诚实边界**：只校验这两个 pre-norm 的**存在/位置**，不校验其 saves/shape/dtype。
+    """
+    report.layer_norm_checked.append(layer_type)
+    if source_info.get("input_layernorm") and not _has_pre_attn_norm(attn_ops):
+        report.layer_norm_findings.append(LayerNormFinding(
+            layer_type, "input_layernorm",
+            "attn 段缺少以层输入为输入的 pre-attn NORM（ln1）"))
+    if source_info.get("pre_mlp_layernorm") and not _ffn_leads_with_norm(ffn_ops):
+        report.layer_norm_findings.append(LayerNormFinding(
+            layer_type, "pre_mlp_layernorm",
+            "ffn 段首个重算子不是 NORM（缺失 pre_mlp_layernorm / ln2）"))
+
+
 # ── 报告数据结构 ──────────────────────────────────────────────────────────────────
 @dataclass
 class Finding:
@@ -263,6 +402,24 @@ class Finding:
 
 
 @dataclass
+class LayerNormFinding:
+    """一条**层级 pre-norm 名册**漂移（第三族 layer_norms，Z1）：某 decoder-body 层缺失了源码
+    无条件强制的 `input_layernorm`（ln1）/ `pre_mlp_layernorm`（ln2）对应的 NORM op。
+
+    诚实边界：本条只表达该 pre-norm 的**存在/位置**缺失，**不**涉及其 saves/shape/dtype。
+    """
+    layer_type: str
+    norm_slot: str          # "input_layernorm" / "pre_mlp_layernorm"
+    detail: str
+
+    @property
+    def message(self) -> str:
+        return (f"[opdag 层级 pre-norm 缺失] 层 {self.layer_type!r} 的 {self.norm_slot}："
+                f"{self.detail}——源码 get_gpt_layer_local_spec 无条件绑定该 norm"
+                f"（get_norm_cls(fused_norm)），手写 LayerSpec 却缺对应 NORM op。")
+
+
+@dataclass
 class Covered:
     layer_type: str
     family: str
@@ -280,15 +437,22 @@ class CrossCheckReport:
     # 已声明覆盖族在抽取时抛异常 → list[(layer_type, family, error)]。这**不是**合法无对应
     # （见模块 docstring）——它意味着该族无从验证，故让 ok=False、strict 下 raise。
     extraction_failures: list = field(default_factory=list)
+    # 第三族 layer_norms（Z1）：层级 pre-norm 缺失 → list[LayerNormFinding]（让 ok=False、strict raise）。
+    layer_norm_findings: list = field(default_factory=list)
+    # 被 layer_norms 族校验过的 decoder-body 层名（可读覆盖记录；与 delta-census 的 `covered` 分列，
+    # 保持 `covered` 仅指 MLA/MoE 两族的语义——GQA/dense 层也参与 layer_norms 但不进 `covered`）。
+    layer_norm_checked: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        """无漂移**且**无提取失败即通过（不可用也视作「无从校验、无可报」→ True）。
+        """无漂移**且**无提取失败**且**无层级 pre-norm 缺失即通过（不可用也视作「无从校验、无可报」→ True）。
 
         注意：提取失败也让 ok=False——一个已声明覆盖的族抽取失败意味着交叉校验无从验证它，
-        若仍返回 True 就是假绿（见模块 docstring「提取失败 ≠ 合法无对应」）。
+        若仍返回 True 就是假绿（见模块 docstring「提取失败 ≠ 合法无对应」）。layer_norms 族的缺失
+        （删 ln1/ln2）同样让 ok=False（Z1 修复）。
         """
-        return not self.findings and not self.extraction_failures
+        return (not self.findings and not self.extraction_failures
+                and not self.layer_norm_findings)
 
     def summary(self) -> str:
         if not self.available:
@@ -297,10 +461,14 @@ class CrossCheckReport:
         status = "通过" if self.ok else "发现漂移/提取失败"
         head = (f"opdag 一致性校验：{status}；"
                 f"覆盖层段={len(self.covered)}（{cov}）、未覆盖层={len(self.uncovered)}、"
-                f"漂移={len(self.findings)}、提取失败={len(self.extraction_failures)}")
+                f"漂移={len(self.findings)}、提取失败={len(self.extraction_failures)}、"
+                f"层级pre-norm校验={len(self.layer_norm_checked)}、"
+                f"pre-norm缺失={len(self.layer_norm_findings)}")
         lines = [head]
         for f in self.findings:
             lines.append("  - " + f.message)
+        for lf in self.layer_norm_findings:
+            lines.append("  - " + lf.message)
         for layer_type, family, error in self.extraction_failures:
             lines.append(
                 f"  - [opdag 提取失败] 层 {layer_type!r} 的 {family} 段：声明覆盖但无法从源抽取 op 图"
@@ -350,9 +518,10 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
                 False（默认）：`warn` 时发 `OpdagDriftWarning`，把漂移/提取失败记进报告返回。
       warn    — 是否在缺源/漂移/提取失败时 `warnings.warn`（默认 True）。
 
-    返回 `CrossCheckReport`（findings/covered/uncovered/extraction_failures/available）。
-    合法无对应的层（embedding/lm_head/mtp/gqa/dense）记 `uncovered`，**不**触发 strict；只有已声明
-    覆盖族（MLA/MoE）抽取失败才记 `extraction_failures` 并触发 strict（见模块 docstring）。
+    返回 `CrossCheckReport`（findings/covered/uncovered/extraction_failures/layer_norm_findings/
+    available）。合法无对应的层（embedding/lm_head/mtp/gqa/dense）记 `uncovered`，**不**触发 strict；
+    只有已声明覆盖族（MLA/MoE/layer_norms）抽取失败才记 `extraction_failures` 并触发 strict；
+    layer_norms 族发现删 ln1/ln2 记 `layer_norm_findings` 并触发 strict（见模块 docstring）。
     """
     mf_root = mf_root or default_mf_root()
     report = CrossCheckReport(available=os.path.isdir(mf_root), mf_root=mf_root)
@@ -363,6 +532,15 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
                 "（设 MINDFORMERS_ROOT 或传 mf_root 启用；缺源不影响评估）。",
                 OpdagDriftWarning, stacklevel=2)
         return report
+
+    # 第三族 layer_norms 的源侧信息（两个层级 pre-norm 是否真 norm）——解析一次，对所有 decoder-body
+    # 层适用（DSv3 每层同一 TransformerLayer 结构；源事实在 MLA/非 MLA 两支一致）。解析失败=已声明覆盖
+    # 族无从验证 → extraction_failures（不静默放行；见模块 docstring「提取失败 ≠ 合法无对应」）。
+    ln_source_info = None
+    try:
+        ln_source_info = layer_norms_source_info(mf_root)
+    except Exception as e:
+        report.extraction_failures.append(("<decoder layers>", "layer_norms", str(e)))
 
     for ltype, ls in spec.layer_specs.items():
         attn_ops, ffn_ops = _split_decoder(ls.ops)
@@ -375,14 +553,20 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
             window = _moe_expert_window(ffn_ops)
             if window is not None:
                 matched |= _check_segment(ltype, window, _MOE_CORR, mf_root, report)
+        # 第三族 layer_norms：每个 decoder-body 层（同时有 attn/ffn 段，即有 h1 残差）都校验两个层级
+        # pre-norm 的在场——这**不**改 matched/covered（保持 covered 仅指 MLA/MoE 两族；GQA/dense 层仍
+        # 记 uncovered），只在缺 ln1/ln2 时记 layer_norm_findings。前两族窗口都 census 不到 ln2 → 补此洞。
+        if ln_source_info is not None and attn_ops is not None and ffn_ops is not None:
+            _check_layer_norms(ltype, attn_ops, ffn_ops, ln_source_info, report)
         if not matched:
             report.uncovered.append(
                 (ltype, "无 opdag 提取源（embedding/lm_head/mtp/gqa/dense 未抽取）"))
 
-    # 漂移 **或** 已声明覆盖族的提取失败都是「非绿」——strict 下都要 raise（提取失败静默放行=假绿）。
-    if report.findings or report.extraction_failures:
+    # 漂移 **或** 提取失败 **或** 层级 pre-norm 缺失都是「非绿」——strict 下都要 raise（静默放行=假绿）。
+    if report.findings or report.extraction_failures or report.layer_norm_findings:
         if strict:
-            if report.extraction_failures and not report.findings:
+            if (report.extraction_failures and not report.findings
+                    and not report.layer_norm_findings):
                 fams = ", ".join(sorted({f for _lt, f, _e in report.extraction_failures}))
                 head = (f"opdag 一致性校验无法完成：已声明覆盖族 [{fams}] 的 op 图抽取失败——"
                         f"无从验证，strict 下不得静默放行。\n")

@@ -59,6 +59,12 @@ def deepseek_v3(num_layers: int = 4) -> LLMConfig:
         #   真机 select_attn（DSv3 8L）18828 = 补 ln2 后 base 15684 + 1.6×kept-MoE(1954)；≈1.00（OOM-安全）。
         #   仅 select-kept-MoE 生效；full/no-recompute/select-keep-attn 不触发（见 mem_timeline._is_kept）。
         kept_frag_factor=1.6,
+        # D1 无重算-MoE OOM-安全标定 margin（2026-07-16；非物理，2 点标定）：无重算下各 MoE 层保留态的
+        #   dispatch/permute/grouped-GEMM fp32-cast + <100MiB 长尾（同族碎片，另一作用域）。仅 pp==1 单 stage
+        #   无重算 loss-BWD 生效（pp>1 由 K_CE=8 平衡，探针实证 pp2/select/full 零扰动）。factor=0.6 由
+        #   8L-none(sim/real 0.931→1.009)+cp2-none(0.937→1.021)两锚点联合标定使二者 OOM-安全；两点理想
+        #   factor 0.53/0.45 差 ~15% → 标定常数、非精确物理，可单值调/关。fused-CE(DSv4)不触发。
+        nr_moe_frag_factor=0.6,
     )
 
 

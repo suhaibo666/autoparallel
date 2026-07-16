@@ -89,6 +89,12 @@ class LLMConfig:
     #   残差**在 op 图粒度之下**（profiler live-set 313 个 <100MiB 碎片，`analysis/realmachine/opdag_validation.md`）
     #   → 无法从显式 op 导出，退标定。默认 0=关（回归安全）。仅 select-kept-MoE 生效（mem_timeline kept_frag）。
     kept_frag_factor: float = 0.0
+    # **无重算-MoE OOM-安全标定 margin 因子**（D1，2026-07-16；非物理，2 点标定）：与 kept_frag 同族碎片
+    #   （dispatch/permute/grouped-GEMM fp32-cast + <100MiB 长尾），但作用域是**无重算-MoE**而非 select-kept。
+    #   仅 pp==1 单 stage 无重算 loss-BWD 生效（pp>1 已由 K_CE=8 平衡）。factor=0.6 由 8L-none+cp2-none 两锚点
+    #   联合标定使二者 OOM-安全（预测≥真机）；两点理想 factor 0.53/0.45 差 ~15%，故明示为标定常数、可单值调/关。
+    #   默认 0=关（回归安全）。fused-CE（DSv4）不触发。见 mem_timeline nr_moe_frag_factor / kept_frag 桶。
+    nr_moe_frag_factor: float = 0.0
     chunk_loss_num: int = 0                 # >1：分块 CE，降 loss 区峰值
     # embedding/head 权重的驻留/gather 副本 dtype（P1-04 接线，2026-07-14）：真机 FSDP 下
     # compute 副本为 bf16=2（全部锚点在此口径验证；fp32 master 在 persistent 的 opt 倍数里另计）。
@@ -176,5 +182,6 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
         norm_compute_dtype_bytes=cfg.layernorm_compute_dtype_bytes,   # norm 激活 fp32（真机 layernorm_compute_dtype）
         kept_frag_factor=cfg.kept_frag_factor,   # B 标定 margin（select-kept-MoE loss 峰碎片长尾）
+        nr_moe_frag_factor=cfg.nr_moe_frag_factor,   # D1 标定 margin（无重算-MoE loss 峰碎片长尾，pp==1）
         dtype_bytes=cfg.compute_dtype_bytes,
     )

@@ -196,7 +196,7 @@ class Buckets:
     swap_buf: int = 0         # 激活 swap H2D 预取缓冲（BWD：复原当前卸载层 saves + 反向序后 depth 层在飞预取窗，双缓冲）
     workspace: int = 0        # 算子 workspace（FWD 逐层临时）
     optstep: int = 0          # 优化器-step 瞬态（②，真机 profiler）：AdamW 更新最大权重时物化的 k_opt 个 fp32 [weight] 临时（Square/sqrt/m̂/update；grad 已拆去 grad_accum 桶，P0-01 重标 K_OPT 6→4）；step 在反向后、激活已释，故与激活互斥
-    kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）
+    kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）。**两作用域共用此桶**：① select-kept-MoE（kept_frag_factor×kept_act）；② 无重算-MoE（D1，nr_moe_frag_factor×_nr_moe_act，仅 pp==1 单 stage 无重算 loss-BWD）——同族碎片、不同 gate，互斥不双算
     grad_accum: int = 0       # **已规约梯度累计驻留**（P0-01，2026-07-14）：真机证实 step-scoped cumulative——每层首次反向后其 reduced 本地分片常驻，至 optimizer 后 zero_grad 释放（两卡探针 1889.5 MiB 吻合）。与 grad_buf（当前层 reduce-scatter 前 full 瞬态）正交
     p2p_buf: int = 0          # **PP stage 间 P2P send 激活缓冲**（P1-15，Task A）：非末 stage 前向把本 stage 输出激活 [S,B,H] send 给下 stage，send 通信期间驻留（1 份；overlap_p2p 时 2 份双缓冲）。recv 侧（非首 stage 首层输入）已隐含在 act_live 首层 pin → 不双算。pp=1 恒 0。仅 FWD 事件驻留、BWD/optstep 清零（pp2 峰在 BWD，不移锚点）
 
@@ -386,7 +386,8 @@ class MemTimeline:
                  grad_dtype_bytes: int = 4, record_timeline: bool = False,
                  alloc_block_bytes: int = 1, cross_entropy_fused: bool = False,
                  norm_compute_dtype_bytes: int = 0,
-                 kept_frag_factor: float = 0.0) -> dict:
+                 kept_frag_factor: float = 0.0,
+                 nr_moe_frag_factor: float = 0.0) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -477,6 +478,12 @@ class MemTimeline:
             _stage_no_recompute = not any(
                 recompute.is_full(l.layer_id) or recompute.is_select(l.layer_id)
                 for l in layers)
+            # D1（2026-07-16）：本 stage 含 MoE 专家核（grouped-GEMM `moe_gemm` op）的层集——
+            #   无重算-MoE margin 的作用层（识别方式与 crosscheck `_moe_expert_window` 一致，取
+            #   op.type 归一化字符串 == "moe_gemm"；resolved 图里 op.type 为纯字符串，故用 getattr 兜底）。
+            _moe_lids = {l.layer_id for l in layers
+                         if any(getattr(op.type, "value", op.type) == "moe_gemm"
+                                for op in l.ops)}
 
             # ── P0-03（2026-07-14 review）：reshard_after_forward 接线 ─────────────────
             # 语义（hyper_parallel fsdp.py:42-74 / hsdp_scheduler.py:225-250 / parallelize.py:1172-1182）:
@@ -576,10 +583,15 @@ class MemTimeline:
             #   - full 层 / loss 层：不计（→ margin 0，12409.5/cp-full 锚点不破）；
             #   - select-attn（重算 attn、留 FFN）：MoE 保留 → 计（sa 靶心，0.823→≥0.95）；
             #   - select-mlp（重算 FFN）：MoE 已重算 → 不计（sm 0.940 保持准确、不推过头）；
-            #   - **no-recompute（None）不计**：pp2-stage1(0.962)/cp2-none(0.911) 的欠预测已由 k_ce
-            #     制度化平衡（另一族），再加此 margin 会双算过预测 → 明确排除。
+            #   - **no-recompute（None）此 kept_act 桶不计**：无重算-MoE 的同族残差改由**独立的
+            #     `_nr_moe_act` + `nr_moe_frag_factor` 桶**处理（D1，2026-07-16，见下），gate 到 pp==1
+            #     单 stage 无重算 loss-BWD；pp>1 无重算 loss stage 仍由 k_ce=8 制度化平衡、不进任一 margin。
             # 随 FWD pin / BWD pop 同步。
             kept_act = 0
+            # D1（2026-07-16）：无重算-MoE 保留态碎片长尾的**标定基**——无重算下各 MoE 层（非 loss）
+            #   全量驻留激活之和。margin = nr_moe_frag_factor × 此值，只在 pp==1 无重算 loss-BWD 生效。
+            #   随 FWD pin / BWD pop 同步（与 kept_act 同机理，但作用域是无重算-MoE 而非 select-kept）。
+            _nr_moe_act = 0
             _FFN_MARKERS = {"fc", "swiglu", "gelu", "router", "dispatch", "e_", "combine", "shared"}
 
             def _is_kept(lid):
@@ -662,6 +674,12 @@ class MemTimeline:
                         B.act_live += saved
                         if _is_kept(lid):
                             kept_act += saved
+                        # D1：无重算-MoE 非 loss 层的全量驻留激活累计（margin 标定基）。仅 nr margin
+                        #   开启时用；no-recompute 判据 = 非 full/非 select/非 swap（与该层 saved 口径一致）。
+                        if (nr_moe_frag_factor and lid in _moe_lids and lid not in loss_lids
+                                and not recompute.is_full(lid) and not recompute.is_select(lid)
+                                and not swap.swaps(lid)):
+                            _nr_moe_act += saved
                     # 该虚拟步(v>1: 一个 chunk / v<=1: 整 stage)所有层 pin 完毕 → FWD 峰。
                     # P1-15（Task A）：本 stage 输出激活已产出 → send buffer 驻留（非末 stage）。
                     B.p2p_buf = p2p_send_bytes
@@ -742,6 +760,19 @@ class MemTimeline:
                         #   full 重算 kept_act=0 → 0（12409.5/cp-full 锚点不破）；无-loss stage 无 loss_lids → 不触发。
                         if kept_frag_factor and lid in loss_lids and kept_act > 0:
                             B.kept_frag = round(kept_frag_factor * kept_act)
+                        # D1（2026-07-16）：**无重算-MoE OOM-安全标定 margin**（非物理，2 点标定）。
+                        #   无重算下 MoE 保留态的 dispatch/permute/grouped-GEMM fp32-cast 横切 + 小张量
+                        #   长尾（profiler live-set 313 个 <100MiB 碎片，opdag_validation.md：**在 op 图
+                        #   粒度之下**，不可显式建模——与 select-kept 的 kept_frag 同族残差，另一作用域）。
+                        #   **gate = pp==1 单 stage 无重算 loss-BWD**：pp>1 的无重算 loss stage 已由
+                        #   K_CE=8（line 上文）制度化平衡到 ~1.007，故显式排除（探针实证：pp2-stage0/1、
+                        #   select、full 锚点在任意 factor 下逐字节不动）。factor=0.6 由 8L-none(→1.009)+
+                        #   cp2-none(→1.021) 两锚点联合标定使二者 OOM-安全（预测≥真机）；两点理想 factor
+                        #   0.53/0.45 差 ~15% → 明示为**标定常数**、非精确物理，可由 preset 单值调/关。
+                        #   fused-CE（loss_lids 空，DSv4）不触发 → 不覆盖 mHC+MTP，其欠预测另档（D2）。
+                        if (nr_moe_frag_factor and pp == 1 and _stage_no_recompute
+                                and lid in loss_lids and _nr_moe_act > 0):
+                            B.kept_frag += round(nr_moe_frag_factor * _nr_moe_act)
                         rec(f"bwd@{lid}", ev_mb, ev_chunk)
                         B.grad_buf = B.recomp_scratch = 0
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
@@ -754,6 +785,12 @@ class MemTimeline:
                         B.act_live -= _popped
                         if _is_kept(lid):
                             kept_act -= _popped
+                        # D1：无重算-MoE 层反向结束 → 从 margin 标定基移除（与 FWD 累计对称；loss 层
+                        #   先反向、其时 _nr_moe_act 仍满，故 margin 取全量；此处保持后续层平衡、无泄漏）。
+                        if (nr_moe_frag_factor and lid in _moe_lids and lid not in loss_lids
+                                and not recompute.is_full(lid) and not recompute.is_select(lid)
+                                and not swap.swaps(lid)):
+                            _nr_moe_act -= _popped
                         # P0-01：该层**首次**反向完成 → reduced grad shard 常驻（后续 microbatch
                         # 就地 AssignAdd/RS-accumulate 累加,不新增内存 → 只加一次）。当前层的 shard
                         # 在事件结束后才计入——fsdp=1 时 grad_buf 与驻留 grad 是同一缓冲,事件内不双计;

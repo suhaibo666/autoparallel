@@ -445,6 +445,12 @@ def _build_llm_config(model: dict) -> LLMConfig:
         kept_frag_factor=(1.6 if (num_moe_experts
                                   and not (attn_type == "dsv4_hybrid" and _dsa_fused(model)))
                           else 0.0),
+        # D1 无重算-MoE OOM-安全标定 margin（2026-07-16；非物理，2 点标定）：无重算下 MoE 保留态碎片长尾。
+        #   注入条件同 kept_frag（MoE 且非 DSv4-fused）；仅 pp==1 单 stage 无重算 loss-BWD 实际生效
+        #   （mem_timeline gate，pp>1 由 K_CE=8 平衡）。factor=0.6 与 presets.deepseek_v3 同源（两锚点标定）。
+        nr_moe_frag_factor=(0.6 if (num_moe_experts
+                                    and not (attn_type == "dsv4_hybrid" and _dsa_fused(model)))
+                            else 0.0),
     )
 
     # dsv4_hybrid / dsa 前沿字段（仅这两变体设，否则留 LLMConfig 默认 → 对 mla/gqa 惰性）。

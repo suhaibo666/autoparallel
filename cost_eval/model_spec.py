@@ -77,8 +77,12 @@ class DimTable:
     #   fp32-cast 横切 + 小张量长尾占「当前 kept 激活」的比例。源码级 op-DAG 提取证实此残差**在 op 图
     #   粒度之下**（profiler live-set 313 个 <100MiB 碎片，`analysis/realmachine/opdag_validation.md`），
     #   非 op 图可导出 → 明示为标定常数。默认 0=不加（回归安全，full/cp-full 锚点不破）。仅 loss-BWD 事件、
-    #   对 select-kept / no-recompute 层生效（mem_timeline kept_frag 桶）。
+    #   对 **select-kept-MoE** 层生效（mem_timeline kept_frag 桶）。
     kept_frag_factor: float = 0.0
+    # **无重算-MoE OOM-安全标定 margin 因子**（D1，2026-07-16；同族碎片、独立作用域）：仅 pp==1 单 stage
+    #   无重算 loss-BWD 生效（pp>1 由 K_CE 平衡）。2 点标定（8L-none+cp2-none），明示为标定常数、非物理。
+    #   默认 0=关。fused-CE 不触发。见 mem_timeline nr_moe_frag_factor。
+    nr_moe_frag_factor: float = 0.0
     dtype_bytes: int = 2
 
     def as_dict(self) -> dict:

@@ -326,7 +326,7 @@ _SWEEP = [
 
 
 def test_baseline_total_params_closed_form():
-    """基线（全 1）持久 = 全模型 numel × 14 —— 手工闭式 279872 el。"""
+    """基线（全 1）持久 = 全模型 numel × 14 —— 手工闭式 280128 el（2026-07-16 含 MoE ln2_g）。"""
     rep = _evaluate(ParallelConfig())
     assert sum(p.breakdown.persistent for p in rep.per_stage) == TOTAL_EL * 14
 

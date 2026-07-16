@@ -3,7 +3,10 @@
 结构 bug：dense decoder 的 FFN 段内嵌 ln2（post_attention_layernorm），但 MoE decoder 的
 `build_moe_ffn_ops`/`build_shared_expert_ops` 直接吃**裸 h1**、无 ln2 → 每个 MoE 层漏建一个
 `[S,B,H]` fp32-cast 常驻激活（norm_compute=fp32），MoE 模型在无重算/select 下系统性欠预测
-（真机 cp2-none 0.927 / DSv3-8L-none 0.922 / select-mlp 0.943 / DSv4-fused 0.968，均 OOM 不安全）。
+（**F1 修复前**真机 cp2-none 0.927 / DSv3-8L-none 0.922 / select-mlp 0.943 / DSv4-fused 0.968，
+均 OOM 不安全）。ln2 只回收其中可显式化的 ~196 MiB；无重算-MoE 的**剩余**碎片长尾于 2026-07-16
+另由 D1 标定 margin（`nr_moe_frag_factor`）补齐 → cp2-none/8L-none 现 OOM-安全（1.021/1.009，
+见 `tests/test_scorecard_anchors.py`）。此处只钉 ln2 结构本身。
 
 修复：统一 `build_transformer_layer` 接口，attn(含 ln1) → **ln2 统一前置** → dense|moe FFN(消费 ln2)。
 本组钉住：MoE 层有 ln2、routed+shared 都消费 ln2、dense 全层逐字节不变。
