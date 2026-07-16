@@ -95,5 +95,7 @@ def test_timesim_imports_only_whitelisted_cost_eval_modules():
     files = glob.glob(os.path.join(ROOT, "timesim", "**", "*.py"), recursive=True)
     assert files, "timesim 包不存在？"
     for p in files:
+        assert os.path.dirname(p) == os.path.join(ROOT, "timesim"), \
+            f"{p}: timesim 出现嵌套子包，_cost_eval_targets 的 level 归一化假设失效（见 helper docstring）"
         bad = _cost_eval_targets(_read(p)) - _ALLOWED
         assert not bad, f"{p} import 了白名单外的 cost_eval 模块: {bad}（契约 §2.2-2）"
