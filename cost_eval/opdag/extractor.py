@@ -27,7 +27,7 @@ import os
 import re
 
 from .schema import OpDAG
-from .init_binder import bind_init, Binding
+from .init_binder import bind_init, Binding, _base_call_name
 from .construct_walker import walk_construct_meta, SubExtract
 from .module_resolver import ResolvedSpec, LEAF_OPTYPE
 from .init_dims import eval_init_dims
@@ -358,7 +358,8 @@ def _make_subcell_resolver(
             mf_root, rel, sub_spec.cell, sub_spec, config_flags,
             recurse=True, subcell_specs=subcell_specs, _stack=stack_with_self,
         )
-        return SubExtract(nodes=dag.nodes, edges=dag.edges, param_names=params, returns=returns)
+        return SubExtract(nodes=dag.nodes, edges=dag.edges, param_names=params, returns=returns,
+                           opaque_calls=dag.opaque_calls)
     return resolver
 
 
@@ -460,8 +461,10 @@ def _extract_meta(
     #     （loss: `self._log_softmax = _LogSoftmax(config)`，loss_func.py:279）。
     #     subcell_specs 未提供（内存侧全部既有调用）时零行为变化。
     if recurse and subcell_specs:
-        from .init_binder import _base_call_name
-        for cname in reversed(init_classes):
+        # T0-6.5 Fix3:init_classes 已是 derived→base(:440);此处按该序 first-wins,与步骤 1
+        # (derived 覆盖 base,:449-456)的 MRO 方向保持一致(此前 reversed 成 base→derived 会让
+        # base 先占住 combined,与步骤 1 语义相反——当前真源无同名跨层触发,纯 latent 一致性修正)。
+        for cname in init_classes:
             cls_node = _find_class(tree, cname)
             init_fn = _method_of(cls_node, "__init__")
             if init_fn is None:

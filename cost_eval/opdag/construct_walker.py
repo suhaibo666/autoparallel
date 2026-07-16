@@ -36,11 +36,15 @@ class SubExtract:
       * nodes/edges —— 子 DAG(id 从 1 起,src 指向子文件),edges 为子内部边(子编号);
       * param_names —— 子 construct 形参(去 self,按序),用于把父调用实参按位重映射到子操作数;
       * returns     —— 子 construct 返回值逐项分类:("node", 子内 producer id)/("param", 形参名)/("none", None),
-                       用于把"子输出 → 下游消费者"的边接回父 SSA。"""
+                       用于把"子输出 → 下游消费者"的边接回父 SSA。
+      * opaque_calls —— 子 walker 记录的 fallthrough 调用点(T0-6.5 Fix2),原样并入父 opaque_calls
+                       (src 已指向子文件,不需重映射;镜像 nodes/edges 的子→父传播,防止子 Cell
+                       边界二次静默丢)。"""
     nodes: list = field(default_factory=list)
     edges: list = field(default_factory=list)
     param_names: list = field(default_factory=list)
     returns: list = field(default_factory=list)
+    opaque_calls: list = field(default_factory=list)
 
 # 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
@@ -212,6 +216,9 @@ class _Walker:
         self._param_set: set[str] = set()
         # `<a,b,c> = x.shape`(不产 op 的标量解包)记录,供 shape 推断按 x 已知 shape 逐轴填标量名。
         self.scalar_binds: list = []
+        # T0-6.5 Fix2:_handle_call 终端 fallthrough 命中的调用点(既非四种已知形态、也非内部方法/
+        # Morph 别名)——显式记录,不静默丢(schema.OpDAG.opaque_calls docstring 详述语义)。
+        self.opaque_calls: list = []
         # ---- 内联支持:类层级 AST(找内部方法定义)+ 递归/帧状态 ----
         self._tree = tree
         self._cls_name = cls_name
@@ -391,7 +398,12 @@ class _Walker:
             out_dtype = self._resolve_cast_dtype(call.args, 0, {})  # astype 目标 dtype 在 idx=0
             self._emit("Cast", {}, call.lineno, [func.value], target_names, out_dtype)
             return
-        # 其它调用(非上述形态):当前不产 op(如 self.token_dispatcher.token_permutation —— AllToAll 派发,opaque)
+        # 其它调用(非上述形态):当前不产 op(如 self.token_dispatcher.token_permutation —— AllToAll 派发,
+        # opaque;或 layers.py:182 `ops.AllReduce(group=...)(x)` 双层调用形态)—— T0-6.5 Fix2:
+        # 显式记录而非静默丢(walker 模块 docstring 纪律:静默丢算子 = DAG 少算子 = 错)。
+        self.opaque_calls.append(
+            {"src": f"{self.src_file}:{call.lineno}", "expr": self._describe(call)}
+        )
 
     def _handle_self_call(self, call: ast.Call, name: str, target_names: list[str]) -> None:
         binding = self.binds.get(name)
@@ -658,6 +670,9 @@ class _Walker:
         for s, d in sub.edges:
             self.edges.append([s + offset, d + offset])
         self._next_id = offset + len(sub.nodes) + 1
+        # T0-6.5 Fix2:子 walker 的 opaque_calls 原样并入(src 已指子文件,无需重映射)——不这样做
+        # 的话子 Cell 边界内的 fallthrough 调用会在父 DAG 视角下二次静默丢(违反 Fix2 初衷)。
+        self.opaque_calls.extend(sub.opaque_calls)
 
         # 4) 子返回值绑回调用点目标
         for tgt, r in zip(target_names, sub.returns):
@@ -830,24 +845,48 @@ class _Walker:
             return attrs["to_dtype"]
         return "fp32"
 
+    def _materialize_call_arg(self, call: ast.Call) -> ast.AST:
+        """Hole1 修复:嵌套 Call 实参(如 `self.sum2(self.mul2(x, y))` 里的 `self.mul2(x, y)`)
+        先递归发射(镜像 `_handle_chained_call` 的 `__chain__` 合成临时名模式),绑定到合成临时名,
+        再把该临时名作为外层调用的 Name 操作数消费——取代此前 `_emit` 参数环里的
+        `if not isinstance(a, ast.Name): continue`(静默丢整条嵌套算子,非仅丢一条边)。
+        若嵌套调用本身落进 `_handle_call` 终端 fallthrough(opaque,如 `F.tuple_to_array(...)`)—
+        不产节点、临时名未登记 SSA——按修复前语义原样返回该 Call(上层判 isinstance Name 会跳过,
+        该实参不计入 ins;fallthrough 已由 Fix2 记入 opaque_calls,不再静默)。"""
+        tmp = f"__arg__i{self._frame_seq}"
+        self._frame_seq += 1
+        before = len(self.nodes)
+        self._handle_call(call, [tmp])
+        if len(self.nodes) == before and tmp not in self.ssa:
+            return call
+        return ast.Name(id=tmp, ctx=ast.Load())
+
     # ---- 发射层:建 OpNode + 连数据流边 + 更新 SSA ----
     def _emit(self, op: str, attrs: dict, lineno: int, arg_exprs, target_names, out_dtype: str) -> OpNode:
-        node_id = self._next_id
-        self._next_id += 1
-
         ins: list[str] = []
         seen_prod: set[int] = set()  # 同一节点内对同一 producer 只连一条边(去重)
+        pending_prods: list[int] = []  # producer id(节点 id 尚未分配,先收集,分配后统一补边)
         for a in arg_exprs:
+            if isinstance(a, ast.Call):
+                # 嵌套 Call 实参:必须先于本节点分配 id(保证 id/nodes 列表顺序与真实数据流一致——
+                # 下游 infer_shapes 等按 dag.nodes 顺序做正向传播,依赖 producer 先于 consumer 出现)。
+                a = self._materialize_call_arg(a)
             if not isinstance(a, ast.Name):
-                continue  # 只有张量形参(Name)算数据流操作数;字面量/属性/嵌套调用暂略
+                continue  # 字面量/属性/未产节点的 opaque 嵌套调用:非可追踪张量操作数,略过
             if a.id in self.ssa:  # 已知 SSA 中间变量 → 用其当前 ref 并向其 producer 连边
                 ins.append(self.ssa[a.id])
                 prod = self.producer.get(a.id)
                 if prod is not None and prod not in seen_prod:
-                    self.edges.append([prod, node_id])
+                    pending_prods.append(prod)
                     seen_prod.add(prod)
             else:  # 方法形参 / 未知名 → 占位 ref(shape 未知,dtype 缺省 bf16)
                 ins.append(f"{a.id}:?:bf16")
+
+        # id 在实参(含嵌套 Call 已递归发射的子节点)处理完毕后才分配,保证 id 单调 = 数据流序。
+        node_id = self._next_id
+        self._next_id += 1
+        for prod in pending_prods:
+            self.edges.append([prod, node_id])
 
         # 元组多目标(a, b = self.f(...)):首目标作主 out;所有目标都登记为本节点产出的 SSA,
         # 以便后续语句消费任意一个都能连回本节点。
@@ -950,5 +989,5 @@ def _run_walker(
     walker.walk_body(construct.body)
     walker.returns = walker._resolve_returns(construct.body)
     dag = OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges,
-                scalar_binds=walker.scalar_binds)
+                scalar_binds=walker.scalar_binds, opaque_calls=walker.opaque_calls)
     return dag, walker.construct_params, walker.returns

@@ -26,6 +26,12 @@ class OpDAG:
     scalar_binds: list = field(default_factory=list)
     # self.<attr> → 符号 token 串(由 __init__ 维度求值得,供 shape 推断解析 reshape/split 里的 self.X)。
     dims_ctx: dict = field(default_factory=dict)
+    # T0-6.5 Fix2:_handle_call 终端 fallthrough(既非四种已知调用形态、也非内部方法/Morph 别名)命中的
+    # 调用点显式记录(镜像 comm_probe.CommSite.opaque_guards 的"opacity 显式携带,不静默丢"先例)。
+    # 每条 {"src": "file.py:line", "expr": "<ast.unparse 的调用原文>"}。该调用**不**产 DAG 节点
+    # (如 embedding 段的 inline AllReduce 由 comm_probe 另侧覆盖,walker 若也发射会双重计数)——
+    # 消费方需对未在已知白名单内的条目自行判断是否 fail-loud,不猜其语义。
+    opaque_calls: list = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
