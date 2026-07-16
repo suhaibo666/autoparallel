@@ -127,7 +127,7 @@ def _forward_max_live(resolved_ops, blk: int, norm_names: set = frozenset(), nor
     return peak
 
 
-def _backward_max_live(resolved_ops) -> int:
+def _backward_max_live(resolved_ops, *, conservative: bool = False) -> int:
     """反向瞬态 `bwd_scratch` 的 **max-live** 峰值（P1-08，`_forward_max_live` 的反向镜像）。
 
     旧口径 `Σ op.bwd_scratch_bytes` 把一层所有 op 的反向临时物化**直接求和**，隐含它们同时存活
@@ -152,11 +152,20 @@ def _backward_max_live(resolved_ops) -> int:
     单调性：任意非负向量下 ``max_i(v_i+v_{i+1}) ≤ Σ v_i`` 且 ``≥ max_i v_i`` 恒成立 → OOM 安全、
     不塌到单峰以下。（未来可从 op 数据依赖判真实存活区间做区间并进一步收紧；当前 positional
     window=2 已足够安全且对全部真实模型退化为纯 max。）
+
+    **conservative 模式（round3 A / F10，2026-07-16）**：window=2 只 bound「**相邻**两 scratch 共存」，
+    对**非相邻的 >2 个大 scratch 同时存活**会欠估（反例 ``[4000,0,3000]``：window-2=4000，真实若三者
+    共存则 7000）。现实模型全退化为单 scratch（loss/DSA 唯一大 scratch）故当前锚点不受影响；但作为
+    OOM-安全**双模式**提供 ``conservative=True`` → 取 **Σ**（全 scratch 共存的严格上界，构造即安全）。
+    默认 ``estimated``（window=2）——对全部真实模型退化为纯 max、逐字节复现旧行为；conservative 仅在
+    用户显式要求"最保守上界"时启用（`HardwareSpec.bwd_scratch_conservative`）。二者恒 est ≤ cons。
     """
     vals = [getattr(op, "bwd_scratch_bytes", 0) for op in resolved_ops]
     n = len(vals)
     if n == 0:
         return 0
+    if conservative:
+        return sum(vals)                          # 全 scratch 共存严格上界（OOM 最保守侧）
     if n == 1:
         return vals[0]
     return max(vals[i] + vals[i + 1] for i in range(n - 1))
@@ -171,6 +180,7 @@ def estimate_structure_memory(
     grad_dtype_bytes: int = 4,
     alloc_block_bytes: int = 1,
     norm_compute_dtype_bytes: int = 0,
+    bwd_scratch_conservative: bool = False,
 ) -> StructureMemory:
     """把一段属于同一结构的 ResolvedOp 汇总成 `StructureMemory`（按名去重）。
 
@@ -227,7 +237,7 @@ def estimate_structure_memory(
     # P1-08：bwd_scratch 由「求和上界」精化为 backward **max-live**（逆序滑窗 window=2）。
     # 单 scratch op 层（loss 的 nll / DSA·dsv4 的 indexer）逐字节不变 == 旧 sum；分离/相邻的多
     # scratch op 层取更紧的 max-live（OOM 安全，≤ sum 恒成立）。见 `_backward_max_live` docstring。
-    bwd_scratch = _backward_max_live(resolved_ops)
+    bwd_scratch = _backward_max_live(resolved_ops, conservative=bwd_scratch_conservative)
     workspace = max((op.workspace_bytes for op in resolved_ops), default=0)
 
     checkpoint_input = 0

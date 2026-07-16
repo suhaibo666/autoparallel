@@ -337,13 +337,15 @@ def test_fp32_residual_false_with_bf16_layernorm_passes():
     from_mindformers_dict(mf)   # 不抛
 
 
-def test_fail_loud_on_add_bias_linear_via_build():
-    # add_bias_linear=True 忠实映射到 LLMConfig → build_llm 原生 fail-loud（DRY，不在转换器重复守卫）。
+def test_add_bias_linear_warns_via_build():
+    # round3 A(N4)：add_bias_linear 内存中性 → build_llm 从 fail-loud 降级为 ModelingApproxWarning
+    #   （DRY，不在转换器重复守卫）；忠实映射到 LLMConfig 后建 spec 发警告但继续。
+    from cost_eval.advisories import ModelingApproxWarning
     mf = _dsv3_mf()
     mf["model"]["add_bias_linear"] = True
     bundle = from_mindformers_dict(mf)
     assert bundle.llm.add_bias_linear is True
-    with pytest.raises(NotImplementedError, match="add_bias_linear"):
+    with pytest.warns(ModelingApproxWarning, match="add_bias_linear"):
         build_llm_spec(bundle.llm)
 
 

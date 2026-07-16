@@ -126,6 +126,26 @@ mindformers 训练配置里非模型/非切分、但影响每卡显存/OOM 判�
 | `未识别的 mindformers model 字段 [...]` | 转换器 fail-loud，新字段需在 `from_mindformers.py` 补映射 |
 | `此并行组合可能不被 mindformers 栈支持` | 评估器算得出但真机栈有已知限制（SP+MoE / TP+MoE / pp>2 优化器 bug） |
 
+## 7.5 OOM-安全咨询与保守旋钮（round3 A，2026-07-16）
+
+估计器在若干**已知欠预测风险**处会发**非致命咨询告警**（`warnings`，不改数值、不产错数，只提示——
+欠预测=误报"放得下"却 OOM，是最危险方向）。分两类（`cost_eval/advisories.py`）：
+
+| 类别 | 何时发 | 含义 / 处置 |
+|---|---|---|
+| `OOMSafetyWarning`（F3） | `n_layers` > 16（远超缩层锚点 ≤8L 的已验证尺度） | 全尺寸预测是**外推**,每层小残差随层数累积（欠方向）、无全尺寸真机验证点。留安全余量:见下方旋钮 |
+| `OOMSafetyWarning`（D1-R） | MoE + 单 stage(pp=1) + 无重算 + 非 fused-CE 但 `nr_moe_frag_factor=0`（直连 `LLMConfig` 绕过 preset/adapter） | 无重算-MoE loss 峰碎片长尾未补 → 欠 ~0.93x。经 `presets.deepseek_v3` / `from_mindformers` 构建会自动注入 0.6;直连请显式设 `dims.nr_moe_frag_factor`（DSv3 标定 0.6） |
+| `ModelingApproxWarning`（N4） | `add_bias_linear` / `add_qkv_bias`=True | bias 内存中性、未建为 param → 按无 bias 继续（不再 fail-loud） |
+| `ModelingApproxWarning`（N9） | `layers_per_stage` + `interleave`>1 同给 | VPP 用「连续均衡切 v 段」近似,层不均匀时 chunk 归属可能有偏 |
+
+**保守旋钮（opt-in，默认关=逐字节复现旧行为）**：
+
+| 旋钮 | 位置 | 作用 |
+|---|---|---|
+| `bwd_scratch_conservative` | `HardwareSpec`（默认 False） | 反向瞬态取**全 scratch 共存严格上界 Σ**（而非默认 window=2）。现实模型全退化为单 scratch → 开关无差;仅当有 >2 个非相邻大 scratch 共存且要"最保守 OOM 上界"时用（F10） |
+| `nr_moe_frag_factor` | `DimTable`（默认 0；DSv3 preset/adapter 注入 0.6） | 无重算-MoE OOM-安全标定 margin（**DSv3 两点标定,非物理**；非 DSv3 结构为未验证外推——见 `from_mindformers.py` D1-R 留档） |
+| `framework_reserve` | `HardwareSpec`（默认 0） | 显式冗余余量（审计/回归旋钮,也可作外推安全余量） |
+
 ## 8. 相关
 
 - 使用/布局/口径与诚实边界：[README_explorer.md](README_explorer.md)

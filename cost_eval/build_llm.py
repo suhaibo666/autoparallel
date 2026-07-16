@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 
+from .advisories import warn_modeling_approx
 from .layer_context import LayerContext
 from .llm_config import LLMConfig, to_dimtable
 from .model_spec import DimTable, LayerSpec, ModelSpec
@@ -208,15 +209,18 @@ def _check_implemented_dispatch(cfg: LLMConfig) -> None:
         raise NotImplementedError(
             f"position_embedding_type={cfg.position_embedding_type!r} 暂未建 op 图"
             "（仅 'rope' 已实现；learned_absolute 需额外 pos 表、none 需去 rope op）。")
-    # ── Task 3：补齐此前 set-but-ignored 的 op-图相关字段（不再静默忽略，fail-loud）──────
+    # ── Task 3：补齐此前 set-but-ignored 的 op-图相关字段。bias 类为**内存中性**字段
+    #   （linear/qkv bias 量级 = [out] 一维,相对权重可忽略）→ round3 A(N4)：从 fail-loud **降级为
+    #   ModelingApproxWarning**(不再硬拒,继续按无 bias 建图;如需忠实计入在各 MATMUL op 补 bias param)。
+    #   其余改 op 图/产错数的字段仍 fail-loud(下方 normalization/PE/qk_layernorm/dsa)。
     if cfg.add_bias_linear:
-        raise NotImplementedError(
-            "add_bias_linear=True 暂未建 op 图：linear bias 未建为 param（量级可忽略但未建模）"
-            "——如需忠实计入请在各 MATMUL op 补 bias param，勿静默忽略。")
+        warn_modeling_approx(
+            "add_bias_linear=True：linear bias 未建为 param（内存中性,量级 = [out] 一维,相对权重"
+            "可忽略）→ 按无 bias 继续估计；如需忠实计入请在各 MATMUL op 补 bias param。")
     if cfg.add_qkv_bias:
-        raise NotImplementedError(
-            "add_qkv_bias=True 暂未建 op 图：QKV 投影 bias 未建为 param（Qwen 系）——内存可忽略"
-            "但未建模；preset 若仅想标注该架构，请用 add_qkv_bias=False + 注释（见 presets.qwen2）。")
+        warn_modeling_approx(
+            "add_qkv_bias=True（Qwen 系）：QKV 投影 bias 未建为 param（内存可忽略）→ 按无 bias 继续"
+            "估计；preset 若仅想标注该架构可用 add_qkv_bias=False + 注释（见 presets.qwen2）。")
     # qk_layernorm dispatch（X3 任务 A，2026-07-15）：gqa/mha 的 attn builder 已建 q/k RMSNorm op
     # （attention.py build_gqa_attn_ops 在 getattr(d,"qk_layernorm") 为真时插入 q_norm/k_norm，
     # 字段由 to_dimtable 从 cfg.qk_layernorm 直通）→ **放行**（op 图已建，不再 fail-loud）。**仅当

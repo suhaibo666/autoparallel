@@ -224,7 +224,8 @@ class MemTimeline:
                  alloc_block_bytes: int = 1, cross_entropy_fused: bool = False,
                  norm_compute_dtype_bytes: int = 0,
                  kept_frag_factor: float = 0.0,
-                 nr_moe_frag_factor: float = 0.0) -> dict:
+                 nr_moe_frag_factor: float = 0.0,
+                 bwd_scratch_conservative: bool = False) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -277,7 +278,8 @@ class MemTimeline:
                     l.ops, grad_dtype_bytes=grad_dtype_bytes,
                     fsdp=fsdp_d, efsdp=efsdp_d,
                     alloc_block_bytes=alloc_block_bytes,
-                    norm_compute_dtype_bytes=norm_compute_dtype_bytes)
+                    norm_compute_dtype_bytes=norm_compute_dtype_bytes,
+                    bwd_scratch_conservative=bwd_scratch_conservative)   # F10 双模式
                 for l in layers
             }
             # 选择性重算：每层按选择器（op 名/类型子串）把 op 划分为选中/非选中，预算三桶

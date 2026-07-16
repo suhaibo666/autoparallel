@@ -175,6 +175,11 @@ class HardwareSpec:
     # 里每个张量按此块粒度上取整 → 少量对齐碎片。这是 framework_reserve「分配器块对齐」项的**公式化**
     # 落地（structure_mem 逐张量 roundup），取代经验常数。默认 512（可按硬件覆盖）。
     alloc_block_bytes: int = 512
+    # bwd_scratch_conservative（round3 A / F10，2026-07-16）：反向瞬态 bwd_scratch 的聚合模式。
+    #   默认 False=**estimated**（逆序滑窗 window=2，对全部真实模型退化为纯 max、逐字节复现旧行为）；
+    #   True=**conservative**（全 scratch 共存的严格上界 Σ）——当模型有 >2 个非相邻大 scratch 共存
+    #   （现实模型不出现，故默认关不影响任何锚点）且用户要"最保守 OOM 上界"时启用。恒 est ≤ cons。
+    bwd_scratch_conservative: bool = False
 
 
 @dataclass

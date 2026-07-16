@@ -1,5 +1,6 @@
 """M3：并行度数 + mesh 关系 + stage→层 分配（镜像 parallel_dims.py）。"""
 from __future__ import annotations
+from .advisories import warn_modeling_approx
 from .specs import ParallelConfig
 
 
@@ -127,6 +128,13 @@ class ParallelModel:
         mids = [l for l in lids if hp <= l < self.n_layers - tp_]
         if self.pc.layers_per_stage:
             # 显式物理配额:stage 内连续均衡切 v 段（近似,见 docstring）。
+            # round3 A(N9):此路径是**静默文档化近似**——mindformers 显式 per-chunk ranges
+            #   (layers_per_stage + interleave 组合)本库暂用连续均衡切代替,层不均匀时 chunk 归属
+            #   可能与真实 round-robin 放置有偏 → 补一条 ModelingApproxWarning(不改数值,只提示)。
+            warn_modeling_approx(
+                f"layers_per_stage={self.pc.layers_per_stage} 与 interleave={v}>1 同时给定:"
+                "本库对该组合用「stage 内连续均衡切 v 段」近似(mindformers 显式 per-chunk ranges "
+                "暂不支持)——层不均匀时 chunk 归属可能与真实放置有偏,VPP 激活峰估计为近似值。")
             base, rem = divmod(len(mids), v)
             chunks, i = [], 0
             for c in range(v):

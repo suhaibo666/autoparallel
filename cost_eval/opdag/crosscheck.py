@@ -49,6 +49,34 @@ grouped-GEMM 段），把手写 `LayerSpec` 的**重算子名册（op census）*
 `LayerNormFinding`（让 `ok=False`、strict 下 raise）。**诚实边界**：本族只校验这两个 pre-norm 的**存在/
 位置**，**不**校验它们的 saves/shape/dtype（与全模块「类别 census、非内存契约验证器」的口径一致）。
 
+**A5 扩展（2026-07-16）：第三族再补三类源码强制的「次级 norm」**——两个层级 pre-norm 之外，源码还
+无条件/条件地强制若干次级归一层，前两族窗口同样 census 不到，静默删掉即又一 F1 类漏建。逐条源忠实：
+
+  1. **MLA 潜向量 q/kv norm**（条件强制）：MLA `self_attention` 的 `q_layernorm`/`kv_layernorm`
+     `= get_norm_cls(fused_norm) if qk_layernorm else IdentityOp`（`gpt_layer_specs.py:155/156`）。用
+     **与 `opdag_mla_census` 同一** `_MLA_SPEC_FLAGS`（`qk_layernorm=True`）解析——此路径下二者是真 norm，
+     故对 MLA 手写 attn 段（signature=含 `linear_kvb`）断言含 `q_a_norm`/`kv_a_norm` 两个 NORM；源若解成
+     IdentityOp（qk 关）则**不**要求（无假阳）。（与 `_MLA_CORR` 的 NORM 总数 delta 语义正交：那是计数
+     对账、此处点名具体潜向量 norm 的在场，可读且抗计数守恒的替换。）**诚实边界**：GQA 支的
+     `q_layernorm`/`k_layernorm`（→ 手写 `q_norm`/`k_norm`，`gpt_layer_specs.py:179/180`）本族**不**单独
+     强制——建模到的 spec 里没有 GQA decoder-body 层（DSv4 混合注意力层是非-body/uncovered；纯 GQA 默认
+     `qk_layernorm=False`），且若用固定 qk-on 的 MLA 解析去要求 GQA，会对合法 qk-off 的 GQA 层误报假阳。
+  2. **final_norm**（无条件强制）：decoder block 末、lm_head 前的 `TransformerBlockSubmodules.layer_norm
+     = get_norm_cls(config.fused_norm)`（`gpt_layer_specs.py:254`，无 if 门控）。该源在 block-spec 函数里、
+     **不**经 `get_gpt_layer_local_spec` 入口 → 用**定向 AST 静态读**确认其绑定为 `get_norm_cls`（非
+     IdentityOp）。手写 head/final 段（非 decoder-body、含 `lm_head` 投影）须**首个重算子是 NORM**
+     （final_norm，位于 lm_head 之前）；缺失即报出。
+  3. **MTP enorm/hnorm**（无条件强制）：`get_mtp_layer_spec` 无条件绑定 `enorm`/`hnorm`
+     `= get_norm_cls(fused_norm)`（`multi_token_prediction.py:102/103`）。同样在 MTP 层 spec 函数里、非主
+     入口 → 定向 AST 读确认。手写 MTP 段（signature=含 `eh_proj`）须含 `enorm`/`hnorm` 两个 NORM。**MTP
+     层被路由出前两族 delta 家族**（其 embedding/enorm/hnorm/eh_proj 前缀 + 内层 decoder + 共享 head 的
+     包装结构不被 MLA/MoE 窗口建模，逐 op delta 会满屏假阳）——只校验这两个 MTP 专属 norm 的在场，记
+     `uncovered`（诚实边界；MTP 内层 decoder 的 ln1/ln2/final_norm 本族不重复校验）。
+
+  三条同 ln1/ln2：只校验**存在/位置**，不校验 saves/shape/dtype。final_norm/MTP 的定向 AST 读失败=已声明
+  覆盖族无从验证 → `extraction_failures`（fail-loud，非静默放行）；MTP 源仅在 spec 真含 MTP 层时才读（无
+  MTP 层的 spec 绝不因 MTP 源读失败而 fail）。
+
 **校验口径的诚实边界（不可过度宣称）**：本模块是一个**算子类别 census 的一致性校验器**——它只比较
 两侧「重算子类别计数」（matmul/norm/linear_grouped/attention/activation…）之间的**逐类别 delta**，
 **不**比较每个张量的 `saves`（保存清单）、shape、dtype、workspace 或生命周期。因此它**无法**发现
@@ -66,6 +94,7 @@ mtp/gqa/dense）记为 `uncovered`，是设计内的诚实边界，strict **不*
 """
 from __future__ import annotations
 
+import ast
 import collections
 import functools
 import os
@@ -245,6 +274,36 @@ _LAYER_NORMS_OPAQUE_NOTE = (
     "只校验两个层级 pre-norm 的**存在/位置**（attn 段有 pre-attn NORM=ln1、ffn 段首个重算子是 "
     "NORM=ln2）；不校验其 saves/shape/dtype（类别 census 边界，见模块 docstring）")
 
+# A5：final_norm / MTP enorm-hnorm 的源在 block-spec / mtp-spec 函数里，**不**经
+# get_gpt_layer_local_spec 入口 → 用定向 AST 静态读（绝不 import mindformers）。
+_GPT_LAYER_SPECS_REL = "parallel_core/training_graph/base_models/gpt/gpt_layer_specs.py"
+_MTP_REL = "parallel_core/training_graph/transformer/multi_token_prediction.py"
+
+# 每个 norm 槽位的源码定位（供 LayerNormFinding 自描述，源忠实、可读）。
+_NORM_SLOT_SOURCE = {
+    "input_layernorm":
+        "get_gpt_layer_local_spec 无条件绑定 input_layernorm=get_norm_cls(fused_norm)"
+        "（gpt_layer_specs.py:162/172）",
+    "pre_mlp_layernorm":
+        "get_gpt_layer_local_spec 无条件绑定 pre_mlp_layernorm=get_norm_cls(fused_norm)"
+        "（gpt_layer_specs.py:164/183）",
+    "q_layernorm":
+        "MLA self_attention.q_layernorm=get_norm_cls(fused_norm) if qk_layernorm else IdentityOp"
+        "（qk_layernorm=True 时真 norm，gpt_layer_specs.py:155）",
+    "kv_layernorm":
+        "MLA self_attention.kv_layernorm=get_norm_cls(fused_norm) if qk_layernorm else IdentityOp"
+        "（qk_layernorm=True 时真 norm，gpt_layer_specs.py:156）",
+    "final_norm":
+        "TransformerBlockSubmodules.layer_norm=get_norm_cls(config.fused_norm)"
+        "（gpt_layer_specs.py:254，无条件）",
+    "mtp_enorm":
+        "get_mtp_layer_spec 无条件绑定 enorm=get_norm_cls(fused_norm)"
+        "（multi_token_prediction.py:102）",
+    "mtp_hnorm":
+        "get_mtp_layer_spec 无条件绑定 hnorm=get_norm_cls(fused_norm)"
+        "（multi_token_prediction.py:103）",
+}
+
 
 def _is_real_norm(resolved) -> bool:
     """判定 `resolve_layer_spec` 解出的一个 submodule 槽位是否为**真归一类**（vs IdentityOp/缺失）。
@@ -269,18 +328,106 @@ def _is_real_norm(resolved) -> bool:
 
 @functools.lru_cache(maxsize=None)
 def layer_norms_source_info(mf_root: str) -> dict:
-    """从真 `gpt_layer_specs.py` 静态解析 DSv3 `TransformerLayer` 的两个层级 pre-norm 槽位是否为真 norm。
+    """从真 `gpt_layer_specs.py` 静态解析 DSv3 `TransformerLayer` 的层级 pre-norm 与 MLA 潜向量 norm。
 
-    返回 `{"input_layernorm": bool, "pre_mlp_layernorm": bool}`（True=真归一类；False=IdentityOp/缺失）。
+    返回 `{"input_layernorm", "pre_mlp_layernorm", "q_layernorm", "kv_layernorm"}` → bool（True=真归一
+    类；False=IdentityOp/缺失）。前两者是 `TransformerLayer` 顶层的两个 pre-norm；后两者是 MLA
+    `self_attention` 子模块的潜向量 q/kv norm（A5，`gpt_layer_specs.py:155/156`；用**与 `opdag_mla_census`
+    同一** `_MLA_SPEC_FLAGS` 解析，`qk_layernorm=True` → 解成真 norm）。
     **诚实边界**：只判「是不是真 norm」，不解析其具体归一类型/shape/dtype。解析失败照全模块 fail-loud
     约定向上抛（由 `validate_against_opdag` 记 `extraction_failures`——已声明覆盖族无从验证 ≠ 合法无对应）。
     """
     top = resolve_layer_spec(mf_root, _LAYER_NORMS_SPEC_FLAGS)
     subs = top.submodules
+    # MLA 潜向量 norm 在 self_attention 子树里（qk_layernorm 门控）。非 ResolvedSpec（缺/异常）→ 空子树。
+    sa = subs.get("self_attention")
+    sa_subs = sa.submodules if isinstance(sa, ResolvedSpec) else {}
     return {
         "input_layernorm": _is_real_norm(subs.get("input_layernorm")),
         "pre_mlp_layernorm": _is_real_norm(subs.get("pre_mlp_layernorm")),
+        # MLA：q_layernorm/kv_layernorm（mla_qkv_concat=False 支的子模块键，见探测）。
+        "q_layernorm": _is_real_norm(sa_subs.get("q_layernorm")),
+        "kv_layernorm": _is_real_norm(sa_subs.get("kv_layernorm")),
     }
+
+
+# ── A5：final_norm / MTP norm 的定向 AST 静态读（源在非主入口函数里，绝不 import）──────────────
+def _norm_kwarg_is_real(value, rel: str, key: str) -> bool:
+    """判定一个 `*Submodules(...)` 构造里某关键字的**绑定表达式**是否为真归一类。
+
+    `get_norm_cls(...)` → True（真 norm）；`IdentityOp`（名）/ 缺失（None）→ False；其它未知构造 → 抛
+    `ValueError`（fail-loud，交由 `extraction_failures`——已声明覆盖但解不出 ≠ 合法放行）。
+    """
+    if value is None:
+        return False
+    if isinstance(value, ast.Call):
+        fn = value.func
+        name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+        if name == "get_norm_cls":
+            return True
+        raise ValueError(f"{rel}: 关键字 {key} 绑定到未知调用 {name}(...)（A5 fail-loud）")
+    if isinstance(value, ast.Name):
+        if value.id in ("IdentityOp", "Identity"):
+            return False
+        raise ValueError(f"{rel}: 关键字 {key} 绑定到未知名 {value.id}（A5 fail-loud）")
+    raise ValueError(
+        f"{rel}: 关键字 {key} 绑定到不可判定表达式 {type(value).__name__}（A5 fail-loud）")
+
+
+def _ast_norm_kwarg_bits(mf_root: str, rel: str, func_name: str, ctor_name: str,
+                         keys) -> dict:
+    """静态读真源 `rel` 里 `func_name` 函数体内对 `ctor_name(...)` 构造的若干 norm 关键字绑定。
+
+    返回 `{key: bool}`（True=真 norm）。只用 `ast`，**绝不** import mindformers。找不到文件/函数/构造、
+    或关键字绑定到未知构造 → 抛 `ValueError`（fail-loud）。这与 `module_resolver` 的静态读同源精神：
+    读真绑定、判是不是 `get_norm_cls`，源码若改成条件/IdentityOp 就能跟上（不硬编码「一定强制」）。
+    """
+    path = os.path.join(mf_root, *rel.split("/"))
+    if not os.path.isfile(path):
+        raise ValueError(f"A5 源读失败：找不到 {path}（fail-loud）")
+    with open(path, "r", encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    fdef = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == func_name), None)
+    if fdef is None:
+        raise ValueError(f"{rel}: 找不到函数 {func_name}（A5 fail-loud）")
+    ctor = None
+    for node in ast.walk(fdef):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            nm = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+            if nm == ctor_name:
+                ctor = node
+                break
+    if ctor is None:
+        raise ValueError(f"{rel}:{func_name} 未找到 {ctor_name}(...) 构造（A5 fail-loud）")
+    kw = {k.arg: k.value for k in ctor.keywords if k.arg}
+    return {key: _norm_kwarg_is_real(kw.get(key), rel, key) for key in keys}
+
+
+@functools.lru_cache(maxsize=None)
+def final_norm_source_info(mf_root: str) -> dict:
+    """block 末 final_norm 是否为真 norm（`TransformerBlockSubmodules.layer_norm`，无条件 get_norm_cls）。
+
+    返回 `{"final_norm": bool}`。定向 AST 读 `get_gpt_decoder_block_spec`（源在 block-spec 函数、非主入口）。
+    """
+    bits = _ast_norm_kwarg_bits(
+        mf_root, _GPT_LAYER_SPECS_REL, "get_gpt_decoder_block_spec",
+        "TransformerBlockSubmodules", ("layer_norm",))
+    return {"final_norm": bits["layer_norm"]}
+
+
+@functools.lru_cache(maxsize=None)
+def mtp_norm_source_info(mf_root: str) -> dict:
+    """MTP 层 enorm/hnorm 是否为真 norm（`get_mtp_layer_spec` 无条件 get_norm_cls）。
+
+    返回 `{"mtp_enorm": bool, "mtp_hnorm": bool}`。定向 AST 读 `get_mtp_layer_spec`（源在 MTP-spec 函数、
+    非主入口）。仅在 spec 真含 MTP 层时才被调用（无 MTP 层的 spec 不因此源读失败而 fail）。
+    """
+    bits = _ast_norm_kwarg_bits(
+        mf_root, _MTP_REL, "get_mtp_layer_spec",
+        "MultiTokenPredictionLayerSubmodules", ("enorm", "hnorm"))
+    return {"mtp_enorm": bits["enorm"], "mtp_hnorm": bits["hnorm"]}
 
 
 # ── 手写层段切分 + census ─────────────────────────────────────────────────────────
@@ -357,17 +504,62 @@ def _ffn_leads_with_norm(ffn_ops) -> bool:
     return False
 
 
+def _is_mla_attn(attn_ops) -> bool:
+    """attn 段是否为 **MLA**（signature=含 `linear_kvb`；GQA 走融合 `qkv` 无此名）。与主循环里 MLA 段
+    的判据一致。"""
+    return bool(attn_ops) and any(getattr(op, "name", None) == "linear_kvb" for op in attn_ops)
+
+
+def _seg_norm_names(ops) -> set:
+    """段内**归一类**（`hand_category==NORM`）op 的名字集合（供次级 norm 按名点名在场判定）。"""
+    return {op.name for op in (ops or []) if hand_category(op) == NORM}
+
+
+def _is_head_segment(ops) -> bool:
+    """段是否为 **head/final 段**（signature=含 `lm_head` 输出投影 op）。embedding/dsv4hyb 无此 op，故不误
+    判；MTP 段虽也含 `lm_head`，但主循环先按 `eh_proj` 拦截 MTP 并 continue，不会走到这里。"""
+    return any(getattr(op, "name", None) == "lm_head" for op in (ops or []))
+
+
+def _head_leads_with_norm(head_ops) -> bool:
+    """head/final 段是否以 **final_norm**（NORM）打头——即**首个重算子**是 NORM，位于 `lm_head` 投影之前。
+
+    判据同 `_ffn_leads_with_norm`：跳过非重算子，首个 `hand_category` 非 None 的 op 必须是 NORM。head 段
+    op 序=[final_norm(NORM), lm_head(LINEAR), logsoftmax(NORM), nll]；删 final_norm 后首个重算子变
+    `lm_head`(LINEAR) → 报出（`logsoftmax` 那个 NORM 在 lm_head **之后**，不算 final_norm）。
+    """
+    for op in head_ops:
+        cat = hand_category(op)
+        if cat is None:
+            continue
+        return cat == NORM
+    return False
+
+
+def _is_mtp_layer(ops) -> bool:
+    """段是否为 **MTP 层**（signature=含 `eh_proj`——MTP 专属的 embedding-hidden 投影）。
+
+    用 `eh_proj`（而非 enorm/hnorm 名）判定：删 enorm/hnorm 之一做突变时，`eh_proj` 仍在 → 层仍被识别为
+    MTP 而正确报出缺失（若用 enorm/hnorm 名判定，删掉后反而认不出 MTP 层）。MLA/GQA/head/embedding 段
+    均无 `eh_proj`，不误判。
+    """
+    return any(getattr(op, "name", None) == "eh_proj" for op in (ops or []))
+
+
 def _check_layer_norms(layer_type, attn_ops, ffn_ops, source_info, report):
-    """第三族 **layer_norms** 的交叉校验：对一个 decoder-body 层，断言源码强制的两个层级 pre-norm
-    在手写 op 图里**存在且就位**——
+    """第三族 **layer_norms** 的交叉校验：对一个 decoder-body 层，断言源码强制的层级 pre-norm 与（A5）
+    MLA 潜向量 norm 在手写 op 图里**存在且就位**——
 
       - 源 `input_layernorm` 为真 norm → attn 段必须含一个 pre-attn NORM（`ln1`，输入为层输入残差流）；
-        缺失 → `LayerNormFinding`。（注：`_MLA_CORR` 的 NORM delta 是**总 NORM 计数**对账，此族专管两个
-        **层级 pre-norm 的在场**，语义正交、不重复报同一 finding。）
+        缺失 → `LayerNormFinding`。（注：`_MLA_CORR` 的 NORM delta 是**总 NORM 计数**对账，此族专管
+        **具体 norm 的在场**，语义正交、不重复报同一 finding。）
       - 源 `pre_mlp_layernorm` 为真 norm → ffn 段**首个重算子是 NORM**（`ln2`）；否则 → `LayerNormFinding`
         （这正是 `moe_experts`/`mla_attn` 两族都 census 不到的删-ln2 突变）。
+      - **A5 MLA 潜向量 q/kv norm**：仅当 attn 段是 MLA（含 `linear_kvb`）时——源 `q_layernorm`/`kv_layernorm`
+        为真 norm（`_MLA_SPEC_FLAGS` 的 qk_layernorm=True 下解成真 norm）→ attn 段须含 `q_a_norm`/`kv_a_norm`
+        两个 NORM；源解成 IdentityOp（qk 关）则**不**要求（无假阳）。
 
-    **诚实边界**：只校验这两个 pre-norm 的**存在/位置**，不校验其 saves/shape/dtype。
+    **诚实边界**：只校验这些 norm 的**存在/位置**，不校验其 saves/shape/dtype。
     """
     report.layer_norm_checked.append(layer_type)
     if source_info.get("input_layernorm") and not _has_pre_attn_norm(attn_ops):
@@ -378,6 +570,46 @@ def _check_layer_norms(layer_type, attn_ops, ffn_ops, source_info, report):
         report.layer_norm_findings.append(LayerNormFinding(
             layer_type, "pre_mlp_layernorm",
             "ffn 段首个重算子不是 NORM（缺失 pre_mlp_layernorm / ln2）"))
+    # A5：MLA 潜向量 q/kv norm（仅 MLA attn 段；源真 norm 时才要求）。
+    if _is_mla_attn(attn_ops):
+        norm_names = _seg_norm_names(attn_ops)
+        if source_info.get("q_layernorm") and "q_a_norm" not in norm_names:
+            report.layer_norm_findings.append(LayerNormFinding(
+                layer_type, "q_layernorm",
+                "MLA attn 段缺少潜向量 q norm（q_a_norm）"))
+        if source_info.get("kv_layernorm") and "kv_a_norm" not in norm_names:
+            report.layer_norm_findings.append(LayerNormFinding(
+                layer_type, "kv_layernorm",
+                "MLA attn 段缺少潜向量 kv norm（kv_a_norm）"))
+
+
+def _check_final_norm(layer_type, ops, final_info, report):
+    """A5 **final_norm**：head/final 段（含 `lm_head`）须以 NORM（final_norm）打头，位于 lm_head 投影之前。
+
+    源 `final_norm` 为真 norm（`TransformerBlockSubmodules.layer_norm`，无条件 get_norm_cls）→ 缺失即
+    `LayerNormFinding`。只判存在/位置，不判 saves/shape/dtype（诚实边界）。
+    """
+    report.layer_norm_checked.append(layer_type)
+    if final_info.get("final_norm") and not _head_leads_with_norm(ops):
+        report.layer_norm_findings.append(LayerNormFinding(
+            layer_type, "final_norm",
+            "head/final 段首个重算子不是 NORM（缺失 final_norm，应在 lm_head 投影之前）"))
+
+
+def _check_mtp_norms(layer_type, ops, mtp_info, report):
+    """A5 **MTP enorm/hnorm**：MTP 段（含 `eh_proj`）须含 `enorm`/`hnorm` 两个 NORM。
+
+    源 `enorm`/`hnorm` 为真 norm（`get_mtp_layer_spec` 无条件 get_norm_cls）→ 缺失即 `LayerNormFinding`。
+    只判存在，不判 saves/shape/dtype（诚实边界）。MTP 内层 decoder 的 ln1/ln2/final_norm 本族不重复校验。
+    """
+    report.layer_norm_checked.append(layer_type)
+    norm_names = _seg_norm_names(ops)
+    if mtp_info.get("mtp_enorm") and "enorm" not in norm_names:
+        report.layer_norm_findings.append(LayerNormFinding(
+            layer_type, "mtp_enorm", "MTP 段缺少 embedding-norm（enorm）"))
+    if mtp_info.get("mtp_hnorm") and "hnorm" not in norm_names:
+        report.layer_norm_findings.append(LayerNormFinding(
+            layer_type, "mtp_hnorm", "MTP 段缺少 hidden-norm（hnorm）"))
 
 
 # ── 报告数据结构 ──────────────────────────────────────────────────────────────────
@@ -403,20 +635,24 @@ class Finding:
 
 @dataclass
 class LayerNormFinding:
-    """一条**层级 pre-norm 名册**漂移（第三族 layer_norms，Z1）：某 decoder-body 层缺失了源码
-    无条件强制的 `input_layernorm`（ln1）/ `pre_mlp_layernorm`（ln2）对应的 NORM op。
+    """一条**归一名册**漂移（第三族 layer_norms，Z1 + A5）：某手写层段缺失了源码强制的某 NORM op。
 
-    诚实边界：本条只表达该 pre-norm 的**存在/位置**缺失，**不**涉及其 saves/shape/dtype。
+    `norm_slot` 词表（每项都溯源到真 mindformers 源，见 `_NORM_SLOT_SOURCE`）：
+      - Z1 两个层级 pre-norm：`"input_layernorm"`（ln1）/ `"pre_mlp_layernorm"`（ln2）。
+      - A5 次级 norm：`"q_layernorm"`/`"kv_layernorm"`（MLA 潜向量 q/kv norm，条件强制）、`"final_norm"`
+        （block 末、lm_head 前，无条件）、`"mtp_enorm"`/`"mtp_hnorm"`（MTP 层两个 norm，无条件）。
+
+    诚实边界：本条只表达该 norm 的**存在/位置**缺失，**不**涉及其 saves/shape/dtype。
     """
     layer_type: str
-    norm_slot: str          # "input_layernorm" / "pre_mlp_layernorm"
+    norm_slot: str          # 见上词表
     detail: str
 
     @property
     def message(self) -> str:
-        return (f"[opdag 层级 pre-norm 缺失] 层 {self.layer_type!r} 的 {self.norm_slot}："
-                f"{self.detail}——源码 get_gpt_layer_local_spec 无条件绑定该 norm"
-                f"（get_norm_cls(fused_norm)），手写 LayerSpec 却缺对应 NORM op。")
+        src = _NORM_SLOT_SOURCE.get(self.norm_slot, "源码强制该 norm")
+        return (f"[opdag 归一名册缺失] 层 {self.layer_type!r} 的 {self.norm_slot}："
+                f"{self.detail}——源据：{src}；手写 LayerSpec 却缺对应 NORM op。")
 
 
 @dataclass
@@ -542,8 +778,34 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
     except Exception as e:
         report.extraction_failures.append(("<decoder layers>", "layer_norms", str(e)))
 
+    # A5 final_norm 源（block 末、lm_head 前的无条件 norm）——每个 spec 都有 head 段，故 eager 读一次。
+    final_info = None
+    try:
+        final_info = final_norm_source_info(mf_root)
+    except Exception as e:
+        report.extraction_failures.append(("<final_norm>", "layer_norms", str(e)))
+
+    # A5 MTP 源（enorm/hnorm）——仅在 spec **真含** MTP 层时才读（无 MTP 层的 spec 绝不因 MTP 源读失败
+    # 而 fail；诚实边界：不为一个不存在的层段引入提取失败）。
+    mtp_info = None
+    if any(_is_mtp_layer(ls.ops) for ls in spec.layer_specs.values()):
+        try:
+            mtp_info = mtp_norm_source_info(mf_root)
+        except Exception as e:
+            report.extraction_failures.append(("<mtp layers>", "layer_norms", str(e)))
+
     for ltype, ls in spec.layer_specs.items():
-        attn_ops, ffn_ops = _split_decoder(ls.ops)
+        ops = ls.ops
+        # A5：MTP 层先拦截——其 embedding/enorm/hnorm/eh_proj 前缀 + 内层 decoder + 共享 head 的包装结构
+        # 不被 MLA/MoE 窗口建模（逐 op delta 会满屏假阳），故**路由出前两族 delta 家族**，只校验
+        # enorm/hnorm 两个 MTP 专属 norm 的在场，记 uncovered（诚实边界）。
+        if _is_mtp_layer(ops):
+            if mtp_info is not None:
+                _check_mtp_norms(ltype, ops, mtp_info, report)
+            report.uncovered.append(
+                (ltype, "MTP 层：enorm/hnorm 名册已校验；MLA/MoE delta 家族不建模 MTP 包装结构"))
+            continue
+        attn_ops, ffn_ops = _split_decoder(ops)
         matched = False
         # MLA 注意力段：signature = 段内含 `linear_kvb`（MLA 独有；GQA 走融合 `qkv` 无此名）。
         if attn_ops is not None and any(op.name == "linear_kvb" for op in attn_ops):
@@ -553,11 +815,14 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
             window = _moe_expert_window(ffn_ops)
             if window is not None:
                 matched |= _check_segment(ltype, window, _MOE_CORR, mf_root, report)
-        # 第三族 layer_norms：每个 decoder-body 层（同时有 attn/ffn 段，即有 h1 残差）都校验两个层级
-        # pre-norm 的在场——这**不**改 matched/covered（保持 covered 仅指 MLA/MoE 两族；GQA/dense 层仍
-        # 记 uncovered），只在缺 ln1/ln2 时记 layer_norm_findings。前两族窗口都 census 不到 ln2 → 补此洞。
+        # 第三族 layer_norms：每个 decoder-body 层（同时有 attn/ffn 段，即有 h1 残差）都校验层级 pre-norm
+        # 与（A5）MLA 潜向量 q/kv norm 的在场——这**不**改 matched/covered（保持 covered 仅指 MLA/MoE 两族；
+        # GQA/dense 层仍记 uncovered），只在缺 norm 时记 layer_norm_findings。前两族窗口都 census 不到 ln2。
         if ln_source_info is not None and attn_ops is not None and ffn_ops is not None:
             _check_layer_norms(ltype, attn_ops, ffn_ops, ln_source_info, report)
+        # A5 final_norm：head/final 段（非 decoder-body、含 `lm_head` 投影）须以 final_norm 打头。
+        if final_info is not None and attn_ops is None and _is_head_segment(ops):
+            _check_final_norm(ltype, ops, final_info, report)
         if not matched:
             report.uncovered.append(
                 (ltype, "无 opdag 提取源（embedding/lm_head/mtp/gqa/dense 未抽取）"))

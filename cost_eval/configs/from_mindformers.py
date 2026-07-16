@@ -448,6 +448,11 @@ def _build_llm_config(model: dict) -> LLMConfig:
         # D1 无重算-MoE OOM-安全标定 margin（2026-07-16；非物理，2 点标定）：无重算下 MoE 保留态碎片长尾。
         #   注入条件同 kept_frag（MoE 且非 DSv4-fused）；仅 pp==1 单 stage 无重算 loss-BWD 实际生效
         #   （mem_timeline gate，pp>1 由 K_CE=8 平衡）。factor=0.6 与 presets.deepseek_v3 同源（两锚点标定）。
+        # **round3 A(D1-R) 迁移风险留档**：0.6 仅在 **DSv3(MLA+MoE、topk4、S4096) 两锚点**标定过,却
+        #   被注入**任意** MoE 非 fused-DSv4 的 YAML（含 Mixtral/GQA+MoE 等）。碎片长尾 ∝ dispatch/permute
+        #   量 ∝ topk/capacity,跨结构未必同——**非 DSv3 结构的 0.6 是未经真机验证的外推**（方向仍偏 OOM
+        #   安全:margin>0 使预测更保守）。真机栈解锁后应加一个非 DSv3 的 MoE 无重算锚点验其迁移性;在此之前
+        #   把它当"保守占位标定"而非精确值。直连 LLMConfig(绕过本适配器)默认 0 → 见 report.py D1-R 运行时警告。
         nr_moe_frag_factor=(0.6 if (num_moe_experts
                                     and not (attn_type == "dsv4_hybrid" and _dsa_fused(model)))
                             else 0.0),

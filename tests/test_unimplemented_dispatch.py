@@ -23,9 +23,8 @@ from cost_eval.build_llm import build_llm_spec
     ("normalization", "LayerNorm"),
     ("position_embedding_type", "learned_absolute"),
     ("position_embedding_type", "none"),
-    # Task 3：补齐此前 set-but-ignored 的 op-图相关字段（不再静默忽略）
-    ("add_bias_linear", True),      # linear bias 未建为 param
-    ("add_qkv_bias", True),         # QKV bias 未建为 param（Qwen）
+    # 注：add_bias_linear / add_qkv_bias 已由 round3 A(N4，2026-07-16)从 fail-loud **降级为
+    #   ModelingApproxWarning**（bias 内存中性）→ 移至下方 test_bias_fields_warn_and_build。
     # 注：qk_layernorm=True 已由 X3（closure-v4 P1-13/F2，2026-07-15）为 gqa/mha **建 q/k norm op**
     #   → 不再 fail-loud（llama 是 gqa）。移至下方正向测试 test_qk_layernorm_gqa_builds_norm_ops。
 ])
@@ -33,6 +32,20 @@ def test_unimplemented_dispatch_raises(field, value):
     cfg = dataclasses.replace(llama(4), **{field: value})
     with pytest.raises(NotImplementedError):
         build_llm_spec(cfg)
+
+
+@pytest.mark.parametrize("field", ["add_bias_linear", "add_qkv_bias"])
+def test_bias_fields_warn_and_build(field):
+    """round3 A(N4)：bias 类字段是**内存中性**（bias = [out] 一维,相对权重可忽略）→ 从 fail-loud
+    降级为 `ModelingApproxWarning`：发警告但**继续按无 bias 建 spec**（不再硬拒、不产错数）。
+    并核对 op 图与 base 逐 op 一致（bias 未建为 param → 不改图,与 SWA 内存中性字段同性质）。"""
+    from cost_eval.advisories import ModelingApproxWarning
+    base = llama(4)
+    cfg = dataclasses.replace(base, **{field: True})
+    with pytest.warns(ModelingApproxWarning, match=field):
+        spec = build_llm_spec(cfg)
+    assert spec is not None
+    assert _op_graph(spec) == _op_graph(build_llm_spec(base))   # bias 未建 param → op 图不变
 
 
 def test_qk_layernorm_gqa_builds_norm_ops():

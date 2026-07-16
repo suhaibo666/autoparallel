@@ -6,11 +6,16 @@ Evaluator 是整个评估器的对外入口：接收 ModelSpec + 并行/优化�
 from __future__ import annotations
 from dataclasses import dataclass
 
+from .advisories import warn_oom_safety
 from .parallel_model import ParallelModel
 from .shape_eval import ShapeEval
 from .static_mem import StaticMem
 from .mem_timeline import MemTimeline, StagePeak
 from .framework import framework_reserve, hccl_reserved_buffer
+
+# round3 A(F3)：缩层真机锚点最大 8L（DSv3）/ 4L(+MTP, DSv4）。n_layers 超过此"已验证尺度"数倍即视为
+#   **外推**——累计每层残差（欠方向）随层数增长、无全尺寸验证点。阈值取 16（远超最大锚点、不误报小配置）。
+_VALIDATED_LAYER_SCALE = 16
 
 
 def feasibility_errors(pc, optimizer, swap) -> list:
@@ -274,6 +279,29 @@ class Evaluator:
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
         g = ShapeEval().resolve(self.spec, pm)
         _validate_recompute_against_graph(self.recompute, g)     # C1：full 空集/select 零命中 fail-loud
+        # ── round3 A：OOM-安全咨询（不改数值,只提示欠预测风险；欠预测=误报"放得下"却 OOM）──
+        n_layers = self.spec.dims.n_layers
+        # F3：缩层锚点外推全尺寸风险——n_layers 远超已验证尺度时,累计每层残差（欠方向）无全尺寸验证点。
+        if n_layers > _VALIDATED_LAYER_SCALE:
+            warn_oom_safety(
+                f"n_layers={n_layers} 超出真机锚点已验证尺度(≤{_VALIDATED_LAYER_SCALE}L,缩层验证)"
+                "——全尺寸预测为**外推**:每层可能有小幅欠计残差,随层数累积(欠预测=OOM-不安全方向),"
+                "且无全尺寸真机验证点。建议留安全余量:开 HardwareSpec.bwd_scratch_conservative "
+                "或设 framework_reserve 冗余。")
+        # D1-R：MoE + pp==1 + 无重算 但 nr_moe_frag margin 未开（直连 LLMConfig 默认 0,绕过 preset/adapter）
+        #   → 无重算-MoE loss 峰会静默欠预测 ~0.93x（D1 已标定 0.6 使其 OOM-安全,但直连路径默认关）。
+        _is_moe = any(getattr(op.type, "value", op.type) == "moe_gemm"
+                      for layers in g.stages.values() for l in layers for op in l.ops)
+        # 排除 fused-CE（DSv4）：其 loss_lids 空 → margin 本就不触发,开 margin 也无用（那是 D2,另档）→
+        #   对 fused-CE 发"开 margin"警告会误导,故仅对**非 fused-CE** 的 MoE 无重算欠预测发 D1-R。
+        if (_is_moe and self.pc.pp == 1 and getattr(self.recompute, "mode", None) == "None"
+                and not getattr(self.spec.dims, "cross_entropy_fused", False)
+                and not getattr(self.spec.dims, "nr_moe_frag_factor", 0.0)):
+            warn_oom_safety(
+                "MoE + 单 stage(pp=1) + 无重算 但 nr_moe_frag_factor=0（margin 未开,常见于直连 "
+                "LLMConfig 绕过 preset/adapter）：无重算-MoE loss 峰的碎片长尾未补,预测会**欠 ~0.93x**"
+                "（OOM-不安全）。经 presets.deepseek_v3 / from_mindformers 构建会自动注入 0.6;直连构造"
+                "请显式设 dims.nr_moe_frag_factor（DSv3 标定值 0.6）或接受欠预测。")
         # 分配器块对齐（平台属性 HardwareSpec.alloc_block_bytes，默认 512）：逐张量 roundup —
         # 「分配器碎片」项的公式化落地（framework_reserve「块对齐取整」分量，取代经验常数）。
         block = getattr(self.hw, "alloc_block_bytes", 1)
@@ -296,7 +324,8 @@ class Evaluator:
             cross_entropy_fused=getattr(self.spec.dims, "cross_entropy_fused", False),
             norm_compute_dtype_bytes=getattr(self.spec.dims, "norm_compute_dtype_bytes", 0),
             kept_frag_factor=getattr(self.spec.dims, "kept_frag_factor", 0.0),
-            nr_moe_frag_factor=getattr(self.spec.dims, "nr_moe_frag_factor", 0.0))
+            nr_moe_frag_factor=getattr(self.spec.dims, "nr_moe_frag_factor", 0.0),
+            bwd_scratch_conservative=getattr(self.hw, "bwd_scratch_conservative", False))
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。
