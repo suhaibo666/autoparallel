@@ -28,12 +28,12 @@ class TimedOp:
     op_id: str                       # 回指 opdag 节点（"<cell>#<id>" / 展开后缀 ".bK"/".rK"）
     op_type: str                     # opdag 词表 + CommOp/…Grad
     phase: str                       # fwd | bwd | recomp
-    in_shapes: tuple                 # tuple[tuple[int,...],...]，已代入 local
-    out_shape: tuple
+    in_shapes: tuple[tuple[int, ...], ...]   # 已代入 local；GEMM 族约定 in_shapes[0]=激活侧（op_flops 依赖此序）
+    out_shape: tuple[int, ...]
     dtype: str
     stream: str
     src: str = ""                    # mindformers file:line（源忠实）
-    deps: tuple = ()                 # 跨流依赖的 op_id（同流 FIFO 隐含）
+    deps: tuple[str, ...] = ()       # 跨流依赖的 op_id（同流 FIFO 隐含）
     comm: CommSpec | None = None
     module: str = ""                 # ColumnParallelLinear 等（shard/通信语义键）
 
@@ -41,7 +41,7 @@ class TimedOp:
 @dataclass(frozen=True)
 class TimedSegment:
     seg_id: str                      # "layer_3.fwd" / "embedding.fwd" / "loss.bwd" …
-    ops: tuple
+    ops: tuple[TimedOp, ...]
 
 
 def op_flops(top: TimedOp) -> int:
