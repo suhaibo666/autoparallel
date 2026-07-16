@@ -52,3 +52,75 @@ def test_weight_local_divides_correct_axis():
     # Column 权重 [H, 2F]：out 维=末轴 ÷tp；Row 权重 [F, H]：in 维=轴0 ÷tp（Megatron 语义）
     assert weight_local("H·(2·ffn_hidden)", DIMS, "ColumnParallelLinear", 2) == (1792, 3072)
     assert weight_local("ffn_hidden·H", DIMS, "RowParallelLinear", 2) == (1536, 1792)
+
+
+def test_localize_fail_loud_on_indivisible_cp():
+    """Task 8 review 委托:indivisible 序轴的 fail-loud 也要覆盖 cp（非仅 tp/feat_div_last）。"""
+    with pytest.raises(ValueError):
+        localize([4096, 1, 1792], "S·B·H", Degrees(cp=3))
+
+
+# ── producer（spec §3.3 b/c：并行代入装配 + TP 通信注入 + SP 状态机）─────────────
+import os
+
+MF_ROOT = os.environ.get("MINDFORMERS_ROOT",
+                         r"E:\97-codes\torch_parallel\mindformers\mindformers")
+
+
+def _mlp_dag():
+    if not os.path.isdir(MF_ROOT):
+        pytest.skip(f"mindformers 源根不存在: {MF_ROOT}")
+    from cost_eval.opdag.extractor import extract_cell
+    from cost_eval.opdag.module_resolver import ResolvedSpec
+    from cost_eval.opdag.shape_infer import infer_shapes
+    dag = extract_cell(
+        MF_ROOT, "parallel_core/training_graph/transformer/mlp.py", "MLPInterleaved",
+        ResolvedSpec(cell="MLPInterleaved",
+                     submodules={"linear_fc1": "ColumnParallelLinear",
+                                 "linear_fc2": "RowParallelLinear"}),
+        {"gated_linear_unit": True, "activation_type": "silu",
+         "add_bias_linear": False, "compute_dtype": "bf16"})
+    # extract_cell 本身只产符号骨架（ins/out 段是 `?`占位，实证见现场 dump）；shape 落实是
+    # opdag 自己的 PART B（shape_infer.infer_shapes），producer 消费的是**已落实符号 shape**的
+    # DAG——与 tests/test_opdag_shape_infer.py::mlp_dag 同一约定（"hidden_states" 是该 Cell
+    # construct 的形参名，Inputs 文档注明 shape=(S,B,H)）。
+    return infer_shapes(dag, {"hidden_states": "S·B·H"})
+
+
+def test_build_segment_tp2_sp_injects_comm():
+    from cost_eval.timesim.producer import build_segment
+    deg = Degrees(tp=2, cp=1, sequence_parallel=True)
+    seg = build_segment("layer_0.mlp.fwd", _mlp_dag(), DIMS, deg)
+    comms = [o for o in seg.ops if o.op_type == "CommOp"]
+    # Column 前 sp all-gather（模块语义注入）+ Row 后 reduce_scatter（comm_probe 源惯用法）
+    assert [c.comm.ctype for c in comms] == ["all_gather", "reduce_scatter"]
+    assert all(c.stream == "comm_tp" for c in comms)
+    # fc1 出 feature ÷tp：gated 2F=6144 → 3072；且 all_gather 后 sp 退出 → seq 全长
+    fc1 = next(o for o in seg.ops if o.op_type == "MatMul")
+    assert fc1.out_shape == (4096, 1, 3072)
+    # View 全部 host_only
+    assert all(o.stream == "host_only" for o in seg.ops if o.op_type == "View")
+    # reduce_scatter 载荷 = 全 seq 输出字节（S·B·H·2B）
+    assert comms[-1].comm.volume_bytes == 4096 * 1 * 1792 * 2
+    # 中间态 feature 分片状态机:fc1~fc2 之间的激活轴（含 ffn_hidden 的轴,非末轴)也要 ÷tp
+    # (swiglu/silu 支路的 x0 reshape 输出:S·B·ffn_hidden → 3072/tp=1536)
+    act = next(o for o in seg.ops if o.op_type == "Activation")
+    assert act.out_shape == (4096, 1, 1536)
+
+
+def test_build_segment_tp1_has_no_comm():
+    from cost_eval.timesim.producer import build_segment
+    seg = build_segment("layer_0.mlp.fwd", _mlp_dag(), DIMS, Degrees())
+    assert all(o.op_type != "CommOp" for o in seg.ops)
+
+
+def test_build_segment_unknown_module_fail_loud():
+    """tp>1 时 matmul 的未知非空 module 名 → fail-loud（防 typo 静默不切分）。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.opdag.schema import OpDAG, OpNode
+    dag = OpDAG(cell="X", nodes=[OpNode(id=1, op="MatMul", src="x.py:1",
+                                        module="ColumnParalleLinear",  # typo
+                                        ins=["x:S·B·H:bf16", "w:H·H:bf16"],
+                                        out="y:S·B·H:bf16")], edges=[])
+    with pytest.raises(ValueError):
+        build_segment("x.fwd", dag, DIMS, Degrees(tp=2))
