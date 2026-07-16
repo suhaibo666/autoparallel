@@ -49,6 +49,11 @@ class LLMConfig:
     o_groups: int = 0                       # 分组输出投影
     o_lora_rank: int = 0
     dsa_fused: bool = True                   # 融合 DSA kernel（生产默认）：稀疏中间量不物化（§真机）
+    # GQA colossal CP 下 KV all-gather 到 full-S 的额外 buffer（modeling opt-in，P1-13/Y1）。默认
+    # False → shape_eval 三重门（method==colossal & cp>1 & 本字段）恒不触发、workspace 逐字节不变
+    # （消费点 shape_eval.py:265）。此前仅靠测试给 DimTable 动态挂属性启用、经公开 LLMConfig 不可达
+    # （F8 订正 2026-07-16）——现为真字段并经 to_dimtable 直通到 DimTable.cp_kv_allgather_buffer。
+    cp_kv_allgather_buffer: bool = False
 
     # ---- ② FFN / MoE ----
     ffn_hidden_size: int | None = None      # 默认 4*H
@@ -162,6 +167,9 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         moe_skew_factor=cfg.moe_skew_factor,
         # Q/K layernorm 直通（2026-07-15 协调补充，供 attention.py 建 GQA q/k norm 读取）。
         qk_layernorm=cfg.qk_layernorm,
+        # GQA colossal CP KV all-gather full-S buffer opt-in 直通（F8 订正 2026-07-16）：默认 False
+        # → shape_eval 门恒不触发、workspace 逐字节不变。
+        cp_kv_allgather_buffer=cfg.cp_kv_allgather_buffer,
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
         num_residual_streams=cfg.num_residual_streams,
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）

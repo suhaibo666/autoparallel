@@ -40,6 +40,12 @@ class ParallelConfig:
     offload_optimizer: bool = False
     microbatch: int = 1
     interleave: int = 1
+    # PP stage 间 P2P send/recv 双缓冲开关（`pipeline_parallel.py:396 pipeline_parallel_overlap_p2p`，
+    # 默认 False）：True 时 send buffer 2 份双缓冲（消费点 mem_timeline.py:527）。默认 False → p2p_buf
+    # 单份、单 stage 锚点逐字节不变。此前仅靠测试给 ParallelConfig 动态挂属性启用、经公开构造不可达
+    # （F8 订正 2026-07-16）——现为真字段。注：YAML 适配器路径对该键仍 fail-loud（backward grad-P2P
+    # 未建模，from_mindformers.py `_PAR_UNSUPPORTED_TRUTHY`），此字段只补**直连 API 可达性**。
+    pipeline_parallel_overlap_p2p: bool = False
     # PP 每 stage 层数（含 embedding+head 两伪层，和==n_layers）：**首选显式配置**（忠实
     # mindformers `offset`/`num_layer_list`，D-8），不自行推测；None=退化均匀切（remainder 归末 stage）。
     layers_per_stage: Optional[list] = None

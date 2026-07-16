@@ -166,9 +166,8 @@ def _layers(spec, cp, method="colossal"):
 def test_integration_gqa_colossal_buffer_and_gates():
     """集成：build_llm GQA + opt-in on。flash 层：colossal cp2 = 减半 fa_ws + full-S KV buffer；
     ulysses cp2 精确减半；cp1 无 buffer。body 激活 saves 三路径皆精确 ÷cp。"""
-    spec = _gqa_spec()
+    spec = _gqa_spec(cp_kv_allgather_buffer=True)        # opt-in 经 LLMConfig 真字段（F8 订正）
     d = spec.dims
-    d.cp_kv_allgather_buffer = True                      # opt-in
     l1 = _layers(spec, 1, "colossal")
     l2 = _layers(spec, 2, "colossal")
     l2u = _layers(spec, 2, "ulysses")
@@ -210,8 +209,7 @@ def test_integration_mla_unaffected_by_opt_in():
                 q_lora_rank=8, kv_lora_rank=8, qk_rope_head_dim=2, qk_nope_head_dim=2,
                 v_head_dim=4)
     spec_off = build_llm_spec(LLMConfig(**base))
-    spec_on = build_llm_spec(LLMConfig(**base))
-    spec_on.dims.cp_kv_allgather_buffer = True
+    spec_on = build_llm_spec(LLMConfig(**base, cp_kv_allgather_buffer=True))   # 真字段（F8 订正）
     for a, b in zip(_layers(spec_off, 2, "colossal"), _layers(spec_on, 2, "colossal")):
         sa, sb = estimate_structure_memory(a.ops), estimate_structure_memory(b.ops)
         assert sa.workspace == sb.workspace              # MLA 不受 opt-in 影响

@@ -361,23 +361,18 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "或为该组合补建模。")
 
     attn_type = _infer_attn_type(model)
-    # qk_layernorm 分类订正（closure-audit F2，2026-07-15）：mindformers **真构造** q_layernorm/
-    # k_layernorm,作用于带 head 维的 Q/K（attention.py:311-357），Qwen3 PyNative 强制 qk_layernorm=True
-    # （modeling_qwen3_train_pynative.py:47-50）；Qwen3-32B（S=4096、64+8 heads、head_dim=128、64 层）
-    # 每层 BF16 72 MiB / FP32 144 MiB、64 层累计 4.5-9 GiB——**非内存中性**。按 attn_type 条件：
-    #   ① gqa/mha：Q/K 上 2 个 RMSNorm 未建 op（评估器 attn 图无对应 norm）→ **fail-loud**。此处直接
-    #      raise（比映射到 LLMConfig 让 build_llm.py:167-170 兜底更早、信息更清）——绝不静默丢弃后
-    #      评「另一份模型」（qk=True/False 得同图）。
+    # qk_layernorm 分类（closure-audit F2 2026-07-15 + **F7 订正 2026-07-16**）：mindformers **真构造**
+    # q_layernorm/k_layernorm,作用于带 head 维的 Q/K（attention.py:311-357），Qwen3 PyNative 强制
+    # qk_layernorm=True（modeling_qwen3_train_pynative.py:47-50）；Qwen3-32B 每层 BF16 72 MiB、64 层
+    # 累计 4.5-9 GiB——**非内存中性**。按 attn_type 条件（下方 kwargs 的 qk_layernorm 据此透传）：
+    #   ① gqa/mha：build_llm 早已为其建 q_norm/k_norm op（X3，build_gqa_attn_ops per-head RMSNorm）
+    #      → **透传 True**。F7：此前此处对 gqa/mha fail-loud，令这份**已建能力经 YAML 路径不可达**
+    #      （direct API 建 q/k norm、adapter 却 raise = split-brain）；现移除该 raise，改为透传（build_llm
+    #      仍是对 gqa/mha 建 op、对 mla/dsv4/dsa 兜底 fail-loud 的唯一权威判定点）。
     #   ② mla/dsv4_hybrid/dsa：**subsumed**——这三条注意力 op 图**已含** q_a_norm/kv_a_norm（MLA 潜空间
     #      norm,attention.py/dsa.py）与 q_hnorm（DSv4 per-head Q RMSNorm,dsv4_hybrid.py:124）,qk_layernorm
-    #      语义被这些已建 norm 覆盖 → 刻意不额外建（保持 LLMConfig.qk_layernorm=False）。DSv4align
-    #      round-trip 的 qk_layernorm=True 走此分支 → 仍 ignore，锚点不破。
-    if model.get("qk_layernorm") and attn_type in ("gqa", "mha"):
-        raise NotImplementedError(
-            f"qk_layernorm=True 且 attn_type={attn_type!r}（gqa/mha）暂未建 op 图：Q/K 上的 2 个 RMSNorm"
-            "未建为 op（评估器 attn 图无对应 norm；Qwen3 系每层 BF16 72 MiB、64 层累计 4.5-9 GiB,"
-            "非可忽略）——静默丢弃会绕过 build_llm.py:167-170 的原生 fail-loud、评估另一份模型。"
-            "请补 q/k norm op 建模,或改用 MLA 家族（q_a_norm/kv_a_norm/q_hnorm 已覆盖 qk norm）。")
+    #      语义被这些已建 norm 覆盖 → **透传 False**（不额外建、不 raise）。DSv4align round-trip 的
+    #      qk_layernorm=True 走此分支 → LLMConfig.qk_layernorm 仍 False，锚点/round-trip 逐字段不破。
     # n_routed_experts（deepseek 系）/ num_experts（qwen3_moe/general 模板同义字段）
     num_moe_experts = model.get("n_routed_experts") or model.get("num_experts")
 
@@ -415,8 +410,10 @@ def _build_llm_config(model: dict) -> LLMConfig:
         # 归一化 / 位置编码（结构相关）
         normalization=model.get("normalization", "RMSNorm"),
         norm_placement=model.get("norm_placement", "pre"),
-        # qk_layernorm **不透传**（留默认 False）：gqa/mha 真值已在上方 fail-loud;mla 家族下 qk norm
-        # 由已建 q_a_norm/kv_a_norm/q_hnorm 覆盖（subsumed，见 _IGNORED_MODEL_KEYS / 上方 F2 注释）。
+        # qk_layernorm 透传（F7 订正 2026-07-16）：**仅 gqa/mha** 透传 True（build_llm 据此建 q_norm/
+        # k_norm op）；mla/dsv4/dsa 恒 False（subsumed——其 latent/per-head norm 已覆盖 qk norm；透 True
+        # 会误触 build_llm 的 mla-qk fail-loud 并破 DSv4align round-trip 锚点，见上方 F2/F7 注释）。
+        qk_layernorm=(bool(model.get("qk_layernorm", False)) and attn_type in ("gqa", "mha")),
         position_embedding_type=_position_embedding(model),
         # 装配
         # tie:qwen3 系用反义字段 untie_embeddings_and_output_weights（True=不 tie）

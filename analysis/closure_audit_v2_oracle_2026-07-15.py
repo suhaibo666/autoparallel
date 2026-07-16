@@ -63,9 +63,10 @@ CASES = {
     # F6 ulysses_degree_in_cp
     "F6 colossal degree=1 (was false-reject) → ACCEPT":
         lambda: _accepted(lambda: from_mindformers_dict({**_mf(), "parallelism": {"context_parallel_method": "colossal", "ulysses_degree_in_cp": 1}})),
-    # F2 qk_layernorm
-    "F2 gqa qk_layernorm=True (Qwen3, unmodeled) → REJECT":
-        lambda: _rejected(lambda: from_mindformers_dict({**_mf(), "model": {**_mf()["model"], "num_key_value_heads": 4, "qk_layernorm": True}})),
+    # F2/F7 qk_layernorm：gqa/mha 现由 build_llm 建 q_norm/k_norm（X3），adapter 亦透传（F7 订正
+    # 2026-07-16 消除 split-brain）→ 从「REJECT」翻正为「ACCEPT」。
+    "F2/F7 gqa qk_layernorm=True (X3-modeled, adapter reachable) → ACCEPT":
+        lambda: _accepted(lambda: from_mindformers_dict({**_mf(), "model": {**_mf()["model"], "num_key_value_heads": 4, "qk_layernorm": True}})),
     "F2 mla qk_layernorm=True (subsumed) → ACCEPT":
         lambda: _accepted(lambda: from_mindformers_dict({**_mf(), "model": {**_mf()["model"], "multi_latent_attention": True, "q_lora_rank": 512, "kv_lora_rank": 256, "qk_rope_head_dim": 64, "qk_nope_head_dim": 64, "v_head_dim": 128, "qk_layernorm": True}})),
     # F4 recompute mode/selector

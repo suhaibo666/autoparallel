@@ -10,7 +10,9 @@ import os
 import pytest
 
 from cost_eval.build_llm import build_llm_spec
+from cost_eval.llm_config import LLMConfig
 from cost_eval.presets import deepseek_v3
+from cost_eval.opdag import crosscheck as _cc
 from cost_eval.opdag.crosscheck import (
     OpdagConsistencyError, default_mf_root, hand_category, opdag_category,
     validate_against_opdag,
@@ -65,6 +67,51 @@ def test_strict_mode_raises_on_drift():
             break
     with pytest.raises(OpdagConsistencyError):
         validate_against_opdag(spec, strict=True, warn=False)
+
+
+@_needs_source
+def test_extraction_failure_trips_strict(monkeypatch):
+    """F6：已声明覆盖族的 opdag 提取失败 ≠ 合法无对应——它意味着交叉校验**无从验证**该族，
+    绝不能静默放行。注入 MLA census 抛异常 → 非 strict 报告 ok=False 且 extraction_failures 记录
+    了 mla_attn（不是塞进 uncovered 假装没事）；strict=True 直接 raise OpdagConsistencyError。"""
+    spec = build_llm_spec(deepseek_v3(4))
+
+    def boom(_root):
+        raise RuntimeError("injected extractor failure")
+
+    monkeypatch.setattr(_cc._MLA_CORR, "census_fn", boom)
+
+    # 非 strict：不 raise，但报告如实反映提取失败（ok=False、extraction_failures 非空、含 mla_attn）
+    rep = validate_against_opdag(spec, warn=False)
+    assert rep.available is True
+    assert rep.ok is False                                     # 提取失败也让 ok 变 False（不只看 findings）
+    assert rep.extraction_failures                             # 提取失败被单列，而非混进 uncovered
+    assert any(fam == "mla_attn" for (_lt, fam, _err) in rep.extraction_failures)
+    # 诚实边界：提取失败不该被降级成 “合法无对应” 的 uncovered 记录
+    assert not any("mla_attn" in note for (_lt, note) in rep.uncovered)
+    # summary 要点名提取失败（可读的失败原因）
+    assert "mla_attn" in rep.summary()
+
+    # strict：提取失败即 raise（这正是此前的假绿路径）
+    with pytest.raises(OpdagConsistencyError) as ei:
+        validate_against_opdag(spec, strict=True, warn=False)
+    assert "mla_attn" in str(ei.value)
+
+
+@_needs_source
+def test_legitimate_no_correspondence_does_not_trip_strict():
+    """F6 对照：全 GQA/dense（无 MLA、无 MoE）的层**合法地**没有 opdag 提取源 → 记为 uncovered，
+    这不是提取失败，strict 也绝不能因此 raise（否则会把 embedding/lm_head/gqa 误伤为漂移）。"""
+    cfg = LLMConfig(
+        num_layers=2, hidden_size=8, num_attention_heads=2, num_query_groups=2,
+        vocab_size=16, seq_length=8, head_dim=4, attn_type="gqa", ffn_hidden_size=16,
+    )
+    spec = build_llm_spec(cfg)
+    rep = validate_against_opdag(spec, strict=True, warn=False)  # strict 下不 raise
+    assert rep.available and rep.ok is True
+    assert not rep.covered                                     # 无 MLA/MoE 段可覆盖
+    assert not rep.extraction_failures                         # 合法无对应 ≠ 提取失败
+    assert rep.uncovered                                       # 全部作为 uncovered log（不 trip strict）
 
 
 def test_evaluator_default_off_does_not_touch_opdag(monkeypatch):

@@ -30,11 +30,11 @@ def _sim(pp, *, mbs=2, B=2, dp=1, record=True, overlap=None):
     d.B = B
     kw = dict(dp_shard=dp, cp=1, tp=1, ep=1, pp=pp, sequence_parallel=True,
               num_microbatches=mbs)
-    pc = ParallelConfig(**kw)
     if overlap is not None:
-        # 运行时开关（源 pipeline_parallel.py:396 pipeline_parallel_overlap_p2p，默认 False）——
-        # 评估器按 getattr 读取，测试直接注入以验证双缓冲。
-        pc.pipeline_parallel_overlap_p2p = overlap
+        # 真字段（源 pipeline_parallel.py:396 pipeline_parallel_overlap_p2p，默认 False）——F8 订正后
+        # 经公开构造字段可达（此前只能构造后动态挂属性）；用于验证 send buffer 双缓冲。
+        kw["pipeline_parallel_overlap_p2p"] = overlap
+    pc = ParallelConfig(**kw)
     pm = ParallelModel(pc, spec.dims.n_layers, world_size=dp * pp)
     g = ShapeEval().resolve(spec, pm)
     persistent = StaticMem().compute(g, OptimizerSpec.adamw(params_fp32=True), pm, False,

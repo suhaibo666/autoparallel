@@ -57,6 +57,10 @@ def _moe_dispatch_token_expr(d: "DimTable") -> str:
         return ("((S*B*topk*capacity_factor + n_experts - 1) // n_experts)"
                 " * n_experts")
     if mode == "skew":
+        # skew 口径的 factor（须有限且 ≥1，「最忙 rank 相对均值的放大」）由**公共构建入口**
+        # `build_llm._validate_structure` 校验（F9 复核 2026-07-16：factor<1 会把 OOM 估计降到均值
+        # 以下、OOM 不安全，故 build_llm_spec 直接拒绝）。此低层 expr 沿用「DimTable 不设门、低层
+        # 表达式可直调单测」的既有约定（对照 test_x2 用 DimTable('bogus') 期望在上层 raise）。
         return "S*B*topk*capacity_factor*moe_skew_factor"
     raise ValueError(
         f"未知 moe_dispatch_mode: {mode!r}（应为 balanced|capacity|skew）")

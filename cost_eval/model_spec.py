@@ -37,6 +37,11 @@ class DimTable:
     # （builder 侧 attention.py 用 `getattr(d, "qk_layernorm")` 读取）。默认 False（DSv3/DSv4
     # qk_layernorm=False）→ 惰性，锚点不动。此前仅 LLMConfig 有此字段、DimTable 缺 → 直通补齐。
     qk_layernorm: bool = False
+    # GQA colossal CP KV all-gather full-S buffer opt-in（P1-13/Y1；F8 订正 2026-07-16 提为真字段）。
+    # shape_eval.py:265 靠 `getattr(spec.dims, "cp_kv_allgather_buffer", False)` 读取；默认 False →
+    # 三重门恒不触发、workspace 逐字节不变（12 golden 锚点走 mla/dsv4 不经 GQA builder，惰性）。
+    # 由 llm_config.to_dimtable 从 LLMConfig 同名字段直通（此前仅测试动态挂属性、经公开 API 不可达）。
+    cp_kv_allgather_buffer: bool = False
     # Shared expert intermediate size (MoE + MLA combined layers)
     moe_shared_F: int = 0
     # shared-expert 门控（closure-audit C3，2026-07-15）：use_shared_expert_gating=True 时有

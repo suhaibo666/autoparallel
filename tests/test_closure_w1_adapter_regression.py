@@ -186,17 +186,23 @@ def test_ulysses_degree_not_in_truthy_set():
     assert "ulysses_degree_in_cp" not in _PAR_UNSUPPORTED_TRUTHY
 
 
-# ══ ③ F2 qk_layernorm 按 attn_type 条件（gqa/mha fail-loud;mla 家族 subsumed）═══════════
-def test_qk_layernorm_mha_truthy_failloud():
-    """mha + qk_layernorm=True → Q/K 上 2 个 RMSNorm 未建 op → fail-loud（绕过 build_llm 静默评错模型）。"""
-    with pytest.raises(NotImplementedError, match="qk_layernorm"):
-        from_mindformers_dict(_mf(qk_layernorm=True))
+# ══ ③ F2/F7 qk_layernorm 按 attn_type 条件（gqa/mha 透传+建 q/k norm；mla 家族 subsumed）══════
+# F7 订正 2026-07-16：build_llm 早已为 gqa/mha 建 q_norm/k_norm（X3），adapter 亦透传 True（此前
+# adapter fail-loud 令已建能力经 YAML 不可达 = split-brain，已消除）。
+def test_qk_layernorm_mha_truthy_passthrough():
+    """mha + qk_layernorm=True → adapter 放行并透传 True，build_llm 建 q_norm/k_norm op（X3）。"""
+    bundle = from_mindformers_dict(_mf(qk_layernorm=True))
+    assert bundle.llm.attn_type == "mha" and bundle.llm.qk_layernorm is True
+    names = {o.name for ls in build_llm_spec(bundle.llm).layer_specs.values() for o in ls.ops}
+    assert "q_norm" in names and "k_norm" in names
 
 
-def test_qk_layernorm_gqa_truthy_failloud():
-    """gqa + qk_layernorm=True（Qwen3 系）→ fail-loud（Qwen3-32B 每层 BF16 72 MiB、64 层 4.5-9 GiB）。"""
-    with pytest.raises(NotImplementedError, match="qk_layernorm"):
-        from_mindformers_dict(_mf(parallelism=None, num_key_value_heads=2, qk_layernorm=True))
+def test_qk_layernorm_gqa_truthy_passthrough():
+    """gqa + qk_layernorm=True（Qwen3 系）→ adapter 放行并透传 True，build_llm 建 q/k per-head RMSNorm。"""
+    bundle = from_mindformers_dict(_mf(parallelism=None, num_key_value_heads=2, qk_layernorm=True))
+    assert bundle.llm.attn_type == "gqa" and bundle.llm.qk_layernorm is True
+    names = {o.name for ls in build_llm_spec(bundle.llm).layer_specs.values() for o in ls.ops}
+    assert "q_norm" in names and "k_norm" in names
 
 
 def test_qk_layernorm_mha_false_accepted():

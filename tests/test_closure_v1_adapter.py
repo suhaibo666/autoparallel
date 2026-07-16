@@ -193,10 +193,11 @@ def test_non_dsv4_ce_false_no_warning():
     assert not any("cross_entropy_fused" in str(w.message) for w in caught)
 
 
-# ── ③ qk_layernorm 按 attn_type 条件（closure-audit F2 订正 2026-07-15）──────────────────
-# 旧 oracle 断言「qk_layernorm=True→LLMConfig 静默保持 False」——把**静默丢语义**固化成期望行为,错。
-# 真实实现：mindformers 真构造 q/k_layernorm（attention.py:311-357）,非内存中性。订正后按 attn_type：
-#   gqa/mha 真值 → fail-loud；mla/dsv4_hybrid/dsa → subsumed（q_a_norm/kv_a_norm/q_hnorm 已建覆盖）。
+# ── ③ qk_layernorm 按 attn_type 条件（closure-audit F2 2026-07-15 + F7 订正 2026-07-16）──────
+# mindformers 真构造 q/k_layernorm（attention.py:311-357）,非内存中性。按 attn_type：
+#   gqa/mha 真值 → build_llm 建 q_norm/k_norm op（X3）,adapter **透传 True**（F7：此前 adapter 对
+#     gqa/mha fail-loud 令已建能力经 YAML 不可达 = split-brain,已消除）；
+#   mla/dsv4_hybrid/dsa → subsumed（q_a_norm/kv_a_norm/q_hnorm 已建覆盖）,透传 False、不 raise。
 # 详尽覆盖见 tests/test_closure_w1_adapter_regression.py;此处保留最小锚点。
 def test_qk_layernorm_in_ignored_not_mapped():
     """qk_layernorm 仍在忽略集（**仅为不触发 unknown-key fail-loud**,非「中性」）、不在已映射集。
@@ -205,13 +206,14 @@ def test_qk_layernorm_in_ignored_not_mapped():
     assert "qk_layernorm" not in _MAPPED_MODEL_KEYS
 
 
-def test_qk_layernorm_true_mha_failloud():
-    """gqa/mha + qk_layernorm=True → **fail-loud**（Q/K 上 2 个 RMSNorm 未建 op）——订正旧「静默 False」oracle。
-    `_mf()` 是 mha（num_attention_heads=8、无 kv_heads）。"""
+def test_qk_layernorm_true_mha_passthrough():
+    """gqa/mha + qk_layernorm=True → adapter **放行并透传 True**（build_llm 早已建 q/k norm；F7 订正
+    2026-07-16 消除 split-brain）。`_mf()` 是 mha（num_attention_heads=8、无 kv_heads）。"""
     m = _mf()
     m["model"]["qk_layernorm"] = True
-    with pytest.raises(NotImplementedError, match="qk_layernorm"):
-        from_mindformers_dict(m)
+    bundle = from_mindformers_dict(m)
+    assert bundle.llm.attn_type == "mha"
+    assert bundle.llm.qk_layernorm is True
 
 
 def test_qk_layernorm_true_dsv4_subsumed():

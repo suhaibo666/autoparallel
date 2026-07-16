@@ -14,6 +14,8 @@ ffn 段已内嵌 ln2/residual），**不另加 norm op**——否则将偏离 `b
 """
 from __future__ import annotations
 
+import math
+
 from .layer_context import LayerContext
 from .llm_config import LLMConfig, to_dimtable
 from .model_spec import DimTable, LayerSpec, ModelSpec
@@ -118,6 +120,26 @@ def _validate_structure(cfg: LLMConfig) -> None:
             raise ValueError(
                 f"moe_ffn_hidden_size({cfg.moe_ffn_hidden_size}) 必须 ≥1（专家 FFN 隐藏维；≤0 产负/零 "
                 "MoE numel）。")
+    # ── MoE dispatched-token 口径合法性（F9，closure-report v2 2026-07-16）──────────────────
+    # 探针实证：`moe_dispatch_mode="skew", moe_skew_factor=0.5` 把 dispatched token 从均衡 16 压到 8
+    # （**低于**均衡值）却无报错——skew 建模的是路由倾斜下**最忙 rank** 相对均值的放大，因子 <1 反而
+    # **低估** OOM 边界（语义颠倒）；非有限值会产 NaN/inf 尺寸。capacity_factor 同理须 ≥1（capacity 是
+    # drop-and-pad 的容量上界，<1 截掉真实 dispatched token、低估 MoE 激活）。dispatch_mode 只有三个
+    # 实现取值（layers/ffn.py `_moe_dispatch_token_expr`）。**默认 balanced/1.0/1.0 全部通过 → 惰性、
+    # 锚点逐字节不变**；这些是 dispatch 口径的自身不变量，无论是否 MoE 层都无害地统一校验。
+    if not math.isfinite(cfg.moe_skew_factor) or cfg.moe_skew_factor < 1.0:
+        raise ValueError(
+            f"moe_skew_factor({cfg.moe_skew_factor}) 必须为有限值且 ≥1.0：skew 口径建模最忙 rank "
+            "相对均值的放大（percentile 倾斜），<1 会把 dispatched token 压到均衡值以下、**低估** OOM "
+            "边界（语义颠倒），非有限值会产 NaN/inf 尺寸。")
+    if cfg.moe_capacity_factor < 1.0:
+        raise ValueError(
+            f"moe_capacity_factor({cfg.moe_capacity_factor}) 必须 ≥1.0：capacity 是 drop-and-pad 的"
+            "容量上界，<1 会截掉真实 dispatched token、低估 MoE 激活（OOM 不安全）。")
+    if cfg.moe_dispatch_mode not in ("balanced", "capacity", "skew"):
+        raise ValueError(
+            f"moe_dispatch_mode={cfg.moe_dispatch_mode!r} 非法（仅 balanced|capacity|skew，见 "
+            "layers/ffn.py `_moe_dispatch_token_expr`）。")
     if cfg.num_moe_experts:
         # §F5b：先拒 bool（`num_moe_experts=True` 是 truthy 会进 MoE 路径当「True 个专家」）——须
         # 先于下方 topk/负数检查，保证 bool 以类型语义而非数值语义 fail-loud。

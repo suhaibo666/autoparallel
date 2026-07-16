@@ -37,6 +37,18 @@ grouped-GEMM 段），把手写 `LayerSpec` 的**重算子名册（op census）*
     边界 log，不比。
   - GQA/dense/embedding/lm_head/mtp 层**无 opdag 提取源** → 作为 uncovered 层 log。
 
+**校验口径的诚实边界（不可过度宣称）**：本模块是一个**算子类别 census 的一致性校验器**——它只比较
+两侧「重算子类别计数」（matmul/norm/linear_grouped/attention/activation…）之间的**逐类别 delta**，
+**不**比较每个张量的 `saves`（保存清单）、shape、dtype、workspace 或生命周期。因此它**无法**发现
+一类不改变 op 类别计数的内存契约漂移——例如从某个 matmul op 删掉一条 `saves` 记录（op 数不变、类别
+census 不变）就**逃不出**本校验。要覆盖这类 save 级/内存契约漂移，需要另建**逐张量的 save-level
+对账**（本模块不做，也不假装做）。一句话：这是**类别 census 一致性检查**，不是**完整内存契约验证器**。
+
+**提取失败 ≠ 合法无对应（strict 语义关键）**：某层「合法地没有 opdag 提取源」（embedding/lm_head/
+mtp/gqa/dense）记为 `uncovered`，是设计内的诚实边界，strict **不**因此失败。但一个**已声明覆盖**的族
+（MLA/MoE）在抽取时**抛异常**是另一回事——它意味着交叉校验**无从验证**该族，若仍静默返回 `ok=True`
+就是**假绿**。故此类失败单列进 `extraction_failures`，让 `ok=False`，strict 下直接 `raise`。
+
 **默认不改变评估行为**：`Evaluator(..., validate_opdag=False)` 默认关；本模块也可独立调用。缺 mindformers
 源（如 CI）→ 报告标 `available=False`、静默跳过（`warn` 一次），绝不因缺源而 fail。
 """
@@ -264,23 +276,35 @@ class CrossCheckReport:
     mf_root: str
     findings: list = field(default_factory=list)     # list[Finding]（漂移）
     covered: list = field(default_factory=list)       # list[Covered]
-    uncovered: list = field(default_factory=list)     # list[(layer_type, note)]
+    uncovered: list = field(default_factory=list)     # list[(layer_type, note)]（合法无对应）
+    # 已声明覆盖族在抽取时抛异常 → list[(layer_type, family, error)]。这**不是**合法无对应
+    # （见模块 docstring）——它意味着该族无从验证，故让 ok=False、strict 下 raise。
+    extraction_failures: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        """无漂移即通过（不可用也视作「无漂移可报」→ True）。"""
-        return not self.findings
+        """无漂移**且**无提取失败即通过（不可用也视作「无从校验、无可报」→ True）。
+
+        注意：提取失败也让 ok=False——一个已声明覆盖的族抽取失败意味着交叉校验无从验证它，
+        若仍返回 True 就是假绿（见模块 docstring「提取失败 ≠ 合法无对应」）。
+        """
+        return not self.findings and not self.extraction_failures
 
     def summary(self) -> str:
         if not self.available:
             return f"opdag 一致性校验：跳过（mindformers 源不可用：{self.mf_root!r}）"
         cov = ", ".join(sorted({c.family for c in self.covered})) or "（无）"
-        head = (f"opdag 一致性校验：{'通过' if self.ok else '发现漂移'}；"
+        status = "通过" if self.ok else "发现漂移/提取失败"
+        head = (f"opdag 一致性校验：{status}；"
                 f"覆盖层段={len(self.covered)}（{cov}）、未覆盖层={len(self.uncovered)}、"
-                f"漂移={len(self.findings)}")
+                f"漂移={len(self.findings)}、提取失败={len(self.extraction_failures)}")
         lines = [head]
         for f in self.findings:
             lines.append("  - " + f.message)
+        for layer_type, family, error in self.extraction_failures:
+            lines.append(
+                f"  - [opdag 提取失败] 层 {layer_type!r} 的 {family} 段：声明覆盖但无法从源抽取 op 图"
+                f"——交叉校验无从验证该族（{error}）")
         return "\n".join(lines)
 
 
@@ -292,8 +316,10 @@ def _check_segment(layer_type, seg_ops, corr, mf_root, report):
     """对一个手写层段跑对应契约的交叉校验，把 Covered / Finding 写进 report。返回是否命中该族。"""
     try:
         ocen = corr.census_fn(mf_root)
-    except Exception as e:  # opdag 提取失败（源结构变动/夹具不匹配）→ 诚实降级为 uncovered，不 crash。
-        report.uncovered.append((layer_type, f"{corr.family}: opdag 提取失败：{e}"))
+    except Exception as e:  # 已声明覆盖族的 opdag 提取失败（源结构变动/夹具不匹配/抽取器异常）。
+        # **不**降级成 uncovered（那会被误读为「合法无对应」而放行）——单列进 extraction_failures，
+        # 让 ok=False、strict 下 raise：交叉校验无从验证该族，静默放行就是假绿（F6）。不 crash。
+        report.extraction_failures.append((layer_type, corr.family, str(e)))
         return True
     hcen = _census_hand(seg_ops, corr.checked)
     report.covered.append(Covered(layer_type, corr.family, corr.source, corr.opaque_note))
@@ -309,17 +335,24 @@ def _check_segment(layer_type, seg_ops, corr, mf_root, report):
 
 def validate_against_opdag(spec, *, mf_root: str | None = None,
                            strict: bool = False, warn: bool = True) -> CrossCheckReport:
-    """把手写 `ModelSpec` 的重算子名册与 opdag 从 mindformers 源抽出的名册做一致性交叉校验。
+    """把手写 `ModelSpec` 的重算子名册与 opdag 从 mindformers 源抽出的名册做**类别 census** 一致性校验。
+
+    **口径**：只比较两侧「重算子类别计数」的逐类别 delta（matmul/norm/linear_grouped/attention/
+    activation），**不**比较每张量 `saves`/shape/dtype/workspace/生命周期。故它是**类别 census 一致性
+    检查**，不是**完整内存契约验证器**——不改变 op 类别计数的 save 级漂移（如从某 matmul 删一条 `saves`）
+    逃得出本校验（详见模块 docstring）。
 
     参数
       spec    — 手写 `ModelSpec`（`build_llm_spec` / `build_dsv3_spec` 产出）。
       mf_root — mindformers 源根；缺省用 `default_mf_root()`。不存在 → 报告标 `available=False`、
                 （warn 时）告警一次后**静默跳过**（绝不因缺源 fail；strict 也不 raise，无从校验）。
-      strict  — True：发现漂移即 `raise OpdagConsistencyError`。False（默认）：`warn` 时发
-                `OpdagDriftWarning`，把漂移记进报告返回。
-      warn    — 是否在缺源/漂移时 `warnings.warn`（默认 True）。
+      strict  — True：发现**漂移**或**已声明覆盖族的提取失败**即 `raise OpdagConsistencyError`。
+                False（默认）：`warn` 时发 `OpdagDriftWarning`，把漂移/提取失败记进报告返回。
+      warn    — 是否在缺源/漂移/提取失败时 `warnings.warn`（默认 True）。
 
-    返回 `CrossCheckReport`（findings/covered/uncovered/available）。
+    返回 `CrossCheckReport`（findings/covered/uncovered/extraction_failures/available）。
+    合法无对应的层（embedding/lm_head/mtp/gqa/dense）记 `uncovered`，**不**触发 strict；只有已声明
+    覆盖族（MLA/MoE）抽取失败才记 `extraction_failures` 并触发 strict（见模块 docstring）。
     """
     mf_root = mf_root or default_mf_root()
     report = CrossCheckReport(available=os.path.isdir(mf_root), mf_root=mf_root)
@@ -346,8 +379,14 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
             report.uncovered.append(
                 (ltype, "无 opdag 提取源（embedding/lm_head/mtp/gqa/dense 未抽取）"))
 
-    if report.findings:
+    # 漂移 **或** 已声明覆盖族的提取失败都是「非绿」——strict 下都要 raise（提取失败静默放行=假绿）。
+    if report.findings or report.extraction_failures:
         if strict:
+            if report.extraction_failures and not report.findings:
+                fams = ", ".join(sorted({f for _lt, f, _e in report.extraction_failures}))
+                head = (f"opdag 一致性校验无法完成：已声明覆盖族 [{fams}] 的 op 图抽取失败——"
+                        f"无从验证，strict 下不得静默放行。\n")
+                raise OpdagConsistencyError(head + report.summary())
             raise OpdagConsistencyError(report.summary())
         if warn:
             warnings.warn(report.summary(), OpdagDriftWarning, stacklevel=2)
