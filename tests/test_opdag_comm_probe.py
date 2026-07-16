@@ -22,6 +22,9 @@ def test_row_parallel_linear_sites():
     assert ("reduce_scatter", "sequence_parallel") in kinds       # :619/:646
     assert ("all_reduce", "!sequence_parallel") in kinds          # :621/:648
     assert all(s.src.startswith("layers.py:") for s in sites)
+    # 真源 :617/:644：comm 二选一嵌在外层 `if self.tp != 1:` 内——该不可识别条件不计入
+    # guard 合取，但必须显式携带在 opaque_guards（ast.unparse 原文恰为 "self.tp != 1"）。
+    assert all(s.opaque_guards == ("self.tp != 1",) for s in sites)
 
 
 def test_vocab_parallel_embedding_sites():
@@ -32,6 +35,9 @@ def test_vocab_parallel_embedding_sites():
     assert "all_reduce" in ctypes                                 # 非 sp 支（docstring 声明）
     rs = [s for s in sites if s.ctype == "reduce_scatter"]
     assert any("sequence_parallel" in s.guard for s in rs)
+    # 真源 :174：内联 ReduceScatter 只被 `if self.sequence_parallel:`（可识别）包围，
+    # 无任何不可识别外层 → opaque_guards 为空。
+    assert all(s.opaque_guards == () for s in rs)
 
 
 def test_column_parallel_linear_has_no_explicit_comm():

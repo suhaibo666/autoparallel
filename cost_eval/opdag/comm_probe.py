@@ -11,13 +11,18 @@ forward 方法，如 `RowParallelLinear.forward_func`/`forward_func_with_bias`�
 
 guard 语义（关键设计点，由 RowParallelLinear 真实嵌套结构倒推确认）：
   只累计**可识别**的包围条件（`self.<flag>` / `not self.<flag>`），按外→内以 "&" 连接；
-  **不可识别的包围条件被透明跳过**（不计入合取），因为它们通常是与通信变体选择正交的结构性
-  前提（如 `RowParallelLinear.forward_func` 里 `if self.tp != 1: if self.sequence_parallel: ...`——
+  不可识别的包围条件不计入 guard 合取——它们通常是与通信变体选择正交的结构性前提
+  （如 `RowParallelLinear.forward_func` 里 `if self.tp != 1: if self.sequence_parallel: ...`——
   外层 `tp != 1` 只是"这些 comm 绑定是否存在"的前提，已被 __init__ 里同一条件蕴含，不参与
   reduce_scatter/all_reduce 的二选一），因此 :619/:646 处 reduce_scatter 的 guard 就是精确的
   "sequence_parallel"，不被外层 "tp != 1" 污染成 "?&sequence_parallel"。
-  若调用点**全程只有不可识别条件包围、一个可识别条件都没有** → guard = "?"（消费方对此 fail-loud，
-  不猜）；调用点完全无 if 包围 → guard = ""（无条件）。
+  若调用点**全程只有不可识别条件包围、一个可识别条件都没有** → guard = "?"；调用点完全无
+  if 包围 → guard = ""（无条件）。
+
+opaque_guards（fail-loud 恢复，spec review 裁决——被跳过的条件不静默丢弃）：
+  每个未计入 guard 的不可识别外层 if 条件，按外→内顺序以 `ast.unparse(test)` 原文记录在
+  `CommSite.opaque_guards`（orelse 支记 `"not (<原文>)"`）。消费方（producer）必须对
+  opaque_guards 中不在已知冗余白名单（如 `self.tp != 1`）内的条目 fail-loud，不猜其真值。
 """
 from __future__ import annotations
 
@@ -36,9 +41,10 @@ COMM_CLS = {
 @dataclass(frozen=True)
 class CommSite:
     ctype: str      # all_reduce | reduce_scatter | all_gather | all_to_all
-    guard: str      # "" 无条件 | "sequence_parallel" | "!sequence_parallel" | 含 "?" 不可识别
+    guard: str      # "" 无条件 | "sequence_parallel" | "!sequence_parallel" | "?" 全程不可识别
     src: str        # "layers.py:619"
     method: str     # 调用点所在方法名
+    opaque_guards: tuple = ()   # 被跳过的不可识别外层 if 条件原文(外→内;orelse 支带 "not (…)")
 
 
 def _comm_ctor(call: ast.Call) -> str | None:
@@ -95,13 +101,13 @@ class _MethodScan(ast.NodeVisitor):
     def __init__(self, binds: dict[str, str], src_file: str, method: str):
         self.binds, self.src_file, self.method = binds, src_file, method
         self.stack: list[str] = []       # 仅可识别层级(外→内)
-        self.unresolved_depth = 0        # 当前处于多少层"不可识别"包围之内
+        self.opaque: list[str] = []      # 不可识别层级的条件原文(外→内,orelse 支带 "not (…)")
         self.sites: list[CommSite] = []
 
     def _guard(self) -> str:
         if self.stack:
             return "&".join(self.stack)
-        if self.unresolved_depth > 0:
+        if self.opaque:
             return "?"
         return ""
 
@@ -112,38 +118,36 @@ class _MethodScan(ast.NodeVisitor):
         if recognized:
             self.stack.append(g)
         else:
-            self.unresolved_depth += 1
+            self.opaque.append(ast.unparse(node.test))
         for s in node.body:
             self.visit(s)
-        if recognized:
-            self.stack.pop()
-        else:
-            self.unresolved_depth -= 1
+        (self.stack if recognized else self.opaque).pop()
 
         if recognized:
-            self.stack.append("!" + g)
+            # 双重否定归一："!flag" 的否定是 "flag",不产 "!!flag"。
+            self.stack.append(g[1:] if g.startswith("!") else "!" + g)
         else:
-            self.unresolved_depth += 1
+            self.opaque.append("not (" + ast.unparse(node.test) + ")")
         for s in node.orelse:
             self.visit(s)
-        if recognized:
-            self.stack.pop()
-        else:
-            self.unresolved_depth -= 1
+        (self.stack if recognized else self.opaque).pop()
+
+    def _emit(self, ctype: str, node: ast.Call):
+        self.sites.append(CommSite(ctype, self._guard(),
+                                   f"{self.src_file}:{node.lineno}", self.method,
+                                   tuple(self.opaque)))
 
     def visit_Call(self, node: ast.Call):
         f = node.func
         # 惯用法A：self.X(...) 且 X 是 __init__ 里的通信绑定
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
                 and f.value.id == "self" and f.attr in self.binds:
-            self.sites.append(CommSite(self.binds[f.attr], self._guard(),
-                                       f"{self.src_file}:{node.lineno}", self.method))
+            self._emit(self.binds[f.attr], node)
         # 惯用法B：ops.<Comm>(group=...)(t) 内联构造调用
         if isinstance(f, ast.Call):
             ct = _comm_ctor(f)
             if ct:
-                self.sites.append(CommSite(ct, self._guard(),
-                                           f"{self.src_file}:{node.lineno}", self.method))
+                self._emit(ct, node)
         self.generic_visit(node)
 
 
