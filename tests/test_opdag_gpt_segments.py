@@ -40,3 +40,32 @@ def test_extract_cross_entropy_loss_inlines_subcells():
     assert len(dag.nodes) >= 5                              # 两子 Cell 已内联（非 2 个 SubCell 占位）
     assert all(n.op != "SubCell" for n in dag.nodes)
     assert all(n.src.split(":")[0] == "loss_func.py" for n in dag.nodes)
+
+
+def test_extract_embedding_walks_morph_func():
+    _require_mf()
+    from cost_eval.opdag.gpt_segments import extract_embedding
+    dag = extract_embedding(MF_ROOT, {"compute_dtype": "bf16"})
+    ops = [n.op for n in dag.nodes]
+    assert "Gather" in ops or "Embedding" in ops          # mint embedding lookup
+    assert all(n.src.split(":")[0] == "layers.py" for n in dag.nodes)
+
+
+def test_lm_head_segment_source_pinned():
+    _require_mf()
+    from cost_eval.opdag.gpt_segments import head_segment_dag
+    dag = head_segment_dag()
+    assert [n.op for n in dag.nodes] == ["MatMul", "View", "View", "Cast"]
+    assert dag.nodes[0].module == "ColumnParallelLinear"
+    assert all(n.src.startswith("gpt_model.py:") for n in dag.nodes)
+    assert dag.nodes[-1].attrs.get("to_dtype") == "fp32"  # logits cast fp32（gpt_model.py:507，2026-07-16 基线；计划稿注 :509 已按实际源行订正）
+
+
+def test_verify_gpt_order():
+    _require_mf()
+    from cost_eval.opdag.gpt_segments import verify_gpt_order
+    order = verify_gpt_order(MF_ROOT)
+    lm = order.index("language_model")
+    head = order.index("output_layer")
+    loss = order.index("compute_language_model_loss")
+    assert lm < head < loss

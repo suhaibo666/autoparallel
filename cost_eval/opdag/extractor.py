@@ -100,11 +100,15 @@ def _init_classes(tree: ast.AST, cls_name: str) -> list[str]:
 
 # ── Morph(self.<method>) 别名侦测 ─────────────────────────────────────────────
 def _unwrap_to_call(node: ast.AST, name: str) -> ast.Call | None:
-    """剥链式 `.add_prim_attr(...)/.shard(...)` 等,取最内层 Call;其 func 为 Name==name 时返回该 Call,否则 None。"""
+    """剥链式 `.add_prim_attr(...)/.shard(...)` 等,取最内层 Call;其 func 为 Name==name,
+    或 Attribute(attr==name)(如 `P.Morph(...)`——mindspore 常见的模块限定调用形式,
+    VocabParallelEmbedding.embedding_morph 即此写法,layers.py:108)时返回该 Call,否则 None。"""
     while isinstance(node, ast.Call):
         f = node.func
         if isinstance(f, ast.Name):
             return node if f.id == name else None
+        if isinstance(f, ast.Attribute) and f.attr == name:
+            return node
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call):
             node = f.value
             continue

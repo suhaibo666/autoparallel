@@ -34,6 +34,13 @@ _CLS2OP = {
     "OneHotExt": ("Elementwise", {"linear": True}),
     "Neg": ("Elementwise", {"linear": True}),
     "Div": ("Elementwise", {"linear": False}),
+
+    # loss/embedding 段原语(T0-5 增补;类名取自 layers.py 实际 import 的
+    # mindspore.ops.auto_generate 算子:VocabParallelEmbedding.embedding_func 的 TP mask 分支
+    # `self.relu`/`self.minimum`/`self.equal`,layers.py:99-101 __init__ 绑定,:153-155 调用)。
+    "ReLU": ("Activation", {"activation_type": "relu"}),
+    "Minimum": ("Elementwise", {"linear": False}),
+    "Equal": ("Elementwise", {"linear": True}),
 }
 
 @dataclass

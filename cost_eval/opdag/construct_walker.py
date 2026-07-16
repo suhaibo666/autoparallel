@@ -49,6 +49,30 @@ DIRECT_OP_MAP = {
     "Reshape": ("View", {"view": "reshape"}),               # Morph 里的 Reshape()(x, shp)
 }
 
+# 具名"自由函数调用"(非 self.<x>、非直接实例化,形如 `mod.sub.func(...)`)按完整点号路径匹配:
+# 点号路径 → (op 类型, attrs)。T0-5 增补(spec §3.3a embedding 段实测触发)——
+# VocabParallelEmbedding.embedding_func(layers.py):
+#   `mint.nn.functional.embedding(masked_input, weight)`(:160)—— mint 查表 lookup,归 Gather;
+#   `ops.mul(output_parallel, input_mask)`(:165)—— TP mask 逐元素乘,归 Elementwise(linear=False)。
+FREE_CALL_MAP = {
+    "mint.nn.functional.embedding": ("Gather", {"embedding": True}),
+    "F.embedding": ("Gather", {"embedding": True}),  # mindspore.ops.functional 别名等价写法
+    "ops.mul": ("Elementwise", {"linear": False}),
+}
+
+
+def _dotted_path(node) -> str | None:
+    """把 `a.b.c.d` 形态的 Attribute 链摊平成点号路径串;链首非 Name(如以 Call/Subscript 起)则 None。"""
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    parts.append(cur.id)
+    return ".".join(reversed(parts))
+
 # 张量方法(链式 `<expr>.method(...)`)里视作纯视图/元数据(反向不新增激活)的方法名。
 _VIEW_METHODS = {"reshape", "view", "transpose", "swapaxes", "flatten", "expand_dims",
                  "tile", "permute", "squeeze", "unsqueeze"}
@@ -347,6 +371,16 @@ class _Walker:
                 attrs = {**attrs, **self._view_capture(call, attrs["view"], target_names)}
             self._emit(op, attrs, call.lineno, arg_exprs, target_names, attrs.get("compute_dtype") or "bf16")
             return
+        # 形态二.五:具名自由函数调用 `mod.sub.func(...)`(非 self.<x>、非直接实例化)——按完整点号路径
+        # 精确匹配 FREE_CALL_MAP(如 `mint.nn.functional.embedding(...)` / `ops.mul(...)`)。
+        # 须放在形态三(链式方法)之前判定的 fail-loud/静默丢弃分支之前,否则会被形态三/兜底静默吞掉。
+        if isinstance(func, ast.Attribute):
+            path = _dotted_path(func)
+            if path in FREE_CALL_MAP:
+                op, attrs = FREE_CALL_MAP[path]
+                self._emit(op, attrs, call.lineno, list(call.args), target_names,
+                           attrs.get("compute_dtype") or "bf16")
+                return
         # 形态三:链式方法 `<innercall>.method(...)`(如 self.swiglu(x).reshape(...)):先发射内层算子,再处理外层方法。
         if isinstance(func, ast.Attribute) and isinstance(func.value, (ast.Call, ast.Subscript)):
             self._handle_chained_call(call, func, target_names)
