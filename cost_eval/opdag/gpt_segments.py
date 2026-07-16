@@ -49,8 +49,19 @@ def extract_embedding(mf_root: str, config_flags: dict) -> OpDAG:
 
     默认注入 enable_embedding_tp=True（标准 TP 训练路径的 mask 分支，layers.py:150-165）、
     sequence_parallel=False（避开 :168-179 sp 分支里 `if bs > 1:` 的运行期不可判定形状分支，
-    layers.py:170/175——AST 剪枝走查下该 if 无法由 config 判定，会 fail-loud；sequence_parallel=False
-    时直接走 :181-186，同为真实存在的标准路径，非回避覆盖）。调用方可在 config_flags 里覆盖这两键。
+    layers.py:170/175——AST 剪枝走查下该 if 无法由 config 判定，会 fail-loud）。
+
+    通信节点**有意不含**在本段 DAG 里（设计裁决，非遗漏）：真源的 inline
+    `ops.AllReduce(group=...)(...)`（layers.py:182，guard !sequence_parallel && enable_embedding_tp）
+    与 `ops.ReduceScatter(group=...)(...)`（:174，guard sequence_parallel）由 comm_probe 捕获、
+    producer 侧注入——若 walker 也发射会造成同一通信的双重计数。当前 walker 对 :182 这类
+    `OpCls(group=...)(x)` 双层调用形态是**静默 fallthrough 跳过**（四种调用形态与 FREE_CALL_MAP
+    均不匹配 Call-func），机制性记录已排入后续 walker 保真任务。
+
+    已知边界（T0 已裁决）：SP 配置下 embedding 段的 sp 支（:169-178，2 个纯 view
+    transpose/reshape + ReduceScatter）**构造性缺失**——覆盖 sequence_parallel=True 会在
+    :170 `if bs > 1:`（运行时标量）fail-loud，并不会产出 SP DAG。视图的 host 成本可忽略，
+    通信由 comm_probe 覆盖（RS site :174，guard sequence_parallel），故该缺失不影响成本口径。
     """
     flags = {"enable_embedding_tp": True, "sequence_parallel": False, **config_flags}
     return extract_cell(
