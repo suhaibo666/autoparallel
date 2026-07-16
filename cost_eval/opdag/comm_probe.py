@@ -1,0 +1,189 @@
+# cost_eval/opdag/comm_probe.py
+"""TP 集合通信惯用法静态探测（spec §3.3c 第一类「源码内显式通信」，风险 R1）。
+
+读真 mindformers Cell 源（AST，绝不 import），对给定类提取**全部方法体**（含 Morph 包裹的
+forward 方法，如 `RowParallelLinear.forward_func`/`forward_func_with_bias`——它们本身就是
+普通 FunctionDef，`self.morphed_forward(...)` 只是间接触发；直接扫方法体即可，无需还原 Morph 别名）
+里的集合通信调用点。两种惯用法：
+  A) __init__ 绑定：`self.X = ops.AllReduce(group=...)`（链式 `.set_prim_instance_name(...)` 等剥壳）
+     → 方法体里 `self.X(t)`；
+  B) 内联：`ops.ReduceScatter(group=...)(t)` 直接构造调用（VocabParallelEmbedding.embedding_func）。
+
+guard 语义（关键设计点，由 RowParallelLinear 真实嵌套结构倒推确认）：
+  只累计**可识别**的包围条件（`self.<flag>` / `not self.<flag>`），按外→内以 "&" 连接；
+  **不可识别的包围条件被透明跳过**（不计入合取），因为它们通常是与通信变体选择正交的结构性
+  前提（如 `RowParallelLinear.forward_func` 里 `if self.tp != 1: if self.sequence_parallel: ...`——
+  外层 `tp != 1` 只是"这些 comm 绑定是否存在"的前提，已被 __init__ 里同一条件蕴含，不参与
+  reduce_scatter/all_reduce 的二选一），因此 :619/:646 处 reduce_scatter 的 guard 就是精确的
+  "sequence_parallel"，不被外层 "tp != 1" 污染成 "?&sequence_parallel"。
+  若调用点**全程只有不可识别条件包围、一个可识别条件都没有** → guard = "?"（消费方对此 fail-loud，
+  不猜）；调用点完全无 if 包围 → guard = ""（无条件）。
+"""
+from __future__ import annotations
+
+import ast
+import os
+from dataclasses import dataclass
+
+from .extractor import _find_class
+
+COMM_CLS = {
+    "AllReduce": "all_reduce", "ReduceScatter": "reduce_scatter",
+    "AllGather": "all_gather", "AlltoAll": "all_to_all", "AlltoAllV": "all_to_all",
+}
+
+
+@dataclass(frozen=True)
+class CommSite:
+    ctype: str      # all_reduce | reduce_scatter | all_gather | all_to_all
+    guard: str      # "" 无条件 | "sequence_parallel" | "!sequence_parallel" | 含 "?" 不可识别
+    src: str        # "layers.py:619"
+    method: str     # 调用点所在方法名
+
+
+def _comm_ctor(call: ast.Call) -> str | None:
+    """Call 是否为 ops.<Comm>()/P.<Comm>()/<Comm>() 构造；是则返回 ctype。"""
+    f = call.func
+    if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+        return COMM_CLS.get(f.attr)
+    if isinstance(f, ast.Name):
+        return COMM_CLS.get(f.id)
+    return None
+
+
+def _unwrap_chain(node: ast.AST) -> ast.Call | None:
+    """剥 `.set_prim_instance_name(...)/.shard(...)` 链，取最内层 Call。"""
+    while isinstance(node, ast.Call):
+        f = node.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call):
+            node = f.value
+            continue
+        return node
+    return None
+
+
+def _mro_classes(tree: ast.AST, cls_name: str) -> list[ast.ClassDef]:
+    """derived→base 顺序的同文件 MRO 类节点（找不到基类源即止，够 layers.py 用）。"""
+    out, seen, queue = [], set(), [cls_name]
+    while queue:
+        cname = queue.pop(0)
+        if cname in seen:
+            continue
+        seen.add(cname)
+        cls = _find_class(tree, cname)
+        if cls is None:
+            continue
+        out.append(cls)
+        for base in cls.bases:
+            if isinstance(base, ast.Name):
+                queue.append(base.id)
+    return out
+
+
+def _guard_of(test: ast.AST) -> str:
+    """if 条件 → 可识别 guard：self.<flag> → flag；not self.<flag> → !flag；其余 "?"（不可识别）。"""
+    if isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name) \
+            and test.value.id == "self":
+        return test.attr
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _guard_of(test.operand)
+        return "!" + inner if inner != "?" else "?"
+    return "?"
+
+
+class _MethodScan(ast.NodeVisitor):
+    def __init__(self, binds: dict[str, str], src_file: str, method: str):
+        self.binds, self.src_file, self.method = binds, src_file, method
+        self.stack: list[str] = []       # 仅可识别层级(外→内)
+        self.unresolved_depth = 0        # 当前处于多少层"不可识别"包围之内
+        self.sites: list[CommSite] = []
+
+    def _guard(self) -> str:
+        if self.stack:
+            return "&".join(self.stack)
+        if self.unresolved_depth > 0:
+            return "?"
+        return ""
+
+    def visit_If(self, node: ast.If):
+        g = _guard_of(node.test)
+        recognized = (g != "?")
+
+        if recognized:
+            self.stack.append(g)
+        else:
+            self.unresolved_depth += 1
+        for s in node.body:
+            self.visit(s)
+        if recognized:
+            self.stack.pop()
+        else:
+            self.unresolved_depth -= 1
+
+        if recognized:
+            self.stack.append("!" + g)
+        else:
+            self.unresolved_depth += 1
+        for s in node.orelse:
+            self.visit(s)
+        if recognized:
+            self.stack.pop()
+        else:
+            self.unresolved_depth -= 1
+
+    def visit_Call(self, node: ast.Call):
+        f = node.func
+        # 惯用法A：self.X(...) 且 X 是 __init__ 里的通信绑定
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                and f.value.id == "self" and f.attr in self.binds:
+            self.sites.append(CommSite(self.binds[f.attr], self._guard(),
+                                       f"{self.src_file}:{node.lineno}", self.method))
+        # 惯用法B：ops.<Comm>(group=...)(t) 内联构造调用
+        if isinstance(f, ast.Call):
+            ct = _comm_ctor(f)
+            if ct:
+                self.sites.append(CommSite(ct, self._guard(),
+                                           f"{self.src_file}:{node.lineno}", self.method))
+        self.generic_visit(node)
+
+
+def probe_cell_comm(mf_root: str, rel: str, cls_name: str) -> list[CommSite]:
+    path = os.path.join(mf_root, *rel.split("/"))
+    with open(path, "r", encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    src_file = os.path.basename(path)
+    classes = _mro_classes(tree, cls_name)
+    if not classes:
+        raise ValueError(f"comm_probe: {src_file} 找不到 class {cls_name}（fail-loud）")
+    # 1) 收集 __init__ 里的通信绑定（惯用法A）
+    binds: dict[str, str] = {}
+    for cls in reversed(classes):                       # base 先，derived 覆盖
+        init = next((n for n in cls.body
+                     if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
+        if init is None:
+            continue
+        for stmt in ast.walk(init):
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+                continue
+            tgt = stmt.targets[0]
+            if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                    and tgt.value.id == "self" and isinstance(stmt.value, ast.Call)):
+                continue
+            inner = _unwrap_chain(stmt.value)
+            ct = _comm_ctor(inner) if inner is not None else None
+            if ct:
+                binds[tgt.attr] = ct
+    # 2) 扫全部方法体的调用点（含 Morph 目标方法——它们就是普通方法）
+    sites: list[CommSite] = []
+    seen_methods: set[str] = set()
+    for cls in classes:                                 # derived 先，同名方法不重扫
+        for fn in cls.body:
+            if not isinstance(fn, ast.FunctionDef) or fn.name in seen_methods \
+                    or fn.name == "__init__":
+                continue
+            seen_methods.add(fn.name)
+            scan = _MethodScan(binds, src_file, fn.name)
+            for s in fn.body:
+                scan.visit(s)
+            sites.extend(scan.sites)
+    return sites
