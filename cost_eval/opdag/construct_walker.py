@@ -223,7 +223,13 @@ class _Walker:
         self._tree = tree
         self._cls_name = cls_name
         self._inline_stack: list[str] = [] # 当前内联链(检测递归)
-        self._frame_seq = 0                # 帧号(局部变量改写唯一化)
+        # 帧号:五族合成名共用的 uniquifier(前缀注册表——新增前缀勿与既有撞形):
+        #   __ret__i<n>        _materialize_return_call  内联方法 `return <Call>` 的返回值物化
+        #   __chain__i<n>      _handle_chained_call      链式调用 `<call>.method(...)` 的内层中值
+        #   __arg__i<n>        _materialize_call_arg     嵌套 Call 实参物化(T0-6.5 Fix1)
+        #   <local>__i<frame>  _inline_method            内联方法局部变量按帧改写(防跨帧同名互扰)
+        #   <param>__i<frame>  _bind_params              非 Name 实参/未传形参的帧内占位名
+        self._frame_seq = 0
         # ---- 剪枝上下文(§Task5):任一非 None 即"开启剪枝",此后不可判定的 if → fail-loud ----
         self.config_flags: dict = dict(config_flags or {})   # self.<flag> / self.config.<flag>==字面量
         self.param_defaults: dict = dict(param_defaults or {})  # construct 形参的缺省值
@@ -381,7 +387,8 @@ class _Walker:
         # 精确匹配 FREE_CALL_MAP(如 `mint.nn.functional.embedding(...)` / `ops.mul(...)`)。
         # 与形态三互斥(形态三要求 func.value 是 Call/Subscript,而点号路径链首必为 Name——
         # _dotted_path 对 Call/Subscript 链头返回 None):若此处不命中,这类调用不会被形态三吞,
-        # 而是落到本方法末尾的终端兜底被**静默丢弃**——故本分支是它们成为算子的唯一入口。
+        # 而是落到本方法末尾的终端兜底记入 opaque_calls(T0-6.5 Fix2,不产节点)——故本分支
+        # 仍是它们成为算子的唯一入口。
         if isinstance(func, ast.Attribute):
             path = _dotted_path(func)
             if path in FREE_CALL_MAP:

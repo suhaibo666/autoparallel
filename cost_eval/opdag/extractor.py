@@ -461,10 +461,11 @@ def _extract_meta(
     #     （loss: `self._log_softmax = _LogSoftmax(config)`，loss_func.py:279）。
     #     subcell_specs 未提供（内存侧全部既有调用）时零行为变化。
     if recurse and subcell_specs:
-        # T0-6.5 Fix3:init_classes 已是 derived→base(:440);此处按该序 first-wins,与步骤 1
-        # (derived 覆盖 base,:449-456)的 MRO 方向保持一致(此前 reversed 成 base→derived 会让
-        # base 先占住 combined,与步骤 1 语义相反——当前真源无同名跨层触发,纯 latent 一致性修正)。
-        for cname in init_classes:
+        # T0-6.5 Fix3:_init_classes 返回序已是 derived→base;此处按该序 first-wins
+        # (`tgt.attr not in combined`),与步骤 1 的 `reversed(...)+update 覆盖`(等效 derived wins)
+        # MRO 方向保持一致(此前此处也 reversed 成 base→derived,first-wins 下变 base wins,与
+        # 步骤 1 语义相反——当前真源无同名跨层触发,纯 latent 一致性修正)。
+        for cname in init_classes:                     # derived→base
             cls_node = _find_class(tree, cname)
             init_fn = _method_of(cls_node, "__init__")
             if init_fn is None:

@@ -59,6 +59,7 @@ def test_loss_dag_nested_call_args_materialized():
 
     # (d) 单连通分量:以 dag.edges 建无向邻接,所有节点(含 id=1)必须彼此可达。
     node_ids = {n.id for n in dag.nodes}
+    assert {i for e in dag.edges for i in e} <= node_ids, "边端点不在节点集"
     adj: dict[int, set] = {i: set() for i in node_ids}
     for s, d in dag.edges:
         adj[s].add(d)
