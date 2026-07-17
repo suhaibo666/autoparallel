@@ -21,6 +21,11 @@ python serve_explorer.py     # → http://127.0.0.1:8765
 - ✅ P0（内存建模）实施计划定稿（TDD，13 任务 + 后续增量）
 - ⬜ P0 实现（`cost_eval/` 代码，待执行计划）
 - ⬜ P1（时间模型：roofline + bubble + overlap）
+- 🔶 P1（时间模型）T0 地基完成：schedule.py 中立化、timesim 骨架+解耦 lint（双向禁令+白名单）、
+  opdag 通信提取（comm_probe）+ GPTModel 级段（loss/embedding/head）+ walker 保真（嵌套实参物化/
+  opaque_calls）、TimedOpSeq producer（fwd 装配+TP/FSDP/EP/CP 通信注入+SP/feature 分片状态机+
+  bwd/recompute 展开+依赖边反转）+ IR 不变量。设计 specs/2026-07-16-step-time-cost-model-design.md，
+  计划 plans/2026-07-16-t0-timesim-foundation.md，下一步 T1（op_cost + segment_sim + pipeline_sim）。
 
 ## 目录
 

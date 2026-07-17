@@ -61,36 +61,13 @@ def test_localize_fail_loud_on_indivisible_cp():
 
 
 # ── producer（spec §3.3 b/c：并行代入装配 + TP 通信注入 + SP 状态机）─────────────
-import os
-
-MF_ROOT = os.environ.get("MINDFORMERS_ROOT",
-                         r"E:\97-codes\torch_parallel\mindformers\mindformers")
+# `_mlp_dag` 夹具已提升为 tests/conftest.py::mlp_dag（真源 MLP 段构建三处复制收敛——Task 11 review）。
 
 
-def _mlp_dag():
-    if not os.path.isdir(MF_ROOT):
-        pytest.skip(f"mindformers 源根不存在: {MF_ROOT}")
-    from cost_eval.opdag.extractor import extract_cell
-    from cost_eval.opdag.module_resolver import ResolvedSpec
-    from cost_eval.opdag.shape_infer import infer_shapes
-    dag = extract_cell(
-        MF_ROOT, "parallel_core/training_graph/transformer/mlp.py", "MLPInterleaved",
-        ResolvedSpec(cell="MLPInterleaved",
-                     submodules={"linear_fc1": "ColumnParallelLinear",
-                                 "linear_fc2": "RowParallelLinear"}),
-        {"gated_linear_unit": True, "activation_type": "silu",
-         "add_bias_linear": False, "compute_dtype": "bf16"})
-    # extract_cell 本身只产符号骨架（ins/out 段是 `?`占位，实证见现场 dump）；shape 落实是
-    # opdag 自己的 PART B（shape_infer.infer_shapes），producer 消费的是**已落实符号 shape**的
-    # DAG——与 tests/test_opdag_shape_infer.py::mlp_dag 同一约定（"hidden_states" 是该 Cell
-    # construct 的形参名，Inputs 文档注明 shape=(S,B,H)）。
-    return infer_shapes(dag, {"hidden_states": "S·B·H"})
-
-
-def test_build_segment_tp2_sp_injects_comm():
+def test_build_segment_tp2_sp_injects_comm(mlp_dag):
     from cost_eval.timesim.producer import build_segment
     deg = Degrees(tp=2, cp=1, sequence_parallel=True)
-    seg = build_segment("layer_0.mlp.fwd", _mlp_dag(), DIMS, deg)
+    seg = build_segment("layer_0.mlp.fwd", mlp_dag, DIMS, deg)
     comms = [o for o in seg.ops if o.op_type == "CommOp"]
     # Column 前 sp all-gather（模块语义注入）+ Row 后 reduce_scatter（comm_probe 源惯用法）
     assert [c.comm.ctype for c in comms] == ["all_gather", "reduce_scatter"]
@@ -108,9 +85,9 @@ def test_build_segment_tp2_sp_injects_comm():
     assert act.out_shape == (4096, 1, 1536)
 
 
-def test_build_segment_tp1_has_no_comm():
+def test_build_segment_tp1_has_no_comm(mlp_dag):
     from cost_eval.timesim.producer import build_segment
-    seg = build_segment("layer_0.mlp.fwd", _mlp_dag(), DIMS, Degrees())
+    seg = build_segment("layer_0.mlp.fwd", mlp_dag, DIMS, Degrees())
     assert all(o.op_type != "CommOp" for o in seg.ops)
 
 
