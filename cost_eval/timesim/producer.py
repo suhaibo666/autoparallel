@@ -35,18 +35,20 @@ feature 轴落在倒数第二位）——因此不能复用 `shard_rules.localiz
 见 spec。
 
 deps 只记跨流依赖（同流 FIFO 隐含，ir.py 字段注释）：本模块按处理顺序维护每个已发节点的
-stream，某节点的入边生产者与它同流则不进 deps。
+stream，某节点的入边生产者与它同流则不进 deps（注入 comm op 例外，见 ir.py deps 注释）。
 
 未知非空 module 的 MatMul 在 tp>1 时 fail-loud（防 typo 静默不切分——Task 8 review 裁决:
 fail-loud 边界在 producer 调用侧）；module=="" 视为复制式 matmul（router gate 等，无 TP 语义），
-不做 weight_local/comm 注入，走通用节点路径。
+不做 weight_local/comm 注入，走通用节点路径。该守卫不只是防 typo："SequenceParallelLinear"
+是已知未实现模块（MLA q/kv down-proj，见 module_resolver.py:40 的映射登记），命中它同样应
+fail-loud 而非静默放过。
 
 View → host_only；符号 shape 若为 `?`（未落实）：ins 侧一律容忍为空 tuple；out 侧仅 device 流
 op fail-loud（View 等 host_only op 容忍，与既有 shape_infer"解不出就保 ?"哲学一致）。
 """
 from __future__ import annotations
 
-from .ir import (TimedOp, TimedSegment, CommSpec,
+from .ir import (TimedOp, TimedSegment, CommSpec, tensor_bytes,
                  STREAM_DEVICE, STREAM_HOST_ONLY, COMM_STREAM)
 from .shard_rules import Degrees, axis_values, localize, weight_local
 from ..opdag.sym_shape import parse_shape, parse_axis
@@ -62,13 +64,6 @@ def _parse_ref(ref: str):
     if len(parts) != 3:
         raise ValueError(f"producer: 非法 TensorRef {ref!r}（fail-loud）")
     return parts[0], parts[1], parts[2]
-
-
-def _bytes_of(shape, dtype: str) -> int:
-    n = 1
-    for d in shape:
-        n *= d
-    return n * (4 if dtype == "fp32" else 2)
 
 
 def _wrap_dim(tok: str) -> str:
@@ -123,7 +118,20 @@ def _out_shape_or_fail(sym: str, stream: str, src: str, dims, deg: Degrees,
     return _local_shape(sym, dims, deg, sp_active, feat_tp, feat_syms, src)
 
 
-def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -> TimedSegment:
+_OPAQUE_COMM_MARKERS = ("AllReduce", "ReduceScatter", "AllGather", "AlltoAll")
+
+
+def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
+                   opaque_comm_ok: bool = False) -> TimedSegment:
+    if not opaque_comm_ok:
+        for call in dag.opaque_calls:
+            expr = call.get("expr", "")
+            if any(marker in expr for marker in _OPAQUE_COMM_MARKERS):
+                raise ValueError(
+                    f"producer: dag.opaque_calls 命中疑似通信调用 @{call.get('src')}: "
+                    f"{expr!r}——embedding 类段的通信由 comm_probe+装配层注入，walker "
+                    f"fallthrough 记录的这条不应被静默吞掉（schema.py opaque_calls docstring "
+                    f"消费契约）。调用方现场核实其语义后传 opaque_comm_ok=True 放行。")
     cell = dag.cell
     id2opid = {n.id: f"{cell}#{n.id}" for n in dag.nodes}
     in_edges: dict[int, list[int]] = {}
@@ -141,10 +149,17 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -
     feat_syms: frozenset = frozenset()   # feat_sharded 区间当前生效的 feature token 集（F1 自推导）
 
     def _producer_ref(p: int) -> tuple[str, str]:
-        """原 DAG 节点 id → 该生产者当前有效的 (op_id, stream)——查 redirect 优先于原始记录。"""
+        """原 DAG 节点 id → 该生产者当前有效的 (op_id, stream)——查 redirect 优先于原始记录。
+        stream_of 查不到（p 尚未发射）→ fail-loud：walker 序=程序序，前向依赖理论不可达，
+        真出现说明上游不变量被打破，不应静默回退成 None 再让下游同流过滤逻辑误判。"""
         if p in redirect:
             return redirect[p]
-        return id2opid[p], stream_of.get(p)
+        stream = stream_of.get(p)
+        if stream is None:
+            raise ValueError(
+                f"producer: 节点 id={p} 的生产者尚未发射（前向依赖，walker 序理论不可达）"
+                f"（fail-loud）")
+        return id2opid[p], stream
 
     for n in dag.nodes:
         module = n.module or ""
@@ -158,7 +173,7 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -
         this_stream = STREAM_HOST_ONLY if n.op == "View" else STREAM_DEVICE
         producers = in_edges.get(n.id, ())
         base_deps = tuple(
-            _producer_ref(p)[0] for p in producers if _producer_ref(p)[1] != this_stream
+            ref[0] for ref in (_producer_ref(p) for p in producers) if ref[1] != this_stream
         )
 
         if n.op == "MatMul" and module in (_COL, _ROW):
@@ -191,7 +206,7 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -
                     in_shapes=(gather_in,), out_shape=gather_out, dtype=x_dt,
                     stream=COMM_STREAM["tp"], src=n.src, deps=ag_deps,
                     module="injected:module-semantics",
-                    comm=CommSpec("all_gather", _bytes_of(gather_in, x_dt), "tp", deg.tp))
+                    comm=CommSpec("all_gather", tensor_bytes(gather_in, x_dt), "tp", deg.tp))
                 ops.append(gather_op)
                 deps = (gather_op.op_id,)
                 sp_active = False
@@ -245,7 +260,7 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -
                     stream=COMM_STREAM["tp"],
                     src="layers.py:619" if ctype == "reduce_scatter" else "layers.py:621",
                     deps=(mm_op.op_id,), module=module,
-                    comm=CommSpec(ctype, _bytes_of(full, out_dt), "tp", deg.tp))
+                    comm=CommSpec(ctype, tensor_bytes(full, out_dt), "tp", deg.tp))
                 ops.append(rs_op)
                 # F3 Bug B：本节点 (Row 矩乘) 的"当前有效"产出改指向 .rs（comm_tp 流）——下游
                 # 同 DAG 消费者解析依赖时经 _producer_ref 查到这个重定向，而非误判成与矩乘同

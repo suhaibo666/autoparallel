@@ -32,6 +32,7 @@ class TimedOp:
     op_type: str                     # opdag 词表 + CommOp/…Grad
     phase: str                       # fwd | bwd | recomp
     in_shapes: tuple[tuple[int, ...], ...]   # 已代入 local；GEMM 族约定 in_shapes[0]=激活侧（op_flops 依赖此序）
+                                      # ；[1](权重)不保证存在——module=="" 的透传 matmul 可能仅 1 入,消费方须 len 守卫
     out_shape: tuple[int, ...]
     dtype: str
     stream: str
@@ -48,6 +49,14 @@ class TimedOp:
 class TimedSegment:
     seg_id: str                      # "layer_3.fwd" / "embedding.fwd" / "loss.bwd" …
     ops: tuple[TimedOp, ...]
+
+
+def tensor_bytes(shape, dtype: str) -> int:
+    """numel(shape) · dtype 字节数：bf16/fp16=2、fp32=4；int 类未建，embedding gather 路径 T1 再补。"""
+    n = 1
+    for d in shape:
+        n *= d
+    return n * (4 if dtype == "fp32" else 2)
 
 
 def op_flops(top: TimedOp) -> int:

@@ -200,3 +200,19 @@ def test_build_segment_feature_axis_ambiguity_fail_loud():
     ], edges=[[1, 2]])
     with pytest.raises(ValueError):
         build_segment("attn.fwd", dag, dims, Degrees(tp=2, sequence_parallel=True))
+
+
+def test_build_segment_opaque_comm_call_fail_loud_without_flag():
+    """Task 9 quality review 搭车项 1：dag.opaque_calls 里若混进 AllReduce/ReduceScatter/AllGather/
+    AlltoAll 字样的调用点（embedding 段等 opaque 段的通信本该由 comm_probe+装配层注入，不是
+    walker fallthrough 静默漏记）——不传 opaque_comm_ok 时须 fail-loud；调用方确认后传
+    opaque_comm_ok=True 放行（schema.py opaque_calls docstring 消费契约）。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.opdag.schema import OpDAG
+    dag = OpDAG(cell="X", nodes=[], edges=[],
+                opaque_calls=[{"src": "layers.py:182",
+                               "expr": "ops.AllReduce(group=self.group)(x)"}])
+    with pytest.raises(ValueError):
+        build_segment("x.fwd", dag, DIMS, Degrees())
+    seg = build_segment("x.fwd", dag, DIMS, Degrees(), opaque_comm_ok=True)
+    assert seg.ops == ()
