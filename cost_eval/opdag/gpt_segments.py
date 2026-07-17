@@ -77,7 +77,8 @@ def head_segment_dag() -> OpDAG:
     # ——Task 9 段拼接方须按各自 id 基准重编号,勿假定两者同基。
     nodes = [
         OpNode(id=0, op="MatMul", src="gpt_model.py:503", module="ColumnParallelLinear",
-               ins=["h:S·B·H:bf16", "W_head:H·vocab:bf16"], out="logits:S·B·vocab:bf16"),
+               ins=["h:S·B·H:bf16", "W_head:H·vocab:bf16"], out="logits:S·B·vocab:bf16",
+               attrs={"in_dim": "H", "out_dim": "vocab"}),
         OpNode(id=1, op="View", src="gpt_model.py:505",
                ins=["logits:S·B·vocab:bf16"], out="logits_t:B·S·vocab:bf16",
                attrs={"view": "transpose"}),

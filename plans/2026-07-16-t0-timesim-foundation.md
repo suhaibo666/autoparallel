@@ -48,7 +48,7 @@ tests/test_timesim_invariants.py     # 新（6ND + bwd 守恒）
 
 **Files:** 无改动。
 
-- [ ] **Step 1: 跑全量测试，记录基线**
+- [x] **Step 1: 跑全量测试，记录基线**
 
 Run: `python -m pytest tests/ -q`
 Expected: 全绿。记下通过数 N_baseline（后续每任务对照，不允许减少）。
@@ -60,7 +60,7 @@ Expected: 全绿。记下通过数 N_baseline（后续每任务对照，不允�
 - Modify: `cost_eval/mem_timeline.py:8-179`
 - Test: `tests/test_schedule_move.py`
 
-- [ ] **Step 1: 写搬家回归测试（先写，此刻 import 失败即"红"）**
+- [x] **Step 1: 写搬家回归测试（先写，此刻 import 失败即"红"）**
 
 ```python
 # tests/test_schedule_move.py
@@ -109,12 +109,12 @@ def test_schedule_behavior_spotcheck():
     assert len(order) == 2 * 4 * 2 and order[0][0] == "FWD"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_schedule_move.py -q`
 Expected: FAIL（`ModuleNotFoundError: cost_eval.schedule`）。
 
-- [ ] **Step 3: 创建 `cost_eval/schedule.py`（逐行搬移，不改一字）**
+- [x] **Step 3: 创建 `cost_eval/schedule.py`（逐行搬移，不改一字）**
 
 文件头：
 
@@ -133,7 +133,7 @@ from dataclasses import dataclass
 `get_schedule_table`、`interleaved_virtual_order`、`chunk_layer_ids` 共 8 个定义，含全部注释块）。
 搬移后确认这些函数体内**不引用** `structure_mem`/桶类（它们是纯函数，仅用 stdlib）。
 
-- [ ] **Step 4: 改 `mem_timeline.py` 为 re-export**
+- [x] **Step 4: 改 `mem_timeline.py` 为 re-export**
 
 删除第 8–179 行（分节注释 + 8 个定义），原位替换为：
 
@@ -149,12 +149,12 @@ from .schedule import (                                    # noqa: F401
 )
 ```
 
-- [ ] **Step 5: 跑新测试 + 全量回归**
+- [x] **Step 5: 跑新测试 + 全量回归**
 
 Run: `python -m pytest tests/test_schedule_move.py -q` → PASS（4 个）。
 Run: `python -m pytest tests/ -q` → 通过数 = N_baseline + 4（锚点全绿；任何内存测试失败 = 搬家动了语义，回退重查）。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cost_eval/schedule.py cost_eval/mem_timeline.py tests/test_schedule_move.py
@@ -167,7 +167,7 @@ git commit -m "refactor(schedule): 1F1B/VPP 调度代数搬家至中立模块 sc
 - Create: `cost_eval/timesim/__init__.py`
 - Test: `tests/test_timesim_decoupling.py`
 
-- [ ] **Step 1: 写 import-lint 测试（含 linter 自检）**
+- [x] **Step 1: 写 import-lint 测试（含 linter 自检）**
 
 ```python
 # tests/test_timesim_decoupling.py
@@ -222,12 +222,12 @@ def test_mem_simulator_never_imports_timesim():
         assert "timesim" not in _imported_names(_read(p)), f"{p} 反向 import timesim"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_timesim_decoupling.py -q`
 Expected: FAIL（`test_timesim_never_imports_mem_simulator` 断言 "timesim 包不存在？"）。
 
-- [ ] **Step 3: 创建包骨架**
+- [x] **Step 3: 创建包骨架**
 
 ```python
 # cost_eval/timesim/__init__.py
@@ -238,11 +238,11 @@ tests/test_timesim_decoupling.py 强制）。允许共享：cost_eval.specs / co
 cost_eval.opdag（上游 IR 资产）。"""
 ```
 
-- [ ] **Step 4: 跑测试 + 全量**
+- [x] **Step 4: 跑测试 + 全量**
 
 Run: `python -m pytest tests/test_timesim_decoupling.py tests/ -q` → 全 PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/__init__.py tests/test_timesim_decoupling.py
@@ -268,7 +268,7 @@ git commit -m "feat(timesim): 包骨架 + import-lint 双向解耦测试(T0-2,�
 - `ColumnParallelLinear`：construct/morphed 方法**无显式通信**（Morph shard layout 是图模式机制）
   → probe 返回空，SP 前置 all-gather 由 producer 按模块语义注入（Task 9，spec §3.3c 允许）。
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 ```python
 # tests/test_opdag_comm_probe.py
@@ -312,9 +312,9 @@ def test_column_parallel_linear_has_no_explicit_comm():
     assert probe_cell_comm(MF_ROOT, TP_REL, "ColumnParallelLinear") == []
 ```
 
-- [ ] **Step 2: 跑测试确认失败**（`ModuleNotFoundError: comm_probe`）
+- [x] **Step 2: 跑测试确认失败**（`ModuleNotFoundError: comm_probe`）
 
-- [ ] **Step 3: 实现 comm_probe.py**
+- [x] **Step 3: 实现 comm_probe.py**
 
 ```python
 # cost_eval/opdag/comm_probe.py
@@ -478,14 +478,14 @@ def probe_cell_comm(mf_root: str, rel: str, cls_name: str) -> list[CommSite]:
     return sites
 ```
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `python -m pytest tests/test_opdag_comm_probe.py -q` → 3 PASS。
 若 `test_vocab_parallel_embedding_sites` 失败：读 layers.py 实际分支，按真源修 guard 断言
 （只许改**测试期望到实际源**，不许改探测器去凑）。若 Column 意外探出通信 → 更新 Task 9 的注入策略
 （改用 probe 结果，删模块语义注入），并把发现记进 commit message。
 
-- [ ] **Step 5: 全量回归 + Commit**
+- [x] **Step 5: 全量回归 + Commit**
 
 ```bash
 python -m pytest tests/ -q
@@ -503,7 +503,7 @@ git commit -m "feat(opdag): comm_probe TP 通信惯用法静态探测(T0-3,R1 �
 **动机**：loss 组合是 `self._log_softmax = _LogSoftmax(config)`（gpt_model.py:373 →
 loss_func.py:279-280）——直接实例化，不走 `build_module`，现有 extractor 绑不上。
 
-- [ ] **Step 1: 写失败测试（loss 段端到端提取）**
+- [x] **Step 1: 写失败测试（loss 段端到端提取）**
 
 ```python
 # tests/test_opdag_gpt_segments.py
@@ -543,12 +543,12 @@ def test_extract_cross_entropy_loss_inlines_subcells():
     assert all(n.src.split(":")[0] == "loss_func.py" for n in dag.nodes)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_opdag_gpt_segments.py -q`
 Expected: FAIL——fail-loud 报 `_log_softmax` 未知绑定（或 SubCell 未解析）。
 
-- [ ] **Step 3: extractor 加惯用法B 绑定**
+- [x] **Step 3: extractor 加惯用法B 绑定**
 
 在 `extractor.py` 的 `_extract_meta` 中 `combined = {**base_binds, **named}` 之后插入：
 
@@ -580,7 +580,7 @@ Expected: FAIL——fail-loud 报 `_log_softmax` 未知绑定（或 SubCell 未�
 （`Binding` 已由 `from .init_binder import bind_init, Binding` 在文件头引入；`_base_call_name`
 就地 import 避免顶部循环。）
 
-- [ ] **Step 4: 跑测试，按 fail-loud 输出增补 `_CLS2OP`**
+- [x] **Step 4: 跑测试，按 fail-loud 输出增补 `_CLS2OP`**
 
 Run: `python -m pytest tests/test_opdag_gpt_segments.py -q`
 预期此时 fail-loud 会报 `_LogSoftmax`/`_NLLLoss` construct 里的未知原语绑定。按下表把**实际报出的**
@@ -606,11 +606,11 @@ docstring，并在 `construct_walker` 的既有未知调用处理处确认其 fa
 阻塞 loss 主链（log_softmax→nll 主路径断边）则本任务 blocked，上报用户裁决；只断旁路（如
 label smoothing 分支被 config 剪枝掉）则按剪枝处理继续。
 
-- [ ] **Step 5: 测试过 + 全量回归（内存侧零变化：`subcell_specs` 新语义只在显式传参时激活）**
+- [x] **Step 5: 测试过 + 全量回归（内存侧零变化：`subcell_specs` 新语义只在显式传参时激活）**
 
 Run: `python -m pytest tests/ -q` → N 增长，无回退。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add cost_eval/opdag/extractor.py cost_eval/opdag/init_binder.py tests/test_opdag_gpt_segments.py
@@ -623,7 +623,7 @@ git commit -m "feat(opdag): 直接实例化子Cell绑定(惯用法B)+loss原语_
 - Create: `cost_eval/opdag/gpt_segments.py`
 - Test: `tests/test_opdag_gpt_segments.py`（追加）
 
-- [ ] **Step 1: 追加失败测试**
+- [x] **Step 1: 追加失败测试**
 
 ```python
 # tests/test_opdag_gpt_segments.py 追加
@@ -657,9 +657,9 @@ def test_verify_gpt_order():
     assert lm < head < loss
 ```
 
-- [ ] **Step 2: 跑测试确认失败**（`ModuleNotFoundError: gpt_segments`）
+- [x] **Step 2: 跑测试确认失败**（`ModuleNotFoundError: gpt_segments`）
 
-- [ ] **Step 3: 实现 gpt_segments.py**
+- [x] **Step 3: 实现 gpt_segments.py**
 
 ```python
 # cost_eval/opdag/gpt_segments.py
@@ -753,7 +753,7 @@ def verify_gpt_order(mf_root: str) -> list[str]:
     return order
 ```
 
-- [ ] **Step 4: 跑测试，按 fail-loud 分诊 embedding**
+- [x] **Step 4: 跑测试，按 fail-loud 分诊 embedding**
 
 Run: `python -m pytest tests/test_opdag_gpt_segments.py -q`
 embedding 走查预期缺口与处置（同 Task 5 纪律：只修报出的）：
@@ -766,7 +766,7 @@ embedding 走查预期缺口与处置（同 Task 5 纪律：只修报出的）�
   方法调用 → `View` 节点（这与 §3.2 词表一致）。
 若缺口超出上述三类且断主链 → blocked，上报。
 
-- [ ] **Step 5: 全量回归 + Commit**
+- [x] **Step 5: 全量回归 + Commit**
 
 ```bash
 python -m pytest tests/ -q
@@ -784,7 +784,7 @@ git commit -m "feat(opdag): embedding/lm_head/loss 段提取 + GPTModel 段序�
 - Create: `cost_eval/timesim/ir.py`
 - Test: `tests/test_timesim_ir.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_ir.py
@@ -836,7 +836,7 @@ def test_segment_holds_ops():
     assert seg.ops[0].op_type == "MatMul"
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/ir.py
@@ -901,7 +901,7 @@ def op_flops(top: TimedOp) -> int:
     return 0
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/ir.py tests/test_timesim_ir.py
@@ -914,7 +914,7 @@ git commit -m "feat(timesim): TimedOp/TimedSegment/CommSpec IR + op_flops(T0-6,s
 - Create: `cost_eval/timesim/shard_rules.py`
 - Test: `tests/test_timesim_producer.py`（先写 shard 部分）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_producer.py
@@ -962,7 +962,7 @@ def test_weight_local_divides_correct_axis():
     assert weight_local("ffn_hidden·H", DIMS, "RowParallelLinear", 2) == (1536, 1792)
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/shard_rules.py
@@ -1043,7 +1043,7 @@ def weight_local(sym: str, dims, module: str, tp: int) -> tuple:
     return tuple(vals)
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/shard_rules.py tests/test_timesim_producer.py
@@ -1056,7 +1056,7 @@ git commit -m "feat(timesim): shard_rules 并行代入(T0-7,轴语义×度数,�
 - Create: `cost_eval/timesim/producer.py`
 - Test: `tests/test_timesim_producer.py`（追加）
 
-- [ ] **Step 1: 追加失败测试（用真提取的 MLP DAG）**
+- [x] **Step 1: 追加失败测试（用真提取的 MLP DAG）**
 
 ```python
 # tests/test_timesim_producer.py 追加
@@ -1104,7 +1104,7 @@ def test_build_segment_tp1_has_no_comm():
     assert all(o.op_type != "CommOp" for o in seg.ops)
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现 producer.py**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现 producer.py**
 
 ```python
 # cost_eval/timesim/producer.py
@@ -1239,7 +1239,7 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -
 **实现注意**：`?` shape（loss 段个别 View）→ 空 tuple 占位；device op 输出遇 `?` → fail-loud
 （代码里已含该分支，报节点 src）。
 
-- [ ] **Step 4: 跑测试（两条都过）+ 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试（两条都过）+ 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/producer.py tests/test_timesim_producer.py
@@ -1252,7 +1252,7 @@ git commit -m "feat(timesim): producer fwd 段装配+TP通信注入+SP状态机(
 - Create: `cost_eval/timesim/frame_comm.py`
 - Test: `tests/test_timesim_producer.py`（追加）
 
-- [ ] **Step 1: 追加失败测试**
+- [x] **Step 1: 追加失败测试**
 
 ```python
 # tests/test_timesim_producer.py 追加
@@ -1282,7 +1282,7 @@ def test_cp_ring_p2p_wraps_flash_attention():
     assert seg.ops[0].stream == "comm_cp"
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/frame_comm.py
@@ -1369,7 +1369,7 @@ def inject_cp(seg: TimedSegment, cp: int, method: str = "colossal") -> TimedSegm
     return TimedSegment(seg.seg_id, tuple(out))
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/frame_comm.py tests/test_timesim_producer.py
@@ -1382,7 +1382,7 @@ git commit -m "feat(timesim): 框架层通信注入 FSDP/EP/CP(T0-9,spec §3.3c 
 - Create: `cost_eval/timesim/bwd_rules.py`
 - Test: `tests/test_timesim_bwd_rules.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_bwd_rules.py
@@ -1439,7 +1439,7 @@ def test_recompute_prefix_full_and_comm_drop():
     assert [o.op_type for o in seg2.ops if o.phase == "recomp"] == ["MatMul", "CommOp", "View"]
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/bwd_rules.py
@@ -1507,7 +1507,7 @@ def expand_bwd(seg: TimedSegment, *, recompute: str | None = None,
     return TimedSegment(seg.seg_id.replace(".fwd", "") + ".bwd", tuple(prefix + bwd))
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/bwd_rules.py tests/test_timesim_bwd_rules.py
@@ -1520,7 +1520,7 @@ git commit -m "feat(timesim): bwd 展开规则库+recompute 前缀(T0-10,spec §
 - Test: `tests/test_timesim_invariants.py`
 - Modify: `README.md`（状态区一行）
 
-- [ ] **Step 1: 写不变量测试**
+- [x] **Step 1: 写不变量测试**
 
 ```python
 # tests/test_timesim_invariants.py
@@ -1597,10 +1597,10 @@ def test_tp_shard_conserves_global_flops():
     assert tp2 * 2 == full
 ```
 
-- [ ] **Step 2: 跑测试**（应直接 PASS——前序任务已就绪；若 FAIL 按 systematic-debugging 处置，
+- [x] **Step 2: 跑测试**（应直接 PASS——前序任务已就绪；若 FAIL 按 systematic-debugging 处置，
   不许调公差凑数：精确式测试的意义就是零公差）
 
-- [ ] **Step 3: README 状态更新**
+- [x] **Step 3: README 状态更新**
 
 `README.md` 状态区追加一行：
 
@@ -1611,7 +1611,7 @@ def test_tp_shard_conserves_global_flops():
   segment_sim + pipeline_sim）。
 ```
 
-- [ ] **Step 4: 全量回归 + Commit**
+- [x] **Step 4: 全量回归 + Commit**
 
 ```bash
 python -m pytest tests/ -q
@@ -1635,3 +1635,12 @@ git commit -m "test(timesim): IR 不变量——GEMM 精确式/bwd 守恒/tp 切
 **明示不在 T0**（spec 对应后续阶段）：op_cost/OpTimeLibrary（T1/T2）、segment_sim/pipeline_sim（T1）、
 经验库采集 runner（T2）、MTP/GQA-dense 段、DP grad-sync per-bucket 注入细化、
 `interleaved_virtual_order` 在时间侧的消费（T1 pipeline_sim）。
+
+## T0 → T1 交接要点（终审 2026-07-17 产出）
+
+1. **producer 输入契约分层严格**：只收 infer_shapes 解析后的 DAG（`?` shape fail-loud）；Col/Row MatMul 须携 in_dim/out_dim attrs；含通信样 opaque_calls 的 DAG 须显式 opaque_comm_ok=True。段现状：MLP 全链通；embedding 需 opaque_comm_ok=True 且**尚非成本忠实**（Gather 出形缺 H 轴、权重 ins 未解析、int 索引 dtype 未建——ir.py tensor_bytes 已明示延后）；loss 在 loss_func.py:161 shape 解析失败（输入种子契约未定）；head 已修（本 commit I1）。
+2. **volume 口径与对偶换算单一事实源 = ir.py CommSpec docstring**：AG 记分片、RS/AR 记全量 → 对偶 AG→RS ×group_size、RS→AG ÷group_size（AR/A2A/p2p 不变）；ring/(n−1)/n/跳数系数全部不在 IR，op_cost 按 ctype×group_axis 施加。
+3. **FSDP overlap 依赖 DES run-ahead 保证**：frame_comm 把各段权重 AG 挂自身段头+deps=()——§5.5 预取语义成立的前提是 comm_dp 可跨段 run-ahead；若 T1 加段边界同步，AG 全暴露（须改挂上一段，docstring 有契约）。另：bwd 现只有 grad-RS 对偶，无 ZeRO-3 式 bwd 权重重 gather op——T1 须决策是否注入。
+4. **Grad shape 约定异构（有意）**：通用 `<op>Grad` = in_shapes=(dy,*fwd_ins)、out_shape=dy；MatMul dX/dW 与 View bwd 的 out_shape=fwd 输入/权重形。op_cost 按 bwd_rules docstring 规则表读 bytes，勿假设单一约定。
+5. **deps=仅跨流**（同流 FIFO 由列表序隐含，bwd 逆序保拓扑）；注入通信 op 间的同流 deps 冗余记录视为已满足。feat_sharded 全局位状态机对背靠背 Column 与多轴 feature 命中 fail-loud——终局设计=per-tensor（值键控）分片状态，attention 族 cell 会最先撞上这些守卫（T1 第一批工作）。
+6. 已知延后修缮：shard_rules 对 opdag.consumer._axis_value 的私名导入（T1 提公共名）；crosscheck uncovered 记录待接入 gpt_segments。

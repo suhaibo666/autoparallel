@@ -35,7 +35,8 @@ grouped-GEMM 段），把手写 `LayerSpec` 的**重算子名册（op census）*
     `combine` 是 token_dispatcher 的 opaque all-to-all + 数据依赖的 TopKRouter（opdag 在 `MoELayer`
     的 router 处 fail-loud，见 `test_opdag_moe_ffn.py` R3 结论）→ **不在 opdag 提取范围**，作为 opaque
     边界 log，不比。
-  - GQA/dense/embedding/lm_head/mtp 层**无 opdag 提取源** → 作为 uncovered 层 log。
+  - GQA/dense/mtp 层**无 opdag 提取源** → 作为 uncovered 层 log。embedding/lm_head 段已由
+    `gpt_segments`（T0-5）提供 opdag 提取源；本模块的 uncovered 记录待消费接入 gpt_segments 后收编。
 
 **第三族 `layer_norms`（层级 pre-norm 名册，Z1 修复 2026-07-16）**：前两族（MLA/MoE）的比较窗口
 把**层级两个强制 pre-norm** 漏在外——`moe_experts` 窗口是 `[首个 moe_gemm … 末个 moe_gemm]`，排除了
@@ -84,8 +85,9 @@ grouped-GEMM 段），把手写 `LayerSpec` 的**重算子名册（op census）*
 census 不变）就**逃不出**本校验。要覆盖这类 save 级/内存契约漂移，需要另建**逐张量的 save-level
 对账**（本模块不做，也不假装做）。一句话：这是**类别 census 一致性检查**，不是**完整内存契约验证器**。
 
-**提取失败 ≠ 合法无对应（strict 语义关键）**：某层「合法地没有 opdag 提取源」（embedding/lm_head/
-mtp/gqa/dense）记为 `uncovered`，是设计内的诚实边界，strict **不**因此失败。但一个**已声明覆盖**的族
+**提取失败 ≠ 合法无对应（strict 语义关键）**：某层「合法地没有 opdag 提取源」（mtp/gqa/dense；
+embedding/lm_head 段已由 gpt_segments 提供，见上「诚实的覆盖边界」——本模块的 uncovered 记录待消费
+接入后收编）记为 `uncovered`，是设计内的诚实边界，strict **不**因此失败。但一个**已声明覆盖**的族
 （MLA/MoE）在抽取时**抛异常**是另一回事——它意味着交叉校验**无从验证**该族，若仍静默返回 `ok=True`
 就是**假绿**。故此类失败单列进 `extraction_failures`，让 `ok=False`，strict 下直接 `raise`。
 

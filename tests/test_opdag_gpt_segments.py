@@ -141,3 +141,21 @@ def test_verify_gpt_order():
     head = order.index("output_layer")
     loss = order.index("compute_language_model_loss")
     assert lm < head < loss
+
+
+def test_head_segment_composes_with_producer():
+    """I1(终审 2026-07-17 producer 契约回归,不需要 mindformers 源——head_segment_dag() 是纯合成 DAG）:
+    producer.build_segment 对 Col/Row MatMul 强制要求 in_dim/out_dim attrs 以重建权重符号 shape
+    （producer.py:184-188:`if not in_dim or not out_dim: raise ValueError(...)`）——head_segment_dag()
+    的 MatMul(module=ColumnParallelLinear) 此前未标注这两个属性,即便 tp=1 也会在此 fail-loud
+    （cross-module 不一致,build_segment(head_segment_dag()) 无法组装）。"""
+    from cost_eval.opdag.gpt_segments import head_segment_dag
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.timesim.shard_rules import Degrees
+    from cost_eval.model_spec import DimTable
+
+    dims = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
+                     S=4096, B=1, vocab=129280, n_layers=4)
+    seg = build_segment("head.fwd", head_segment_dag(), dims, Degrees())
+    mm = next(op for op in seg.ops if op.op_type == "MatMul")
+    assert mm.in_shapes[1] == (1792, 129280)
