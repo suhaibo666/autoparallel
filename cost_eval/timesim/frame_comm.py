@@ -33,14 +33,17 @@ _GEMM_FAMILY = ("MatMul", "GroupedMatMul")
 
 
 def inject_fsdp(seg: TimedSegment, dp_shard: int) -> TimedSegment:
-    """dp_shard<=1 → 恒等；否则在段头插入本段权重的 all_gather（fwd 预取语义）。"""
-    if dp_shard <= 1:
+    """dp_shard<=1 / 空段 / 段内无 GEMM 权重（full==0，无可 gather）→ 恒等；
+    否则在段头插入本段权重的 all_gather（fwd 预取语义）。"""
+    if dp_shard <= 1 or not seg.ops:
         return seg
     full = sum(
         tensor_bytes(op.in_shapes[1], op.dtype)
         for op in seg.ops
         if op.op_type in _GEMM_FAMILY and len(op.in_shapes) >= 2
     )
+    if full == 0:
+        return seg
     # ir.py CommSpec 约定：AG volume=分片入参字节（gather 前本 rank 持有的 1/dp_shard；
     # (n-1)·环系数归 op_cost/T1）。ceil≈FSDP flat-param pad 到整除
     volume = -(-full // dp_shard)

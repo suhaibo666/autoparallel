@@ -1467,6 +1467,7 @@ _DUAL = {"all_reduce": "all_reduce", "reduce_scatter": "all_gather",
 def _bwd_of(o: TimedOp) -> list[TimedOp]:
     b = dict(phase="bwd", deps=(), src=o.src, dtype=o.dtype, module=o.module)
     if o.op_type == "CommOp":
+        # ⚠ volume 须按 ir.py CommSpec 对偶换算规则缩放（AG↔RS ×/÷group_size），勿直接复制
         dual = CommSpec(_DUAL[o.comm.ctype], o.comm.volume_bytes,
                         o.comm.group_axis, o.comm.group_size)
         return [TimedOp(op_id=o.op_id + ".b0", op_type="CommOp",

@@ -17,13 +17,19 @@ COMM_STREAM = {"tp": "comm_tp", "cp": "comm_cp", "ep": "comm_ep",
 
 @dataclass(frozen=True)
 class CommSpec:
+    """通信 op 语义规格（挂 TimedOp.comm）。
+
+    volume_bytes = 本 rank 载荷字节（(n-1)/n 等算法系数归 op_cost，T1）——per-ctype 约定：
+      - all_gather=分片入参字节（gather 前、本 rank 持有的那一份）；
+      - reduce_scatter/all_reduce=全量（未分片）字节；
+      - all_to_all=全量本地参与字节（op_cost 施 (n−1)/n 对分系数，spec §4.1）；
+      - p2p=单跳载荷字节（跳数系数 op_cost 按 group_axis 施：pp=1、cp ring=cp−1）；
+      ring 系数按 ctype 在 op_cost 分别施加（T1，不在这里杜撰）。
+
+    **对偶换算（bwd_rules 用）**：AG→RS volume ×group_size、RS→AG ÷group_size
+    （AG 记分片、RS 记全量所致）；AR/A2A/p2p 对偶 volume 不变。"""
     ctype: str            # all_reduce | reduce_scatter | all_gather | all_to_all | p2p
-    volume_bytes: int     # 本 rank 载荷字节（(n-1)/n 等算法系数归 op_cost，T1）——per-ctype 约定：
-                           # all_gather=分片入参字节（gather 前、本 rank 持有的那一份）；
-                           # reduce_scatter/all_reduce=全量（未分片）字节；
-                           # all_to_all=全量本地参与字节（op_cost 施 (n−1)/n 对分系数，spec §4.1）；
-                           # p2p=单跳载荷字节（跳数系数 op_cost 按 group_axis 施：pp=1、cp ring=cp−1）；
-                           # ring 系数按 ctype 在 op_cost 分别施加（T1，不在这里杜撰）。
+    volume_bytes: int     # per-ctype 约定见类 docstring
     group_axis: str       # tp | cp | ep | dp | pp
     group_size: int
 

@@ -27,6 +27,27 @@ def test_fsdp_noop_when_unsharded():
     assert inject_fsdp(seg, dp_shard=1) is seg
 
 
+def test_fsdp_noop_on_empty_segment():
+    seg = TimedSegment("l.fwd", ())
+    assert inject_fsdp(seg, dp_shard=4) is seg
+
+
+def test_fsdp_noop_when_no_gemm_weights():
+    """无 GEMM 权重（full==0）→ 无可 gather → 恒等（与既有恒等语义一致）。"""
+    norm = TimedOp(op_id="a#7", op_type="Norm", phase="fwd",
+                   in_shapes=((4096, 1, 1792),), out_shape=(4096, 1, 1792),
+                   dtype="bf16", stream="device", src="norm.py:1")
+    seg = TimedSegment("l.fwd", (norm,))
+    assert inject_fsdp(seg, dp_shard=4) is seg
+
+
+def test_fsdp_gather_volume_ceils_on_indivisible_shard():
+    # full=3·5·2=30 字节，dp_shard=4 → ceil(30/4)=8——钉 ceil 分支（FSDP flat-param pad 口径）
+    seg = TimedSegment("l.fwd", (_mm(w=(3, 5)),))
+    seg2 = inject_fsdp(seg, dp_shard=4)
+    assert seg2.ops[0].comm.volume_bytes == 8
+
+
 def test_ep_alltoall_wraps_grouped_region():
     g = TimedOp(op_id="m#5", op_type="GroupedMatMul", phase="fwd",
                 in_shapes=((2, 2048, 1792), (2, 1792, 1024)), out_shape=(2, 2048, 1024),
@@ -39,6 +60,8 @@ def test_ep_alltoall_wraps_grouped_region():
     disp = seg2.ops[1]
     assert disp.stream == "comm_ep" and disp.comm.group_size == 4
     assert disp.comm.volume_bytes == 2 * 2048 * 1792 * 2   # grouped 输入激活字节（balanced 口径）
+    comb = seg2.ops[3]
+    assert comb.comm.volume_bytes == 2 * 2048 * 1024 * 2   # grouped 输出字节（combine 侧）
 
 
 def test_ep_noop_without_grouped():
@@ -66,10 +89,12 @@ def test_cp_ulysses_alltoall_both_sides():
                  out_shape=(2048, 1, 8, 224),
                  dtype="bf16", stream="device", src="attention.py:1")
     seg2 = inject_cp(TimedSegment("l.fwd", (fa,)), cp=2, method="ulysses")
+    assert [o.op_type for o in seg2.ops] == ["CommOp", "FlashAttention", "CommOp"]
     ctypes = [o.comm.ctype for o in seg2.ops if o.op_type == "CommOp"]
     assert ctypes == ["all_to_all", "all_to_all"]
-    pre = next(o for o in seg2.ops if o.op_type == "CommOp")
+    pre, post = seg2.ops[0], seg2.ops[2]
     assert pre.comm.volume_bytes == 3 * (2048 * 1 * 8 * 224 * 2)
+    assert post.comm.volume_bytes == 2048 * 1 * 8 * 224 * 2   # post a2a 载荷 = FA 输出字节
 
 
 def test_cp_unknown_method_fail_loud():
@@ -78,3 +103,18 @@ def test_cp_unknown_method_fail_loud():
     # cp 不活跃（cp<=1）时 typo 也要报——method 校验先于早退
     with pytest.raises(ValueError):
         inject_cp(TimedSegment("l.fwd", (_mm(),)), cp=1, method="ring2")
+
+
+def test_injector_order_independence_on_mixed_segment():
+    """三注入器组合顺序无关（冻结该性质）：各注入器锚定的 op 类型（GEMM 权重/FlashAttention/
+    GroupedMatMul）都不是对方的产物（CommOp），故应用先后不影响产出 op 序列。"""
+    fa = TimedOp(op_id="a#3", op_type="FlashAttention", phase="fwd",
+                 in_shapes=((2048, 1, 8, 224),) * 3, out_shape=(2048, 1, 8, 224),
+                 dtype="bf16", stream="device", src="attention.py:1")
+    g = TimedOp(op_id="m#5", op_type="GroupedMatMul", phase="fwd",
+                in_shapes=((2, 2048, 1792), (2, 1792, 1024)), out_shape=(2, 2048, 1024),
+                dtype="bf16", stream="device", src="moe.py:1")
+    seg = TimedSegment("mix.fwd", (_mm(), fa, g))
+    a = inject_cp(inject_ep(inject_fsdp(seg, dp_shard=4), ep=4), cp=2, method="colossal")
+    b = inject_fsdp(inject_ep(inject_cp(seg, cp=2, method="colossal"), ep=4), dp_shard=4)
+    assert a.ops == b.ops

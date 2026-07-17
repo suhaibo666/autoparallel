@@ -51,6 +51,7 @@ from __future__ import annotations
 from .ir import (TimedOp, TimedSegment, CommSpec, tensor_bytes,
                  STREAM_DEVICE, STREAM_HOST_ONLY, COMM_STREAM)
 from .shard_rules import Degrees, axis_values, localize, weight_local
+from ..opdag.comm_probe import COMM_CLS
 from ..opdag.sym_shape import parse_shape, parse_axis
 
 _COL = "ColumnParallelLinear"
@@ -118,7 +119,9 @@ def _out_shape_or_fail(sym: str, stream: str, src: str, dims, deg: Degrees,
     return _local_shape(sym, dims, deg, sp_active, feat_tp, feat_syms, src)
 
 
-_OPAQUE_COMM_MARKERS = ("AllReduce", "ReduceScatter", "AllGather", "AlltoAll")
+# 从 comm_probe 的通信原语类名表派生（单一事实源）——新原语进 COMM_CLS 时本守卫自动跟进，
+# 不会静默失覆盖。
+_OPAQUE_COMM_MARKERS = tuple(COMM_CLS)
 
 
 def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
