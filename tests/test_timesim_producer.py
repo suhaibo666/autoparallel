@@ -126,6 +126,60 @@ def test_build_segment_unknown_module_fail_loud():
         build_segment("x.fwd", dag, DIMS, Degrees(tp=2))
 
 
+def test_injected_ag_keeps_data_producer_dep():
+    """F3 Bug A 回归：注入 AG 挂 comm_tp 流——它的 deps 必须含矩乘的**全部**入边生产者
+    （device 流的 Norm 从 AG 视角是跨流，不能被"与矩乘同 device 流"的过滤误丢、挂空）。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.opdag.schema import OpDAG, OpNode
+    dag = OpDAG(cell="X", nodes=[
+        OpNode(id=1, op="Norm", src="norm.py:1",
+               ins=["x0:S·B·H:bf16"], out="x:S·B·H:bf16"),
+        OpNode(id=2, op="MatMul", src="col.py:1", module="ColumnParallelLinear",
+               attrs={"in_dim": "H", "out_dim": "H"},
+               ins=["x:S·B·H:bf16"], out="y:S·B·H:bf16"),
+    ], edges=[[1, 2]])
+    seg = build_segment("x.fwd", dag, DIMS, Degrees(tp=2, sequence_parallel=True))
+    ag = next(o for o in seg.ops if o.op_id.endswith(".ag"))
+    assert ag.deps == ("X#1",)
+    mm = next(o for o in seg.ops if o.op_type == "MatMul")
+    assert mm.deps == ("X#2.ag",)
+
+
+def test_row_downstream_dep_redirects_to_rs():
+    """F3 Bug B 回归：Row 注入 .rs 后，下游消费者的依赖须重定向解析到 `<matmul>.rs`
+    （comm_tp 流），而非矩乘本身（device 流会被同流过滤掉、下游永远看不到 .rs）。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.opdag.schema import OpDAG, OpNode
+    dag = OpDAG(cell="X", nodes=[
+        OpNode(id=1, op="MatMul", src="row.py:1", module="RowParallelLinear",
+               attrs={"in_dim": "H", "out_dim": "H"},
+               ins=["x:S·B·H:bf16"], out="y:S·B·H:bf16"),
+        OpNode(id=2, op="Norm", src="norm.py:1",
+               ins=["y:S·B·H:bf16"], out="z:S·B·H:bf16"),
+    ], edges=[[1, 2]])
+    seg = build_segment("x.fwd", dag, DIMS, Degrees(tp=2, sequence_parallel=True))
+    norm = next(o for o in seg.ops if o.op_type == "Norm")
+    assert norm.deps == ("X#1.rs",)
+
+
+def test_column_inside_feature_shard_zone_fail_loud():
+    """Column∘Column 直连守卫（spec re-review）：前一 Column 的 feature 分片区未被 Row 关闭时
+    再遇 Column → fail-loud（否则激活收缩维已 ÷tp 而 weight-in 仍全量，矩乘静默不一致——
+    复审探针实证 contraction 3072 vs weight-in 6144 无报错）。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.opdag.schema import OpDAG, OpNode
+    dag = OpDAG(cell="X", nodes=[
+        OpNode(id=1, op="MatMul", src="col1.py:1", module="ColumnParallelLinear",
+               attrs={"in_dim": "H", "out_dim": "ffn_hidden"},
+               ins=["x:S·B·H:bf16"], out="h:S·B·ffn_hidden:bf16"),
+        OpNode(id=2, op="MatMul", src="col2.py:1", module="ColumnParallelLinear",
+               attrs={"in_dim": "ffn_hidden", "out_dim": "H"},
+               ins=["h:S·B·ffn_hidden:bf16"], out="y:S·B·H:bf16"),
+    ], edges=[[1, 2]])
+    with pytest.raises(ValueError):
+        build_segment("x.fwd", dag, DIMS, Degrees(tp=2))
+
+
 def test_build_segment_feature_axis_ambiguity_fail_loud():
     """F1（reviewer 验证的漏洞）：feature token 集不再硬编码 {"ffn_hidden","moe_ffn"}，而是从
     触发 feat_sharded 的 Column 节点 out_dim 自推导；且强制恰一轴命中。合成一个

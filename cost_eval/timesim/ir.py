@@ -36,7 +36,10 @@ class TimedOp:
     dtype: str
     stream: str
     src: str = ""                    # mindformers file:line（源忠实）
-    deps: tuple[str, ...] = ()       # 跨流依赖的 op_id（同流 FIFO 隐含）
+    deps: tuple[str, ...] = ()       # 跨流依赖的 op_id（同流 FIFO 隐含）。注入通信 op 之间可能
+                                      # 冗余记录同流依赖（如 Row.rs → 下一 Column.ag 同在 comm_tp，
+                                      # producer 的 AG deps 取全部生产者不做同流过滤）——FIFO 已
+                                      # 隐含故冗余无害，消费方视作已满足即可（不丢信息的口径选择）。
     comm: CommSpec | None = None
     module: str = ""                 # ColumnParallelLinear 等（shard/通信语义键）
 

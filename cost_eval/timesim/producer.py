@@ -170,6 +170,14 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd") -
                     f"（PART A 未标注线性维度，fail-loud）")
             weight_sym = f"{_wrap_dim(in_dim)}·{_wrap_dim(out_dim)}"
 
+            if module == _COL and deg.tp > 1 and feat_sharded:
+                # 复审探针实证：Column∘Column 直连（上一个 Column 的 feature 分片区尚未被 Row
+                # 关闭）会静默不一致——激活收缩维已 ÷tp 而本节点 weight-in 仍是全量（如 3072 vs
+                # 6144），矩乘内部矛盾却不报错。
+                raise ValueError(
+                    f"producer: Column@{n.src} 落在前一个 Column 的 feature 分片区内"
+                    f"（背靠背 Column 不在支持族，需 per-tensor 分片跟踪（T1）——fail-loud）")
+
             deps = base_deps
             if module == _COL and deg.tp > 1 and sp_active:
                 gather_in = _local_shape(x_sym, dims, deg, sp_active=True, feat_tp=1)
