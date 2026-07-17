@@ -18,7 +18,10 @@ COMM_STREAM = {"tp": "comm_tp", "cp": "comm_cp", "ep": "comm_ep",
 @dataclass(frozen=True)
 class CommSpec:
     ctype: str            # all_reduce | reduce_scatter | all_gather | all_to_all | p2p
-    volume_bytes: int     # 本 rank 载荷字节（(n-1)/n 等算法系数归 op_cost，T1）
+    volume_bytes: int     # 本 rank 载荷字节（(n-1)/n 等算法系数归 op_cost，T1）——per-ctype 约定：
+                           # all_gather=分片入参字节（gather 前、本 rank 持有的那一份）；
+                           # reduce_scatter/all_reduce=全量（未分片）字节；ring 系数按 ctype 在
+                           # op_cost 分别施加（T1，不在这里杜撰）。
     group_axis: str       # tp | cp | ep | dp | pp
     group_size: int
 

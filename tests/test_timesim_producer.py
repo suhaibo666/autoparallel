@@ -124,3 +124,25 @@ def test_build_segment_unknown_module_fail_loud():
                                         out="y:S·B·H:bf16")], edges=[])
     with pytest.raises(ValueError):
         build_segment("x.fwd", dag, DIMS, Degrees(tp=2))
+
+
+def test_build_segment_feature_axis_ambiguity_fail_loud():
+    """F1（reviewer 验证的漏洞）：feature token 集不再硬编码 {"ffn_hidden","moe_ffn"}，而是从
+    触发 feat_sharded 的 Column 节点 out_dim 自推导；且强制恰一轴命中。合成一个
+    attention-family Column（out_dim="n_heads·v_head_dim"，MLP 之外的 family——旧硬编码集合下
+    这条链会静默不切分：weight ÷tp 但激活轴始终不命中 _FEATURE_SYMS，矩乘内部不一致却不报错），
+    下游 View 把这两个 sym 拆成两条独立轴（歧义，无 per-tensor 分片跟踪）→ 必须 fail-loud。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.opdag.schema import OpDAG, OpNode
+    dims = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
+                     S=4096, B=1, vocab=129280, n_layers=4, v_head_dim=128)
+    dag = OpDAG(cell="Attn", nodes=[
+        OpNode(id=1, op="MatMul", src="attn.py:1", module="ColumnParallelLinear",
+               attrs={"in_dim": "H", "out_dim": "n_heads·v_head_dim"},
+               ins=["x:S·B·H:bf16"], out="q:S·B·(n_heads·v_head_dim):bf16"),
+        OpNode(id=2, op="View", src="attn.py:2",
+               ins=["q:S·B·(n_heads·v_head_dim):bf16"],
+               out="q4:S·B·n_heads·v_head_dim:bf16"),
+    ], edges=[[1, 2]])
+    with pytest.raises(ValueError):
+        build_segment("attn.fwd", dag, dims, Degrees(tp=2, sequence_parallel=True))
