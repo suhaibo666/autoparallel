@@ -1,4 +1,6 @@
 """bwd 展开规则库（spec §3.3d/e）：bprop_rules 的姊妹件，逆拓扑序 + 通信对偶(volume 换算) + recompute 前缀。"""
+import os
+
 import pytest
 
 from cost_eval.timesim.ir import TimedOp, TimedSegment, CommSpec, op_flops
@@ -99,10 +101,19 @@ def test_seg_id_suffix():
     assert expand_bwd(TimedSegment("layer_0.fwd", (_mm(),))).seg_id == "layer_0.bwd"
 
 
+def test_dual_table_ar_a2a_p2p_volume_unchanged():
+    """_DUAL 表全覆盖：AR/A2A/p2p 自对偶且 volume 不变（ir.py 对偶换算规则的另半边）；
+    未知 ctype fail-loud（ValueError 而非裸 KeyError）。"""
+    from cost_eval.timesim.bwd_rules import _dual_comm
+    for ct in ("all_reduce", "all_to_all", "p2p"):
+        d = _dual_comm(CommSpec(ct, 1024, "tp", 4))
+        assert d.ctype == ct and d.volume_bytes == 1024
+    with pytest.raises(ValueError):
+        _dual_comm(CommSpec("broadcast", 1024, "tp", 4))
+
+
 # ── spec review F1/F2：bwd deps=fwd 依赖边反转 + recompute 前缀 deps 段内 remap ────
 # （真 MLP tp2/sp 段验证——spec §5.1:230 跨流依赖只来自 TimedOp.deps，无"等前序列表项"规则）
-import os
-
 MF_ROOT = os.environ.get("MINDFORMERS_ROOT",
                          r"E:\97-codes\torch_parallel\mindformers\mindformers")
 

@@ -41,6 +41,10 @@ class TimedOp:
     phase: str                       # fwd | bwd | recomp
     in_shapes: tuple[tuple[int, ...], ...]   # 已代入 local；GEMM 族约定 in_shapes[0]=激活侧（op_flops 依赖此序）
                                       # ；[1](权重)不保证存在——module=="" 的透传 matmul 可能仅 1 入,消费方须 len 守卫
+                                      # ；通用 <op>Grad 节点（bwd_rules 展开产物）约定 in_shapes=(dy,*fwd_ins)
+                                      # （dy 前置）、out_shape=dy 形状（融合多输入 Grad 无单一 dX 形状，取 dy 为
+                                      # 带宽口径；注意与 dX/View 支的 out_shape=fwd 输入形状**不同**）——
+                                      # T1 op_cost 按此解读 bytes，详见 bwd_rules 模块 docstring 规则表
     out_shape: tuple[int, ...]
     dtype: str
     stream: str

@@ -14,6 +14,10 @@
   FlashAttention    → 单条 FlashAttentionGrad（内核不拆 dQ/dK/dV，T1 经验库整体标定）。
   其余（Norm/Activation/Elementwise/Cast/Gather…) → 单条 "<op_type>Grad"（带宽类，op_flops
                           对其返回 0，成本走 T1 经验库，不在此杜撰系数）。
+                          通用 `<op>Grad` 约定：`in_shapes=(dy, *fwd_ins)`（dy 前置）、
+                          `out_shape`=**dy 形状**（融合多输入 Grad 无单一 dX 形状，取 dy 为
+                          带宽口径）——注意与 dX/View 支的 out_shape=fwd 输入形状**不同**，
+                          T1 op_cost 按此解读 bytes。
 
 bwd deps = **fwd 依赖边反转**（spec §5.1 跨流依赖只来自 TimedOp.deps，无"等前序列表项"规则——
 deps=() 会使 bwd exposed comm 结构性归零）：fwd edge P→C 反转后，C 的输入梯度生产者恒为
@@ -42,6 +46,10 @@ _DUAL = {"all_reduce": "all_reduce", "reduce_scatter": "all_gather",
 
 def _dual_comm(c: CommSpec) -> CommSpec:
     """对偶通信（volume 按 ir.py CommSpec 换算规则缩放，勿直接复制）。"""
+    if c.ctype not in _DUAL:
+        raise ValueError(
+            f"bwd_rules: 未知通信原语 ctype={c.ctype!r}（_DUAL 对偶表未登记，"
+            f"新原语需连同 volume 换算规则一并裁决——fail-loud）")
     ctype = _DUAL[c.ctype]
     vol = c.volume_bytes
     if c.ctype == "reduce_scatter":      # RS(全量) → AG(分片)
@@ -100,4 +108,4 @@ def expand_bwd(seg: TimedSegment, *, recompute: str | None = None,
     bwd: list[TimedOp] = []
     for o in reversed(seg.ops):
         bwd.extend(_bwd_of(o, deps=rev.get(o.op_id, ())))
-    return TimedSegment(seg.seg_id.replace(".fwd", "") + ".bwd", tuple(prefix + bwd))
+    return TimedSegment(seg.seg_id.removesuffix(".fwd") + ".bwd", tuple(prefix + bwd))
