@@ -5,9 +5,11 @@ EP dispatch/combine、CP 三条并行轴的注入，均为 fwd）。
 
 FSDP：per-segment 权重 all-gather 注入段头（fwd 预取语义——按 spec §5.5，第 i+1 段的权重 gather
 挂在第 i 段序列头部，与上段计算的重叠是 pipeline_sim（T1）里"位置"的自然结果，本模块不建模
-重叠本身）；载荷 = 段内 GEMM 族权重（in_shapes[1]）字节和——len(in_shapes)<2 的 GEMM 跳过
-（module=="" 的透传 matmul 可能仅 1 入，arity 现实见 ir.py in_shapes 字段注释）。dp_shard<=1
-（未切片）→ 恒等，不注入。
+重叠本身）；载荷 = 段内 GEMM 族权重（in_shapes[1]）字节和 ÷ dp_shard（ir.py CommSpec AG 约定
+=分片入参字节）——len(in_shapes)<2 的 GEMM 跳过（module=="" 的透传 matmul 可能仅 1 入，arity
+现实见 ir.py in_shapes 字段注释）。dp_shard<=1（未切片）→ 恒等，不注入。T1 契约：FSDP gather
+挂各段自身头部+deps=()——等效于 §5.5 预取语义的前提是 T1 DES 允许 comm_dp 跨段 run-ahead；
+若 T1 加段边界同步，此 AG 将全暴露（届时需改挂上一段）。
 
 EP：GroupedMatMul 区两侧包一对 dispatch/combine all-to-all（balanced 路由口径——继承内存侧同一
 假设，v1 不建 unbalanced 容量溢出）；dispatch 载荷 = 该区首个 GroupedMatMul 的输入激活字节，
@@ -34,11 +36,14 @@ def inject_fsdp(seg: TimedSegment, dp_shard: int) -> TimedSegment:
     """dp_shard<=1 → 恒等；否则在段头插入本段权重的 all_gather（fwd 预取语义）。"""
     if dp_shard <= 1:
         return seg
-    volume = sum(
+    full = sum(
         tensor_bytes(op.in_shapes[1], op.dtype)
         for op in seg.ops
         if op.op_type in _GEMM_FAMILY and len(op.in_shapes) >= 2
     )
+    # ir.py CommSpec 约定：AG volume=分片入参字节（gather 前本 rank 持有的 1/dp_shard；
+    # (n-1)·环系数归 op_cost/T1）。ceil≈FSDP flat-param pad 到整除
+    volume = -(-full // dp_shard)
     gather_op = TimedOp(
         op_id=f"{seg.seg_id}.fsdp_ag", op_type="CommOp", phase=seg.ops[0].phase,
         in_shapes=(), out_shape=(), dtype="bf16",   # 段级聚合载荷，无单一张量 shape/dtype 可挂
@@ -49,7 +54,8 @@ def inject_fsdp(seg: TimedSegment, dp_shard: int) -> TimedSegment:
 
 def inject_ep(seg: TimedSegment, ep: int) -> TimedSegment:
     """ep<=1 或段内无 GroupedMatMul → 恒等；否则在 grouped 区（首..末个 GroupedMatMul）两侧
-    各插一条 dispatch/combine all_to_all。"""
+    各插一条 dispatch/combine all_to_all。同段多个不相邻 grouped 区会被单对 a2a 包裹
+    （v1 简化；现源无此模式）。"""
     grouped_idx = [i for i, op in enumerate(seg.ops) if op.op_type == "GroupedMatMul"]
     if ep <= 1 or not grouped_idx:
         return seg
@@ -74,11 +80,11 @@ def inject_ep(seg: TimedSegment, ep: int) -> TimedSegment:
 def inject_cp(seg: TimedSegment, cp: int, method: str = "colossal") -> TimedSegment:
     """cp<=1 → 恒等。method="colossal" → 每条 FlashAttention 前插一条 kv p2p；
     method="ulysses" → 每条 FlashAttention 前后各插一条 all_to_all；
-    其余 method → ValueError（fail-loud）。"""
-    if cp <= 1:
-        return seg
+    其余 method → ValueError（fail-loud，且先于 cp<=1 早退——cp 不活跃时 typo 也要报）。"""
     if method not in ("colossal", "ulysses"):
         raise ValueError(f"frame_comm: 未知 CP method {method!r}（fail-loud，不猜语义）")
+    if cp <= 1:
+        return seg
 
     ops: list[TimedOp] = []
     for op in seg.ops:
@@ -96,10 +102,13 @@ def inject_cp(seg: TimedSegment, cp: int, method: str = "colossal") -> TimedSegm
             ops.append(p2p)
             ops.append(op)
         else:   # ulysses：FA 前后各一条 all_to_all（seq-parallel↔head-parallel 切换）
-            in_volume = sum(tensor_bytes(s, op.dtype) for s in op.in_shapes)
+            # 载荷只切 q,k,v（in_shapes[:3]，bprop_rules.py:31 口径）——真机 FA 调用含
+            # attn_mask（bf16 S×S 可比肩 q），mask 不参与重排，全量求和会静默膨胀载荷。
+            qkv = op.in_shapes[:3]
+            in_volume = sum(tensor_bytes(s, op.dtype) for s in qkv)
             pre = TimedOp(
                 op_id=f"{op.op_id}.cp_pre", op_type="CommOp", phase=op.phase,
-                in_shapes=op.in_shapes, out_shape=op.in_shapes[0],
+                in_shapes=qkv, out_shape=op.in_shapes[0],
                 dtype=op.dtype, stream=COMM_STREAM["cp"], deps=(),
                 comm=CommSpec("all_to_all", in_volume, "cp", cp))
             post = TimedOp(

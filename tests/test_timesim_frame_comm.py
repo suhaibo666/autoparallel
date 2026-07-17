@@ -17,8 +17,8 @@ def test_fsdp_gather_injected_at_segment_head():
     first = seg2.ops[0]
     assert first.op_type == "CommOp" and first.comm.ctype == "all_gather"
     assert first.stream == "comm_dp" and first.comm.group_axis == "dp"
-    # 载荷 = 段内权重字节（两 matmul 的 in_shapes[1]，bf16）
-    assert first.comm.volume_bytes == (1792 * 6144 + 3072 * 1792) * 2
+    # AG volume=gather 前本 rank 分片（ir.py 约定）；记全量会被 T1 的 (n-1)·系数二次放大 ~n×
+    assert first.comm.volume_bytes == (1792 * 6144 + 3072 * 1792) * 2 // 4
     assert seg2.ops[1:] == seg.ops
 
 
@@ -59,14 +59,22 @@ def test_cp_ring_p2p_precedes_flash_attention():
 
 
 def test_cp_ulysses_alltoall_both_sides():
+    # 真机 FA 调用含 attn_mask（第 4 入参，bf16 S×S 可比肩 q）——ulysses a2a 载荷只切
+    # q,k,v（in_shapes[:3]，bprop_rules.py:31 口径），mask 不重排、全量求和会静默膨胀载荷。
     fa = TimedOp(op_id="a#3", op_type="FlashAttention", phase="fwd",
-                 in_shapes=((2048, 1, 8, 224),) * 3, out_shape=(2048, 1, 8, 224),
+                 in_shapes=((2048, 1, 8, 224),) * 3 + ((2048, 2048),),
+                 out_shape=(2048, 1, 8, 224),
                  dtype="bf16", stream="device", src="attention.py:1")
     seg2 = inject_cp(TimedSegment("l.fwd", (fa,)), cp=2, method="ulysses")
     ctypes = [o.comm.ctype for o in seg2.ops if o.op_type == "CommOp"]
     assert ctypes == ["all_to_all", "all_to_all"]
+    pre = next(o for o in seg2.ops if o.op_type == "CommOp")
+    assert pre.comm.volume_bytes == 3 * (2048 * 1 * 8 * 224 * 2)
 
 
 def test_cp_unknown_method_fail_loud():
     with pytest.raises(ValueError):
         inject_cp(TimedSegment("l.fwd", (_mm(),)), cp=2, method="ring2")
+    # cp 不活跃（cp<=1）时 typo 也要报——method 校验先于早退
+    with pytest.raises(ValueError):
+        inject_cp(TimedSegment("l.fwd", (_mm(),)), cp=1, method="ring2")
