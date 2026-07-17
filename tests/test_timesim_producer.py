@@ -1,7 +1,10 @@
 # tests/test_timesim_producer.py
 """shard_rules + producer（spec §3.3 b/c）。"""
+from types import SimpleNamespace
+
 import pytest
 
+from cost_eval.timesim.producer import build_segment
 from cost_eval.timesim.shard_rules import Degrees, axis_values, localize
 from cost_eval.model_spec import DimTable
 
@@ -157,12 +160,17 @@ def test_column_inside_feature_shard_zone_fail_loud():
         build_segment("x.fwd", dag, DIMS, Degrees(tp=2))
 
 
-def test_build_segment_feature_axis_ambiguity_fail_loud():
+def test_build_segment_feature_axis_resolved_by_carrier():
     """F1（reviewer 验证的漏洞）：feature token 集不再硬编码 {"ffn_hidden","moe_ffn"}，而是从
     触发 feat_sharded 的 Column 节点 out_dim 自推导；且强制恰一轴命中。合成一个
     attention-family Column（out_dim="n_heads·v_head_dim"，MLP 之外的 family——旧硬编码集合下
     这条链会静默不切分：weight ÷tp 但激活轴始终不命中 _FEATURE_SYMS，矩乘内部不一致却不报错），
-    下游 View 把这两个 sym 拆成两条独立轴（歧义，无 per-tensor 分片跟踪）→ 必须 fail-loud。"""
+    下游 View 把这两个 sym 拆成两条独立轴。
+
+    **T1 语义变更（per-tensor carrier 规则）**：T0 把 out_dim 全 token 集 {"n_heads","v_head_dim"}
+    当 feature 轴集合——两 sym 拆两轴即"≥2 轴命中"歧义 fail-loud；T1 的 carrier=out_dim 顶层乘积
+    首个符号因子（"n_heads"），拆轴后只命中 n_heads 一轴——同一 DAG 现在**成功构段**且分片正确
+    落在 carrier 轴上（÷tp）。真歧义守卫由 test_carrier_duplicate_axes_fail_loud 接棒。"""
     from cost_eval.timesim.producer import build_segment
     from cost_eval.opdag.schema import OpDAG, OpNode
     dims = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
@@ -175,8 +183,11 @@ def test_build_segment_feature_axis_ambiguity_fail_loud():
                ins=["q:S·B·(n_heads·v_head_dim):bf16"],
                out="q4:S·B·n_heads·v_head_dim:bf16"),
     ], edges=[[1, 2]])
-    with pytest.raises(ValueError):
-        build_segment("attn.fwd", dag, dims, Degrees(tp=2, sequence_parallel=True))
+    seg = build_segment("attn.fwd", dag, dims, Degrees(tp=2, sequence_parallel=True))
+    mm = next(o for o in seg.ops if o.op_type == "MatMul")
+    assert mm.out_shape == (4096, 1, 8 * 128 // 2)         # flat 轴 ÷tp
+    view = next(o for o in seg.ops if o.op_type == "View")
+    assert view.out_shape == (4096, 1, 4, 128)             # carrier=n_heads 恰一轴 ÷tp
 
 
 def test_build_segment_opaque_comm_call_fail_loud_without_flag():
@@ -193,3 +204,99 @@ def test_build_segment_opaque_comm_call_fail_loud_without_flag():
         build_segment("x.fwd", dag, DIMS, Degrees())
     seg = build_segment("x.fwd", dag, DIMS, Degrees(), opaque_comm_ok=True)
     assert seg.ops == ()
+
+
+# ── per-tensor 分片状态（T1 交接要点5 端态设计）——纯合成 DAG，不依赖 mindformers ──────
+
+
+def _synth_dag(nodes, edges, opaque=()):
+    return SimpleNamespace(cell="synth", nodes=nodes, edges=edges,
+                           opaque_calls=list(opaque))
+
+
+def _node(id, op, src, ins, out, module="", attrs=None):
+    return SimpleNamespace(id=id, op=op, src=src, ins=ins, out=out,
+                           module=module, attrs=attrs or {})
+
+
+# 合成测试用 dims：qk_head_dim token 映射 DimTable.qk_nope_head_dim（consumer._SYM2FIELD），
+# 既有模块级 DIMS 未设该字段（=0 → 未解析 fail-loud），此处单独给值。
+DIMS_ATTN = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
+                     S=4096, B=1, vocab=129280, n_layers=4,
+                     qk_nope_head_dim=224, v_head_dim=224)
+
+
+def test_per_tensor_state_branch_isolation():
+    """per-tensor 核心性质：不过 Column 的旁支不携 feature 分片（T0 全局位在此必错）。
+    合成结构 = MLA pe_concat 惯用法缩影：主支过 Column（heads 分片），旁支直连 View。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "u:S·B·(n_heads·qk_head_dim):bf16", module="ColumnParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "n_heads·qk_head_dim"}),
+        _node(2, "View", "f.py:2", ["u:S·B·(n_heads·qk_head_dim):bf16"],
+              "u4:S·B·n_heads·qk_head_dim:bf16", attrs={"view": "reshape"}),
+        _node(3, "View", "f.py:3", ["x:S·B·H:bf16"],
+              "side:S·B·H:bf16", attrs={"view": "reshape"}),
+    ]
+    seg = build_segment("s.fwd", _synth_dag(nodes, [[1, 2]]), DIMS_ATTN, Degrees(tp=2))
+    by_src = {o.src: o for o in seg.ops if o.op_type != "CommOp"}
+    # 主支：flat 轴÷tp → reshape 后 n_heads 轴÷tp（carrier=n_heads，恰一轴）
+    assert by_src["f.py:1"].out_shape == (4096, 1, 8 * 224 // 2)
+    assert by_src["f.py:2"].out_shape == (4096, 1, 4, 224)
+    # 旁支：从未过 Column → 不分片（T0 全局 feat_sharded 位在此会误除或 fail-loud）
+    assert by_src["f.py:3"].out_shape == (4096, 1, 1792)
+
+
+def test_per_tensor_sp_reconciliation_ag():
+    """S 分歧汇合（源事实4：MLA pe_concat 惯用法）：SP 驻留支与已聚合支在多输入 op 汇合 →
+    驻留支注入 layout-redistribution AG（volume=分片字节，AG 口径）。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "u:S·B·(n_heads·qk_head_dim):bf16", module="ColumnParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "n_heads·qk_head_dim"}),
+        _node(2, "View", "f.py:2", ["x:S·B·H:bf16"],
+              "side:S·B·H:bf16", attrs={"view": "reshape"}),
+        _node(3, "Elementwise", "f.py:3",
+              ["u:S·B·(n_heads·qk_head_dim):bf16", "side:S·B·H:bf16"],
+              "z:S·B·H:bf16"),
+    ]
+    deg = Degrees(tp=2, sequence_parallel=True)
+    seg = build_segment("s.fwd", _synth_dag(nodes, [[1, 3], [2, 3]]), DIMS_ATTN, deg)
+    comms = [o for o in seg.ops if o.op_type == "CommOp"]
+    # Column 前模块语义 AG（.ag）+ side 支在节点3 汇合前的重分布 AG（.ag1）
+    assert [c.module for c in comms] == ["injected:module-semantics",
+                                         "injected:layout-redistribution"]
+    redis = comms[1]
+    assert redis.comm.ctype == "all_gather"
+    assert redis.in_shapes == ((2048, 1, 1792),)          # S/(tp) 驻留分片
+    assert redis.out_shape == (4096, 1, 1792)
+    assert redis.comm.volume_bytes == 2048 * 1792 * 2      # AG=分片入参字节
+    # 汇合节点吃聚合后的 side → 两输入 S 一致（注入 AG 与汇合节点同 src，须滤 CommOp）
+    z = next(o for o in seg.ops if o.src == "f.py:3" and o.op_type != "CommOp")
+    assert z.in_shapes[1] == (4096, 1, 1792)
+    assert redis.op_id in z.deps
+
+
+def test_carrier_duplicate_axes_fail_loud():
+    """同一 carrier 命中 ≥2 轴 = 真歧义 → fail-loud（per-tensor 后守卫收窄到此形态）。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "u:S·B·(n_heads·qk_head_dim):bf16", module="ColumnParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "n_heads·qk_head_dim"}),
+        _node(2, "View", "f.py:2", ["u:S·B·(n_heads·qk_head_dim):bf16"],
+              "bad:S·B·n_heads·(n_heads·qk_head_dim):bf16", attrs={"view": "reshape"}),
+    ]
+    with pytest.raises(ValueError, match="命中 2 轴"):
+        build_segment("s.fwd", _synth_dag(nodes, [[1, 2]]), DIMS_ATTN, Degrees(tp=2))
+
+
+def test_row_without_sharded_input_fail_loud():
+    """tp>1 的 Row 输入无 feature carrier（上游没有 Column）→ fail-loud（Megatron Row 恒
+    消费分片激活；静默不切会双倍计算量）。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "y:S·B·H:bf16", module="RowParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "H"}),
+    ]
+    with pytest.raises(ValueError, match="Row"):
+        build_segment("s.fwd", _synth_dag(nodes, []), DIMS_ATTN, Degrees(tp=2))
