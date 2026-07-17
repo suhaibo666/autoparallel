@@ -97,3 +97,74 @@ def test_recompute_prefix_full_and_comm_drop():
 
 def test_seg_id_suffix():
     assert expand_bwd(TimedSegment("layer_0.fwd", (_mm(),))).seg_id == "layer_0.bwd"
+
+
+# ── spec review F1/F2：bwd deps=fwd 依赖边反转 + recompute 前缀 deps 段内 remap ────
+# （真 MLP tp2/sp 段验证——spec §5.1:230 跨流依赖只来自 TimedOp.deps，无"等前序列表项"规则）
+import os
+
+MF_ROOT = os.environ.get("MINDFORMERS_ROOT",
+                         r"E:\97-codes\torch_parallel\mindformers\mindformers")
+
+
+def _mlp_seg():
+    """producer 真 MLP tp2/sp fwd 段（与 test_timesim_producer._mlp_dag 同一装配约定）。"""
+    if not os.path.isdir(MF_ROOT):
+        pytest.skip(f"mindformers 源根不存在: {MF_ROOT}")
+    from cost_eval.opdag.extractor import extract_cell
+    from cost_eval.opdag.module_resolver import ResolvedSpec
+    from cost_eval.opdag.shape_infer import infer_shapes
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.timesim.shard_rules import Degrees
+    from cost_eval.model_spec import DimTable
+    dims = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
+                    S=4096, B=1, vocab=129280, n_layers=4)
+    dag = extract_cell(
+        MF_ROOT, "parallel_core/training_graph/transformer/mlp.py", "MLPInterleaved",
+        ResolvedSpec(cell="MLPInterleaved",
+                     submodules={"linear_fc1": "ColumnParallelLinear",
+                                 "linear_fc2": "RowParallelLinear"}),
+        {"gated_linear_unit": True, "activation_type": "silu",
+         "add_bias_linear": False, "compute_dtype": "bf16"})
+    dag = infer_shapes(dag, {"hidden_states": "S·B·H"})
+    return build_segment("layer_0.mlp.fwd", dag, dims,
+                         Degrees(tp=2, sequence_parallel=True))
+
+
+def test_bwd_deps_reverse_fwd_edges_real_mlp():
+    """F1：bwd deps=fwd 依赖边反转——否则 bwd exposed comm 结构性归零。两条关键反转边：
+    ① fwd Row矩乘→.rs（deps=(row,)）反转 ⇒ Row 的 dX(.b0) 和 dW(.b1) 都等 .rs 的对偶 AG
+      （dW 也要 dy，与真实 autodiff 一致）；
+    ② fwd .ag→Column矩乘（deps=(ag,)）反转 ⇒ 对偶 grad-RS(.ag.b0) 等 Column 的 dX(.b0)。"""
+    fwd = _mlp_seg()
+    ag = next(o for o in fwd.ops if o.op_id.endswith(".ag"))
+    rs = next(o for o in fwd.ops if o.op_id.endswith(".rs"))
+    col_id = ag.op_id[:-len(".ag")]
+    row_id = rs.op_id[:-len(".rs")]
+    by_id = {o.op_id: o for o in expand_bwd(fwd).ops}
+    assert rs.op_id + ".b0" in by_id[row_id + ".b0"].deps   # ① dX ← 对偶AG
+    assert rs.op_id + ".b0" in by_id[row_id + ".b1"].deps   # ① dW ← 对偶AG（dW 也要 dy）
+    assert col_id + ".b0" in by_id[ag.op_id + ".b0"].deps   # ② grad-RS ← dX
+
+
+def test_recompute_prefix_deps_remap_real_mlp():
+    """F2：recompute 前缀 deps 段内 remap——被重放的生产者 +".r"，未重放（被剔 CommOp）drop
+    （其输出 fwd 已保存故段首即可用，这正是它不重算的原因）；否则前缀 deps 悬空指 fwd op_id，
+    重算的 AG→matmul 串行化丢失。"""
+    fwd = _mlp_seg()
+    ag = next(o for o in fwd.ops if o.op_id.endswith(".ag"))
+    col_id = ag.op_id[:-len(".ag")]
+    # recomp_comm=False：被剔通信的 dep 消失；前缀内全部 deps 段内可解析
+    seg_f = expand_bwd(fwd, recompute="full", recomp_comm=False)
+    rc_f = [o for o in seg_f.ops if o.phase == "recomp"]
+    ids_f = {o.op_id for o in rc_f}
+    assert all(d in ids_f for o in rc_f for d in o.deps)     # 无悬空
+    col_r = next(o for o in rc_f if o.op_id == col_id + ".r")
+    assert ag.op_id + ".r" not in col_r.deps and ag.op_id not in col_r.deps
+    # recomp_comm=True：remap 到 .ag.r（重算的 AG→matmul 串行化保留）；同样无悬空
+    seg_t = expand_bwd(fwd, recompute="full", recomp_comm=True)
+    rc_t = [o for o in seg_t.ops if o.phase == "recomp"]
+    ids_t = {o.op_id for o in rc_t}
+    assert all(d in ids_t for o in rc_t for d in o.deps)     # 无悬空
+    col_rt = next(o for o in rc_t if o.op_id == col_id + ".r")
+    assert ag.op_id + ".r" in col_rt.deps

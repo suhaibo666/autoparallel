@@ -15,11 +15,18 @@
   其余（Norm/Activation/Elementwise/Cast/Gather…) → 单条 "<op_type>Grad"（带宽类，op_flops
                           对其返回 0，成本走 T1 经验库，不在此杜撰系数）。
 
+bwd deps = **fwd 依赖边反转**（spec §5.1 跨流依赖只来自 TimedOp.deps，无"等前序列表项"规则——
+deps=() 会使 bwd exposed comm 结构性归零）：fwd edge P→C 反转后，C 的输入梯度生产者恒为
+`C.op_id+".b0"`（dX 惯例居 .b0），故 P 的**全部** bwd 产物（含 dW .b1——dW 也要 dy，与真实
+autodiff 一致）deps 都取其 fwd 消费者的 .b0 集；同流冗余项无害（ir.py deps 字段注释）。
+
 recompute（spec §2.2-3 契约）：recompute="full" 时，在 bwd 序之前插入 phase="recomp" 前缀——
 按 fwd 顺序重放原 ops（非逆序，因为 recompute 只是"重新跑一遍 fwd"）；recomp_comm=False（默认，
 对应 mindformers recompute_comm=False 的常见配置）时前缀跳过 CommOp，不重放通信——这是从"内存
 侧"独立实现的语义，不依赖 mindformers 侧 recompute 具体代码路径（解耦契约，测试用例覆盖两种
-取值）。
+取值）。前缀 deps **段内 remap**：被重放的生产者 dep 追加 ".r"（重算 AG→matmul 的串行化保留）；
+未重放的（被剔 CommOp）drop——其输出 fwd 已保存（这正是它不重算的原因），段首即可用无需等待；
+producer 只发段内 deps，drop 规则无外部误伤。
 
 bwd host 单价（host_only 流上 bwd op 的时间成本）：本模块只产出 IR 节点，不做计时；T1 op_cost
 经验库再对 bwd/recomp 的 host_only 单价分相标定（fwd/bwd 可能不同，此处不预设）。"""
@@ -44,8 +51,8 @@ def _dual_comm(c: CommSpec) -> CommSpec:
     return CommSpec(ctype, vol, c.group_axis, c.group_size)
 
 
-def _bwd_of(o: TimedOp) -> list[TimedOp]:
-    b = dict(phase="bwd", deps=(), src=o.src, dtype=o.dtype, module=o.module)
+def _bwd_of(o: TimedOp, deps: tuple[str, ...] = ()) -> list[TimedOp]:
+    b = dict(phase="bwd", deps=deps, src=o.src, dtype=o.dtype, module=o.module)
     if o.op_type == "CommOp":
         return [TimedOp(op_id=o.op_id + ".b0", op_type="CommOp",
                         in_shapes=(o.out_shape,), out_shape=o.in_shapes[0] if o.in_shapes else (),
@@ -78,11 +85,19 @@ def expand_bwd(seg: TimedSegment, *, recompute: str | None = None,
     """fwd 段 → bwd 段（可选 recompute 前缀）。seg_id 的 .fwd 后缀替换为 .bwd。"""
     prefix: list[TimedOp] = []
     if recompute == "full":
+        replayed: set[str] = set()   # F2：dep 段内 remap——重放者 +".r"，被剔 CommOp drop
         for o in seg.ops:
             if o.op_type == "CommOp" and not recomp_comm:
                 continue
-            prefix.append(replace(o, op_id=o.op_id + ".r", phase="recomp"))
+            prefix.append(replace(o, op_id=o.op_id + ".r", phase="recomp",
+                                  deps=tuple(d + ".r" for d in o.deps if d in replayed)))
+            replayed.add(o.op_id)
+    # F1：fwd 依赖边反转——P 的 bwd deps = 其 fwd 消费者 C 的输入梯度生产者 C.op_id+".b0" 集
+    rev: dict[str, tuple[str, ...]] = {}
+    for o in seg.ops:
+        for d in o.deps:
+            rev[d] = rev.get(d, ()) + (o.op_id + ".b0",)
     bwd: list[TimedOp] = []
     for o in reversed(seg.ops):
-        bwd.extend(_bwd_of(o))
+        bwd.extend(_bwd_of(o, deps=rev.get(o.op_id, ())))
     return TimedSegment(seg.seg_id.replace(".fwd", "") + ".bwd", tuple(prefix + bwd))
