@@ -67,12 +67,12 @@ README.md                            # 改：状态区一行
 - Modify: `cost_eval/timesim/shard_rules.py:15`（import 改公名）
 - Test: `tests/test_opdag_consumer.py`（追加）
 
-- [ ] **Step 1: 跑全量测试，记录基线 N_baseline**
+- [x] **Step 1: 跑全量测试，记录基线 N_baseline**
 
 Run: `python -m pytest tests/ -q`
 Expected: 全绿。记下通过数 N_baseline（后续每任务对照，不允许减少）。
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 ```python
 # tests/test_opdag_consumer.py 追加
@@ -84,7 +84,7 @@ def test_axis_value_public_name():
 
 Run: `python -m pytest tests/test_opdag_consumer.py -q` → FAIL（AttributeError: axis_value）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `consumer.py` 的 `_axis_value` 函数定义之后追加：
 
@@ -102,9 +102,9 @@ from ..opdag.consumer import axis_value as _axis_value
 
 （shard_rules 内部引用名不变，改动最小。）
 
-- [ ] **Step 4: 跑测试 + 全量回归** → 通过数 = N_baseline + 1。
+- [x] **Step 4: 跑测试 + 全量回归** → 通过数 = N_baseline + 1。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cost_eval/opdag/consumer.py cost_eval/timesim/shard_rules.py tests/test_opdag_consumer.py
