@@ -142,3 +142,9 @@ def test_moe_dispatched_input_sized_e_cap_h(ffn_bytes, dims):
     assert disp, ffn_bytes["per_save"]
     expect = dims.n_experts * _cap_value(dims) * dims.H * 2
     assert disp[0][3] == expect
+
+
+def test_axis_value_public_name():
+    """T0 交接要点6:跨包消费(timesim.shard_rules)用公名,私名保留兼容。"""
+    from cost_eval.opdag import consumer
+    assert consumer.axis_value is consumer._axis_value

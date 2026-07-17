@@ -83,6 +83,11 @@ def _axis_value(f, dims):
     return val
 
 
+# 公共名（T0→T1 交接要点6）：timesim.shard_rules 等跨包消费方用此名；
+# 私名 _axis_value 保留（本模块内部/存量引用兼容）。
+axis_value = _axis_value
+
+
 def resolve_shape_elems(sym_shape, dims):
     """符号 shape 串 → 元素总数（各轴之积）。空/`?`/任一轴未解析 → None（不杜撰）。"""
     if sym_shape is None:

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..opdag.consumer import _axis_value
+from ..opdag.consumer import axis_value as _axis_value
 from ..opdag.sym_shape import parse_shape
 
 
