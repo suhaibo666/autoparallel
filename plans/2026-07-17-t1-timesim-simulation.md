@@ -120,7 +120,7 @@ git commit -m "refactor(opdag): _axis_value 公名化 axis_value(T1-1,交接要�
 
 **动机（交接要点5）**：T0 的 `sp_active`/`feat_sharded` 是两个全局 bool——MLP 单链恰好成立；MLA 多支路（rope 支不过 Column，与过 Column 的 k_no_pe 在 pe_concat 汇合）立即失效。端态设计=状态挂**生产者节点**：`state[node_id] = {carrier_sym: divisor}`。
 
-- [ ] **Step 1: 写失败测试（先写 per-tensor 性质，用纯合成 DAG，不依赖 mindformers）**
+- [x] **Step 1: 写失败测试（先写 per-tensor 性质，用纯合成 DAG，不依赖 mindformers）**
 
 ```python
 # tests/test_timesim_producer.py 追加（文件头 import 区补 from types import SimpleNamespace）
@@ -224,12 +224,12 @@ def test_row_without_sharded_input_fail_loud():
 2. `test_build_segment_feature_axis_ambiguity_fail_loud`（:160）：T0 的「两 sym 拆两轴=歧义」在 carrier 规则下**已可正确解析**（carrier 只命中一轴）——把该测试改写为**正向**断言：同一合成 DAG 现在成功构段、feature 轴落在 carrier 轴上正确 ÷tp（保留原 docstring 并注明 T1 语义变更）；真歧义守卫由上面新测试 `test_carrier_duplicate_axes_fail_loud` 接棒。
 3. `test_build_segment_unknown_module_fail_loud`（:94）：若它拿 `"SequenceParallelLinear"` 当未知模块（T0 注册为"已知未实现"）——SPL 在本计划 Task 2/3 转正支持，把测试里的模块名换成真假名（如 `"TotallyUnknownLinear"`），守卫语义不变。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_timesim_producer.py -q`
 Expected: 新测试 FAIL（`test_per_tensor_state_branch_isolation` 在 T0 全局位下 side 支被误判 0 轴命中 fail-loud）。
 
-- [ ] **Step 3: 重写 producer.py（完整替换文件）**
+- [x] **Step 3: 重写 producer.py（完整替换文件）**
 
 ```python
 # cost_eval/timesim/producer.py
@@ -583,12 +583,12 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
     return TimedSegment(seg_id=seg_id, ops=tuple(ops))
 ```
 
-- [ ] **Step 4: 跑 producer 测试 + 全量回归**
+- [x] **Step 4: 跑 producer 测试 + 全量回归**
 
 Run: `python -m pytest tests/test_timesim_producer.py tests/ -q`
 Expected: 新增测试全 PASS；MLP 行为测试（tp2_sp/tp1/AG deps/RS redirect）**逐字节不变**全 PASS；两个改写的守卫测试 PASS；全量无回退。若 MLP 行为测试失败=重构改了语义，回退重查（此任务是纯行为保持 + 能力扩展）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/producer.py tests/test_timesim_producer.py
