@@ -75,3 +75,28 @@ def test_fsdp_regather_and_grad_rs():
     assert comms[-1].comm.volume_bytes == comms[0].comm.volume_bytes * 4     # AG分片→RS全量
     # reshard="never" 语义由门面控制：不调 fsdp_regather 即无重 gather
     assert all(o.comm.ctype != "all_gather" for o in bwd.ops if o.op_type == "CommOp")
+
+
+def test_recompute_comm_fsdp_no_double_gather():
+    """Task 10 review Important：recompute=full + recomp_comm=True 时，expand_bwd 的重算前缀
+    已重放 fwd 的 .fsdp_ag（即重 gather）；门面据此守卫 `not(recompute=='full' and recomp_comm)`
+    **跳过** fsdp_regather——否则 comm_dp 上双 all_gather 重复计（方向保守但错）。"""
+    from cost_eval.timesim.frame_comm import inject_fsdp, fsdp_regather
+    from cost_eval.timesim.bwd_rules import expand_bwd
+
+    def _dp_ag(seg):
+        return [o for o in seg.ops if o.op_type == "CommOp"
+                and o.stream == "comm_dp" and o.comm.ctype == "all_gather"]
+
+    fwd = inject_fsdp(_layer(0), dp_shard=4)
+    bwd = expand_bwd(fwd, recompute="full", recomp_comm=True)   # 前缀重放 .fsdp_ag
+    assert len(_dp_ag(bwd)) == 1                                # 重算前缀已含 1 条重 gather
+    assert len(_dp_ag(fsdp_regather(bwd, fwd, dp_shard=4))) == 2  # 反证：再 regather 则双 AG
+    # 门面在该组合下跳过 fsdp_regather、跑通不 crash（守卫路径）
+    r = evaluate_step_time([_layer(0), _layer(1)], Degrees(dp=4), HW, pp=1, m=1,
+                           recompute="full", recomp_comm=True,
+                           reshard_after_forward="default")
+    assert r.t_step_us > 0
+    # recomp_comm=False（默认）时前缀不重放 AG，门面仍需 fsdp_regather（守卫不触发）
+    bwd_nc = expand_bwd(fwd, recompute="full", recomp_comm=False)
+    assert len(_dp_ag(bwd_nc)) == 0                             # 前缀跳过 CommOp → 无重 gather

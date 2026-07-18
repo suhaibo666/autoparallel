@@ -91,7 +91,11 @@ def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
                 fwd_layers.append(seg)
             bwd_layers = [expand_bwd(fs, recompute=recompute, recomp_comm=recomp_comm)
                           for fs in reversed(fwd_layers)]
-            if deg.dp > 1 and reshard_after_forward != "never":
+            # recompute="full"+recomp_comm=True 时，重算前缀已重放 fwd 的 .fsdp_ag（即重 gather），
+            # 再 fsdp_regather 会在 comm_dp 上双 AG 重复计（Task 10 review Important）——故此时跳过；
+            # recompute=None / recomp_comm=False / select 均不重放该 AG，仍需 fsdp_regather。
+            if (deg.dp > 1 and reshard_after_forward != "never"
+                    and not (recompute == "full" and recomp_comm)):
                 bwd_layers = [fsdp_regather(bs, fs, deg.dp)
                               for bs, fs in zip(bwd_layers, reversed(fwd_layers))]
             for kind, layers in (("FWD", fwd_layers), ("BWD", bwd_layers)):
