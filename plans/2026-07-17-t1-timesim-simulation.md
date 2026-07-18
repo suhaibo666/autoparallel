@@ -1329,7 +1329,7 @@ git commit -m "feat(timesim): pass_builder 多层段拼接——连续 pass 语�
 - Create: `cost_eval/timesim/segment_sim.py`
 - Test: `tests/test_timesim_segment_sim.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_segment_sim.py
@@ -1433,7 +1433,7 @@ def test_per_layer_and_top_contributors():
     assert st.top_contributors[0] in ("layer_0.fwd/a", "layer_1.fwd/a")
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/segment_sim.py
@@ -1563,9 +1563,9 @@ def simulate_segment(seg: TimedSegment, costs: dict) -> SegmentTime:
                        exposed, h_clock, per_layer, top)
 ```
 
-- [ ] **Step 4: 跑测试（手算断言逐条核对，失败=先查测试手算再查实现——三态判据次序是 spec 规定，不许倒换）+ 全量回归**
+- [x] **Step 4: 跑测试（手算断言逐条核对，失败=先查测试手算再查实现——三态判据次序是 spec 规定，不许倒换）+ 全量回归**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/segment_sim.py tests/test_timesim_segment_sim.py
