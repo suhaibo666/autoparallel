@@ -602,7 +602,7 @@ git commit -m "refactor(timesim): producer per-tensor 分片状态(T1-2,交接�
 - Modify: `tests/conftest.py`（mla_dag 夹具）
 - Test: `tests/test_timesim_mla_segment.py`
 
-- [ ] **Step 1: conftest 加 MLA 夹具（与 test_opdag_mla.py 同一提取参数 + infer_shapes 种子 `x`）**
+- [x] **Step 1: conftest 加 MLA 夹具（与 test_opdag_mla.py 同一提取参数 + infer_shapes 种子 `x`）**
 
 ```python
 # tests/conftest.py 追加
@@ -636,7 +636,7 @@ def mla_dag():
     return infer_shapes(dag, {"x": "S·B·H"})
 ```
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 ```python
 # tests/test_timesim_mla_segment.py
@@ -728,9 +728,9 @@ def test_mla_tp_shard_conserves_gemm_flops(mla_dag):
     assert sum(tp2.values()) * 2 == sum(full.values())   # 全局守恒
 ```
 
-- [ ] **Step 3: 跑测试确认失败**（weight_local 对 SPL 无分支时权重意外被切/或 producer 守卫报 SPL 未知——按报错逐一）
+- [x] **Step 3: 跑测试确认失败**（weight_local 对 SPL 无分支时权重意外被切/或 producer 守卫报 SPL 未知——按报错逐一）
 
-- [ ] **Step 4: shard_rules.weight_local 加 SPL 分支**
+- [x] **Step 4: shard_rules.weight_local 加 SPL 分支**
 
 ```python
 def weight_local(sym: str, dims, module: str, tp: int) -> tuple[int, ...]:
@@ -752,7 +752,7 @@ def weight_local(sym: str, dims, module: str, tp: int) -> tuple[int, ...]:
 
 （producer 的 `_KNOWN_MATMUL_MODULES` 已在 Task 2 含 SPL。）
 
-- [ ] **Step 5: 跑测试（4 条全过）+ 全量回归** → **Step 6: Commit**
+- [x] **Step 5: 跑测试（4 条全过）+ 全量回归** → **Step 6: Commit**
 
 ```bash
 git add cost_eval/timesim/shard_rules.py tests/conftest.py tests/test_timesim_mla_segment.py
