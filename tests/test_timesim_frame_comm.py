@@ -92,6 +92,8 @@ def test_cp_ring_structural_blocks():
     # 每块 FA 保留原跨流 deps；k≥1 块追加对应 p2p dep
     assert fas[0].deps == ("a#9",)
     assert p2ps[0].op_id in fas[1].deps and "a#9" in fas[1].deps
+    # 末块（保留原 op_id、下游 deps 实际挂钩的块）也须换绑其对应 p2p（review 覆盖缺口补齐）
+    assert p2ps[-1].op_id in fas[-1].deps and "a#9" in fas[-1].deps
     # p2p 载荷 = k+v 单块字节（单跳口径）
     kv = 2048 * 1 * 8 * 224 * 2
     assert all(o.comm.volume_bytes == 2 * kv for o in p2ps)

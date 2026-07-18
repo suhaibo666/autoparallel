@@ -768,7 +768,7 @@ git commit -m "feat(timesim): MLA 段端到端——SequenceParallelLinear 权�
 
 **动机**：T0 版 colossal = 每 FA 前 1 条 p2p、跳数系数 (cp−1) 留给 op_cost——但 ring attention 的真实结构是 **cp 个 FA 块 × (cp−1) 跳 kv p2p 交替**，块间 p2p 可与上一块 FA 重叠。DES 的价值就在结构性 overlap 涌现（spec §5.5），系数化会把可遮盖通信错算成串行。结构化后 p2p 恒单跳，op_cost 不再需要跳数系数（口径单一化）。同时修正 T0 的 FA 算力低估：单 FA 节点（q=S/cp, kv=S/cp）只算了 1/cp 的注意力量；cp 个块结构化后总量对上。
 
-- [ ] **Step 1: 更新测试（改 test_timesim_frame_comm.py 的 colossal 用例）**
+- [x] **Step 1: 更新测试（改 test_timesim_frame_comm.py 的 colossal 用例）**
 
 找到现有 colossal 断言测试（`kinds == ["p2p"]` 形态），替换为：
 
@@ -815,7 +815,7 @@ def test_cp_ulysses_unchanged():
 
 （若旧文件已有等价 ulysses 用例则保留原用例、只删旧 colossal 断言。）
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 `frame_comm.py` 的 `inject_cp` colossal 支替换为：
 
@@ -862,7 +862,7 @@ def test_cp_ulysses_unchanged():
         cp−1 条 p2p op（T1-4），pp 本就单跳——op_cost 不再施跳数系数）；
 ```
 
-- [ ] **Step 4: 跑测试 + 全量回归** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量回归** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/frame_comm.py cost_eval/timesim/ir.py tests/test_timesim_frame_comm.py
