@@ -995,7 +995,7 @@ git commit -m "feat(timesim): TimeHardware 时间侧硬件常数(T1-5,契约4 �
 - Create: `cost_eval/timesim/op_cost.py`
 - Test: `tests/test_timesim_op_cost.py`（追加）
 
-- [ ] **Step 1: 追加失败测试**
+- [x] **Step 1: 追加失败测试**
 
 ```python
 # tests/test_timesim_op_cost.py 追加
@@ -1094,7 +1094,7 @@ def test_host_dominated_flag():
     assert CM.cost(tiny).host_dominated is True
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/op_cost.py
@@ -1223,7 +1223,7 @@ def price_segment(seg, cm: CostModel) -> dict:
     return {op.op_id: cm.cost(op) for op in seg.ops}
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/op_cost.py tests/test_timesim_op_cost.py
