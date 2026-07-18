@@ -1712,12 +1712,24 @@ def _dep_of(kind: str, s: int, mb: int, c: int, pp: int, v: int):
 
 def simulate_pipeline(durations: dict, pp: int, m: int, *, v: int = 1,
                        group_size: int | None = None, p2p_us: float = 0.0) -> PipelineResult:
+    gs = group_size or pp
+    if v > 1 and gs != pp:
+        # VPP v1 仅支持深度优先分组 gs==pp（Megatron 默认）；gs≠pp 广度优先变体调度序与本
+        # 反向依赖模型不自洽（pp≥4 实测死锁）→ fail-loud，v1.5。（Task 9 实测发现）
+        raise ValueError(
+            f"pipeline_sim: VPP(v={v}) 时间仿真 v1 仅支持深度优先分组 group_size==pp；"
+            f"gs={gs}≠pp={pp} 的广度优先变体不自洽（v1.5）——fail-loud")
     orders = []
     for s in range(pp):
         if v <= 1:
             evs = [(e.kind, e.mb, 0) for e in build_1f1b(s, pp, m)]
         else:
-            evs = interleaved_virtual_order(s, pp, m, v, group_size or pp)
+            # VPP 反向 chunk 反转（Megatron get_model_chunk_id(forward=False)=v−1−chunk）：
+            # interleaved_virtual_order 为 mem_timeline 设计（反向 chunk 升序、FIFO），但跨
+            # stage 反向依赖要求同 stage 反向 chunk 降序（B(c,s) 需 B(c+1,s)）——时间侧消费时
+            # 反转使之自洽（契约3 各自 walk，mem 侧不反转、schedule.py 不动）。v=1 反转为恒等。
+            evs = [(k, mb, (v - 1 - c) if k == "BWD" else c)
+                   for (k, mb, c) in interleaved_virtual_order(s, pp, m, v, gs)]
         orders.append(evs)
 
     done: dict[tuple, float] = {}
@@ -2238,6 +2250,10 @@ git commit -m "docs(timesim): T1a 收尾——README 状态+交接要点固化(T
   ——本计划 pipeline 只用 transformer 层段，首末 stage 的 embedding/head/loss 时长并入
   per-step 固定开销标定常数（§6.3-3 口径），T2 锚点标定时一并清偿；
 - 非均匀 layers_per_stage、select 重算、MoE 段 producer 打通、mc2/swap/zero-bubble（§9 v1.5）；
+- **VPP 非默认分组 group_size≠pp（广度优先变体）**：pipeline_sim 时间侧只建模深度优先
+  gs=pp（Megatron 默认，DSv3 用之）；gs≠pp 与跨 stage 反向依赖不自洽，fail-loud 留 v1.5
+  （Task 9 实测发现，非计划原列——interleaved_virtual_order 为 mem 侧 FIFO 设计，时间侧需
+  反向 chunk 反转，深度优先下已验证自洽）；
 - 多通信流带宽争抢、跨 pass host run-ahead（§7.2 诚实边界 2/4，v1 有界近似）；
 - crosscheck uncovered 记录接入 gpt_segments（T0 交接要点6 后半，opdag 簿记）→ T2 census 对账时一并做。
 
