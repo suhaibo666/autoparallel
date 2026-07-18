@@ -159,3 +159,31 @@ def test_head_segment_composes_with_producer():
     seg = build_segment("head.fwd", head_segment_dag(), dims, Degrees())
     mm = next(op for op in seg.ops if op.op_type == "MatMul")
     assert mm.in_shapes[1] == (1792, 129280)
+
+
+def test_head_segment_producer_tp_sp_injects_module_semantics_ag():
+    """回归（T1-2 质量复审附加发现）：head_segment_dag() 的 Column MatMul 带**显式权重 ref**
+    （ins=["h:...", "W_head:H·vocab:..."]，真实 lm_head 生产代码非合成 fixture），tp>1+sp 下
+    须走 Column 模块语义 all_gather（op_id 尾 ".ag"、module="injected:module-semantics"），
+    而**不是**被 S 分歧重分布误触发成 layout-redistribution（".ag0"）。producer 的 is_linear
+    守卫（reconciliation 对线性族 MatMul 跳过）锁死此正确行为——lm_head 的 TP+SP 是主流配置，
+    不是边角。tp=1 的 test_head_segment_composes_with_producer 走不到 reconciliation,故此处专测。"""
+    from cost_eval.opdag.gpt_segments import head_segment_dag
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.timesim.shard_rules import Degrees
+    from cost_eval.model_spec import DimTable
+
+    dims = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
+                     S=4096, B=1, vocab=129280, n_layers=4)
+    seg = build_segment("head.fwd", head_segment_dag(), dims,
+                        Degrees(tp=2, sequence_parallel=True))
+    comms = [o for o in seg.ops if o.op_type == "CommOp"]
+    assert len(comms) == 1                                    # 单个 AG，非重复注入
+    ag = comms[0]
+    assert ag.module == "injected:module-semantics"          # Column 语义，非 layout-redistribution
+    assert ag.op_id.endswith(".ag") and not ag.op_id.endswith(".ag0")
+    assert ag.comm.ctype == "all_gather"
+    # 权重全量按 Column 语义 out(末轴 vocab)÷tp、Column 输出 carrier=vocab ÷tp
+    mm = next(o for o in seg.ops if o.op_type == "MatMul")
+    assert mm.in_shapes[1] == (1792, 129280 // 2)
+    assert mm.out_shape == (4096, 1, 129280 // 2)

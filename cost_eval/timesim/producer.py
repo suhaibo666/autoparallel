@@ -27,7 +27,8 @@ bool——对 MLP 单链成立，MLA 多支路（rope 支不过 Column、与过 
     expand_dims :722，本模块注入点=**每个**满足分歧条件的多输入汇合 op（不去重）：驻留
     张量喂多个汇合点时相对真机"重分布一次+复用"会重复计通信量，当前 MLA 惯用法只有一处
     汇合故成立；位置差几个小 op 的 S 局部度，量级 S·B·rope_dim 字节，诚实边界）。线性族
-    MatMul 不参与此重分布（激活单入，真 walker 不在 MatMul ins 发权重 ref）。
+    MatMul 不参与此重分布（权重符号 shape 由 attrs 重建；个别手写 DAG——gpt_segments
+    head_segment_dag 的 lm_head Column——在 ins 带显式权重 ref，参与会误触发，Task 2 质量复审）。
   - ColumnParallelLinear：输入含 feature carrier → fail-loud（Column∘Column 不在支持族）；
     输入含 "S" → 矩乘前注入 all_gather（模块语义注入，comm_probe 实证 Column 源无显式通信）
     并清 "S"；输出 = {carrier(out_dim): tp}（tp>1）。
@@ -173,7 +174,7 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
                 f"producer: MatMul@{n.src} 的 module {module!r} 不在已知集"
                 f"{sorted(_KNOWN_MATMUL_MODULES - {''})}（tp>1 下静默不切分会错切——fail-loud）")
 
-        # —— 输入侧：ref 名 → [名, sym, dtype, 状态, 生产者节点id|None, 重分布AG|None] ——
+        # —— 输入侧：每个 ref 建一条 _InInfo(name/sym/dt/state/pnode/ag) 工作记录 ——
         # 名字优先匹配（node.out 名 + split_targets）；未匹配名与未匹配入边"恰一对一"时按
         # 排除法配对——walker 的链式视图别名把目标名指到内层节点而**不新增 out 名**
         # （construct_walker.py:461-469：ssa/producer 有记录、DAG 节点无此名），名字查不到
@@ -206,9 +207,12 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
                 info.state = dict(seed) if _has_s_axis(info.sym) else {}
 
         # —— "S" 分歧重分布（多输入汇合，模块 docstring 规则；源事实4）——
-        # 线性族 MatMul 跳过：真 walker 从不在 MatMul ins 里发权重 ref（激活单入），此路径仅
-        # 合成多入 DAG 可达；跳过以免 Column 的 S gather 被误标 layout-redistribution、Row 的
-        # S 残留守卫被 S 提前清除绕过（Task 2 质量复审）。
+        # 线性族 MatMul 跳过：其权重符号 shape 由 in_dim/out_dim attrs 重建（非 ins[1]），但
+        # **个别 DAG 仍在 ins 里带显式权重 ref**——gpt_segments.head_segment_dag() 的 lm_head
+        # Column 即 ins=["h:S·B·H", "W_head:H·vocab"]（真实生产代码，非合成 fixture）。若不跳过，
+        # 权重 ref（无 S）与激活（S 驻留）在此被判 S 分歧 → 误注入 layout-redistribution AG 并
+        # 提前清激活的 S，把 Column 自己的模块语义 AG 顶替掉（Task 2 质量复审在 lm_head tp+sp
+        # 路径实证）。extract_cell 产的 MatMul 确是激活单入，但本守卫不能依赖它。
         is_linear = n.op == "MatMul" and module in (_COL, _ROW, _SPL)
         real = [info for info in in_infos if info.sym and info.sym != "?"]
         if len(real) > 1 and not is_linear:
