@@ -24,17 +24,21 @@ bool——对 MLP 单链成立，MLA 多支路（rope 支不过 Column、与过 
     pe_concat/tile_kv 布局实证；in_shapes 因此允许 heads 轴不齐，host_only 无成本）；
     "S" 分歧（部分 SP 驻留、部分已聚合）→ 给驻留侧注入 all_gather
     （module="injected:layout-redistribution"）——对应 semi-auto 布局重分布（真机声明点
-    expand_dims :722，本模块注入点=首个多输入汇合 op，位置差几个小 op 的 S 局部度，
-    量级 S·B·rope_dim 字节，诚实边界）。
+    expand_dims :722，本模块注入点=**每个**满足分歧条件的多输入汇合 op（不去重）：驻留
+    张量喂多个汇合点时相对真机"重分布一次+复用"会重复计通信量，当前 MLA 惯用法只有一处
+    汇合故成立；位置差几个小 op 的 S 局部度，量级 S·B·rope_dim 字节，诚实边界）。线性族
+    MatMul 不参与此重分布（激活单入，真 walker 不在 MatMul ins 发权重 ref）。
   - ColumnParallelLinear：输入含 feature carrier → fail-loud（Column∘Column 不在支持族）；
     输入含 "S" → 矩乘前注入 all_gather（模块语义注入，comm_probe 实证 Column 源无显式通信）
     并清 "S"；输出 = {carrier(out_dim): tp}（tp>1）。
   - RowParallelLinear：tp>1 时输入携 feature carrier 的须恰一个且命中 in_dim syms、且无 "S"
     残留（Megatron Row 恒消费 feature 分片/全 seq 激活）；无 carrier 且无 "S" 的输入（上游
-    没有 Column）fail-loud——静默不切会双倍计算量；**无 carrier 但 "S" 驻留**的输入按状态
-    本地化放行（T0 行为兼容形态：.rs redirect 契约测试的合成 DAG 即此形，真实 Megatron 段
-    不出现——Row 前恒有 Column）；矩乘后注入 RS（sp，出 {"S":tp}）
-    / AR（非 sp，出 {}）——源惯用法 layers.py:619/:621；下游经 redirect 指向 .rs（F3 Bug B）。
+    没有 Column）fail-loud——静默不切会双倍计算量；**无 carrier 但 "S" 驻留**的输入仅当来自
+    段入口裸输入（x_pnode is None）时按状态本地化放行（T0 行为兼容形态：.rs redirect 契约
+    测试的合成 DAG 即此形，真实 Megatron 段不出现——Row 前恒有 Column），来自图内生产链的
+    （如 SPL→Row 直连）则 fail-loud（收缩维不一致，Task 2 质量复审收紧）；矩乘后注入 RS（sp，
+    出 {"S":tp}）/ AR（非 sp，出 {}）——源惯用法 layers.py:619/:621；下游经 redirect 指向
+    .rs（F3 Bug B）。
   - SequenceParallelLinear（T1 新支持，layers.py:819「A is not parallelized. X is
     parallelized with data_parallel and sequence_parallel」，shard 布局 :845-866 入/出均
     ("cp","tp") 切 S、权重不切）：权重全量、无通信、状态透传。
@@ -42,6 +46,8 @@ deps 只记跨流依赖（同流 FIFO 隐含，ir.py 字段注释）；依赖发
 （与 dag.edges 等价——walker 对 tuple 全目标登记 producer，_emit :898-908）。
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from .ir import (TimedOp, TimedSegment, CommSpec, tensor_bytes,
                  STREAM_DEVICE, STREAM_HOST_ONLY, COMM_STREAM)
@@ -53,6 +59,19 @@ _COL = "ColumnParallelLinear"
 _ROW = "RowParallelLinear"
 _SPL = "SequenceParallelLinear"
 _KNOWN_MATMUL_MODULES = {_COL, _ROW, _SPL, ""}
+
+
+@dataclass
+class _InInfo:
+    """build_segment 主循环里一条输入 ref 的可变工作记录（替代 6 元素裸 list——扩展主循环时
+    字段名比下标更抗滑错）。`state`=该输入的 per-tensor 分片状态；`pnode`=生产者 DAG 节点 id
+    （None=段入口外部量）；`ag`=为消解 S 分歧给本输入注入的重分布 AG（None=未注入）。"""
+    name: str
+    sym: str
+    dt: str
+    state: dict | None
+    pnode: int | None
+    ag: object = None
 
 # 从 comm_probe 的通信原语类名表派生（单一事实源）——新原语进 COMM_CLS 时本守卫自动跟进。
 _OPAQUE_COMM_MARKERS = tuple(COMM_CLS)
@@ -161,61 +180,65 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
         # 但边在。sym=="?" 的 ref（rotary_pos_emb/attention_mask 类外部量）不参与配对。
         # 配对歧义（候选名>1 或 剩余边>1 且有候选名）→ fail-loud 不猜。
         producers = list(dict.fromkeys(in_edges.get(n.id, ())))
-        in_infos: list[list] = []
-        for ref in n.ins:
-            nm, sym, dt = _parse_ref(ref)
-            in_infos.append([nm, sym, dt, None, name2node.get(nm), None])
-        matched = {info[4] for info in in_infos if info[4] is not None}
+        in_infos: list[_InInfo] = [
+            _InInfo(nm, sym, dt, None, name2node.get(nm))
+            for nm, sym, dt in (_parse_ref(ref) for ref in n.ins)
+        ]
+        matched = {info.pnode for info in in_infos if info.pnode is not None}
         free_prods = [p for p in producers if p not in matched]
         candidates = [info for info in in_infos
-                      if info[4] is None and info[1] and info[1] != "?"]
+                      if info.pnode is None and info.sym and info.sym != "?"]
         if free_prods and candidates:
             if len(free_prods) == 1 and len(candidates) == 1:
-                candidates[0][4] = free_prods[0]
+                candidates[0].pnode = free_prods[0]
             else:
                 raise ValueError(
                     f"producer: 节点 {n.src} 有 {len(free_prods)} 条未匹配入边与 "
                     f"{len(candidates)} 个未匹配输入名，无法唯一配对（fail-loud）")
         leftover_prods = [p for p in free_prods
-                          if all(info[4] != p for info in in_infos)]
+                          if all(info.pnode != p for info in in_infos)]
         for info in in_infos:
-            if info[4] is not None:
-                info[3] = dict(node_state.get(info[4], {}))
-            elif info[0] in input_states:
-                info[3] = dict(input_states[info[0]])
+            if info.pnode is not None:
+                info.state = dict(node_state.get(info.pnode, {}))
+            elif info.name in input_states:
+                info.state = dict(input_states[info.name])
             else:
-                info[3] = dict(seed) if _has_s_axis(info[1]) else {}
+                info.state = dict(seed) if _has_s_axis(info.sym) else {}
 
         # —— "S" 分歧重分布（多输入汇合，模块 docstring 规则；源事实4）——
-        real = [info for info in in_infos if info[1] and info[1] != "?"]
-        if len(real) > 1:
-            s_flags = [bool(info[3].get("S")) for info in real]
+        # 线性族 MatMul 跳过：真 walker 从不在 MatMul ins 里发权重 ref（激活单入），此路径仅
+        # 合成多入 DAG 可达；跳过以免 Column 的 S gather 被误标 layout-redistribution、Row 的
+        # S 残留守卫被 S 提前清除绕过（Task 2 质量复审）。
+        is_linear = n.op == "MatMul" and module in (_COL, _ROW, _SPL)
+        real = [info for info in in_infos if info.sym and info.sym != "?"]
+        if len(real) > 1 and not is_linear:
+            s_flags = [bool(info.state.get("S")) for info in real]
             if any(s_flags) and not all(s_flags):
                 for k, info in enumerate(in_infos):
-                    nm, sym, dt, st, pnode, _ = info
-                    if not (sym and sym != "?" and st.get("S")):
+                    if not (info.sym and info.sym != "?" and info.state.get("S")):
                         continue
-                    shard_shape = _localize_with_state(sym, dims, deg, st, n.src)
-                    new_st = {c: d for c, d in st.items() if c != "S"}
-                    full_shape = _localize_with_state(sym, dims, deg, new_st, n.src)
+                    shard_shape = _localize_with_state(info.sym, dims, deg, info.state, n.src)
+                    new_st = {c: d for c, d in info.state.items() if c != "S"}
+                    full_shape = _localize_with_state(info.sym, dims, deg, new_st, n.src)
                     ag_deps = ()
-                    if pnode is not None:
-                        ag_deps = (_producer_ref(pnode)[0],)
+                    if info.pnode is not None:
+                        ag_deps = (_producer_ref(info.pnode)[0],)
                     ag = TimedOp(
                         op_id=f"{id2opid[n.id]}.ag{k}", op_type="CommOp", phase=phase,
-                        in_shapes=(shard_shape,), out_shape=full_shape, dtype=dt,
+                        in_shapes=(shard_shape,), out_shape=full_shape, dtype=info.dt,
                         stream=COMM_STREAM["tp"], src=n.src, deps=ag_deps,
                         module="injected:layout-redistribution",
-                        comm=CommSpec("all_gather", tensor_bytes(shard_shape, dt),
+                        comm=CommSpec("all_gather", tensor_bytes(shard_shape, info.dt),
                                       "tp", deg.tp))
                     ops.append(ag)
-                    info[3] = new_st
-                    info[5] = ag
+                    info.state = new_st
+                    info.ag = ag
 
         def _base_deps() -> tuple[str, ...]:
             deps, seen = [], set()
-            refs = [((ag.op_id, ag.stream) if ag is not None else _producer_ref(pnode))
-                    for nm, sym, dt, st, pnode, ag in in_infos if ag is not None or pnode is not None]
+            refs = [((info.ag.op_id, info.ag.stream) if info.ag is not None
+                     else _producer_ref(info.pnode))
+                    for info in in_infos if info.ag is not None or info.pnode is not None]
             refs += [_producer_ref(p) for p in leftover_prods]   # 无名可配的入边不丢依赖
             for ref in refs:
                 if ref[1] != this_stream and ref[0] not in seen:
@@ -224,8 +247,10 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
             return tuple(deps)
 
         # ================= 线性层族 =================
-        if n.op == "MatMul" and module in (_COL, _ROW, _SPL):
-            nm, x_sym, x_dt, x_st, x_pnode, x_ag = in_infos[0]
+        if is_linear:
+            x_info = in_infos[0]
+            x_sym, x_dt, x_st, x_pnode, x_ag = (x_info.sym, x_info.dt, x_info.state,
+                                                x_info.pnode, x_info.ag)
             in_dim, out_dim = n.attrs.get("in_dim"), n.attrs.get("out_dim")
             if not in_dim or not out_dim:
                 raise ValueError(
@@ -276,8 +301,14 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
                     raise ValueError(
                         f"producer: Row@{n.src} 输入 feature 分片状态 {{}} 与 in_dim "
                         f"{in_dim!r} 不匹配（无 Column 上游——fail-loud）")
-                # else：无 carrier 但 "S" 驻留——T0 行为兼容形态（模块 docstring Row 条目；
-                # .rs redirect 契约测试的合成 DAG），按状态本地化放行，不 fail-loud。
+                elif x_pnode is not None:
+                    # 无 carrier 但 "S" 驻留，且来自**图内生产链**（如 SPL→Row 直连）：收缩维
+                    # 与全量 weight-in 不一致却无人报——fail-loud（Task 2 质量复审收紧）。
+                    raise ValueError(
+                        f"producer: Row@{n.src} 输入无 feature 分片且非段入口（图内生产者 "
+                        f"id={x_pnode} 的 S 驻留激活喂 Row，收缩维不一致——fail-loud）")
+                # else（x_pnode is None）：段入口裸输入的 S 驻留——T0 行为兼容形态（.rs
+                # redirect 契约测试的合成 DAG），按状态本地化放行，真实 Megatron 段不出现。
 
             x_local = _localize_with_state(x_sym, dims, deg, x_st, n.src)
             weight_shape = weight_local(weight_sym, dims, module, deg.tp)
@@ -321,16 +352,17 @@ def build_segment(seg_id: str, dag, dims, deg: Degrees, *, phase: str = "fwd",
 
         # ================= 通用节点 =================
         merged: dict[str, int] = {}
-        for nm, sym, dt, st, pnode, ag in in_infos:
-            for c, d in st.items():
+        for info in in_infos:
+            for c, d in info.state.items():
                 if c in merged and merged[c] != d:
                     raise ValueError(
                         f"producer: 汇合节点 {n.src} 的 carrier {c!r} 度数冲突"
                         f"（{merged[c]} vs {d}）——fail-loud")
                 merged[c] = d
         in_shapes = tuple(
-            _localize_with_state(sym, dims, deg, st, n.src) if sym and sym != "?" else ()
-            for nm, sym, dt, st, pnode, ag in in_infos
+            _localize_with_state(info.sym, dims, deg, info.state, n.src)
+            if info.sym and info.sym != "?" else ()
+            for info in in_infos
         )
         if out_sym and out_sym != "?":
             # 汇合出边状态 = 并集中 out sym 实际含有的 carrier（_localize_with_state 对缺轴

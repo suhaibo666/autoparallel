@@ -220,10 +220,10 @@ def _node(id, op, src, ins, out, module="", attrs=None):
 
 
 # 合成测试用 dims：qk_head_dim token 映射 DimTable.qk_nope_head_dim（consumer._SYM2FIELD），
-# 既有模块级 DIMS 未设该字段（=0 → 未解析 fail-loud），此处单独给值。
+# 既有模块级 DIMS 未设该字段（=0 → 未解析 fail-loud），此处单独给值。q_lora_rank 供 SPL 测试。
 DIMS_ATTN = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
                      S=4096, B=1, vocab=129280, n_layers=4,
-                     qk_nope_head_dim=224, v_head_dim=224)
+                     qk_nope_head_dim=224, v_head_dim=224, q_lora_rank=1536)
 
 
 def test_per_tensor_state_branch_isolation():
@@ -268,6 +268,9 @@ def test_per_tensor_sp_reconciliation_ag():
                                          "injected:layout-redistribution"]
     redis = comms[1]
     assert redis.comm.ctype == "all_gather"
+    assert redis.stream == "comm_tp"                        # 通信轴道
+    assert redis.comm.group_axis == "tp"
+    assert redis.comm.group_size == 2                       # group_size 是 op_cost 计时直接输入
     assert redis.in_shapes == ((2048, 1, 1792),)          # S/(tp) 驻留分片
     assert redis.out_shape == (4096, 1, 1792)
     assert redis.comm.volume_bytes == 2048 * 1792 * 2      # AG=分片入参字节
@@ -300,3 +303,55 @@ def test_row_without_sharded_input_fail_loud():
     ]
     with pytest.raises(ValueError, match="Row"):
         build_segment("s.fwd", _synth_dag(nodes, []), DIMS_ATTN, Degrees(tp=2))
+
+
+def test_row_graph_internal_no_carrier_s_fail_loud():
+    """Task 2 质量复审收紧：无 carrier 但 "S" 驻留且来自**图内生产链**（SPL→Row 直连，
+    收缩维不一致）→ fail-loud；只有段入口裸输入的该形态才放行（见 .rs redirect 契约测试）。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "u:S·B·H:bf16", module="SequenceParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "H"}),
+        _node(2, "MatMul", "f.py:2", ["u:S·B·H:bf16"],
+              "y:S·B·H:bf16", module="RowParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "H"}),
+    ]
+    with pytest.raises(ValueError, match="非段入口"):
+        build_segment("s.fwd", _synth_dag(nodes, [[1, 2]]), DIMS_ATTN,
+                      Degrees(tp=2, sequence_parallel=True))
+
+
+def test_spl_no_comm_weight_full_state_passthrough():
+    """SequenceParallelLinear（layers.py:819「A is not parallelized. X is parallelized with
+    data_parallel and sequence_parallel」）：权重全量不切、无通信注入、SP 驻留状态透传。
+    tp=2+sp 下 SPL 节点：入/出 S÷tp、权重全量，状态透传到下游单输入 Norm 同样 S÷tp。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "q:S·B·q_lora_rank:bf16", module="SequenceParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "q_lora_rank"}),
+        _node(2, "Norm", "f.py:2", ["q:S·B·q_lora_rank:bf16"],
+              "qn:S·B·q_lora_rank:bf16"),
+    ]
+    seg = build_segment("s.fwd", _synth_dag(nodes, [[1, 2]]), DIMS_ATTN,
+                        Degrees(tp=2, sequence_parallel=True))
+    assert all(o.op_type != "CommOp" for o in seg.ops)      # SPL 无通信
+    mm = next(o for o in seg.ops if o.op_type == "MatMul")
+    assert mm.in_shapes == ((2048, 1, 1792), (1792, 1536))  # 入 S÷tp、权重全量不切
+    assert mm.out_shape == (2048, 1, 1536)                   # 出 S÷tp（SP 驻留透传）
+    norm = next(o for o in seg.ops if o.op_type == "Norm")
+    assert norm.out_shape == (2048, 1, 1536)                 # 状态透传到下游单输入 op
+
+
+def test_spl_inside_feature_shard_zone_fail_loud():
+    """SPL 落在前一个 Column 的 feature 分片区内 → fail-loud（与 Column∘Column 同守卫：
+    SPL 权重按语义不随 tp 切，而激活收缩维已 ÷tp，矩乘静默不一致）。"""
+    nodes = [
+        _node(1, "MatMul", "f.py:1", ["x:S·B·H:bf16"],
+              "u:S·B·(n_heads·qk_head_dim):bf16", module="ColumnParallelLinear",
+              attrs={"in_dim": "H", "out_dim": "n_heads·qk_head_dim"}),
+        _node(2, "MatMul", "f.py:2", ["u:S·B·(n_heads·qk_head_dim):bf16"],
+              "v:S·B·q_lora_rank:bf16", module="SequenceParallelLinear",
+              attrs={"in_dim": "n_heads·qk_head_dim", "out_dim": "q_lora_rank"}),
+    ]
+    with pytest.raises(ValueError, match="feature 分片区"):
+        build_segment("s.fwd", _synth_dag(nodes, [[1, 2]]), DIMS_ATTN, Degrees(tp=2))
