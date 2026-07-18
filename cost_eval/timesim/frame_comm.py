@@ -29,6 +29,8 @@ reduce-scatter 等）归 bwd_rules（Task 11），本模块只做 fwd。
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .ir import TimedOp, TimedSegment, CommSpec, tensor_bytes, COMM_STREAM
 
 _GEMM_FAMILY = ("MatMul", "GroupedMatMul")
@@ -141,3 +143,19 @@ def inject_cp(seg: TimedSegment, cp: int, method: str = "colossal") -> TimedSegm
             ops.append(op)
             ops.append(post)
     return TimedSegment(seg.seg_id, tuple(ops))
+
+
+def fsdp_regather(bwd_seg: TimedSegment, fwd_seg: TimedSegment, dp_shard: int) -> TimedSegment:
+    """ZeRO-3 bwd 权重重 gather（spec §3.3c「fwd 预取 + bwd 重 gather，随
+    reshard_after_forward」；T0 交接要点3 裁决=注入，门面按 reshard!="never" 调用）。
+    克隆 fwd 段的 .fsdp_ag 到 bwd 段头（fwd 无 gather / dp_shard<=1 → 恒等）。
+    注：fwd AG 的 bwd 对偶（grad reduce-scatter）由 expand_bwd 自动产出且落 bwd 段尾
+    （fwd 段头反转），本函数只补"重新拿回权重"这一条。"""
+    if dp_shard <= 1:
+        return bwd_seg
+    src_ag = next((o for o in fwd_seg.ops
+                   if o.op_type == "CommOp" and o.op_id.endswith(".fsdp_ag")), None)
+    if src_ag is None:
+        return bwd_seg
+    ag = replace(src_ag, op_id=f"{bwd_seg.seg_id}.fsdp_ag", phase="bwd")
+    return TimedSegment(bwd_seg.seg_id, (ag,) + bwd_seg.ops)
