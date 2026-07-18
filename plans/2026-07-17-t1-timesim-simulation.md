@@ -1582,7 +1582,7 @@ git commit -m "feat(timesim): segment_sim 段内多流 DES+三态归因守恒(T1
 - Create: `cost_eval/timesim/pipeline_sim.py`
 - Test: `tests/test_timesim_pipeline_sim.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_pipeline_sim.py
@@ -1648,7 +1648,7 @@ def test_critical_path_ends_at_last_event():
     assert len(r.critical_path) >= 2
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/pipeline_sim.py
@@ -1787,13 +1787,13 @@ def simulate_pipeline(durations: dict, pp: int, m: int, *, v: int = 1,
                           tuple(reversed(path)))
 ```
 
-- [ ] **Step 4: 跑测试 + 全量回归**
+- [x] **Step 4: 跑测试 + 全量回归**
 
 Run: `python -m pytest tests/test_timesim_pipeline_sim.py tests/ -q`
 `test_plain_1f1b_closed_form_exact` 是零公差精确式（1F1B DES 与闭式在均匀退化下逐值相等，
 手推轨迹见 spec §7.1-L0③）；失败按 systematic-debugging 处置，不许加公差凑数。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/pipeline_sim.py tests/test_timesim_pipeline_sim.py
