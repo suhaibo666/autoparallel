@@ -879,7 +879,7 @@ git commit -m "feat(timesim): inject_cp ring 结构化——cp 块 FA+单跳 p2p
 - Create: `cost_eval/timesim/machine.py`
 - Test: `tests/test_timesim_op_cost.py`（先写 machine 部分）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_op_cost.py
@@ -913,7 +913,7 @@ def test_unknown_axis_fail_loud():
         synth_hw().link("nvlink")
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/machine.py
@@ -982,7 +982,7 @@ DEFAULT_910B = TimeHardware(
 )
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/machine.py tests/test_timesim_op_cost.py
