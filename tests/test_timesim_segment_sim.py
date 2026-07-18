@@ -116,23 +116,27 @@ def test_tail_single_axis_comm_exceeds_device():
 
 
 def test_tail_crossing_axes_conserves():
-    """尾段跨轴嵌套通信（dp 预取 deps=() 长且早 + 段内 tp 通信短且晚、嵌套在 dp 内——
+    """尾段跨轴嵌套通信（dp 预取 deps=() 长且早 + 段内 tp 通信短且晚、严格嵌套在 dp 内——
     frame_comm 的 FSDP/EP/CP 预取真实形态）：Σ三态==makespan 守恒，归因给完成最晚的 dp 轴
-    （嵌套 tp 得 0）。旧的 fin 排序单前沿版在此漏计 5.0 且错配轴（Task 8 对抗性 review S4b）。"""
+    （嵌套 tp 得 0）。旧 fin 排序单前沿版在此**既漏计 1.0（破守恒，Σ=101≠102）又错配轴**
+    （给成 {tp:5, dp:94}）——Task 8 对抗性 review S4b。
+    关键：c_tp 起点（3）须**严格 >** device 收尾 cursor（=2，由 dev=1 决定）；若 c_tp 恰在
+    cursor 起（如 dev=5→cursor=6），旧版在该输入下反而守恒、仅错配轴，conservation 断言便
+    区分不出新旧（review 指出的测试精度点，故此处 dev=1 让守恒断言本身也能判别）。"""
     seg = TimedSegment("s", (_dev("a"),
                              _comm("c_dp", deps=(), axis="dp"),
                              _comm("c_tp", deps=("a",), axis="tp")))
-    costs = {"a": _cost(host=1.0, dev=5.0),
+    costs = {"a": _cost(host=1.0, dev=1.0),
              "c_dp": _cost(host=1.0, comm=100.0),
              "c_tp": _cost(host=1.0, comm=5.0)}
     st = simulate_segment(seg, costs)
     assert st.duration_us == pytest.approx(102.0)
     total = st.t_compute + st.t_membound + st.t_host_gap + sum(st.t_exposed_comm.values())
-    assert total == pytest.approx(st.duration_us)             # L0① 守恒（旧版缺 5.0）
-    assert st.t_exposed_comm["dp"] == pytest.approx(96.0)     # 完成最晚的 dp 轴全担尾段
+    assert total == pytest.approx(st.duration_us)             # L0① 守恒（旧版此输入 Σ=101，缺 1.0）
+    assert st.t_exposed_comm["dp"] == pytest.approx(100.0)    # 完成最晚的 dp 轴全担尾段
     assert st.t_exposed_comm.get("tp", 0.0) == pytest.approx(0.0)  # 嵌套 tp 轴 0
     assert st.t_host_gap == pytest.approx(1.0)
-    assert st.t_compute == pytest.approx(5.0)
+    assert st.t_compute == pytest.approx(1.0)
 
 
 def test_tail_pure_host_no_comm():
