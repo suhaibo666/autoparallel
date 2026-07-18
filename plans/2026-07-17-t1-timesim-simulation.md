@@ -1807,7 +1807,7 @@ git commit -m "feat(timesim): pipeline_sim 全局 DES——1F1B/VPP 调度消费
 - Modify: `cost_eval/timesim/frame_comm.py`（追加 fsdp_regather）
 - Test: `tests/test_timesim_report.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_report.py
@@ -1890,7 +1890,7 @@ def test_fsdp_regather_and_grad_rs():
     assert all(o.comm.ctype != "all_gather" for o in bwd.ops if o.op_type == "CommOp")
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 `frame_comm.py` 追加（文件头 import 补 `from dataclasses import replace`）：
 
@@ -2005,7 +2005,10 @@ def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
                 fwd_layers.append(seg)
             bwd_layers = [expand_bwd(fs, recompute=recompute, recomp_comm=recomp_comm)
                           for fs in reversed(fwd_layers)]
-            if deg.dp > 1 and reshard_after_forward != "never":
+            # recompute="full"+recomp_comm=True 时重算前缀已重放 .fsdp_ag（重 gather），再
+            # fsdp_regather 会双 AG 重复计（Task 10 review）——故此组合跳过；其余仍需 regather。
+            if (deg.dp > 1 and reshard_after_forward != "never"
+                    and not (recompute == "full" and recomp_comm)):
                 bwd_layers = [fsdp_regather(bs, fs, deg.dp)
                               for bs, fs in zip(bwd_layers, reversed(fwd_layers))]
             for kind, layers in (("FWD", fwd_layers), ("BWD", bwd_layers)):
@@ -2084,7 +2087,7 @@ def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
         uncalibrated=not hw.calibrated)
 ```
 
-- [ ] **Step 4: 跑测试 + 全量回归** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量回归** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/report.py cost_eval/timesim/frame_comm.py tests/test_timesim_report.py
