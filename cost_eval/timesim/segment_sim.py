@@ -96,16 +96,26 @@ def simulate_segment(seg: TimedSegment, costs: dict) -> SegmentTime:
         per_layer[layer_of(op.op_id)] = per_layer.get(layer_of(op.op_id), 0.0) + (fin - start)
         cursor = fin
 
-    # 设备后尾段：通信道覆盖归 exposed（重叠取 fin 更晚者），未覆盖归 host_gap
-    t = cursor
-    tail = sorted((r for r in comm_rows if r[1] > cursor), key=lambda r: r[1])
-    for start, fin, axis, _ in tail:
-        lo = max(start, t)
-        if fin > lo:
-            exposed[axis] = exposed.get(axis, 0.0) + (fin - lo)
-            t = fin
-    if makespan > t:
-        host_gap += makespan - t
+    # 设备后尾段 [cursor, makespan]（device 全空闲）：**扫描线**逐子区间归因——每个子区间取
+    # 当刻仍在传输、且完成最晚的通信轴（"取完成最晚者"，与 dev-gap 的 blocking 同语义），无任何
+    # 通信在传则归 host_gap。逐子区间恰归一次 → Σ==makespan 守恒。
+    # （旧版按 fin 排序 + 单一前沿 t，在跨轴嵌套/交叉区间下会漏计并错配轴——Task 8 对抗性 review
+    # 用 frame_comm 的 FSDP/EP/CP deps=() 预取 + 段内 tp 通信尾的真实形态实证守恒破坏，此处修。）
+    tail_ivals = [(max(s, cursor), f, axis) for s, f, axis, _ in comm_rows if f > cursor]
+    if tail_ivals:
+        pts = sorted({cursor, makespan}
+                     | {p for s, f, _ in tail_ivals for p in (s, f) if cursor <= p <= makespan})
+        for lo, hi in zip(pts, pts[1:]):
+            if hi <= lo:
+                continue
+            active = [(f, axis) for s, f, axis in tail_ivals if s <= lo < f]
+            if active:
+                exposed_axis = max(active)[1]                # 完成最晚的活跃轴
+                exposed[exposed_axis] = exposed.get(exposed_axis, 0.0) + (hi - lo)
+            else:
+                host_gap += hi - lo                          # 尾段无通信在传 → host 尾巴
+    elif makespan > cursor:
+        host_gap += makespan - cursor                        # 纯 host 尾（无通信尾段，如末尾 View）
 
     dur_of = {op.op_id: fin - start for start, fin, op, _, _ in dev_rows}
     dur_of.update({op_id: fin - start for start, fin, _, op_id in comm_rows})

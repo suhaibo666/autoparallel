@@ -97,3 +97,52 @@ def test_per_layer_and_top_contributors():
     assert set(st.per_layer) == {"layer_0.fwd", "layer_1.fwd"}
     assert st.per_layer["layer_1.fwd"] == pytest.approx(5.0)
     assert st.top_contributors[0] in ("layer_0.fwd/a", "layer_1.fwd/a")
+
+
+# ── 设备后尾段扫描线（Task 8 对抗性 review 修：跨轴嵌套通信守恒）──────────────────────
+
+
+def test_tail_single_axis_comm_exceeds_device():
+    """单轴通信尾超过 device 收尾：device 尾段 [6,56] 全归该通信轴 exposed + 守恒（S3 形态）。"""
+    seg = TimedSegment("s", (_dev("a"), _comm("c1", deps=("a",), axis="tp")))
+    costs = {"a": _cost(host=1.0, dev=5.0), "c1": _cost(host=1.0, comm=50.0)}
+    st = simulate_segment(seg, costs)
+    # a 发射@1→D[1,6]；c1 发射@2、dep a@6 → C_tp[6,56]；device 尾段 [6,56] 全 c1 暴露
+    assert st.duration_us == pytest.approx(56.0)
+    assert st.t_exposed_comm["tp"] == pytest.approx(50.0)
+    assert st.t_host_gap == pytest.approx(1.0)
+    total = st.t_compute + st.t_membound + st.t_host_gap + sum(st.t_exposed_comm.values())
+    assert total == pytest.approx(st.duration_us)
+
+
+def test_tail_crossing_axes_conserves():
+    """尾段跨轴嵌套通信（dp 预取 deps=() 长且早 + 段内 tp 通信短且晚、嵌套在 dp 内——
+    frame_comm 的 FSDP/EP/CP 预取真实形态）：Σ三态==makespan 守恒，归因给完成最晚的 dp 轴
+    （嵌套 tp 得 0）。旧的 fin 排序单前沿版在此漏计 5.0 且错配轴（Task 8 对抗性 review S4b）。"""
+    seg = TimedSegment("s", (_dev("a"),
+                             _comm("c_dp", deps=(), axis="dp"),
+                             _comm("c_tp", deps=("a",), axis="tp")))
+    costs = {"a": _cost(host=1.0, dev=5.0),
+             "c_dp": _cost(host=1.0, comm=100.0),
+             "c_tp": _cost(host=1.0, comm=5.0)}
+    st = simulate_segment(seg, costs)
+    assert st.duration_us == pytest.approx(102.0)
+    total = st.t_compute + st.t_membound + st.t_host_gap + sum(st.t_exposed_comm.values())
+    assert total == pytest.approx(st.duration_us)             # L0① 守恒（旧版缺 5.0）
+    assert st.t_exposed_comm["dp"] == pytest.approx(96.0)     # 完成最晚的 dp 轴全担尾段
+    assert st.t_exposed_comm.get("tp", 0.0) == pytest.approx(0.0)  # 嵌套 tp 轴 0
+    assert st.t_host_gap == pytest.approx(1.0)
+    assert st.t_compute == pytest.approx(5.0)
+
+
+def test_tail_pure_host_no_comm():
+    """末尾 host_only op 决定 makespan（无通信尾段）：尾段 [6,11] 纯 host_gap，守恒（elif 分支）。"""
+    seg = TimedSegment("s", (_dev("a"), _view("v", deps=("a",))))
+    costs = {"a": _cost(host=1.0, dev=5.0), "v": _cost(host=10.0)}
+    st = simulate_segment(seg, costs)
+    # a: h@1→D[1,6]；v host_only h_clock=1+10=11 → makespan=11；尾段 [6,11] 纯 host 尾巴
+    assert st.duration_us == pytest.approx(11.0)
+    assert st.t_host_gap == pytest.approx(6.0)                # 首发射 1 + 尾段 5
+    assert sum(st.t_exposed_comm.values()) == pytest.approx(0.0)
+    total = st.t_compute + st.t_membound + st.t_host_gap + sum(st.t_exposed_comm.values())
+    assert total == pytest.approx(st.duration_us)
