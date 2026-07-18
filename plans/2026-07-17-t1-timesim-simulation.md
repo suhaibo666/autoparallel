@@ -712,19 +712,20 @@ def test_mla_tp2_sp_shapes(mla_dag):
 
 
 def test_mla_tp_shard_conserves_gemm_flops(mla_dag):
-    """性质：SPL 权重不切（每 rank 全量算）→ 只有 Col/Row 的 GEMM ÷tp。
-    tp2 per-rank = SPL(全量) + (Col+Row)/2。"""
+    """性质（全局守恒）：tp=2+sp 下 per-rank 每个 GEMM 都减半 → 总 per-rank = 全局/2。
+    **五个矩乘各自 ÷tp，机理不同但都减半**：SPL（q_down/kv_down）靠序列 S 分片（SP 把 token
+    维分到各 rank，probe 实证 q_down 入 (2048,1,1792)——SPL"权重不切"是 weight shape 的性质，
+    由 test_mla_tp2_sp_shapes 的 q_down 权重 (1792,1536) 全量断言捕获，**不是** flops 不变）；
+    Column（q_up/kv_up）靠输出 feature 分片；Row（proj）靠输入 feature 分片。逐 src 都减半。"""
     full = {o.src: op_flops(o) for o in
             build_segment("s", mla_dag, DIMS, Degrees()).ops if o.op_type == "MatMul"}
     tp2 = {o.src: op_flops(o) for o in
            build_segment("s", mla_dag, DIMS, Degrees(tp=2, sequence_parallel=True)).ops
            if o.op_type == "MatMul"}
-    for src, f in full.items():
-        mod_full = f
-        if src.endswith(":797") or src.endswith(":802"):
-            assert tp2[src] == mod_full, src          # SPL 不切
-        else:
-            assert tp2[src] * 2 == mod_full, src      # Col/Row 减半
+    assert set(full) == set(tp2)
+    for src, mod_full in full.items():
+        assert tp2[src] * 2 == mod_full, src          # 每个矩乘 per-rank 减半（含 SPL）
+    assert sum(tp2.values()) * 2 == sum(full.values())   # 全局守恒
 ```
 
 - [ ] **Step 3: 跑测试确认失败**（weight_local 对 SPL 无分支时权重意外被切/或 producer 守卫报 SPL 未知——按报错逐一）
