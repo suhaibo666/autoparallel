@@ -2103,7 +2103,7 @@ git commit -m "feat(timesim): StepTimeReport 门面+步收尾+fsdp_regather(T1-1
 **Files:**
 - Test: `tests/test_timesim_l0.py`
 
-- [ ] **Step 1: 写测试（真源 MLP 段驱动全链路；数条应直接 PASS——前序任务已就绪，FAIL 按
+- [x] **Step 1: 写测试（真源 MLP 段驱动全链路；数条应直接 PASS——前序任务已就绪，FAIL 按
   systematic-debugging 处置，不许调公差）**
 
 ```python
@@ -2189,10 +2189,10 @@ def test_l1_report_flags_uncalibrated():
     assert r.uncalibrated is True
 ```
 
-- [ ] **Step 2: 跑测试 + 全量回归**（`test_l0_serial_roofline_sum_exact` 零公差——若差在
+- [x] **Step 2: 跑测试 + 全量回归**（`test_l0_serial_roofline_sum_exact` 零公差——若差在
   epsilon 级查浮点求和顺序，差在数量级查 pass 组装重复/遗漏）
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_timesim_l0.py
