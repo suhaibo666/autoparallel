@@ -20,12 +20,18 @@ python serve_explorer.py     # → http://127.0.0.1:8765
 - ✅ 设计定稿（4 份 spec）
 - ✅ P0（内存建模）实施计划定稿（TDD，13 任务 + 后续增量）
 - ✅ P0 实现+真机验证（DSv3 4L 峰值比 1.000，见 analysis/realmachine/）
-- 🔶 P1 进行中（T0 地基完成 ↓，T1=op_cost/segment_sim/pipeline_sim 待做）
+- 🔶 P1 进行中（T0 地基 + T1a 仿真核心完成 ↓，T1b explorer 面板 / T2 经验库+真机标定 待做）
 - 🔶 P1（时间模型）T0 地基完成：schedule.py 中立化、timesim 骨架+解耦 lint（双向禁令+白名单）、
   opdag 通信提取（comm_probe）+ GPTModel 级段（loss/embedding/head）+ walker 保真（嵌套实参物化/
   opaque_calls）、TimedOpSeq producer（fwd 装配+TP/FSDP/EP/CP 通信注入+SP/feature 分片状态机+
   bwd/recompute 展开+依赖边反转）+ IR 不变量。设计 specs/2026-07-16-step-time-cost-model-design.md，
-  计划 plans/2026-07-16-t0-timesim-foundation.md，下一步 T1（op_cost + segment_sim + pipeline_sim）。
+  计划 plans/2026-07-16-t0-timesim-foundation.md。
+- 🔶 P1（时间模型）T1a 仿真核心完成：producer per-tensor 分片状态（MLA/attention 族段打通、
+  SequenceParallelLinear）、inject_cp ring 结构化、op_cost（roofline×默认η，provenance=theory）、
+  segment_sim（多流 DES+三态归因守恒）、pipeline_sim（1F1B/VPP 全局 DES，VPP 反向 chunk 反转对齐
+  Megatron）、StepTimeReport 门面（MFU/HFU/瓶颈拆解，恒标未标定）。L0 阶梯+L1 轻量互证全绿。
+  计划 plans/2026-07-17-t1-timesim-simulation.md，下一步 T1b（explorer 时间面板）/ T2
+  （OpTimeLibrary + 真机标定）。
 
 ## 目录
 

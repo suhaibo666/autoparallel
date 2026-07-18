@@ -2205,7 +2205,7 @@ git commit -m "test(timesim): L0 阶梯——串行 roofline 还原/pipeline 守
 - Modify: `README.md`（状态区）
 - Modify: 本计划文档（执行后补交接要点终稿）
 
-- [ ] **Step 1: README 状态区追加**
+- [x] **Step 1: README 状态区追加**
 
 ```markdown
 - 🔶 P1（时间模型）T1a 仿真核心完成：producer per-tensor 分片状态（MLA/attention 族段打通、
@@ -2216,16 +2216,16 @@ git commit -m "test(timesim): L0 阶梯——串行 roofline 还原/pipeline 守
   T2（OpTimeLibrary+真机标定）。
 ```
 
-- [ ] **Step 2: 全量回归最终确认**
+- [x] **Step 2: 全量回归最终确认**
 
 Run: `python -m pytest tests/ -q`
 Expected: 全绿，通过数 ≥ N_baseline + 本计划新增测试数；12 内存锚点一个不少。
 
-- [ ] **Step 3: 在本计划文档末尾补「T1a → T1b/T2 交接要点」终稿**（执行过程中的实际发现为准，
+- [x] **Step 3: 在本计划文档末尾补「T1a → T1b/T2 交接要点」终稿**（执行过程中的实际发现为准，
   至少覆盖：per-tensor 状态的新守卫触发面、MLA 段的 `?` 容忍清单、报告 JSON 形态与 T1b 面板
   的对接字段、DEFAULT_910B 各常数的替换点）。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md plans/2026-07-17-t1-timesim-simulation.md
@@ -2260,6 +2260,31 @@ git commit -m "docs(timesim): T1a 收尾——README 状态+交接要点固化(T
 - 多通信流带宽争抢、跨 pass host run-ahead（§7.2 诚实边界 2/4，v1 有界近似）；
 - crosscheck uncovered 记录接入 gpt_segments（T0 交接要点6 后半，opdag 簿记）→ T2 census 对账时一并做。
 
-## T1a → T1b/T2 交接要点（执行后补终稿）
+## T1a → T1b/T2 交接要点（终稿，2026-07-19 执行完成）
 
-（Task 12 Step 3 填写。）
+**成果**：`cost_eval/timesim/` 全链路就绪，1332 passed（T1a 起 1273→1332，净增 59 测试，12 内存锚点全程不破）。模块：ir / shard_rules / producer / frame_comm / bwd_rules（T0）+ machine / op_cost / pass_builder / segment_sim / pipeline_sim / report（T1a）。门面入口 `report.evaluate_step_time(layer_segments, deg, hw, *, pp, m, ...) → StepTimeReport`。
+
+### 1. 执行中发现并修复的设计级问题（load-bearing，勿回退）
+- **segment_sim 尾段守恒 bug（对抗性 review 抓，Critical）**：设备后尾段 [cursor,makespan] 的通信归因原按 fin 排序 + 单一前沿，跨轴嵌套/交叉区间下**破坏 Σ三态==makespan**（最坏漏计 ~50%）+ 错配轴。已改**扫描线**逐子区间取"当刻活跃且完成最晚的轴"（`segment_sim.py` 尾段块）。frame_comm 的 FSDP/EP/CP `deps=()` 预取 + 段内 tp 通信尾就是真实触发形态。回归：`test_tail_crossing_axes_conserves`（须 dev=1 让 cursor 严格早于嵌套区间起点，conservation 断言才判别新旧）。
+- **VPP 调度死锁（实施 BLOCKED→根因修，Critical）**：`schedule.interleaved_virtual_order` 为 mem 侧设计（反向 chunk 升序 FIFO），但跨 stage 反向依赖要求同 stage 反向 chunk **降序**。pipeline_sim 消费时按 Megatron `get_model_chunk_id(forward=False)=v−1−chunk` 反转反向事件 chunk（`pipeline_sim.py`，**schedule.py 未改**、契约3 各自 walk）。对抗性 review 拉 live Megatron 源逐事件核对 faithful。**限制**：仅深度优先 `group_size==pp`（Megatron 默认，DSv3 用之）验证自洽；`gs≠pp`（pp≥4 实测仍死锁）与 `m%pp≠0` 均 fail-loud，留 v1.5。
+- **recompute_comm + FSDP 双 all_gather（集成 review 抓，Important）**：`recompute="full"+recomp_comm=True` 时重算前缀已重放 `.fsdp_ag`（即重 gather），门面守卫 `not(recompute=="full" and recomp_comm)` 跳过 fsdp_regather，否则 comm_dp 双 AG。
+- **op_flops in_shapes[0]=激活侧、FA 非对称式** `2·B·N·Sq·Skv·(Dq+Dv)·causal`（MLA 的 Dq≠Dv）、GEMM 对 fwd/dX/dW 统一——见 ir/op_cost docstring。
+
+### 2. T1b（explorer 时间面板）对接
+- **消费 StepTimeReport 字段**：`t_step_us` / `t_pipeline_us` / `t_opt_us` / `t_grad_sync_tail_us` / `fixed_step_us`（瀑布分解，组装恒等式 t_step==四者和）；`per_stage`（list[dict]：stage/busy_us/bubble_us/host_gap_us/exposed_comm{轴}——泳道/pipeline 图）；`bubble_fraction`（+ `bubble_fraction_closed_form` 参考）；`critical_path`（((stage,kind,mb,chunk)…)）；`mfu`/`hfu`；`provenance_mix`（T1 恒 {hit:0,model:0,theory:1}——面板须显警示条）；`bottleneck_ranking`（((名,us)…) 降序）；`uncalibrated`（恒 True → 面板未标定警示）。
+- **段内泳道图**数据源：`segment_sim.SegmentTime`（duration/t_compute/t_membound/t_host_gap/t_exposed_comm{轴}/host_len_us/per_layer/top_contributors，top 回指 file:line）——门面目前只把 SegmentTime 聚合进 per_stage，若面板要逐段泳道需门面**额外暴露 seg_times dict**（现为局部变量，report.py 内）。
+- 解耦：面板只消费 timesim JSON，与内存面板无共享内部状态（spec §8）。
+
+### 3. T2（经验库 + 真机标定）对接
+- **换库即换数**：`machine.DEFAULT_910B`（peak_flops/hbm_bw/link_alpha_us/link_bw/eta/host_unit_us，全 `calibrated=False`）是唯一常数落点，标定后换该对象即可，代码零改动。
+- **CostModel 预留 lib 位**：`CostModel(hw, lib=<OpTimeLibrary>)` 现抛 NotImplementedError（防假装标定）——T2 实现三级退化的命中/内插（provenance hit/model），`provenance_mix` 自动反映。
+- **首末 stage 段**：本 pipeline 只用 transformer 层段，embedding/head/loss 时长并入 `fixed_step_us` 标定常数（现默认 0）——T2 锚点用「实测 − 仿真」反解填入；embedding/loss 段成本忠实化（T0 交接要点1 的 Gather 出形/权重 ins/int dtype）亦 T2。
+- **census 对账**：L2 kernel_details.csv vs op_cost 名册（spec §7.1-L2），crosscheck uncovered 接 gpt_segments。真机 runner 走 116（[[shb-container-env-prefix]]）。
+
+### 4. 已知边界 / 后续（非阻塞）
+- 报告 per_layer 只聚合 device op 时长（不含 comm），语义"每层 device 足迹"——面板若需含通信需门面调整；
+- `gs≠pp` VPP、`m%pp≠0`、select 重算、MoE 段 producer、非均匀 layers_per_stage、swap/offload/zero-bubble/mc2 = v1.5（spec §9）；
+- 多通信流带宽争抢、跨 pass host run-ahead = v1 有界近似（spec §7.2）；
+- Calculon 对标（L1）+ 端到端锚点矩阵（L4）= T2 人工步。
+
+**执行模式复盘**：subagent-driven（每任务 implementer + spec/quality 或合并 review；DES 类任务上**对抗性 review**——独立构造探针验守恒/核 live 上游源——分别抓出 segment_sim Critical 守恒 bug 与验证 VPP 反转 faithful，价值显著）。两个 DES（segment_sim/pipeline_sim）的 bug 都不在基础测试覆盖内、靠对抗性探针才现形——T2 真机对账仍应保持该强度。
