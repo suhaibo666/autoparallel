@@ -36,7 +36,10 @@ class OpCost:
     bytes_rw: int
     arith_intensity: float
     ridge: float
-    bound: str                # compute | memory | comm | host
+    bound: str                # compute | memory | comm | host —— "host" 仅表示"该 op 无 device
+                              # 分量、roofline 分类无意义"（View/host_only），**≠** spec §4.1-D2
+                              # 讲的 segment_sim 涌现态 host-bound（那是"有 device 工作却被延迟"，
+                              # 由段仿真判定，不是 op 静态属性）。勿把二者混为一谈（Task 6 review）。
     host_dominated: bool
     eta_key: str
     provenance: str           # T1 恒 "theory"（spec §4.2 第3级）

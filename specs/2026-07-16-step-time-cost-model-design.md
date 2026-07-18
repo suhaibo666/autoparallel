@@ -150,7 +150,9 @@ class OpCost:
     flops: int; bytes_rw: int
     arith_intensity: float    # FLOPs / bytes_rw（通信 op 为 0）
     ridge: float              # 机器平衡点 = peak_FLOPS(dtype)/HBM_BW，判据留痕
-    bound: str                # compute | memory | comm —— 静态 roofline 分类（AI vs ridge）
+    bound: str                # compute | memory | comm | host —— 静态 roofline 分类（AI vs ridge）；
+                              # "host"=View/host_only（无 device 分量、分类无意义），**≠**下文 D2 讲的
+                              # segment_sim 涌现态 host-bound（T1 实现补，Task 6 review 同步）
     host_dominated: bool      # t_host > t_dev（该 op 发射比执行贵：View/Cast/小elementwise 典型）
     eta_key: str
     provenance: str           # hit | model(置信度) | theory —— 该数字的可信来源

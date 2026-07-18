@@ -4,8 +4,8 @@
 import pytest
 
 from cost_eval.timesim.machine import TimeHardware, DEFAULT_910B, synth_hw
-from cost_eval.timesim.ir import TimedOp, CommSpec
-from cost_eval.timesim.op_cost import CostModel, OpCost
+from cost_eval.timesim.ir import TimedOp, TimedSegment, CommSpec
+from cost_eval.timesim.op_cost import CostModel, OpCost, price_segment
 
 
 def test_synth_hw_roundtrip():
@@ -121,3 +121,20 @@ def test_generic_grad_bytes_convention():
 def test_host_dominated_flag():
     tiny = _op(op_type="Cast", in_shapes=((8, 8),), out_shape=(8, 8))
     assert CM.cost(tiny).host_dominated is True
+
+
+def test_lib_param_not_implemented():
+    """T1/T2 边界守卫（防静默假装标定过）：传 OpTimeLibrary → NotImplementedError（review Minor-1）。"""
+    with pytest.raises(NotImplementedError):
+        CostModel(HW, lib=object())
+
+
+def test_price_segment_returns_cost_per_op():
+    """price_segment：整段 {op_id → OpCost}（segment_sim/report 的输入，review Minor-3）。"""
+    seg = TimedSegment("s.fwd", (_op(op_id="a"),
+                                 _op(op_id="b", op_type="Norm",
+                                     in_shapes=((4096, 1, 1792),), out_shape=(4096, 1, 1792))))
+    costs = price_segment(seg, CM)
+    assert set(costs) == {"a", "b"}
+    assert all(isinstance(c, OpCost) for c in costs.values())
+    assert costs["a"].bound == "compute" and costs["b"].bound == "memory"
