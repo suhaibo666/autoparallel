@@ -15,8 +15,10 @@ EP：GroupedMatMul 区两侧包一对 dispatch/combine all-to-all（balanced 路
 假设，v1 不建 unbalanced 容量溢出）；dispatch 载荷 = 该区首个 GroupedMatMul 的输入激活字节，
 combine 载荷 = 该区末个 GroupedMatMul 的输出字节。ep<=1 或段内无 GroupedMatMul → 恒等。
 
-CP：colossal（环状 p2p）→ 每条 FlashAttention 前插一条 kv p2p（载荷=k+v 字节；环的跳数系数归
-op_cost/T1，本模块只管"有一跳 p2p 通信、且在 FA 前"这一结构事实）；ulysses → FlashAttention
+CP：colossal（环状 attention）→ 结构化为 cp 个 FlashAttention 块 × 块间 cp−1 条单跳 kv p2p
+交替（T1-4；载荷=k+v 字节，p2p 恒单跳——跳数已结构化，不再留给 op_cost 系数；块间 p2p 与
+上一块 FA 的重叠交给 pipeline_sim/segment_sim 的 DES 涌现，本模块只管"块间该出现一跳 p2p
+通信"这一结构事实）；ulysses → FlashAttention
 前后各插一条 all_to_all（seq-parallel↔head-parallel 切换）。method 不在
 {"colossal","ulysses"} → ValueError（fail-loud，不猜语义）。cp<=1 → 恒等。
 
@@ -81,9 +83,10 @@ def inject_ep(seg: TimedSegment, ep: int) -> TimedSegment:
 
 
 def inject_cp(seg: TimedSegment, cp: int, method: str = "colossal") -> TimedSegment:
-    """cp<=1 → 恒等。method="colossal" → 每条 FlashAttention 前插一条 kv p2p；
-    method="ulysses" → 每条 FlashAttention 前后各插一条 all_to_all；
-    其余 method → ValueError（fail-loud，且先于 cp<=1 早退——cp 不活跃时 typo 也要报）。"""
+    """cp<=1 → 恒等。method="colossal" → 结构化为 cp 个 FlashAttention 块、块间 cp−1 条单跳
+    kv p2p 交替（T1-4，overlap 交 DES 涌现）；method="ulysses" → 每条 FlashAttention 前后各插
+    一条 all_to_all；其余 method → ValueError（fail-loud，且先于 cp<=1 早退——cp 不活跃时 typo
+    也要报）。"""
     if method not in ("colossal", "ulysses"):
         raise ValueError(f"frame_comm: 未知 CP method {method!r}（fail-loud，不猜语义）")
     if cp <= 1:
@@ -95,15 +98,30 @@ def inject_cp(seg: TimedSegment, cp: int, method: str = "colossal") -> TimedSegm
             ops.append(op)
             continue
         if method == "colossal":
-            volume = (tensor_bytes(op.in_shapes[1], op.dtype)
-                       + tensor_bytes(op.in_shapes[2], op.dtype))
-            p2p = TimedOp(
-                op_id=f"{op.op_id}.cp", op_type="CommOp", phase=op.phase,
-                in_shapes=(op.in_shapes[1], op.in_shapes[2]), out_shape=op.in_shapes[1],
-                dtype=op.dtype, stream=COMM_STREAM["cp"], deps=(),
-                comm=CommSpec("p2p", volume, "cp", cp))
-            ops.append(p2p)
-            ops.append(op)
+            # ring 结构化（T1-4）：cp 个 FA 块 × 块间 cp-1 条单跳 kv p2p。每块 shape 与
+            # localize 后的原 FA 相同（q=S/cp × kv 环转块=S/cp）；p2p deps=()（kv 段首可发，
+            # 与上一块 FA 的重叠由 DES 涌现——spec §5.5 位置即语义）；末块保留原 op_id，
+            # 下游 deps 不换绑。causal zigzag 负载均衡差异归 op_cost 的 causal 系数（v1 均匀）。
+            kv_bytes = (tensor_bytes(op.in_shapes[1], op.dtype)
+                        + tensor_bytes(op.in_shapes[2], op.dtype))
+            for k in range(cp):
+                if k > 0:
+                    p2p = TimedOp(
+                        op_id=f"{op.op_id}.p2p{k}", op_type="CommOp", phase=op.phase,
+                        in_shapes=(op.in_shapes[1], op.in_shapes[2]),
+                        out_shape=op.in_shapes[1], dtype=op.dtype,
+                        stream=COMM_STREAM["cp"], deps=(),
+                        src="cp[colossal]:module-semantics",
+                        comm=CommSpec("p2p", kv_bytes, "cp", cp))
+                    ops.append(p2p)
+                    blk_deps = op.deps + (p2p.op_id,)
+                else:
+                    blk_deps = op.deps
+                blk_id = op.op_id if k == cp - 1 else f"{op.op_id}.cp{k}"
+                ops.append(TimedOp(
+                    op_id=blk_id, op_type="FlashAttention", phase=op.phase,
+                    in_shapes=op.in_shapes, out_shape=op.out_shape, dtype=op.dtype,
+                    stream=op.stream, src=op.src, deps=blk_deps, module=op.module))
         else:   # ulysses：FA 前后各一条 all_to_all（seq-parallel↔head-parallel 切换）
             # 载荷只切 q,k,v（in_shapes[:3]，bprop_rules.py:31 口径）——真机 FA 调用含
             # attn_mask（bf16 S×S 可比肩 q），mask 不参与重排，全量求和会静默膨胀载荷。

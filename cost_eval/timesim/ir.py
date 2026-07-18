@@ -23,8 +23,8 @@ class CommSpec:
       - all_gather=分片入参字节（gather 前、本 rank 持有的那一份）；
       - reduce_scatter/all_reduce=全量（未分片）字节；
       - all_to_all=全量本地参与字节（op_cost 施 (n−1)/n 对分系数，spec §4.1）；
-      - p2p=单跳载荷字节（跳数系数 op_cost 按 group_axis 施：pp=1、cp ring=cp−1）；
-      ring 系数按 ctype 在 op_cost 分别施加（T1，不在这里杜撰）。
+      - p2p=单跳载荷字节（**恒单跳**：cp ring 的 cp−1 跳已由 frame_comm.inject_cp 结构化为
+        cp−1 条 p2p op（T1-4），pp 本就单跳——op_cost 不再施跳数系数）；
 
     **对偶换算（bwd_rules 用）**：AG→RS volume ×group_size、RS→AG ÷group_size
     （AG 记分片、RS 记全量所致）；AR/A2A/p2p 对偶 volume 不变。"""

@@ -69,16 +69,32 @@ def test_ep_noop_without_grouped():
     assert inject_ep(seg, ep=4) is seg
 
 
-def test_cp_ring_p2p_precedes_flash_attention():
-    fa = TimedOp(op_id="a#3", op_type="FlashAttention", phase="fwd",
-                 in_shapes=((2048, 1, 8, 224),) * 3, out_shape=(2048, 1, 8, 224),
-                 dtype="bf16", stream="device", src="attention.py:1")
-    seg = TimedSegment("l.fwd", (fa,))
-    seg2 = inject_cp(seg, cp=2, method="colossal")
-    assert seg2.ops[0].op_type == "CommOp" and seg2.ops[0].comm.ctype == "p2p"
-    assert seg2.ops[0].stream == "comm_cp" and seg2.ops[0].comm.group_axis == "cp"
-    # 载荷 = k+v 字节（in_shapes[1]/[2]；跳数系数归 op_cost/T1）
-    assert seg2.ops[0].comm.volume_bytes == 2 * (2048 * 1 * 8 * 224 * 2)
+def test_cp_ring_structural_blocks():
+    """colossal ring 结构化（T1-4）：cp 个 FA 块、块间 cp-1 条单跳 kv p2p；
+    p2p_k deps=()（段首即可发）、FA_k deps 含 p2p_k → p2p 与上一块 FA 的重叠交给 DES 涌现。
+    下游依赖不换绑：最末块保留原 op_id。"""
+    from cost_eval.timesim.ir import TimedOp, TimedSegment
+    from cost_eval.timesim.frame_comm import inject_cp
+    fa = TimedOp(op_id="a#0", op_type="FlashAttention", phase="fwd",
+                 in_shapes=((2048, 1, 8, 224),) * 3 + ((),), out_shape=(2048, 1, 8, 224),
+                 dtype="bf16", stream="device", src="attention.py:1", deps=("a#9",))
+    seg = inject_cp(TimedSegment("l.fwd", (fa,)), cp=4, method="colossal")
+    fas = [o for o in seg.ops if o.op_type == "FlashAttention"]
+    p2ps = [o for o in seg.ops if o.op_type == "CommOp"]
+    assert len(fas) == 4 and len(p2ps) == 3
+    assert [o.comm.ctype for o in p2ps] == ["p2p"] * 3
+    assert all(o.stream == "comm_cp" and o.deps == () for o in p2ps)
+    # 交替序：FA0, p2p1, FA1, p2p2, FA2, p2p3, FA3
+    assert [o.op_type for o in seg.ops] == ["FlashAttention", "CommOp"] * 3 + ["FlashAttention"]
+    # 末块保留原 id（下游 deps 不换绑）；前块带 .cpK 后缀
+    assert fas[-1].op_id == "a#0"
+    assert fas[0].op_id == "a#0.cp0"
+    # 每块 FA 保留原跨流 deps；k≥1 块追加对应 p2p dep
+    assert fas[0].deps == ("a#9",)
+    assert p2ps[0].op_id in fas[1].deps and "a#9" in fas[1].deps
+    # p2p 载荷 = k+v 单块字节（单跳口径）
+    kv = 2048 * 1 * 8 * 224 * 2
+    assert all(o.comm.volume_bytes == 2 * kv for o in p2ps)
 
 
 def test_cp_ulysses_alltoall_both_sides():
