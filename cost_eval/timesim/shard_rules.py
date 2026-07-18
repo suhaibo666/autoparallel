@@ -77,12 +77,16 @@ def localize(vals: list[int], sym_shape: str, deg: Degrees, *,
 
 def weight_local(sym: str, dims, module: str, tp: int) -> tuple[int, ...]:
     """线性层**权重**的 local shape（切分轴随模块语义，不是一律末轴）：
-    ColumnParallelLinear 权重 [in, out] → out(末轴) ÷tp；
-    RowParallelLinear    权重 [in, out] → in(轴0)  ÷tp。"""
+    ColumnParallelLinear   权重 [in, out] → out(末轴) ÷tp；
+    RowParallelLinear      权重 [in, out] → in(轴0)  ÷tp；
+    SequenceParallelLinear 权重不切（layers.py:819「A is not parallelized」，:850 布局
+    ("None","None")——T1 Task 3）。"""
     vals = axis_values(sym, dims)
     if tp > 1:
         if module == "ColumnParallelLinear":
             vals[-1] = _div_exact(vals[-1], tp, "col-weight out")
         elif module == "RowParallelLinear":
             vals[0] = _div_exact(vals[0], tp, "row-weight in")
+        elif module == "SequenceParallelLinear":
+            pass                                   # 权重全量（每 rank 复制）
     return tuple(vals)
