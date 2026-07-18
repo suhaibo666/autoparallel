@@ -1242,7 +1242,7 @@ git commit -m "feat(timesim): OpCost+CostModel——roofline×默认η+per-ctype
 
 **动机（spec §5.2）**：PyNative 的 host 不在层边界停——L1 仿真单元是一个 (stage, phase, microbatch[, chunk]) 的**完整连续 pass**，按层孤立仿真再求和会掐断 host run-ahead 系统性高估。故需把 per-layer TimedSegment 拼成单段：op_id 加层前缀防碰撞（同 cell 多层 id 相同）、段内 deps 同步改写、层标记保留供 SegmentTime.per_layer 聚合。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 # tests/test_timesim_pass_builder.py
@@ -1282,7 +1282,7 @@ def test_concat_drops_cross_layer_unknown_deps():
     assert p.ops[0].deps == ("external#9",)
 ```
 
-- [ ] **Step 2: 跑确认失败** → **Step 3: 实现**
+- [x] **Step 2: 跑确认失败** → **Step 3: 实现**
 
 ```python
 # cost_eval/timesim/pass_builder.py
@@ -1316,7 +1316,7 @@ def concat_segments(seg_id: str, segments: list) -> TimedSegment:
     return TimedSegment(seg_id, tuple(ops))
 ```
 
-- [ ] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
+- [x] **Step 4: 跑测试 + 全量** → **Step 5: Commit**
 
 ```bash
 git add cost_eval/timesim/pass_builder.py tests/test_timesim_pass_builder.py
