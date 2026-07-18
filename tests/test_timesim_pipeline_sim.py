@@ -67,6 +67,22 @@ def test_vpp_nondefault_group_size_fail_loud():
         simulate_pipeline(_uniform(4, 10.0, 20.0, v=2), pp=4, m=8, v=2, group_size=2)
 
 
+def test_vpp_closed_form_bubble_exact():
+    """L0③ VPP 版（review 补强）：均匀 stage + p2p=0 → bubble_fraction 精确 =
+    (pp−1)/(m·v+pp−1)（plain 版 v=1 的自然推广，虚拟微批数 m·v）——零公差,锁反转后调度的
+    bubble 数值正确性（原 test_vpp_reduces_bubble 只弱断言 t2<t1）。"""
+    for pp, m, v in [(2, 4, 2), (4, 8, 2), (3, 6, 2), (2, 4, 3)]:
+        r = simulate_pipeline(_uniform(pp, 10.0, 20.0, v), pp=pp, m=m, v=v, p2p_us=0.0)
+        assert r.bubble_fraction == pytest.approx((pp - 1) / (m * v + pp - 1))
+
+
+def test_vpp_m_not_divisible_by_pp_fail_loud():
+    """VPP 要求 m%pp==0（Megatron 交错硬约束）→ 不整除 fail-loud（首个出时间数的消费者补验，
+    否则对不可跑配置出貌似合理的数，review Important）。"""
+    with pytest.raises(ValueError, match="整除"):
+        simulate_pipeline(_uniform(4, 10.0, 20.0, v=2), pp=4, m=6, v=2)   # 6%4≠0
+
+
 def test_missing_duration_fail_loud():
     with pytest.raises(KeyError):
         simulate_pipeline({(0, "FWD", 0): 1.0}, pp=2, m=2)

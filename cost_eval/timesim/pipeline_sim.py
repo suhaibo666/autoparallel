@@ -15,8 +15,8 @@ interleaved_virtual_order（group_size 默认 pp，Megatron model_parallel_confi
 stage 反向 chunk 须**降序**）。而 schedule.interleaved_virtual_order 为 mem_timeline 设计，
 其 docstring 明言"forward/backward 均按同一 schedule table FIFO"——反向 chunk 是**升序**。
 时间侧消费时按 Megatron `get_model_chunk_id(forward=False)=v−1−chunk` 反转反向事件的 chunk，
-使之与因果序一致（契约3「各自独立 walk」：mem 侧不反转、不受影响；时间侧自建消费）。v=1 时
-v−1−c≡c 反转为恒等，plain 路径逐字节不变。
+使之与因果序一致（契约3「各自独立 walk」：mem 侧不反转、不受影响；时间侧自建消费）。v≤1 走
+build_1f1b 独立分支、chunk 恒 0，根本不经反转逻辑（且 v−1−c≡c 亦为恒等）——plain 路径不变。
 **分组限制（v1）**：仅深度优先分组 group_size==pp（Megatron 默认
 microbatch_group_size_per_vp_stage=pp）经验证自洽（跨 pp/v 广泛探针守恒+无死锁）；gs≠pp 的
 广度优先变体调度序与本反向依赖模型不自洽（pp≥4 实测仍死锁）→ fail-loud，留 v1.5。
@@ -75,6 +75,13 @@ def simulate_pipeline(durations: dict, pp: int, m: int, *, v: int = 1,
             f"pipeline_sim: VPP(v={v}) 时间仿真 v1 仅支持深度优先分组 group_size==pp"
             f"（Megatron 默认 microbatch_group_size_per_vp_stage=pp）；gs={gs}≠pp={pp} 的广度"
             f"优先变体调度序与跨 stage 反向依赖不自洽（pp≥4 实测死锁）——v1.5，fail-loud")
+    if v > 1 and m % pp != 0:
+        # Megatron 交错 1F1B 硬约束 num_microbatches%pp==0（schedules.py:1140-1160，
+        # 0<remainder<pp 时 RuntimeError）——不整除无法构成合法虚拟流水；本仿真是首个从该
+        # 调度出实际时间数的消费者,故在此补 fail-loud(否则会对不可跑配置出貌似合理的数)。
+        raise ValueError(
+            f"pipeline_sim: VPP(v={v}) 要求 microbatch 数 m 被 pp 整除（Megatron 硬约束）；"
+            f"m={m}%pp={pp}≠0 无法构成合法虚拟流水——fail-loud")
     orders = []
     for s in range(pp):
         if v <= 1:
