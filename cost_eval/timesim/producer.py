@@ -45,6 +45,18 @@ bool——对 MLP 单链成立，MLA 多支路（rope 支不过 Column、与过 
     ("cp","tp") 切 S、权重不切）：权重全量、无通信、状态透传。
 deps 只记跨流依赖（同流 FIFO 隐含，ir.py 字段注释）；依赖发现按输入 ref 名→生产者节点
 （与 dag.edges 等价——walker 对 tuple 全目标登记 producer，_emit :898-908）。
+
+comm_probe 消费现状（code-review T1a [5] 补记，避免"探针建了不用"的死代码误读）：spec §3.3c
+设计的是**探针驱动**注入——识别出源码里的显式通信惯用法就发 CommOp，识别不出才退回模块语义
+注入并 fail-loud。本模块（T1 范围）反过来：TP/SP 通信是**硬编码**语义（上文 Row `.rs` 的
+reduce_scatter/all_reduce 二选一、Column 的 sp all_gather），从不调用
+`opdag.comm_probe.probe_cell_comm`——下面 import 的 `COMM_CLS` 只用于 opaque_calls 疑似通信
+调用的字符串守卫（_OPAQUE_COMM_MARKERS），不是消费探针的解析结果。为不让 comm_probe 沦为
+死代码，`tests/test_producer_comm_matches_probe.py` 做**交叉校验**：用 probe 从真 layers.py
+提取的 CommSite（源真相）断言与本模块硬编码的 ctype/guard（消费假设）一致，并断言 Row/
+Embedding 站点不出现 guard=="?"——源码 idiom 漂移、或本模块硬编码被误改，测试即变红，不是
+静默分道扬镳。**运行时探针驱动注入**（producer 直接消费 probe_cell_comm 结果决定发哪种
+CommOp，取代现有 if/else 硬编码）是 v1.5 工作，当前 T1 只做静态交叉校验锁一致性。
 """
 from __future__ import annotations
 
