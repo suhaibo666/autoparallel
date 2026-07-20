@@ -58,7 +58,7 @@ usage/页面布局/口径与诚实边界见 README_explorer；本文件只讲「
 | pp | `pp` | 流水线并行 | 1 | `pp ≤ layers+mtp` |
 | pp 层分配 | `pp_split` | 每 stage 的 transformer(+mtp) 层数，逗号分隔（`num_layer_list`） | 空=均匀切 | 段数==pp、和==layers+mtp、每段≥1；**embedding→stage0、head→末 stage 自动归置（不占配额）**；空时余数**前置**分摊（N=8 pp=3→3,3,2） |
 | vpp | `vpp` | 虚拟流水交错数（`pp_interleave_num`） | 1 | ≥1；>1 需 pp>1、microbatch≥pp |
-| microbatch | `mbs` | 流水 microbatch 数 | 空=auto（pp>1 时=pp，否则 1） | ≥1 或留空 |
+| 微批/梯度累积 | `mbs` | `num_microbatches` = 每次 optimizer step 的微批数 = **梯度累积步数**。**pp=1 时即纯梯度累积**（每微批 F/B 后 reduced 梯度分片常驻=`grad_accum` 桶，直到 optimizer；设 >1 才建模非-PP 梯度累积驻留，否则欠估）；pp>1 时同时驱动 1F1B 流水。KPI 显示梯度累积步数/驻留量/有效 batch（=micro·dp·num_microbatches） | 空=auto（pp>1 时=pp，否则 1=无累积） | ≥1 或留空 |
 | cp | `cp` | 上下文并行 | 1 | `cp \| seq` |
 | cp 算法 | `method` | `colossal`（KV all-gather full-S）/`ulysses`/`ring`/`hybrid` | colossal | — |
 

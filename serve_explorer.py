@@ -24,7 +24,8 @@ from cost_eval.report import Evaluator
 
 MiB = 2 ** 20
 BK = ["persistent", "act_live", "kept_frag", "gather_buf", "grad_buf", "recomp_scratch",
-      "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "optstep", "framework"]
+      "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "optstep",
+      "grad_accum", "p2p_buf", "framework"]   # grad_accum/p2p_buf(2026-07-20):此前遗漏→HTML 不展示
 _CP_METHODS = ("colossal", "ulysses", "ring", "hybrid")
 # select 选择器:**单一来源** = 转换器 _SELECT_MODULE_OPS（2026-07-14 review P1.5:此前双维护
 # 导致口径漂移——serve 多 "qkv" 而转换器没有,GQA yaml select 静默漏选）。
@@ -724,8 +725,19 @@ def eval_config(p):
                                       if getattr(s.breakdown, k, 0)}} for s in sp.timeline],
         })
     worst_reserved = max(rep.reserved_estimate_bytes(sp.stage) for sp in rep.per_stage)   # 最紧 stage
+    # 梯度累积读数（2026-07-20）：num_microbatches = 梯度累积步数（pp=1 时纯累积）。有效全局 batch
+    #   = micro_batch × data_parallel(dp_shard·dp_replicate) × num_microbatches。grad_accum_mib =
+    #   各 stage 峰值断面里最大的 reduced 梯度累计驻留（m≥2 才 >0；pp=1 m=1 时为 0=无累积）。
+    _mbs = pc.num_microbatches
+    _dp_total = pc.dp_shard * pc.dp_replicate
+    grad_accum_mib = round(max((sp.breakdown.grad_accum for sp in rep.per_stage), default=0) / MiB, 1)
     return {"ok": True, "world": world, "tightest": rep.tightest_stage,
             "device_peak": round(max(s["peak"] for s in stages), 1), "stages": stages,
+            "num_microbatches": _mbs,                    # = 梯度累积步数（pp=1 纯累积;pp>1 兼流水微批）
+            "grad_accum_steps": _mbs,                    # 别名（语义明示）
+            "eff_batch": d.B * _dp_total * _mbs,         # 有效全局 batch = micro·dp·num_microbatches
+            "micro_batch": d.B, "dp_total": _dp_total,
+            "grad_accum_mib": grad_accum_mib,            # 峰值断面的梯度累积驻留（m≥2 才 >0）
             "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0),
             "allocated_oom": rep.allocated_oom,   # P2-01 顶层：任一 stage allocated 峰值超容
             "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容（含 pool 近似）
@@ -1063,7 +1075,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
     <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的可切分层数(transformer+mtp,mindformers num_layer_list 口径),段数=pp、和=layers+mtp;embedding/head 是伪层自动归 stage0/末 stage、不占配额也不计入显示层数"></div>
     <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num);>1 时每个物理 stage 持 vpp 个非连续 chunk(round-robin: 虚拟 stage=chunk*pp+rank),微批数需≥pp,更深 warmup→更多在飞激活。例:pp=2,vpp=2,8 层→stage0 持 chunk0(L1,2)+chunk2(L5,6),stage1 持 chunk1(L3,4)+chunk3(L7,8)"></div>
-    <div class="fld"><label>microbatch</label><input name="mbs" placeholder="auto(=pp)" style="width:76px" title="流水微批数 num_microbatches;空=auto(pp>1 时取 pp)。m>pp 时 1F1B warmup/在飞深度随 m 分化"></div>
+    <div class="fld"><label>微批/梯度累积</label><input name="mbs" placeholder="auto(pp>1=pp,pp=1=1)" style="width:112px" title="num_microbatches = 每次 optimizer step 的微批数 = 梯度累积步数。空=auto(pp>1 取 pp;pp=1 取 1=无累积)。pp=1 时它就是**纯梯度累积**：每微批 F/B 后其 reduced 梯度分片常驻(grad_accum 桶)直到 optimizer step——设 >1 才建模非-PP 梯度累积驻留(否则欠估)。pp>1 时同时驱动 1F1B 流水(warmup/在飞深度随 m 分化)。"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
@@ -1103,8 +1115,8 @@ const PRESETS=__PRESETS__;
 const OPC={matmul:"#4e79a7",flash_attn:"#e15759",elementwise:"#b07aa1",norm:"#59a14f",rope:"#8cd17d",
   moe_router:"#f9a825",moe_gemm:"#2f4b7c",dispatch:"#76b7b2",combine:"#76b7b2",embedding:"#7cae60",
   dsa:"#e15759",csa:"#e15759",hca:"#e15759"};
-const BKC={persistent:"#6b6b6b",act_live:"#4e79a7",kept_frag:"#c0392b",gather_buf:"#59a14f",grad_buf:"#f28e2b",recomp_scratch:"#b07aa1",bwd_scratch:"#e15759",bwd_working_set:"#8cd17d",swap_buf:"#76b7b2",workspace:"#bab0ac",optstep:"#ff9da7",framework:"#d7d7d7"};
-const BKD={persistent:"参数+优化器状态",act_live:"存活激活",kept_frag:"B margin(保留-MoE碎片)",gather_buf:"FSDP all-gather",grad_buf:"梯度缓冲",recomp_scratch:"full重算重物化",bwd_scratch:"反向临时(loss fp32)",bwd_working_set:"无重算反向工作集",swap_buf:"激活swap",workspace:"算子workspace",optstep:"优化器step",framework:"框架"};
+const BKC={persistent:"#6b6b6b",act_live:"#4e79a7",kept_frag:"#c0392b",gather_buf:"#59a14f",grad_buf:"#f28e2b",recomp_scratch:"#b07aa1",bwd_scratch:"#e15759",bwd_working_set:"#8cd17d",swap_buf:"#76b7b2",workspace:"#bab0ac",optstep:"#ff9da7",grad_accum:"#9c755f",p2p_buf:"#edc948",framework:"#d7d7d7"};
+const BKD={persistent:"参数+优化器状态",act_live:"存活激活",kept_frag:"B margin(保留-MoE碎片)",gather_buf:"FSDP all-gather",grad_buf:"梯度缓冲",recomp_scratch:"full重算重物化",bwd_scratch:"反向临时(loss fp32)",bwd_working_set:"无重算反向工作集",swap_buf:"激活swap",workspace:"算子workspace",optstep:"优化器step",grad_accum:"梯度累积驻留(num_microbatches≥2)",p2p_buf:"PP P2P send缓冲",framework:"框架"};
 let cur=null,curStage=0,openLayers=new Set();
 function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function fmib(m){return m>=1024?(m/1024).toFixed(1)+" GiB":m.toFixed(0)+" MiB";}
@@ -1123,7 +1135,8 @@ async function refresh(){
   eb.style.display="none";
   cur=d;curStage=d.tightest;openLayers=new Set();
   document.getElementById("kpeak").textContent=fmib(d.device_peak);
-  document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · hccl(reserved)+${d.hccl_mib}M · reserved余量 ${d.reserved_margin_mib}M`;
+  const gaTxt=d.num_microbatches>1?`梯度累积 ${d.num_microbatches}步(+${fmib(d.grad_accum_mib)}驻留)`:"无梯度累积(微批=1)";
+  document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · ${gaTxt} · 有效batch ${d.eff_batch}(micro ${d.micro_batch}×dp ${d.dp_total}×m ${d.num_microbatches}) · hccl+${d.hccl_mib}M · 余量 ${d.reserved_margin_mib}M`;
   document.getElementById("tabs").innerHTML=d.stages.map(s=>`<div class="tab ${s.stage===curStage?"on":""} ${s.oom?"oom":(s.reserved_oom?"rsv":"")}" data-s="${s.stage}">Stage ${s.stage} · ${fmib(s.peak)}${s.oom?" ⚠OOM":(s.reserved_oom?" ⚠reserved":"")}<span style="color:${s.stage===curStage?'#dde':'#999'};font-weight:400"> · ${s.n_layers}层${s.extras&&s.extras.length?" +"+s.extras.map(e=>e==="embedding"?"emb":e==="lm_head"?"head":e).join("+"):""}</span></div>`).join("");
   document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{curStage=+t.dataset.s;openLayers=new Set();drawStage();}));
   drawStage();
