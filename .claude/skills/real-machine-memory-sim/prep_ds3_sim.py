@@ -19,6 +19,12 @@ EP = int(os.environ.get("SIM_EP", "1"))         # 专家并行度（变配置验
 TP = int(os.environ.get("SIM_TP", "1"))         # 张量并行度
 PP = int(os.environ.get("SIM_PP", "1"))         # 流水并行度
 DPSHARD = int(os.environ.get("SIM_DPSHARD", "-1"))  # FSDP shard 度（-1=auto）
+# 梯度累积测试用：global_batch_size 可配。pp=1 时梯度累积步数 m = GBS / (local_batch·dp)，
+# 本 harness 固定 local_batch=1 → m = GBS/dp（dp=2 时 GBS=2→m=1，GBS=8→m=4）。
+GBS = int(os.environ.get("SIM_GBS", "2"))
+# 重算开关：默认 "full"（全层重算，对标 sim RecomputeSpec("full")）；"off"/"none" → 无重算
+# （全存激活，对标 sim RecomputeSpec("None")；已验证 log_NR / set_norecomp.py 走 mode:None）。
+RECOMPUTE = os.environ.get("SIM_RECOMPUTE", "full").strip().lower()
 
 # 1) 合成数据集（input_ids/labels/loss_mask/position_ids），仅几十条
 if not os.path.exists(DS_FILE):
@@ -42,11 +48,14 @@ with open(BASE) as f:
     cfg = yaml.safe_load(f)
 cfg["train_dataset"]["dataloader"]["dataset_files"] = [DS_DIR]
 cfg["training"]["local_batch_size"] = 1
-cfg["training"]["global_batch_size"] = 2          # 2 cards × 1（FSDP-only）
+cfg["training"]["global_batch_size"] = GBS        # 梯度累积：m = GBS/(local·dp)（默认 2 → dp=2 时 m=1）
 cfg["training"]["steps"] = STEPS
 cfg["model"]["num_hidden_layers"] = N_LAYERS
 cfg["model"]["seq_length"] = SEQ
-cfg["recompute"]["full_recompute_layer"] = [f"0-{N_LAYERS - 1}"]
+if RECOMPUTE in ("off", "none", "0", "false"):
+    cfg["recompute"] = {"mode": "None"}           # 无重算：全存激活（对标 sim RecomputeSpec("None")）
+else:
+    cfg["recompute"]["full_recompute_layer"] = [f"0-{N_LAYERS - 1}"]
 cfg["checkpoint"]["enable_save"] = False
 cfg["parallelism"]["expert_parallel"] = EP      # 变配置：EP
 cfg["parallelism"]["tensor_parallel"] = TP      # 变配置：TP
@@ -58,4 +67,5 @@ if PP > 1:
 out = os.path.join(CUR, "ds3_sim.yaml")
 with open(out, "w") as f:
     yaml.dump(cfg, f, indent=2)
-print("WROTE_CONFIG", out, "layers", N_LAYERS, "steps", STEPS, "seq", SEQ)
+print("WROTE_CONFIG", out, "layers", N_LAYERS, "steps", STEPS, "seq", SEQ,
+      "gbs", GBS, "recompute", cfg["recompute"])
