@@ -67,6 +67,23 @@ def test_vpp_nondefault_group_size_fail_loud():
         simulate_pipeline(_uniform(4, 10.0, 20.0, v=2), pp=4, m=8, v=2, group_size=2)
 
 
+def test_vpp_group_size_zero_not_swallowed_fail_loud():
+    """review [10]：`gs = group_size or pp` 把显式合法值 group_size=0（falsy）误当"未设"，
+    静默改写成 gs=pp，从而绕过上面 gs≠pp 的 fail-loud 守卫——对本该拒绝的配置悄悄出数。
+    修复后只有 None 才默认 pp，显式 0 应保留并照样触发该守卫。"""
+    with pytest.raises(ValueError, match="group_size"):
+        simulate_pipeline(_uniform(4, 10.0, 20.0, v=2), pp=4, m=8, v=2, group_size=0)
+
+
+def test_vpp_group_size_none_and_explicit_pp_still_normal():
+    """回归确认：group_size=None（默认）与显式传 group_size=pp 均不受影响，出数一致。"""
+    r_default = simulate_pipeline(_uniform(4, 10.0, 20.0, v=2), pp=4, m=8, v=2)
+    r_explicit_pp = simulate_pipeline(_uniform(4, 10.0, 20.0, v=2), pp=4, m=8, v=2,
+                                       group_size=4)
+    assert r_explicit_pp.t_total_us == pytest.approx(r_default.t_total_us)
+    assert r_explicit_pp.bubble_fraction == pytest.approx(r_default.bubble_fraction)
+
+
 def test_vpp_closed_form_bubble_exact():
     """L0③ VPP 版（review 补强）：均匀 stage + p2p=0 → bubble_fraction 精确 =
     (pp−1)/(m·v+pp−1)（plain 版 v=1 的自然推广，虚拟微批数 m·v）——零公差,锁反转后调度的

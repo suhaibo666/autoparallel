@@ -17,6 +17,10 @@ def layer_of(op_id: str) -> str:
 
 
 def concat_segments(seg_id: str, segments: list) -> TimedSegment:
+    seg_ids = [s.seg_id for s in segments]
+    if len(set(seg_ids)) != len(seg_ids):
+        raise ValueError(f"pass_builder: concat_segments 入参段 seg_id 有重复 {seg_ids}——"
+                         f"op_id 前缀去碰撞依赖 seg_id 互异(fail-loud)")
     ops: list[TimedOp] = []
     for seg in segments:
         local_ids = {o.op_id for o in seg.ops}

@@ -110,8 +110,15 @@ def simulate_segment(seg: TimedSegment, costs: dict) -> SegmentTime:
                 continue
             active = [(f, axis) for s, f, axis in tail_ivals if s <= lo < f]
             if active:
-                exposed_axis = max(active)[1]                # 完成最晚的活跃轴
-                exposed[exposed_axis] = exposed.get(exposed_axis, 0.0) + (hi - lo)
+                # 完成最晚的活跃轴；同刻并列（fin 相等）时均分该子区间，不按轴名 lex 序
+                # 独占（review [13]：旧版 max(active)[1] 用 (fin,axis) 元组比较，fin 相等
+                # 时按字典序把整个子区间错判给 lex 更大的轴，另一轴记 0——归因扭曲，Σ守恒
+                # 不破但 per-axis exposed_comm 数值不对）。
+                max_fin = max(f for f, _ in active)
+                tied = sorted({axis for f, axis in active if f == max_fin})
+                share = (hi - lo) / len(tied)
+                for ax in tied:
+                    exposed[ax] = exposed.get(ax, 0.0) + share
             else:
                 host_gap += hi - lo                          # 尾段无通信在传 → host 尾巴
     elif makespan > cursor:

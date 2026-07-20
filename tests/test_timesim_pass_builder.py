@@ -1,4 +1,6 @@
 """concat_segments：op_id 层前缀 + deps 改写 + 层标记。"""
+import pytest
+
 from cost_eval.timesim.ir import TimedOp, TimedSegment
 from cost_eval.timesim.pass_builder import concat_segments, layer_of
 
@@ -32,3 +34,11 @@ def test_concat_drops_cross_layer_unknown_deps():
                 stream="device", src="f.py:1", deps=("external#9",))
     p = concat_segments("s0.mb0.bwd", [TimedSegment("layer_0.bwd", (a,))])
     assert p.ops[0].deps == ("external#9",)
+
+
+def test_concat_rejects_duplicate_seg_ids():
+    """review [15]：op_id 前缀去碰撞方案（`seg.seg_id + "/"`）整个成立的前提是入参段
+    seg_id 互异。若重复，op_id 会跨段碰撞，price_segment/simulate_segment 的 op_by_id
+    dict 只留最后一个、层间 deps 解析到错的 op——静默出错，须 fail-loud 拒绝。"""
+    with pytest.raises(ValueError, match="seg_id"):
+        concat_segments("p", [_seg("layer_0.fwd"), _seg("layer_0.fwd")])

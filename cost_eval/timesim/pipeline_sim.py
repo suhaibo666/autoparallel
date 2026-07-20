@@ -69,7 +69,7 @@ def _dep_of(kind: str, s: int, mb: int, c: int, pp: int, v: int):
 
 def simulate_pipeline(durations: dict, pp: int, m: int, *, v: int = 1,
                        group_size: int | None = None, p2p_us: float = 0.0) -> PipelineResult:
-    gs = group_size or pp
+    gs = pp if group_size is None else group_size
     if v > 1 and gs != pp:
         raise ValueError(
             f"pipeline_sim: VPP(v={v}) 时间仿真 v1 仅支持深度优先分组 group_size==pp"

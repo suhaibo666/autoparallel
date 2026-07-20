@@ -150,3 +150,27 @@ def test_tail_pure_host_no_comm():
     assert sum(st.t_exposed_comm.values()) == pytest.approx(0.0)
     total = st.t_compute + st.t_membound + st.t_host_gap + sum(st.t_exposed_comm.values())
     assert total == pytest.approx(st.duration_us)
+
+
+def test_tail_tie_axes_split_evenly():
+    """review [13]：尾段扫描线 `exposed_axis = max(active)[1]` 用 (fin, axis) 元组比较，
+    多条通信同刻 finish 时 fin 相等、按轴名字典序把整个子区间全判给 lex 更大的轴
+    （这里 "tp" > "dp"），另一轴记 0——per-axis exposed_comm 归因被扭曲（虽 Σ守恒不破）。
+
+    构造：comm_dp 先发射（h_emit 早）+ dur 长、comm_tp 后发射（h_emit 晚）+ dur 短，
+    两者通信起点都早于 device 尾段起点 cursor=4.0（故整个尾段 [4,24] 内二者全程都在
+    传输）、且两者 fin 精确相等（=24.0）——是一个跨越整个尾段的精确 tie。
+    op 序 (c_dp, c_tp, a) 使 h_clock 累加顺序为 c_dp→c_tp→a：
+      c_dp 发射@1、dep_end=0 → C_dp[1,24]（dur=23）；
+      c_tp 发射@2、dep_end=0 → C_tp[2,24]（dur=22）；
+      a    发射@3、dep_end=0 → D[3,4]（dev=1，cursor=4）。
+    尾段 [4,24] 两轴 tie：修复前全 20.0 记给 tp、dp 记 0；修复后应均分 10.0/10.0。"""
+    seg = TimedSegment("s", (_comm("c_dp", axis="dp"), _comm("c_tp", axis="tp"), _dev("a")))
+    costs = {"c_dp": _cost(host=1.0, comm=23.0), "c_tp": _cost(host=1.0, comm=22.0),
+             "a": _cost(host=1.0, dev=1.0)}
+    st = simulate_segment(seg, costs)
+    assert st.duration_us == pytest.approx(24.0)
+    assert st.t_exposed_comm.get("dp", 0.0) == pytest.approx(10.0)
+    assert st.t_exposed_comm.get("tp", 0.0) == pytest.approx(10.0)
+    total = st.t_compute + st.t_membound + st.t_host_gap + sum(st.t_exposed_comm.values())
+    assert total == pytest.approx(st.duration_us)          # 守恒不受归因方式影响
