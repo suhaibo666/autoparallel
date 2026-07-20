@@ -50,17 +50,43 @@ env（本次提交），使梯度累积 + 无重算配置可复现。
 > 上一轮 explorer UI（`94b28e1`，把 pp=1 num_microbatches 当"省显存梯度累积"、显示 grad_accum
 > 驻留）是按 **master 语义**建的——**对不上 116 实测**，需随下方决策修正。
 
-## 5. 待定决策（仿真对齐哪个行为）
+## 5. 决策（2026-07-20，已定）：按「正常的多一分 grad」估计
 
-| 选项 | 做法 | 代价/风险 |
-|---|---|---|
-| A 查清116意图再改 | 上116确认 batch-放大是有意设计还是待修临时态、会不会很快合入 master 省显存循环 | 最稳，多一轮真机核查 |
-| B 对齐116(batch放大) | pp=1 且 num_microbatches>1 时仿真按 batch 放大建模（激活∝m），撤回上轮"省显存 grad_accum" UI 框架 | 匹配当前验证目标；若116后续合master又得反转 |
-| C 保持现状(对齐master) | 维持省显存模型，视116 feature为临时/回归，仅文档标注版本差异 | 不改数值；但对116当前分支欠21× |
-| D 双模式可切换 | 两种语义都建、配置旗标切、默认对齐116 | 最全但工作量最大 |
+**用户裁定**：仿真建模**正常/省显存的梯度累积语义**——pp=1 累积时**激活保持单微批(不 ∝ m)**，
+峰值 = 单微批峰值 **＋ 一份常驻累计梯度**(`grad_accum` 桶)。**不追** 116 feature 分支的线性增长。
 
-**建议**：倾向 A→B（先核实116意图，确认是设计则按 batch 放大改并撤回上轮 UI 框架），但这是
-**版本路线判断**，需用户定夺。**在决策前 core/UI 不动**，避免追一个可能的临时状态。
+**据此 core 无需改——仿真已正确建此模型**（逐值核实）：
+
+| m | 仿真 peak (MiB) | grad_accum (MiB) | Δ vs m=1 |
+|---|---|---|---|
+| 1 | 20142.3 | 0.0 | — |
+| ≥2 | 21875.1 | 1732.8 | **+1732.8 = 恰一份梯度**（m≥2 饱和，就地累加不随步数增长）|
+
+`grad_accum` = 累计 **reduced 梯度分片** = 每卡一份梯度(grad_dtype×params/dp)，pp2 真机探针标定
+(P0-01)。**pp>1 已真机验证**：pp2-stage1(m=2) 记分卡 ratio **1.007**——省显存微批循环在 pp>1 下即便
+116 也生效，故该桶对流水场景成立。
+
+### 5.1 116 线性增长 = 内存泄漏? （用户新假设，待 subagent 测）
+用户提出：116 feature 分支 pp=1 累积的**显存 ∝ m 可能是内存泄漏**（微批循环存在、但各 microstep 的
+激活未随 `_split_micro_batch`/step 结束释放 → 累积驻留 → 线性），**而非有意的 batch 放大**。关键辨别：
+- **泄漏**：`training_step` 有 `for micro_step in range(num_accumulation_steps)` 循环、`_split_micro_batch`
+  切成 local 大小小微批，但激活跨 microstep 不释放 → 单 step 内显存**逐 microstep 阶梯上涨、不回落**（m 个
+  递增台阶）。若如此,116 的线性是 **bug**,正常/master 行为(省显存 +1 grad)才对 → **仿真是对的**、116 待修。
+- **有意 batch 放大**：无微批循环、一次前反向跑整个 (local×m) 批 → 单 step 内**一个大驼峰**(非 m 个台阶)。
+辨别法(subagent 执行)：① 读 116 feature 分支**实际** `training_step` 源码(有无循环、`_split_micro_batch`
+是否真切片、喂进 `_forward_backward` 的 batch 是 local 还是 local×m)；② 单 step 内**细粒度**显存 profile
+(MindSpore Profiler / 逐 microstep MEMPROBE)看是"m 个不回落台阶"(泄漏)还是"一个大驼峰"(batch 放大)。
+
+**无论结论,仿真按正常语义估的决策不变**；但结论决定 116 那 21× 差异的定性(bug 待报 vs 版本行为差异),
+写进本报告并（若泄漏）给 mindformers 侧一个可复现的泄漏证据。
+
+### 5.2 诚实 caveat（务必留档）
+- 仿真按正常语义估(省显存 +1 grad)，**故对 116 `feature/pynative-arch-evolution` 分支 pp=1 大
+  global_batch 累积会欠预测**(该分支实测显存∝m；m=4 仿真 0.381)。**有意选择**：建正常/正确行为、不建该
+  分支的线性增长(疑似泄漏,见 §5.1)。差值=激活按 m 线性放大那部分。
+- 上轮 explorer UI(`94b28e1`)按此正常语义建——**与本决策一致,保留**；仅加一句版本 caveat 到 tooltip。
+- master 分支省显存微批循环(`trainer.py:1001` `_split_micro_batch`)与仿真模型吻合；116 若合入该循环、
+  或修掉 §5.1 的疑似泄漏,其 pp=1 即回到省显存、与仿真一致。
 
 *证据：本次 `[MEMPROBE]` 原始行（m=1/2/4，rank0/1）、训练日志 num_accumulation_steps=1/2/4、
 仿真复算、master `trainer.py:1001` 微批循环源码。真机数据全部来自实测，无杜撰。*
