@@ -31,6 +31,15 @@ def test_unknown_axis_fail_loud():
         synth_hw().link("nvlink")
 
 
+def test_peak_unknown_dtype_fail_loud():
+    """peak() 未知 dtype 应 KeyError fail-loud，与姊妹方法 link() 同口径（review Tier C），
+    不得静默回退 bf16。"""
+    with pytest.raises(KeyError):
+        synth_hw().peak("fp8")
+    assert synth_hw().peak("bf16") == 100e12
+    assert synth_hw().peak("fp32") == 25e12
+
+
 HW = synth_hw()
 CM = CostModel(HW)
 
@@ -52,6 +61,21 @@ def test_gemm_cost_exact():
     assert c.bound == "compute"                                 # AI 远超 ridge=100
     assert c.provenance == "theory"
     assert c.eta_key == "gemm:bf16"
+
+
+def test_gemm_memory_bound_takes_memory_branch():
+    """瘦 GEMM（flops>0 但 ai<ridge）：roofline t=max(compute,memory) 应取内存分支，
+    而非恒取 compute 分支（review Tier A——被自己标成 memory-bound 的 op 却按 compute 定价）。"""
+    thin = _op(in_shapes=((1, 16), (16, 16)), out_shape=(1, 16))
+    c = CM.cost(thin)
+    flops = 2 * (1 * 16) * 16
+    bytes_rw = (16 + 256 + 16) * 2                  # in0+in1+out，bf16=2B/elem
+    assert c.flops == flops
+    assert c.bytes_rw == bytes_rw
+    assert flops / bytes_rw < c.ridge                # 确认真落在 memory 区（ai<ridge=100）
+    assert c.bound == "memory"
+    assert c.t_dev_us == pytest.approx(bytes_rw / (1e12 * 1.0) * 1e6)      # 内存分支
+    assert c.t_dev_us != pytest.approx(flops / (100e12 * 1.0) * 1e6)      # 非 compute 分支
 
 
 def test_fa_cost_formula():

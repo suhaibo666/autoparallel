@@ -113,7 +113,8 @@ class CostModel:
             flops, eta_key = 0, "bw"
 
         if flops > 0:
-            t_dev = flops / (hw.peak(top.dtype) * hw.eta[eta_key]) * 1e6
+            t_dev = max(flops / (hw.peak(top.dtype) * hw.eta[eta_key]),
+                        bytes_rw / (hw.hbm_bw * hw.eta["bw"])) * 1e6
         else:
             t_dev = bytes_rw / (hw.hbm_bw * hw.eta["bw"]) * 1e6
         ai = flops / bytes_rw if bytes_rw else 0.0

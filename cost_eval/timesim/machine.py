@@ -24,7 +24,7 @@ class TimeHardware:
     calibrated: bool = False
 
     def peak(self, dtype: str) -> float:
-        return self.peak_flops.get(dtype) or self.peak_flops["bf16"]
+        return self.peak_flops[dtype]        # 未知 dtype KeyError=fail-loud（与 link 同口径）
 
     def link(self, axis: str) -> tuple[float, float]:
         return (self.link_alpha_us[axis], self.link_bw[axis])   # 未知轴 KeyError=fail-loud
