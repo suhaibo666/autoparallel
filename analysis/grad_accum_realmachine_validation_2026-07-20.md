@@ -66,19 +66,38 @@ env（本次提交），使梯度累积 + 无重算配置可复现。
 (P0-01)。**pp>1 已真机验证**：pp2-stage1(m=2) 记分卡 ratio **1.007**——省显存微批循环在 pp>1 下即便
 116 也生效，故该桶对流水场景成立。
 
-### 5.1 116 线性增长 = 内存泄漏? （用户新假设，待 subagent 测）
-用户提出：116 feature 分支 pp=1 累积的**显存 ∝ m 可能是内存泄漏**（微批循环存在、但各 microstep 的
-激活未随 `_split_micro_batch`/step 结束释放 → 累积驻留 → 线性），**而非有意的 batch 放大**。关键辨别：
-- **泄漏**：`training_step` 有 `for micro_step in range(num_accumulation_steps)` 循环、`_split_micro_batch`
-  切成 local 大小小微批，但激活跨 microstep 不释放 → 单 step 内显存**逐 microstep 阶梯上涨、不回落**（m 个
-  递增台阶）。若如此,116 的线性是 **bug**,正常/master 行为(省显存 +1 grad)才对 → **仿真是对的**、116 待修。
-- **有意 batch 放大**：无微批循环、一次前反向跑整个 (local×m) 批 → 单 step 内**一个大驼峰**(非 m 个台阶)。
-辨别法(subagent 执行)：① 读 116 feature 分支**实际** `training_step` 源码(有无循环、`_split_micro_batch`
-是否真切片、喂进 `_forward_backward` 的 batch 是 local 还是 local×m)；② 单 step 内**细粒度**显存 profile
-(MindSpore Profiler / 逐 microstep MEMPROBE)看是"m 个不回落台阶"(泄漏)还是"一个大驼峰"(batch 放大)。
+### 5.1 116 线性增长 = 内存泄漏? —— 已测：**否,是有意 batch 放大**（2026-07-20 subagent 定性）
 
-**无论结论,仿真按正常语义估的决策不变**；但结论决定 116 那 21× 差异的定性(bug 待报 vs 版本行为差异),
-写进本报告并（若泄漏）给 mindformers 侧一个可复现的泄漏证据。
+用户假设"线性增长可能是泄漏(微批循环在跑、激活跨 microstep 未释放)"。**双路取证结论：不是泄漏,
+是 batch 放大 by design——feature 分支 pp=1 根本没有省显存的微批循环**,泄漏在结构上不可能发生。
+
+**(A) 源码（116 `feature/pynative-arch-evolution` @ `0f4c2f15`，已提交无本地改）**：
+- `num_accumulation_steps = GBS/(dp·local)`（`trainer.py:458`）**只喂给 dataset builder**（`:488` 作
+  `num_grad_acc`），**不驱动任何前向循环**。
+- `_inner_train_loop`（`:719`）：一个 batch → 一次 `training_step` → **无累积循环**。
+- pp=1 走 `SingleStageSchedule.step`（`single_stage.py:34`）：**一次 `model(**inputs)` + 一次
+  `loss.backward()`**,无循环无切片；`training_step` **每次调用都跑完整 optimizer**。
+- 喂进那一次前向的 batch = `GBS/dp = local×m`（`utils.py:378` `dataset.batch(global_batch//dp)`）——
+  累积因子完全落在 dataset batch 尺寸里。
+- **`_split_micro_batch` 在 feature 分支不存在**（`git grep` 无）。对比 **master**：`training_step`
+  `for micro_step in range(num_accumulation_steps): _split_micro_batch(切 local) → _forward_backward`、
+  优化器只在末微批 → **峰值 m-恒定(省显存)**。**feature 的 schedule 重构丢掉了这个微批循环**（把 batching
+  搬进 dataset + 单 `SingleStageSchedule.step`）→ 峰值 ∝ m。
+
+**(B) 实测（m=4, 8L, dp=2, 无重算, 卡6/7；monkeypatch 探 SingleStageSchedule.step）**：
+- **`fwd_calls_total == train_step`**（每步恰 1 次前向,非 4 次）→ **无 m=4 微批循环**。
+- **`input_shapes=(4,4096)`** → batch 维 = 4 = local(1)×m(4) = GBS/dp → **整个累积批一次喂入**。
+- 单 step 内显存 = **一个大驼峰**：persistent 5230 → after-fwd 41237(单次 +36007 激活) → after-bwd
+  6963(激活释放、梯度留),**每步相同、回落到基线,无跨步堆积**。**不是** m 个不回落台阶。
+- peak 57413.7 精确复现 m=4;线性拟合 `peak≈7485+12482·m`（floor=persistent+框架,slope=激活∝batch）。
+
+**判据落点**：泄漏需"循环在 ∧ 切片对 ∧ 跨 microstep 不释放";feature 分支前两条都不成立(无循环、无
+`_split_micro_batch`),**故无 microstep、无从堆积 → 结构上不可能泄漏**。是 batch 放大 by construction。
+
+**给 mindformers 侧的可行结论（非 bug 单,是行为回归提示）**：feature 分支 pp=1 梯度累积**不再省显存**
+（master 靠 `_split_micro_batch` 微批循环保持峰值 m-恒定;schedule 重构换成 `.batch(GBS/dp)`+单
+`SingleStageSchedule.step` → 峰值 ∝ m）。若要 pp=1 省显存累积,修法=在 `SingleStageSchedule.step`
+内/外恢复类 master 的微批循环。**仿真按正常语义估的决策不变,仿真是对的**。
 
 ### 5.2 诚实 caveat（务必留档）
 - 仿真按正常语义估(省显存 +1 grad)，**故对 116 `feature/pynative-arch-evolution` 分支 pp=1 大
