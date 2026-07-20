@@ -1,9 +1,11 @@
 """StepTimeReport 门面（spec §6.3/6.4）：合成小段端到端（不依赖 mindformers），
 验证组装管线、步收尾、MFU/HFU、fsdp_regather。"""
+import warnings
+
 import pytest
 
 from cost_eval.specs import OptimizerSpec
-from cost_eval.timesim.ir import TimedOp, TimedSegment
+from cost_eval.timesim.ir import TimedOp, TimedSegment, tensor_bytes
 from cost_eval.timesim.shard_rules import Degrees
 from cost_eval.timesim.machine import synth_hw
 from cost_eval.timesim.report import evaluate_step_time
@@ -17,6 +19,17 @@ def _layer(i):
     nm = TimedOp(op_id="c#1", op_type="Norm", phase="fwd",
                  in_shapes=((1024, 1, 512),), out_shape=(1024, 1, 512),
                  dtype="bf16", stream="device", src=f"l{i}.py:2", deps=("c#0",))
+    return TimedSegment(f"layer_{i}.fwd", (mm, nm))
+
+
+def _layer_fp32(i):
+    """同 _layer，但权重/激活均为 fp32——用于 review [6]/[7] 的 dtype (不)敏感性对照。"""
+    mm = TimedOp(op_id="c#0", op_type="MatMul", phase="fwd",
+                 in_shapes=((1024, 1, 512), (512, 512)), out_shape=(1024, 1, 512),
+                 dtype="fp32", stream="device", src=f"l{i}.py:1")
+    nm = TimedOp(op_id="c#1", op_type="Norm", phase="fwd",
+                 in_shapes=((1024, 1, 512),), out_shape=(1024, 1, 512),
+                 dtype="fp32", stream="device", src=f"l{i}.py:2", deps=("c#0",))
     return TimedSegment(f"layer_{i}.fwd", (mm, nm))
 
 
@@ -45,11 +58,13 @@ def test_recompute_scissors():
 
 
 def test_pp2_uses_pipeline_and_p2p():
+    # r0 默认不传 p2p_bytes → 现从段边界激活派生（review [11]，非静默 0）；r1 显式传**更大**
+    # p2p_bytes，故 r1 的 pipeline 更长。
     r1 = evaluate_step_time([_layer(0), _layer(1)], Degrees(pp=2), HW, pp=2, m=4,
-                            p2p_bytes=1024 * 512 * 2)
+                            p2p_bytes=1024 * 512 * 2 * 4)
     r0 = evaluate_step_time([_layer(0), _layer(1)], Degrees(pp=2), HW, pp=2, m=4)
-    assert r1.t_pipeline_us > r0.t_pipeline_us          # p2p 时延拉长
-    assert r1.bubble_fraction > 0
+    assert r1.t_pipeline_us > r0.t_pipeline_us          # 更大 p2p 时延拉长
+    assert r0.bubble_fraction > 0                        # r0 也含派生 p2p，bubble 仍 >0
     assert r1.bubble_fraction_closed_form == pytest.approx(1 / 5)
 
 
@@ -100,3 +115,85 @@ def test_recompute_comm_fsdp_no_double_gather():
     # recomp_comm=False（默认）时前缀不重放 AG，门面仍需 fsdp_regather（守卫不触发）
     bwd_nc = expand_bwd(fwd, recompute="full", recomp_comm=False)
     assert len(_dp_ag(bwd_nc)) == 0                             # 前缀跳过 CommOp → 无重 gather
+
+
+def test_pp_p2p_derived_from_segment_boundary():
+    """review [11]（Tier A）：pp>1 且不传 p2p_bytes 时，须从 stage0 段边界激活推导 p2p_bytes，
+    不再静默为 0（spec §6.2：跨 stage p2p = alpha + act_bytes/BW）。"""
+    from cost_eval.timesim.pipeline_sim import simulate_pipeline
+    from cost_eval.timesim.pass_builder import concat_segments
+    from cost_eval.timesim.op_cost import CostModel as _CM, price_segment as _price
+    from cost_eval.timesim.segment_sim import simulate_segment as _sim
+    from cost_eval.timesim.bwd_rules import expand_bwd
+
+    layers = [_layer(0), _layer(1)]
+    r = evaluate_step_time(layers, Degrees(pp=2), HW, pp=2, m=4)
+
+    # 手工重建"不含 p2p"的基线：pp=2、每 stage 恰 1 层、v=1、默认 Degrees()
+    # 无 cp/ep/dp 注入（均为恒等）——与门面装配等价。
+    cm = _CM(HW)
+    durations = {}
+    for s, layer in enumerate(layers):
+        bwd = expand_bwd(layer)
+        for kind, segs in (("FWD", [layer]), ("BWD", [bwd])):
+            p = concat_segments(f"s{s}.c0.{kind.lower()}", segs)
+            costs = _price(p, cm)
+            st = _sim(p, costs)
+            durations[(s, kind, 0)] = st.duration_us
+    baseline = simulate_pipeline(durations, 2, 4, p2p_us=0.0)
+    assert r.t_pipeline_us > baseline.t_total_us          # 推导的 p2p_us>0 确被计入
+
+    # 推导字节 = stage0 最后一层最后一个非空 out_shape op（这里是 Norm）的 out_shape 字节。
+    expected_bytes = tensor_bytes((1024, 1, 512), "bf16")
+    alpha, bw = HW.link("pp")
+    expected_p2p_us = alpha + expected_bytes / bw * 1e6
+    with_p2p = simulate_pipeline(durations, 2, 4, p2p_us=expected_p2p_us)
+    assert r.t_pipeline_us == pytest.approx(with_p2p.t_total_us)
+
+
+def test_pp_p2p_fails_loud_when_undeliverable():
+    """review [11]：pp>1、不传 p2p_bytes、且段边界激活也推导不出（空段）→ fail-loud，
+    不静默用 0（对照修复前的静默行为）。"""
+    empty = TimedSegment("layer_0.fwd", ())
+    with pytest.raises(ValueError, match="p2p_bytes"):
+        evaluate_step_time([empty, empty], Degrees(pp=2), HW, pp=2, m=4)
+
+
+def test_opt_and_grad_tail_param_count_dtype_independent():
+    """review [6]（Tier C）：参数量须按 numel 算，与权重 dtype 无关；fp32 权重不应被误判成
+    2 倍参数量（旧码 `stage_weight_bytes // 2` 假设 bf16=2 字节/参数，对 fp32(4字节/参数)
+    会算出 2x 参数量，t_opt/grad_tail 虚高 ~1.9x）。"""
+    opt = OptimizerSpec()
+    r_bf16 = evaluate_step_time([_layer(0), _layer(1)], Degrees(), HW, pp=1, m=1,
+                                opt=opt, dp_replicate=2)
+    r_fp32 = evaluate_step_time([_layer_fp32(0), _layer_fp32(1)], Degrees(), HW, pp=1, m=1,
+                                 opt=opt, dp_replicate=2)
+    assert r_fp32.t_opt_us == pytest.approx(r_bf16.t_opt_us)
+    assert r_fp32.t_grad_sync_tail_us == pytest.approx(r_bf16.t_grad_sync_tail_us)
+
+
+def test_mfu_denom_uses_compute_dtype_peak():
+    """review [7]（Tier C）：MFU/HFU 分母须用段内代表 compute dtype 的峰值（hw.peak(dtype)），
+    而非硬编码 peak('bf16')。fp32 段应使用 peak('fp32')（synth_hw 中 = peak('bf16')/4）。"""
+    r_bf16 = evaluate_step_time([_layer(0), _layer(1)], Degrees(), HW, pp=1, m=2)
+    r_fp32 = evaluate_step_time([_layer_fp32(0), _layer_fp32(1)], Degrees(), HW, pp=1, m=2)
+    # flops_eff 与 dtype 无关（op_flops 只看 shape，不看 dtype），用 bf16 侧（denom 恒正确、
+    # 修复前后都用 peak('bf16')）反解 flops_eff*m，再用它预测 fp32 侧应有的 mfu。
+    flops_eff_x_m = r_bf16.mfu * r_bf16.t_step_us * 1e-6 * HW.peak("bf16") * 1
+    expected_mfu_fp32 = flops_eff_x_m / (r_fp32.t_step_us * 1e-6 * HW.peak("fp32") * 1)
+    assert r_fp32.mfu == pytest.approx(expected_mfu_fp32)
+
+
+def test_fixed_step_zero_warns_unpriced_gap():
+    """review [3]（Tier B，诚实信号）：fixed_step_us==0（默认）时必须发 warning——
+    embedding/lm_head/loss 段未定价、静默并入 fixed_step_us=0，不可无信号；显式传
+    fixed_step_us>0 则不发（调用方已知情补齐）。"""
+    from cost_eval.timesim.report import UnpricedStepGapWarning
+    with pytest.warns(UnpricedStepGapWarning):
+        evaluate_step_time([_layer(0), _layer(1)], Degrees(), HW, pp=1, m=2)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        evaluate_step_time([_layer(0), _layer(1)], Degrees(), HW, pp=1, m=2,
+                           fixed_step_us=100.0)
+    assert not any(issubclass(w.category, UnpricedStepGapWarning) for w in caught)

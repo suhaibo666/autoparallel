@@ -13,14 +13,18 @@
   1. grad sync：per-layer grad RS 已在 bwd 段内（expand_bwd 对偶自动涌现，可遮盖部分在段内
      DES 自动遮盖）；dp_replicate>1 的 DDP grad AR 无处可挂 → 作 barrier 尾**全暴露**串行加
      （v1 保守，诚实边界）。
-  2. optimizer step：带宽类粗口径 = 本 stage 权重字节/2 · (state_bytes_per_param +
-     grad_dtype_bytes) ÷ dp_shard ÷ (HBM·η_opt)（分片优化器；opt=None → 0——评估"纯前反向"）。
-  3. per-step 固定开销 fixed_step_us：标定常数（T2 锚点反解），默认 0、单列不混 η。
+  2. optimizer step：带宽类粗口径 = 本 stage 权重**参数量**（numel，dtype 无关）·
+     (state_bytes_per_param + grad_dtype_bytes) ÷ dp_shard ÷ (HBM·η_opt)（分片优化器；
+     opt=None → 0——评估"纯前反向"）。
+  3. per-step 固定开销 fixed_step_us：标定常数（T2 锚点反解），默认 0、单列不混 η——为 0 时
+     发 UnpricedStepGapWarning（embedding/lm_head/loss 未计的诚实信号，code-review [3]）。
+  4. pp>1 的 p2p：不传 p2p_bytes 则从 stage0 段边界激活推导（spec §6.2），推导不出 fail-loud。
 MFU/HFU（§6.4，Megatron 惯例分开报）：分子 = m·Σ_(stage,chunk,phase) OpCost.flops（MFU 不含
-recomp、HFU 含）；分母 = t_step · peak(dtype) · pp（每 stage world/pp 个 rank 算各自分片，
-约分后剩 pp——推导见测试）。provenance_mix 按 (t_dev+t_comm) 加权聚合（§4.3）。"""
+recomp、HFU 含）；分母 = t_step · peak(**段内代表 compute dtype**) · pp（每 stage world/pp 个
+rank 算各自分片，约分后剩 pp——推导见测试）。provenance_mix 按 (t_dev+t_comm) 加权聚合（§4.3）。"""
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 from ..schedule import chunk_layer_ids
@@ -55,9 +59,44 @@ class StepTimeReport:
     uncalibrated: bool
 
 
-def _weight_bytes(seg) -> int:
-    return sum(tensor_bytes(o.in_shapes[1], o.dtype) for o in seg.ops
-               if o.op_type in _GEMM and o.phase == "fwd" and len(o.in_shapes) >= 2)
+class UnpricedStepGapWarning(UserWarning):
+    """fixed_step_us==0 时门面只给 transformer 层段定价、embedding/lm_head/loss 未计的诚实信号
+    （code-review [3]，仿内存侧 OOMSafetyWarning）。"""
+
+
+def _weight_params(seg) -> int:
+    """GEMM fwd 权重**参数量（numel，dtype 无关）**——步收尾 t_opt/grad_tail 按参数量算，
+    不用字节（旧码 `stage_weight_bytes // 2` 硬编码 bf16=2B/param，对 fp32 权重算成 2 倍，
+    code-review [6]）。"""
+    total = 0
+    for o in seg.ops:
+        if o.op_type in _GEMM and o.phase == "fwd" and len(o.in_shapes) >= 2:
+            n = 1
+            for d in o.in_shapes[1]:
+                n *= d
+            total += n
+    return total
+
+
+def _boundary_p2p_bytes(stage_layers) -> int:
+    """跨 stage 边界激活（残差流隐状态）字节 = 该 stage 最后一层最后一个非空 out_shape op 的
+    out_shape 字节（SP 时该 out_shape 已是 S/tp·B·H）。无非空 out_shape op → 0（调用方 fail-loud）。"""
+    if not stage_layers:
+        return 0
+    for op in reversed(stage_layers[-1].ops):
+        if op.out_shape:
+            return tensor_bytes(op.out_shape, op.dtype)
+    return 0
+
+
+def _compute_dtype(layer_segments) -> str:
+    """段内代表 compute dtype = 第一个 GEMM op 的 dtype（找不到默认 bf16）——MFU 分母峰值用它
+    （code-review [7]，spec §6.4 peak(dtype)）。"""
+    for seg in layer_segments:
+        for op in seg.ops:
+            if op.op_type in _GEMM:
+                return op.dtype
+    return "bf16"
 
 
 def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
@@ -70,6 +109,11 @@ def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
     L = len(layer_segments)
     if pp <= 0 or L % pp:
         raise ValueError(f"report: 层数 {L} 不被 pp={pp} 整除（v1 均匀切层——fail-loud）")
+    if fixed_step_us == 0.0:
+        warnings.warn(
+            "report: embedding/lm_head/loss 段未定价，已并入 fixed_step_us=0——t_step 不含首末 "
+            "stage 计算（尤其 lm_head 词表投影，常是全 step 最大 GEMM）。T2 标定或显式传 "
+            "fixed_step_us 补齐。", UnpricedStepGapWarning, stacklevel=2)
     cm = CostModel(hw, causal=causal)
     per_stage_layers = [layer_segments[s * (L // pp):(s + 1) * (L // pp)]
                         for s in range(pp)]
@@ -78,7 +122,7 @@ def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
     seg_times: dict = {}
     flops_eff = flops_recomp = 0
     prov_us: dict = {"hit": 0.0, "model": 0.0, "theory": 0.0}
-    stage_weight_bytes = [0] * pp
+    stage_weight_params = [0] * pp
     for s in range(pp):
         chunks = chunk_layer_ids(list(range(len(per_stage_layers[s]))), v)
         for c, idxs in enumerate(chunks):
@@ -112,29 +156,37 @@ def evaluate_step_time(layer_segments: list, deg: Degrees, hw: TimeHardware, *,
                         flops_eff += oc.flops
                     prov_us[oc.provenance] = prov_us.get(oc.provenance, 0.0) \
                         + oc.t_dev_us + oc.t_comm_us
-            stage_weight_bytes[s] += sum(_weight_bytes(f) for f in fwd_layers)
+            stage_weight_params[s] += sum(_weight_params(f) for f in fwd_layers)
 
+    # p2p 时延（spec §6.2）：pp>1 时不传 p2p_bytes 则从 stage0 段边界激活推导，推导不出 fail-loud
+    # （不静默用 0，code-review [11]）。
     p2p_us = 0.0
-    if p2p_bytes and pp > 1:
+    if pp > 1:
+        if not p2p_bytes:
+            p2p_bytes = _boundary_p2p_bytes(per_stage_layers[0])
+            if not p2p_bytes:
+                raise ValueError(
+                    "report: pp>1 需 p2p_bytes，且无法从段边界激活推导（段无非空 out_shape op）"
+                    "——请显式提供 p2p_bytes（fail-loud，不静默用 0）")
         alpha, bw = hw.link("pp")
         p2p_us = alpha + p2p_bytes / bw * 1e6
     pipe = simulate_pipeline(durations, pp, m, v=v, group_size=group_size, p2p_us=p2p_us)
 
-    # —— 步收尾（§6.3）——
+    # —— 步收尾（§6.3）——参数量按 numel（dtype 无关，code-review [6]）——
     grad_tail = 0.0
     if dp_replicate > 1:
-        gb = max(stage_weight_bytes) // 2 * (opt.grad_dtype_bytes if opt else 4)
+        gb = max(stage_weight_params) * (opt.grad_dtype_bytes if opt else 4)
         grad_tail = cm.comm_time_us(CommSpec("all_reduce", gb, "dp", dp_replicate))
     t_opt = 0.0
     if opt is not None:
-        params = max(stage_weight_bytes) // 2                    # bf16 权重 → 参数量
+        params = max(stage_weight_params)
         traffic = params * (opt.state_bytes_per_param + opt.grad_dtype_bytes)
         t_opt = traffic / max(deg.dp, 1) / (hw.hbm_bw * hw.eta["opt"]) * 1e6 \
             + hw.host_us("MatMul", "fwd")                        # host 发射一笔（粗口径）
     t_step = pipe.t_total_us + grad_tail + t_opt + fixed_step_us
 
-    # —— MFU/HFU（模块 docstring 推导）——
-    denom = t_step * 1e-6 * hw.peak("bf16") * pp
+    # —— MFU/HFU（§6.4）：分母峰值用段内代表 compute dtype（code-review [7]）——
+    denom = t_step * 1e-6 * hw.peak(_compute_dtype(layer_segments)) * pp
     mfu = m * flops_eff / denom if denom else 0.0
     hfu = m * (flops_eff + flops_recomp) / denom if denom else 0.0
 
