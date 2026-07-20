@@ -99,6 +99,25 @@ def test_seg_id_suffix():
     assert expand_bwd(TimedSegment("layer_0.fwd", (_mm(),))).seg_id == "layer_0.bwd"
 
 
+def test_recompute_unsupported_value_fails_loud():
+    """code-review [4]：recompute 只认 None/'full'——其余任何值（含 report 门面将来可能传的
+    'select'、或拼写错误如 'ful'）现在 fail-loud，不再静默漏建重算前缀（flops_recomp=0、
+    HFU==MFU 的静默错误）。"""
+    seg = TimedSegment("l.fwd", (_mm(),))
+    with pytest.raises(ValueError, match="recompute"):
+        expand_bwd(seg, recompute="select")
+    with pytest.raises(ValueError, match="recompute"):
+        expand_bwd(seg, recompute="ful")
+
+
+def test_recompute_none_and_full_still_allowed():
+    """回归：白名单守卫不应误伤既有支持值。"""
+    seg = TimedSegment("l.fwd", (_mm(),))
+    expand_bwd(seg)                          # recompute=None（默认）
+    expand_bwd(seg, recompute=None)          # 显式 None
+    expand_bwd(seg, recompute="full")        # 显式 'full'
+
+
 def test_dual_table_ar_a2a_p2p_volume_unchanged():
     """_DUAL 表全覆盖：AR/A2A/p2p 自对偶且 volume 不变（ir.py 对偶换算规则的另半边）；
     未知 ctype fail-loud（ValueError 而非裸 KeyError）。"""
@@ -164,3 +183,33 @@ def test_recompute_prefix_deps_remap_real_mlp(mlp_dag):
     assert all(d in ids_t for o in rc_t for d in o.deps)     # 无悬空
     col_rt = next(o for o in rc_t if o.op_id == col_id + ".r")
     assert ag.op_id + ".r" in col_rt.deps
+
+
+def _mlp_seg_non_sp(mlp_dag):
+    """producer 真 MLP tp2/非-SP fwd 段——review [2] 的量级锁测试专用（sequence_parallel=False，
+    Row 侧 fwd 通信原语为 all_reduce 而非 SP 的 reduce_scatter，见 producer.build_segment
+    docstring RowParallelLinear 分支）。"""
+    from cost_eval.timesim.producer import build_segment
+    from cost_eval.timesim.shard_rules import Degrees
+    from cost_eval.model_spec import DimTable
+    dims = DimTable(H=1792, F=3072, n_heads=8, n_kv=8, head_dim=224,
+                    S=4096, B=1, vocab=129280, n_layers=4)
+    return build_segment("layer_0.mlp.fwd", mlp_dag, dims,
+                         Degrees(tp=2, sequence_parallel=False))
+
+
+def test_bwd_ar_placement_faithful_magnitude_non_sp_tp(mlp_dag):
+    """code-review [2]：非 SP 张量并行下，bwd_rules 把 bwd 通信当 fwd 通信的对偶（`_dual_comm`），
+    fwd 的 all_reduce 挂在 Row 算子（producer 非 SP 时 ctype=all_reduce），故其 bwd 对偶也落在
+    Row.bwd——而 Megatron 真语义的 backward all_reduce 应在 Column 侧（f 算子）。这是**重叠位置**
+    的近似（v1.5 精修，见 expand_bwd docstring 诚实边界），但**数目**（每 Column→Row 块 1 个）
+    与**载荷**（volume_bytes，全量激活 S·B·H 字节）必须与 fwd 恰好一致——本测试锁住这个忠实量级，
+    防止未来重构悄悄破坏它。"""
+    fwd = _mlp_seg_non_sp(mlp_dag)
+    fwd_ar = [o for o in fwd.ops if o.op_type == "CommOp" and o.comm.ctype == "all_reduce"]
+    assert len(fwd_ar) == 1                                  # MLP 单 Column→Row 块 → 1 个 AR
+    bwd = expand_bwd(fwd)
+    bwd_ar = [o for o in bwd.ops if o.phase == "bwd" and o.op_type == "CommOp"
+             and o.comm.ctype == "all_reduce"]
+    assert len(bwd_ar) == len(fwd_ar)                         # 数目忠实
+    assert bwd_ar[0].comm.volume_bytes == fwd_ar[0].comm.volume_bytes   # 载荷忠实

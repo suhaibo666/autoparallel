@@ -90,7 +90,22 @@ def _bwd_of(o: TimedOp, deps: tuple[str, ...] = ()) -> list[TimedOp]:
 
 def expand_bwd(seg: TimedSegment, *, recompute: str | None = None,
                recomp_comm: bool = False) -> TimedSegment:
-    """fwd 段 → bwd 段（可选 recompute 前缀）。seg_id 的 .fwd 后缀替换为 .bwd。"""
+    """fwd 段 → bwd 段（可选 recompute 前缀）。seg_id 的 .fwd 后缀替换为 .bwd。
+
+    诚实边界（非 SP 张量并行的 bwd 通信放置位，code-review [2]）：bwd 通信按"fwd 通信的对偶"
+    生成（`_dual_comm`），落在与其对偶 fwd 算子相同的位置。非 SP TP（sequence_parallel=False）
+    下 fwd 的 all_reduce 挂在 Row 算子（producer 的 `.rs`，非 SP 时 ctype=all_reduce），于是本
+    函数把对偶 all_reduce 也放在 Row.bwd；但真实 Megatron TP 语义里，backward all_reduce 应在
+    **Column 侧**（f 算子：把上一层的 dX 梯度 all-reduce 后再传回），Row 的 backward 其实是
+    identity。本实现的**数目**（每 Column→Row 块 1 个）与**载荷**（volume_bytes，全量激活
+    S·B·H 字节）均忠实——只有**重叠计算的位置**（落 Row.bwd 而非 Column.bwd）是近似，对 T1
+    相对排序档是二阶效应。真正修正需 producer 标记 Column 侧 f 算子的 bwd 通信、或 bwd_rules
+    感知 Column/Row 块结构，属 v1.5 级重设计，不在本次范围（见
+    test_bwd_ar_placement_faithful_magnitude_non_sp_tp 锁住量级忠实防回退）。"""
+    if recompute not in (None, "full"):
+        raise ValueError(
+            f"bwd_rules: recompute={recompute!r} 未支持——v1 仅 None/'full';'select'（选择性重算）"
+            f"=v1.5，拼写错误亦在此拦（fail-loud，不静默漏计重算成本）")
     prefix: list[TimedOp] = []
     if recompute == "full":
         replayed: set[str] = set()   # F2：dep 段内 remap——重放者 +".r"，被剔 CommOp drop
