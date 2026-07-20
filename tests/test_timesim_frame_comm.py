@@ -1,8 +1,8 @@
 """frame_comm：框架层通信注入 FSDP/EP/CP（spec §3.3c 第二类——不在 layer construct 源码里的通信）。"""
 import pytest
 
-from cost_eval.timesim.ir import TimedOp, TimedSegment
-from cost_eval.timesim.frame_comm import inject_fsdp, inject_ep, inject_cp
+from cost_eval.timesim.ir import TimedOp, TimedSegment, STREAM_DEVICE
+from cost_eval.timesim.frame_comm import inject_fsdp, inject_ep, inject_cp, fsdp_regather
 
 
 def _mm(op_id="a#1", w=(1792, 6144)):
@@ -48,6 +48,38 @@ def test_fsdp_gather_volume_ceils_on_indivisible_shard():
     assert seg2.ops[0].comm.volume_bytes == 8
 
 
+def _fsdp_layer():
+    """mm（权重）+ norm，与 test_timesim_report.py 的 _layer(0) 同构——用于验证 bwd 段
+    "第一个 device op"落在 bwd 逆序首位（NormGrad），而非碰巧的单 op 段。"""
+    mm = TimedOp(op_id="c#0", op_type="MatMul", phase="fwd",
+                 in_shapes=((1024, 1, 512), (512, 512)), out_shape=(1024, 1, 512),
+                 dtype="bf16", stream="device", src="l.py:1")
+    nm = TimedOp(op_id="c#1", op_type="Norm", phase="fwd",
+                 in_shapes=((1024, 1, 512),), out_shape=(1024, 1, 512),
+                 dtype="bf16", stream="device", src="l.py:2", deps=("c#0",))
+    return TimedSegment("layer_0.fwd", (mm, nm))
+
+
+def test_fsdp_bwd_regather_wired_into_first_device_op():
+    """review [12]：重 gather AG 插 bwd 段头，但 deps=() 且没有任何 bwd op 依赖它——结构上
+    恒可重叠（segment_sim 只认 TimedOp.deps，看不到它其实挡在 bwd 计算前面）。
+    修复：AG 本身仍 deps=()（可预取），但 bwd 段第一个 device（计算）op 追加依赖该 AG
+    （bwd 计算等权重重 gather 完成；segment_sim 的 device 流 FIFO 会让后续 device op
+    也自然排在其后，无需逐个都挂 dep）。"""
+    from cost_eval.timesim.bwd_rules import expand_bwd
+
+    fwd = inject_fsdp(_fsdp_layer(), dp_shard=4)
+    bwd = expand_bwd(fwd)
+    bwd2 = fsdp_regather(bwd, fwd, dp_shard=4)
+
+    ag = bwd2.ops[0]
+    assert ag.op_type == "CommOp" and ag.comm.ctype == "all_gather"
+    assert ag.deps == ()                          # AG 本身仍可预取，不被卡
+    first_device = next(o for o in bwd2.ops if o.stream == STREAM_DEVICE)
+    assert first_device.op_id == "c#1.b0"         # bwd 逆序首位＝NormGrad（非碰巧的头一个）
+    assert ag.op_id in first_device.deps          # bwd 首个 device op 须等重 gather 完成
+
+
 def test_ep_alltoall_wraps_grouped_region():
     g = TimedOp(op_id="m#5", op_type="GroupedMatMul", phase="fwd",
                 in_shapes=((2, 2048, 1792), (2, 1792, 1024)), out_shape=(2, 2048, 1024),
@@ -67,6 +99,57 @@ def test_ep_alltoall_wraps_grouped_region():
 def test_ep_noop_without_grouped():
     seg = TimedSegment("l.fwd", (_mm(),))
     assert inject_ep(seg, ep=4) is seg
+
+
+def test_ep_dispatch_combine_wired_into_deps():
+    """review [0]：旧码 disp/comb 的 deps=()、grouped 区首 op 保持原 deps、下游仍指向 grouped
+    op——segment_sim 的跨流排程只认显式 deps、不看列表位置，于是这条强制串行的通信（token
+    dispatch/combine）被当成完全可重叠。修复：串成 router→disp→grouped→comb→下游
+    （mirror producer.py Row.rs 的下游 redirect 手法）。"""
+    before = TimedOp(op_id="a#1", op_type="MatMul", phase="fwd",
+                      in_shapes=((4096, 1, 1792), (1792, 6144)), out_shape=(4096, 1, 6144),
+                      dtype="bf16", stream="device", src="mlp.py:1")
+    g = TimedOp(op_id="m#5", op_type="GroupedMatMul", phase="fwd",
+                in_shapes=((2, 2048, 1792), (2, 1792, 1024)), out_shape=(2, 2048, 1024),
+                dtype="bf16", stream="device", src="moe.py:1", deps=("router#0",))
+    after = TimedOp(op_id="a#9", op_type="MatMul", phase="fwd",
+                    in_shapes=((2, 2048, 1024), (1024, 1792)), out_shape=(2, 2048, 1792),
+                    dtype="bf16", stream="device", src="mlp.py:2", deps=("m#5",))
+    seg = TimedSegment("moe.fwd", (before, g, after))
+    seg2 = inject_ep(seg, ep=4)
+
+    ops = {o.op_id: o for o in seg2.ops}
+    disp, comb = ops["moe.fwd.ep_disp"], ops["moe.fwd.ep_comb"]
+    grouped, downstream = ops["m#5"], ops["a#9"]
+    assert disp.deps == ("router#0",)                  # ① disp 等 grouped 区首 op 的原生产者
+    assert grouped.deps == ("router#0", disp.op_id)     # ② grouped 首 op 追加等 dispatch
+    assert comb.deps == ("m#5",)                        # ③ combine 等 grouped 区末 op
+    assert downstream.deps == (comb.op_id,)             # ④ 下游改指 combine（不再直连 grouped）
+
+
+def test_ep_dispatch_combine_exposed_in_segment_sim():
+    """集成（review [0]）：串上 deps 后，simulate_segment 应把 dispatch/combine 的传输时间
+    算进 exposed_comm['ep']——修复前两者 deps=() 且无人依赖，t_exposed_comm 里恒无 'ep' 键
+    （或恒为 0），通信被系统性当成免费。"""
+    from cost_eval.timesim.machine import synth_hw
+    from cost_eval.timesim.op_cost import CostModel, price_segment
+    from cost_eval.timesim.segment_sim import simulate_segment
+
+    before = TimedOp(op_id="a#1", op_type="MatMul", phase="fwd",
+                      in_shapes=((4096, 1, 1792), (1792, 6144)), out_shape=(4096, 1, 6144),
+                      dtype="bf16", stream="device", src="mlp.py:1")
+    g = TimedOp(op_id="m#5", op_type="GroupedMatMul", phase="fwd",
+                in_shapes=((2, 2048, 1792), (2, 1792, 1024)), out_shape=(2, 2048, 1024),
+                dtype="bf16", stream="device", src="moe.py:1")
+    after = TimedOp(op_id="a#9", op_type="MatMul", phase="fwd",
+                    in_shapes=((2, 2048, 1024), (1024, 1792)), out_shape=(2, 2048, 1792),
+                    dtype="bf16", stream="device", src="mlp.py:2", deps=("m#5",))
+    seg2 = inject_ep(TimedSegment("moe.fwd", (before, g, after)), ep=4)
+
+    cm = CostModel(synth_hw())
+    costs = price_segment(seg2, cm)
+    st = simulate_segment(seg2, costs)
+    assert st.t_exposed_comm.get("ep", 0.0) > 0.0
 
 
 def test_cp_ring_structural_blocks():
@@ -121,6 +204,19 @@ def test_cp_unknown_method_fail_loud():
     # cp 不活跃（cp<=1）时 typo 也要报——method 校验先于早退
     with pytest.raises(ValueError):
         inject_cp(TimedSegment("l.fwd", (_mm(),)), cp=1, method="ring2")
+
+
+def test_cp_colossal_fa_arity_guard():
+    """review [14]：colossal 支直接读 op.in_shapes[1]/[2]（k/v）取 kv_bytes，FA op 若 <3 个
+    in_shapes → 裸 IndexError（op_cost._fa_flops 与 ulysses 支的 in_shapes[:3] 切片都是
+    fail-loud/安全切片，colossal 独漏）。修复：读之前加与 op_cost 同口径的 fail-loud 守卫。"""
+    fa = TimedOp(op_id="a#0", op_type="FlashAttention", phase="fwd",
+                 in_shapes=((2048, 1, 8, 224), (2048, 1, 8, 224)),   # 仅 2 个（缺 v）
+                 out_shape=(2048, 1, 8, 224), dtype="bf16", stream="device",
+                 src="attention.py:1")
+    seg = TimedSegment("l.fwd", (fa,))
+    with pytest.raises(ValueError, match="in_shapes"):
+        inject_cp(seg, cp=2, method="colossal")
 
 
 def test_injector_order_independence_on_mixed_segment():
