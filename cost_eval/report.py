@@ -4,7 +4,7 @@ Evaluator 是整个评估器的对外入口：接收 ModelSpec + 并行/优化�
 配置，依次调用 M3→M4→M5→M6，返回 PeakMemoryReport。
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .advisories import warn_oom_safety
 from .parallel_model import ParallelModel
@@ -198,6 +198,7 @@ class PeakMemoryReport:
     hccl_reserved_bytes: int = 0   # D-2：HCCL 通信缓冲（reserved 池，按通信域数；world-level 同值）
     hccl_communicators: tuple = ()  # 去重后 size>1 的通信域清单 [(name,size),...]（framework.communicator_breakdown）
     max_device_memory: int = 0     # P2-01（C4）：设备容量，供 reserved 口径 OOM 判定
+    persistent_breakdown: dict = field(default_factory=dict)  # {stage: 持久态分量分解}（static_mem.persistent_breakdown）
 
     def reserved_estimate_bytes(self, stage: int) -> int:
         """该 stage 的 reserved 池估计 = allocated 峰值 + HCCL 通信缓冲 + allocator pool 碎片。
@@ -314,6 +315,11 @@ class Evaluator:
             g, self.opt, pm, alloc_block_bytes=block,
             offload_params=self.pc.offload_params,
             offload_optimizer=self.pc.offload_optimizer)
+        # 持久态组成分解（同口径，供展示/审计；Σ 分量 == persistent[stage]）。
+        pbreak = StaticMem().persistent_breakdown(
+            g, self.opt, pm, alloc_block_bytes=block,
+            offload_params=self.pc.offload_params,
+            offload_optimizer=self.pc.offload_optimizer)
         # framework_reserve 现默认 0（生产）：框架瞬态已按机理拆进 op 图（FSDP 预取→gather_buf、
         # flash-ws→flash workspace、MoE staging→dispatch/combine workspace）+ 分配器对齐→上面的
         # 逐张量 roundup。hw.framework_reserve 仅审计/回归旋钮（显式给值复现旧经验常数，如 golden 177）。
@@ -338,4 +344,5 @@ class Evaluator:
         return PeakMemoryReport(per_stage, tightest,
                                 any(p.oom for p in per_stage), hccl_reserved_bytes=hccl,
                                 hccl_communicators=communicator_breakdown(self.pc),   # 去重后通信域清单
-                                max_device_memory=self.hw.max_device_memory)   # P2-01：reserved 口径判定
+                                max_device_memory=self.hw.max_device_memory,   # P2-01：reserved 口径判定
+                                persistent_breakdown=pbreak)   # 持久态分量分解 {stage: {...}}

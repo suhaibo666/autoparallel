@@ -56,6 +56,11 @@ class StructureMemory:
     checkpoint_input: int = 0
     forward_max_live: int = 0
     grad_shard_bytes: int = 0
+    # persistent 组成分解用：本结构内、按 fsdp/efsdp 切后的**驻留参数量**（去重、未乘倍数、未块对齐）。
+    #   matrix = Muon 分类的 2D 矩阵权重（is_muon_matrix_weight）；other = 其余。persistent 分量拆解
+    #   （参数副本/master/momentum/v）= 这两个计数 × 每分量每元素字节（static_mem.persistent_breakdown）。
+    persist_numel_matrix: int = 0
+    persist_numel_other: int = 0
 
 
 def _align_up(nbytes: int, block: int) -> int:
@@ -218,6 +223,7 @@ def estimate_structure_memory(
     # 静默截断会低估每卡显存 → OOM 风险，且与 resolve_tensor 对 sharded 维不整除即 raise 的
     # 口径不一致（shape_eval.py:59-63）。opt_state_bytes==0（mem_timeline 只取瞬态桶）时不查。
     persistent = 0
+    persist_numel_matrix = persist_numel_other = 0   # 驻留参数计数(分量拆解用,见 static_mem.persistent_breakdown)
     if opt_state_bytes or matrix_opt_state_bytes:
         for w in params.values():
             divisor = efsdp if w.is_expert else fsdp
@@ -228,8 +234,13 @@ def estimate_structure_memory(
                     f"（切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
             # Muon:2D 矩阵权重用 matrix_opt_state_bytes(momentum-only,较小)，其余走 opt_state_bytes。
             #   AdamW/uniform 时 muon_matrix_names 空 → 全走 opt_state_bytes（逐字节不变）。
+            _cnt = w.local_numel // divisor
             _osb = matrix_opt_state_bytes if w.name in muon_matrix_names else opt_state_bytes
-            persistent += _align_up((w.local_numel // divisor) * _osb, blk)
+            persistent += _align_up(_cnt * _osb, blk)
+            if w.name in muon_matrix_names:      # 计数按 Muon-矩阵分类(AdamW 也分类,但同倍数;
+                persist_numel_matrix += _cnt     #   分量拆解时由 static_mem 按 optimizer 类型决定是否折回)
+            else:
+                persist_numel_other += _cnt
     # norm 激活 fp32（真机 layernorm_compute_dtype=fp32 → 保留输入 fp32 cast，profiler 的 Cast 大头）
     norm_names = _norm_save_names(resolved_ops) if norm_compute_dtype_bytes else frozenset()
     activation_saves = sum(_align_up(s.local_numel * _dt(s, norm_names, norm_compute_dtype_bytes), blk)
@@ -274,6 +285,8 @@ def estimate_structure_memory(
         checkpoint_input=checkpoint_input,
         forward_max_live=forward_max_live,
         grad_shard_bytes=grad_shard_bytes,
+        persist_numel_matrix=persist_numel_matrix,
+        persist_numel_other=persist_numel_other,
     )
 
 

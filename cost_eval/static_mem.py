@@ -92,3 +92,79 @@ class StaticMem:
             )
 
         return out
+
+    def persistent_breakdown(self, g, opt, pm, cpu_offload: bool = False,
+                             alloc_block_bytes: int = 1, *,
+                             offload_params: bool = None,
+                             offload_optimizer: bool = None) -> dict:
+        """每 stage 持久态（persistent）**组成分解** —— 与 `compute` **完全同口径**（同 fsdp/efsdp
+        分母、同 offload 语义、同 `estimate_structure_memory` 按名去重），把每卡持久字节拆成显式分量：
+
+          persistent = 本卡驻留参数 P × 每参数持久字节
+                     = P × [ 参数副本(compute-dtype) + master(fp32) + momentum + v(二阶动量) ]
+
+        每分量每元素字节（优化器状态恒 fp32：master/m/v 各 4B）：
+          - **参数副本** = `opt.param_persist_bytes()`（bf16 params=2；fp32=0，无独立 compute 副本）；
+          - **master(fp32)** = 4；**momentum(m)** = 4；**v(二阶动量)** = 4。
+          - **Muon**：2D 矩阵权重（`is_muon_matrix_weight`）momentum-only → **无 v**（v 仅计非矩阵参数）；
+            AdamW：矩阵/非矩阵同口径（都含 v），矩阵计数折回非矩阵一并计 v。
+          - **offload**：`offload_params`→参数副本归零；`offload_optimizer`→master/m/v 全零（与 `compute`
+            的 `mult` 派生一致）。
+          - **512B 块对齐残差**（DSv3=0，各张量本已对齐）单列为「块对齐」分量，保证
+            **Σ 分量 == `compute()[stage]`**（逐字节相等）。
+
+        返回 `{stage: {param_count, matrix_count, optimizer, offloaded, components, total_bytes}}`，
+        `components=[[名称, 每元素字节, 该分量总字节], ...]`。
+        """
+        if offload_params is None:
+            offload_params = cpu_offload
+        if offload_optimizer is None:
+            offload_optimizer = cpu_offload
+        # 与 compute 同：喂给 estimate 的每元素倍数（含 offload 派生）——用它跑同一去重/切分/块对齐,
+        # 既拿到 aligned persistent，又拿到驻留参数计数（matrix/other）。
+        mult = matrix_mult = 0
+        if not offload_params:
+            mult += opt.param_persist_bytes()
+            matrix_mult += opt.matrix_param_persist_bytes()
+        if not offload_optimizer:
+            mult += opt.optimizer_state_bytes()
+            matrix_mult += opt.matrix_optimizer_state_bytes()
+        fsdp = pm.dense_fsdp_degree()
+        efsdp = pm.efsdp_degree()
+        is_muon = str(getattr(opt, "type", "")).lower() == "muon"
+        # 每分量每元素字节（offload 归零对应项）。优化器状态恒 fp32=4B。
+        pc_b = 0 if offload_params else opt.param_persist_bytes()   # 参数副本(bf16=2/fp32=0)
+        st_b = 0 if offload_optimizer else 4                        # master/m/v 各 4B(fp32)
+        out: dict = {}
+        for stage, layers in g.stages.items():
+            n_mat = n_oth = aligned = 0
+            for layer in layers:
+                sm = estimate_structure_memory(
+                    layer.ops, fsdp=fsdp, efsdp=efsdp,
+                    opt_state_bytes=mult, matrix_opt_state_bytes=matrix_mult,
+                    alloc_block_bytes=alloc_block_bytes)
+                n_mat += sm.persist_numel_matrix
+                n_oth += sm.persist_numel_other
+                aligned += sm.persistent
+            n_total = n_mat + n_oth
+            n_no_v = n_mat if is_muon else 0        # 无 v 的参数（Muon 2D 矩阵）；AdamW=0（矩阵折回）
+            n_with_v = n_total - n_no_v
+            pc_lbl = "参数副本(bf16)" if pc_b else "参数副本(fp32,无独立副本)"
+            mom_lbl = "优化器 momentum" if is_muon else "优化器 m(一阶动量)"
+            v_lbl = "优化器 v(二阶动量,仅非矩阵)" if is_muon else "优化器 v(二阶动量)"
+            comps = [
+                [pc_lbl, pc_b, n_total * pc_b],
+                ["优化器 master(fp32)", st_b, n_total * st_b],
+                [mom_lbl, st_b, n_total * st_b],
+                [v_lbl, st_b, n_with_v * st_b],
+            ]
+            resid = aligned - sum(c[2] for c in comps)   # 512B 块对齐残差（DSv3=0）
+            if resid > 0:
+                comps.append(["块对齐(512B)", 0, resid])
+            out[stage] = {
+                "param_count": n_total, "matrix_count": (n_mat if is_muon else 0),
+                "optimizer": ("Muon" if is_muon else "AdamW"),
+                "offloaded": bool(offload_params or offload_optimizer),
+                "components": comps, "total_bytes": aligned,
+            }
+        return out

@@ -729,6 +729,14 @@ def eval_config(p):
         rng = f"{lys[0].layer_type}(L{lys[0].layer_id})…{lys[-1].layer_type}(L{lys[-1].layer_id})" if lys else ""
         extras = [l.layer_type for l in lys if l.layer_type in _PSEUDO]   # 附着的伪层（embedding/head）
         resv_bytes = rep.reserved_estimate_bytes(sp.stage)   # 该 stage: allocated 峰值 + HCCL 缓冲
+        _pb = rep.persistent_breakdown.get(sp.stage) or {}   # 持久态分量分解（Σ 分量 == persistent 桶）
+        persist_bd = ({
+            "param_count": _pb.get("param_count", 0), "matrix_count": _pb.get("matrix_count", 0),
+            "optimizer": _pb.get("optimizer", ""), "offloaded": _pb.get("offloaded", False),
+            "total_mib": round(_pb.get("total_bytes", 0) / MiB, 1),
+            "components": [{"name": n, "per_elem": p, "mib": round(b / MiB, 1)}
+                           for n, p, b in _pb.get("components", []) if b > 0],
+        } if _pb.get("param_count") else None)
         stages.append({
             "stage": sp.stage, "peak": round(sp.peak_bytes / MiB, 1), "peak_event": sp.peak_event,
             "oom": sp.oom,   # allocated 口径（保留旧名兼容）
@@ -741,6 +749,7 @@ def eval_config(p):
             "reserved_mib": round(resv_bytes / MiB, 1),   # 该 stage reserved 估计（含 pool，MiB）
             "layers_desc": rng, "n_layers": len(split_lys),
             "extras": extras,   # 该 stage 附着的伪层（不计入 n_layers；embedding→stage0/head→末 stage）
+            "persist_breakdown": persist_bd,   # 持久态(persistent)组成分量（本卡驻留参数 × 每分量字节）
             "graph": graph_json(lys, norm_dtype, spec, d, rc),
             "timeline": [{"event": s.event, "total": round(s.total_bytes / MiB, 1),
                           "buckets": {k: round(getattr(s.breakdown, k, 0) / MiB, 1) for k in BK
@@ -1096,6 +1105,14 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
 .barrow .bv{width:76px;text-align:right;color:#555;flex-shrink:0;font-variant-numeric:tabular-nums}
 .busy{opacity:.45;pointer-events:none}
 .legend{font:10px var(--mono);color:var(--mut);padding:6px 17px 11px}.legend span{margin-right:11px;white-space:nowrap}
+/* 持久态组成分解 */
+.ppane{padding:13px 16px}
+.pbform{font:12.5px/1.75 var(--mono);color:var(--ink);margin-bottom:5px}
+.pbform b{color:var(--saved);font-weight:650}
+.pbtag{display:inline-block;font:590 10px/1 var(--mono);background:var(--blue-soft);color:var(--blue);border-radius:6px;padding:3px 8px;margin:2px 0 2px 6px;vertical-align:middle}
+.pbtag.off{background:rgba(255,159,10,.16);color:#b4780a}
+.pbnote2{font:10.5px/1.55 var(--mono);color:var(--mut);margin:0 0 11px;padding-bottom:9px;border-bottom:1px solid var(--line2)}
+.pbnote{font:10px/1.3 var(--mono);color:#9aa2ad;margin:-1px 0 6px 116px}
 /* hover 仅精确指针(触屏不留粘滞 hover) */
 @media (hover:hover) and (pointer:fine){
   .sec>.sh:hover{background:rgba(0,0,0,.028)}
@@ -1244,6 +1261,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
     <div class="grid">
       <div class="maincol">
         <div class="card"><header id="ghdr">模型结构 · op-DAG（点层展开）</header><div class="oplegend" id="oplegend"></div><div class="gpane" id="gpane"></div></div>
+        <div class="card"><header id="phdr">持久态 persistent 组成</header><div class="ppane" id="pbreak"></div></div>
         <div class="card"><header id="tlhdr">内存时间线（FWD→BWD,按时间顺序）</header>
           <div class="tlpane"><p class="desc" id="tldesc"></p><div id="tl"></div></div>
           <div class="legend" id="leg"></div></div>
@@ -1322,9 +1340,32 @@ async function refresh(){
 function drawStage(){
   document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("on",+t.dataset.s===curStage));
   const st=cur.stages.find(s=>s.stage===curStage);
-  drawGraph(st); drawTimeline(st);
+  drawGraph(st); drawPersist(st); drawTimeline(st);
   const ev=st.timeline, pi=ev.findIndex(z=>z.total===st.peak);
   showBuckets(ev[pi>=0?pi:0]);
+}
+/* ── 持久态 persistent 组成分解（本卡驻留参数 × 每分量字节;Σ 分量 == persistent 桶）── */
+const PBCOL=[["参数副本","#6b6b6b"],["master","#4e79a7"],["momentum","#59a14f"],["m(","#59a14f"],["v(","#f28e2b"],["块对齐","#c8ccd2"]];
+function PBC(name){for(const [k,c] of PBCOL)if(name.indexOf(k)>=0)return c;return "#8b93a0";}
+function drawPersist(st){
+  const pb=st.persist_breakdown, el=document.getElementById("pbreak");
+  document.getElementById("phdr").textContent=`持久态 persistent 组成 · Stage ${st.stage}`;
+  if(!pb){el.innerHTML='<p class="desc" style="margin:2px 0">该 stage 无持久态(全部卸载 CPU / 无驻留参数)。</p>';return;}
+  const P=pb.param_count, fmtN=n=>n.toLocaleString("en-US");
+  const perParam=pb.components.reduce((a,c)=>a+(c.per_elem||0),0);   // 每参数字节(不含块对齐)
+  const mx=Math.max(...pb.components.map(c=>c.mib),0.001);
+  const bars=pb.components.map(c=>{
+    const pct=pb.total_mib>0?(c.mib/pb.total_mib*100):0;
+    const cnt=c.name.indexOf("仅非矩阵")>=0?(P-pb.matrix_count):P;
+    const note=c.per_elem?`<div class="pbnote">${c.per_elem} B/参数 × ${fmtN(cnt)} 参数</div>`:"";
+    return `<div class="barrow"><span class="bl">${esc(c.name)}</span><span class="bartrack"><span class="barfill" style="width:${(c.mib/mx*100).toFixed(1)}%;background:${PBC(c.name)}"></span></span><span class="bv">${c.mib.toFixed(1)}M · ${pct.toFixed(0)}%</span></div>${note}`;
+  }).join("");
+  el.innerHTML=`<div class="pbform">持久态 = 本卡驻留参数 <b>${fmtN(P)}</b> × 每参数 <b>${perParam} B</b> = <b>${pb.total_mib.toFixed(1)} MiB</b>`
+    +`<span class="pbtag">${esc(pb.optimizer)}</span>`
+    +(pb.matrix_count?`<span class="pbtag">Muon 2D 矩阵 ${fmtN(pb.matrix_count)}(无 v)</span>`:"")
+    +(pb.offloaded?`<span class="pbtag off">部分卸载 CPU</span>`:"")+`</div>`
+    +`<div class="pbnote2">P 已按 fsdp/tp/ep 切分;优化器状态恒 fp32(master/m/v 各 4B);梯度不在持久态(step-scoped,见下方 grad_accum 桶)</div>`
+    +bars;
 }
 /* ── ③ 模型结构 op-DAG（逐层可展开;真 SVG DAG:拓扑分层+连线箭头,分支/汇合可见）── */
 function cellLayout(ops,edges){
