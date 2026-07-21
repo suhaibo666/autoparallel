@@ -12,7 +12,7 @@ v2（2026-07-11，修用户四条）:
 import dataclasses
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -1387,9 +1387,18 @@ refresh();
 
 
 if __name__ == "__main__":
+    # 用法: serve_explorer.py [port] [host]
+    #   port 默认 8765;host 默认 127.0.0.1(本地开发)。多用户部署传 0.0.0.0 对外监听。
+    # **多用户隔离**：服务无服务端会话状态——每个 /api/eval 请求由 `eval_config(p)` 纯函数按各自
+    # query 参数独立计算(不改任何模块全局),配置全在各自浏览器表单里。因此不同访问者天然互不干扰。
+    # `ThreadingHTTPServer`(每连接一线程)在此之上消除请求排队:一个用户的仿真不阻塞其他人;
+    # handler 为纯函数、无共享可变态,线程安全无需加锁。daemon_threads 让退出时不被在途线程卡住。
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    srv = HTTPServer(("127.0.0.1", port), H)
-    print(f"内存实验台 v2 → http://127.0.0.1:{port}   (Ctrl-C 退出)")
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    srv = ThreadingHTTPServer((host, port), H)
+    srv.daemon_threads = True
+    shown = host if host not in ("0.0.0.0", "::") else "<本机IP>"
+    print(f"内存实验台 v2 → http://{shown}:{port}   (bind {host}, 多线程, Ctrl-C 退出)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
