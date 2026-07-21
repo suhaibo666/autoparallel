@@ -109,3 +109,38 @@ env（本次提交），使梯度累积 + 无重算配置可复现。
 
 *证据：本次 `[MEMPROBE]` 原始行（m=1/2/4，rank0/1）、训练日志 num_accumulation_steps=1/2/4、
 仿真复算、master `trainer.py:1001` 微批循环源码。真机数据全部来自实测，无杜撰。*
+
+---
+
+## 6. DSv4 补测（用 `deepseek_v4/mindformers` 代码，2026-07-20）
+
+用户要求用 **`/home/suhaibo/workspace/deepseek_v4/mindformers`**（DSv4 主代码,**≠** DSv3 harness 的
+`mindformers/mindformers`）跑 DSv4 4L 缩层、梯度累积开时对比。结论：**机制已源码坐实 = 省显存(与仿真
+同 regime),但真机数值未测到（当前 HEAD 两处版本漂移回归把训练卡在 step 0,未杜撰数字）。**
+
+**机制（源码,`deepseek_v4/mindformers@master` HEAD `c3df3ffd3`）**：`training_step`（`trainer.py:1106`）
+是**省显存微批循环**——`for micro_step in range(num_accumulation_steps): _next_batch()(取 local=1 一
+微批) → _forward_backward(各自前反向) …优化器只在末微批`。每微批激活先释放、只累计梯度常驻。**这与
+DSv3 那次的 `feature/pynative-arch-evolution`(无循环→batch放大)相反,DSv4 master 行为 = DSv3 master**。
+→ DSv4 累积 Δ 应 ≈ 一份梯度,正是仿真所建 regime（Δ_sim=1887.7,memory-saving **MATCH**,非 batch 放大
+欠预测）。**仿真对 DSv4 梯度累积在正确 regime,无需 batch-放大修正。**
+
+**真机数值未测到（诚实留白,两处 blocker 均源码举证,均是 2026-07-15/18 后的版本漂移,非 07-06 锚点态）**：
+- **FUSED=1** 建模即崩：`csa.py:29` import 新融合算子名(`npu_sparse_flash_mla` 等),而本机 hyper_parallel
+  wheel 只导出旧名 → ImportError → fail-loud "DSV4 fused ops unavailable"。csa.py 07-15/18 重写了融合 API,
+  wheel 未同步。
+- **FUSED=0** 建成但 step0 崩：`AssertionError: hsdp expects uniform original parameter dtype but got
+  {bf16, fp32}`（`fully_shard/param_group.py:413`）。模型现有 **15 个 bf16 参数**(MoE/FFN 的
+  fc1/fc2/experts/shared/output_layer)与 59 个 fp32 混布(07-15 精度对齐 commit 引入)→ 触发 FSDP 组内
+  dtype 一致断言。
+
+**两个 caveat**：① 数值 Δ 未实测,机制结论靠源码(高可信但非实测);② 即便解阻,当前 HEAD 的
+**bf16-FFN 权重**已偏离仿真的 uniform-fp32-param 假设 → DSv4 **绝对** persistent/grad 会与仿真的
+14971.8 有出入(锚点 15415.5/14971.8 是 07-06 fp32 态标定的)。这属**另一独立漂移**(DSv4 模型精度布局变了、
+仿真 DSv4 模型可能需随之更新),与梯度累积 regime 无关。
+
+**harness**：`prep_dsv4align.py` 加 `SIM_GBS`(镜像 DSv3,向后兼容),本次提交;`run_dsv4_gbs.sh` 留在 116。
+
+*证据：`prep_dsv4align.py` 两 GBS 的 `num_accumulation_steps=1/4` 日志、两 blocker 的源码报错(csa.py:29 /
+param_group.py:413)、`deepseek_v4/mindformers@c3df3ffd3 trainer.py:1106` 微批循环源码、仿真复算 14971.8/
+16859.5。真机峰值**未测到即不报**,无杜撰。*

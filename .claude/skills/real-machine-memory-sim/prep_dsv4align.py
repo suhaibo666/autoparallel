@@ -17,6 +17,9 @@ DS_FILE = os.path.join(DS_DIR, "dataset.mindrecord")
 N = int(os.environ.get("SIM_LAYERS", "4"))
 STEPS = int(os.environ.get("SIM_STEPS", "3"))
 SEQ = int(os.environ.get("SIM_SEQ", "2048"))
+# 梯度累积测试用：global_batch_size 可配。本 harness 固定 local_batch=1 → 累积步数
+# m = GBS / (local_batch·dp) = GBS/dp（dp=2 时 GBS=2→m=1，GBS=8→m=4）。镜像 prep_ds3_sim.py。
+GBS = int(os.environ.get("SIM_GBS", "2"))
 MTP = int(os.environ.get("SIM_MTP", "0"))    # num_nextn_predict_layers（MTP 头数）
 MHC = int(os.environ.get("MHC", "0"))        # 1 → 开 mHC（hc_mult=HC 残差流）
 HC = int(os.environ.get("SIM_HC", "4"))
@@ -47,7 +50,7 @@ cfg = {
     "checkpoint": {"enable_save": False, "load_path": "", "no_load_optim": True,
                    "save_max": 1, "prefix": "custom", "remove_redundancy": False},
     "context": {"device_target": "Ascend", "max_device_memory": "54GB", "mode": 1},
-    "training": {"steps": STEPS, "local_batch_size": 1, "global_batch_size": 2,
+    "training": {"steps": STEPS, "local_batch_size": 1, "global_batch_size": GBS,
                  "max_norm": 1.0, "seed": 42, "deterministic": True},
     "optimizer": {"type": "AdamW", "betas": [0.9, 0.95], "eps": 1.0e-8, "weight_decay": 0.01},
     "lr_scheduler": {"type": "ConstantWarmUpLR", "learning_rate": 1.0e-5, "warmup_ratio": 0},
@@ -145,5 +148,5 @@ if os.environ.get("RECOMPUTE") != "1":
 out = os.path.join(CUR, "dsv4_sim.yaml")
 with open(out, "w") as f:
     yaml.dump(cfg, f, indent=2, sort_keys=False)
-print("WROTE_CONFIG", out, "layers", N, "seq", SEQ, "compress_ratios", compress_ratios,
+print("WROTE_CONFIG", out, "layers", N, "seq", SEQ, "gbs", GBS, "compress_ratios", compress_ratios,
       "mtp", MTP, "mhc", MHC, "fused", FUSED, "use_fused_mhc", cfg["model"]["use_fused_mhc"])
