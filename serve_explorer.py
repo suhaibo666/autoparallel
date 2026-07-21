@@ -308,6 +308,10 @@ def parse_and_validate(p):
     dp = _i(p, "dp", 2); tp = _i(p, "tp", 1); ep = _i(p, "ep", 1)
     pp = _i(p, "pp", 1); cp = _i(p, "cp", 1); vpp = _i(p, "vpp", 1)
     mtp = _i(p, "mtp", 0)
+    # mHC 残差流数（HyperConnection，hidden×n）：1=无 mHC(plain)、≥2=开 mHC(DSv4=4)。空=保留基座
+    #   （v4 预设基座 num_residual_streams=4、v3=1）→ 不误覆盖预设的 mHC；显式填则以该值为准。
+    hc_raw = (p.get("hc") or "").strip()
+    hc = _i(p, "hc", 0) if hc_raw else 0
     mbs_raw = (p.get("mbs") or "").strip()
     mbs = _i(p, "mbs", 0) if mbs_raw else 0          # 0=auto(=pp)
     if mbs_raw and mbs < 1:
@@ -316,6 +320,8 @@ def parse_and_validate(p):
         errs.append("vpp 必须是 ≥1 的整数")
     if mtp < 0:
         errs.append("mtp 层数必须是 ≥0 的整数")
+    if hc_raw and hc < 1:
+        errs.append("mHC残差流数必须 ≥1(1=无 mHC;≥2=开 hidden×n 残差流,DSv4=4)")
     T = N + max(0, mtp)      # 可切分总层数 = transformer + MTP（2026-07-11 用户口径:mtp 计入切分）
     attn = p.get("attn", "mla"); method = p.get("method", "colossal")
     rmode = p.get("recompute", "None"); sel = p.get("select", "attn")
@@ -427,6 +433,11 @@ def parse_and_validate(p):
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk,
         mtp_num_layers=max(0, mtp))
+    # mHC（HyperConnection 残差变体）：hc 显式设时覆盖基座——1=plain、≥2=mhc(hidden×n 残差流)。
+    #   空(hc=0)则保留基座（v4 预设 base=deepseek_v4→num_residual_streams=4、v3→plain）→ 不误关预设 mHC。
+    if hc >= 1:
+        cfg = dataclasses.replace(cfg, residual_variant=("mhc" if hc > 1 else "plain"),
+                                  num_residual_streams=hc)
     # （细粒度重算已在上方统一入口 parse_recompute_cfg 解析,含 per-stage 写法——用户报告 #2 合并,
     #   此处不再单独处理 per-stage；stage→层映射用的是**归置前**的用户配额 pp_split，口径不变。）
     # pp 层分配 → 含伪层的 layers_per_stage:embedding→stage0、head+MTP→末 stage（不占用户配额;
@@ -1056,6 +1067,7 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>seq</label><input name="seq" type="number" min="1" value="4096"></div>
     <div class="fld"><label>batch</label><input name="batch" type="number" min="1" value="1"></div>
     <div class="fld"><label>mtp 层数</label><input name="mtp" type="number" min="0" value="0" title="MTP(num_nextn_predict_layers);计入可切分总层数(pp 分配的和=layers+mtp),位于层序列末端"></div>
+    <div class="fld"><label>mHC残差流</label><input name="hc" type="number" min="1" value="1" style="width:70px" title="mHC(HyperConnection)残差流数 num_residual_streams：1=无 mHC(plain);≥2=开 mHC，hidden 状态 ×n 条残差流(DeepSeek-V4=4)。选 DSv4 预设自动填 4。留 1=按普通残差估。mHC 主要抬持久态(×n 残差流参数/激活)"></div>
   </div>
   <div class="cfgrow"><span class="cap">结构维度</span>
     <div class="fld"><label>hidden</label><input name="hidden" type="number" min="1" value="1792"></div>
@@ -1326,6 +1338,9 @@ function resetRuntimeExtras(){
 function applyPreset(key){
   const pr=PRESETS[key]; if(!pr)return;
   Object.entries(pr.ui).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el)el.value=v;});
+  // mHC 残差流：预设 ui 未显式给 hc 时按基座推(v4 基座=deepseek_v4→4 条残差流,v3=1=无 mHC)。
+  const _hc=document.querySelector(".top [name=hc]");
+  if(_hc)_hc.value=(pr.ui.hc!==undefined?pr.ui.hc:(pr.base==="v4"?4:1));
   resetRuntimeExtras();      // 手配路径 → extra 回到固定假设(64GiB/AdamW-fp32/...)
   document.getElementById("kmeta").textContent="来源: "+pr.source;
 }
@@ -1348,7 +1363,7 @@ document.getElementById("yamlfile").addEventListener("change",async e=>{
 });
 /* 结构字段被手改 → 已偏离预设 → 下拉自动跳 Custom（并行/重算字段不算偏离） */
 const STRUCT_FIELDS=["attn","layers","dense_k","experts","topk","heads","kv_groups","seq","batch",
-  "hidden","ffn","moe_ffn","q_lora","kv_lora","qk_nope","qk_rope","v_head","vocab"];
+  "mtp","hc","hidden","ffn","moe_ffn","q_lora","kv_lora","qk_nope","qk_rope","v_head","vocab"];
 function markCustom(){const sel=document.getElementById("preset");if(sel.value!=="custom"){sel.value="custom";
   document.getElementById("kmeta").textContent="来源: "+PRESETS.custom.source;}}
 document.querySelectorAll(".top [name]").forEach(e=>{if(e.id==="preset")return;
