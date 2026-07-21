@@ -778,10 +778,14 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
             "（config.py:471-477）——该 yaml 真机跑不起来，请补 sequence_parallel: true。")
     local_bs = int(train.get("local_batch_size", 1) or 1)
     global_bs = train.get("global_batch_size")
-    # num_microbatches：pp>1 取 pipeline_parallel_microbatch_size，否则 1
-    # （对齐 validate_dsv3.main 的 `mbs = PP if PP>1 else 1`，且 P4:57 pipeline_parallel_microbatch_size=1）。
-    ppm = int(par.get("pipeline_parallel_microbatch_size", 1) or 1)
-    num_microbatches = ppm if pp > 1 else 1
+    # num_microbatches：pp>1 → **默认 = pp**（1F1B 惯例，与 eval_config 的 mbs=auto=pp、真机
+    #   `global//(local·dp)` 一致）；显式 pipeline_parallel_microbatch_size 优先。
+    # ⚠ 此前误用其默认 **1**（`mbs = PP if PP>1 else 1` 的 PP 意图写成了 ppm 默认 1）→ 下面
+    #   `data_parallel_shard=-1` 的 auto 解析把 dp_shard **高估 pp 倍**（现场 DSv4-Flash 实证：256 卡/
+    #   pp8 真 dp_shard=32，旧算法给 256 → efsdp/持久欠估 ~8×，真机 58G vs 仿真 18G）。2026-07-21 修。
+    _ppm = par.get("pipeline_parallel_microbatch_size")
+    ppm = int(_ppm) if _ppm else 1                              # microbatch SIZE → ParallelConfig.microbatch
+    num_microbatches = (int(_ppm) if _ppm else pp) if pp > 1 else 1   # COUNT：pp>1 且未显式给 → 缺省=pp
     # dp_replicate（P0.3，2026-07-14 review）：纯数据并行度——权重/优化器逐 rank **复制**不切分。
     # 评估器正确建模该语义：持久态只 ÷fsdp_degree=dp_shard·cp（static_mem.py:31），dp_replicate 仅进
     # world size（report.py:53）与通信域数（framework.py:52，reserved 池）。老式 yaml 的
@@ -806,6 +810,14 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
         dp_shard, dp_repl = 1, max(dp_repl, int(dp_total))
     elif global_bs is not None:
         dp_shard = max(1, int(global_bs) // (local_bs * num_microbatches * dp_repl))
+        # data_parallel_shard=-1（纯 FSDP,「用掉所有剩余卡」）**真值取决于总卡数**,而总卡数不在 yaml 里。
+        # 这里从 global_batch/(local·num_microbatches) 反推是**近似**（假设 num_microbatches=pp）——真机
+        # 若微批数≠pp 则 dp_shard 不同。用户须按实际总卡核对:dp_shard = 总卡 /(pp·tp·cp)。
+        warnings.warn(
+            f"data_parallel_shard=-1（纯 FSDP）:总卡数不在 yaml 中,已按 global_batch/(local·pp)="
+            f"{dp_shard} 反推（假设微批数=pp={pp}）。**请按实际总卡核对** dp_shard=总卡/(pp·tp·cp);"
+            f"填错会使持久态/梯度按 1/dp_shard 整体缩放、峰值大幅偏差（现场 DSv4-Flash:256卡→dp_shard=32）。",
+            UserWarning)
     else:
         dp_shard = 1
     # 上下文相关键联合判定（closure-audit F1/F6，2026-07-15）——须在 dp_shard/cp/method 确定后：

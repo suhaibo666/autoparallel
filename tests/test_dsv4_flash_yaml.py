@@ -80,6 +80,9 @@ def test_dsv4_flash_yaml_imports():
     # ④ 结构：43 层 + 1 MTP、pp=8、ep=32
     assert b.llm.num_layers == 43 and b.llm.mtp_num_layers == 1
     assert b.parallel.pp == 8 and b.parallel.ep == 32
+    # ④ data_parallel_shard=-1 auto：num_microbatches 缺省=pp（非 1）→ dp_shard=global/(local·pp)=
+    #   256/(1·8)=32（真机 256卡/pp8 值）；此前误用 ppm 默认 1 → dp_shard=256、持久欠估 ~8×。
+    assert b.parallel.dp_shard == 32
     # ④ PP overlap → 近似 warn（放行）
     assert any("overlap" in str(w.message) for w in rec)
 
