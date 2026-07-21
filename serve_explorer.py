@@ -378,12 +378,16 @@ def parse_and_validate(p):
         errs.append(f"ep({ep}) 必须整除 dp_shard·cp·tp={dp*cp*tp}（专家在该区内分片,ParallelModel 规则）")
     if rmode not in ("None", "full", "select", "custom"):
         errs.append(f"recompute {rmode!r} 不支持")
-    # 重算层范围（sel_layers）：对 **full/select/custom 均生效**（空=全部层 1-N）。
+    # 重算层范围（sel_layers）：对 **full/select/custom 均生效**（空=全部可切分层 1..T）。
     #   - full/select 生效（用户报告 #1，2026-07-15）；此前仅 custom 消费。
     #   - **多段不连续**：`1-8;12-13;23-25`（`,`/`;`/全角均可，用户报告 2026-07-15）→ 层号并集。
+    #   - **域 = 1..T（T=N+mtp）**（用户报告 2026-07-21）：MTP 层是一等 decoder 层（`build_mtp_ops`
+    #     = embedding+1 decoder+head），占 layer_id N+1..N+mtp（emb=0/transformer=1..N/mtp 随后），
+    #     其重算配置与普通 transformer 层同口径。此前域=1..N 把 MTP 排除在「全部层」外、且用户填 MTP
+    #     层号被判越界 → MTP 恒不重算。改域=1..T 修复（mtp=0 时 T==N，逐字节不变）。
     sel_ops_raw = [s.strip() for s in p.get("sel_ops", "").split(",") if s.strip()]
     lr_raw = p.get("sel_layers", "").strip()
-    e_lr, sel_layer_set = _parse_layer_ranges(lr_raw, 1, N)   # 1-indexed 1..N；空→None
+    e_lr, sel_layer_set = _parse_layer_ranges(lr_raw, 1, T)   # 1-indexed 1..T(含 MTP)；空→None
     # pp 层分配（mindformers num_layer_list 口径）——提前解析：细粒度重算按 stage 写法需其做 stage→层映射。
     e_pp, pp_split = parse_pp_split(p.get("pp_split", ""), pp, T)
     errs += e_pp
@@ -395,8 +399,8 @@ def parse_and_validate(p):
     # 非空层范围：full/select/custom 均校验（多段解析报错透传，越界/倒序/非整数即报错，不静默忽略）。
     if lr_raw and rmode in ("full", "select", "custom"):
         errs += [f"重算层范围：{m}" for m in e_lr]
-    if not sel_layer_set:                       # 空/缺省 → 全部层 1..N
-        sel_layer_set = set(range(1, N + 1))
+    if not sel_layer_set:                       # 空/缺省 → 全部可切分层 1..T（transformer + MTP）
+        sel_layer_set = set(range(1, T + 1))
     if rmode == "custom" and sel_cfg is None and not sel_ops_raw:
         errs.append("custom 重算需至少勾选一个 op（图上点 ↻）或填「细粒度重算」文本")
     if errs:
@@ -450,7 +454,7 @@ def parse_and_validate(p):
         pp_split = tuple(full)
     pc_args = dict(dp=dp, tp=tp, ep=(ep if has_moe else 1), pp=pp, cp=cp, method=method,
                    rmode=rmode, sel=sel, N=N, sel_ops=sel_ops_raw,
-                   sel_layers=sorted(sel_layer_set),   # 重算层范围层号集（多段并集；空→全部 1..N）
+                   sel_layers=sorted(sel_layer_set),   # 重算层范围层号集（多段并集；空→全部 1..T=N+mtp,含 MTP）
                    sel_cfg=sel_cfg, pp_split=pp_split, vpp=vpp, mbs=mbs)
     return [], cfg, pc_args
 
@@ -662,7 +666,7 @@ def eval_config(p):
     spec = build_llm_spec(cfg)
     d = spec.dims
     N = pa["N"]
-    lset = pa["sel_layers"]   # 重算层范围层号集（多段并集；空 sel_layers → 全部 1..N，见 parse_and_validate）
+    lset = pa["sel_layers"]   # 重算层范围层号集（多段并集；空→全部 1..T=N+mtp,含 MTP 层,见 parse_and_validate）
     if pa["rmode"] == "full":
         rc = RecomputeSpec("full", full_layers=set(lset))
     elif pa["rmode"] == "select":
@@ -1202,7 +1206,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
     <div class="sb">
       <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
       <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
-      <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8;12-13;23-25" title="重算作用的层（1..N,含端点）——对 full / select / custom 均生效;空=全部层。&#10;**支持多段不连续**:1-8;12-13;23-25(分隔符 , 或 ; 皆可,全角亦可)。&#10;例:full+「1-2」=只前 2 层整层重算;select+「1-8;23-25」=这 11 层按 select 模块重算"></div>
+      <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8;12-13;23-25" title="重算作用的层（1..N+mtp,含端点）——对 full / select / custom 均生效;空=全部可切分层。&#10;**MTP 层是一等 decoder 层**,层号紧接 transformer(=N+1..N+mtp),与普通层同口径可重算(2026-07-21)。&#10;**支持多段不连续**:1-8;12-13;23-25(分隔符 , 或 ; 皆可,全角亦可)。&#10;例:full+「1-2」=只前 2 层整层重算;layers=8+mtp=1 时「9」=只重算 MTP 层"></div>
       <div class="fld"><label>细粒度重算</label><input name="sel_cfg" placeholder="s0:both; s2-3:mlp  或  self_attention:0-7,11-12" title="统一入口,按段自动识别两种写法(不可混用),非空即优先于图上勾选/select 模块:&#10;① 按 PP stage —— s0:both; s1-2:self_attention; s3:none (stage 号支持多段 s0,2-3;stage→层跟当前 pp 切分)&#10;② 按绝对层号(mf select_module,0-indexed) —— self_attention:0-7,11-12,22-24; flash:4-7 (**每 pattern 的层范围支持多段不连续**,逗号分隔)&#10;模式/pattern = none | self_attention | mlp | both(≈full) | 任意 op 名子串;分号分隔多条 pattern"></div>
       <div class="fld" id="rcrow" style="display:none"><label>重算 op（图上勾选）</label><div id="rcchips" style="font:11px/1.5 var(--mono);color:var(--mut)">（在左图 op 节点上点 <b>↻</b> 勾选;再点取消）</div></div>
       <input type="hidden" name="sel_ops" value="">
