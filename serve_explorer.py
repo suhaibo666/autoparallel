@@ -905,6 +905,14 @@ def _bundle_to_fields(b):
     f["maxdev_gib"] = round(b.hardware.max_device_memory / (2 ** 30), 4)   # 设备容量(GiB)
     f["opt_dtype"] = "fp32" if b.optimizer.state_bytes_per_param == 12 else "bf16"   # 优化器 params dtype
     f["grad_bytes"] = b.optimizer.grad_dtype_bytes            # 反向 grad dtype 字节
+    # 优化器类型(AdamW/Muon)+ per-head:此前遗漏 → yaml type:Muon 在 UI round-trip 被静默降级为 AdamW
+    #（现场 DSv4-Flash 修）。Muon 持久更省(2D 矩阵 momentum-only)、per-head 改 NS workspace。
+    f["optimizer"] = "muon" if str(getattr(b.optimizer, "type", "")).lower() == "muon" else "adamw"
+    f["muon_per_head"] = int(bool(getattr(b.optimizer, "per_head", False)))
+    # mHC 残差流(num_residual_streams):此前遗漏 → yaml enable_hyper_connections+num_residual_streams=4
+    #   在 round-trip 被静默降级为 plain(hc=1)→ 持久/激活欠算 ×n。residual_variant≠mhc → 1(无 mHC)。
+    f["hc"] = (int(getattr(llm, "num_residual_streams", 1) or 1)
+               if getattr(llm, "residual_variant", "plain") == "mhc" else 1)
     return f
 
 
@@ -954,7 +962,14 @@ class H(BaseHTTPRequestHandler):
                 # P1-18:嵌套 offset 在必需字段兜底后物化(兜底可能刚注入 num_hidden_layers)
                 _materialize_nested_offset(mf, warnings)
                 from cost_eval.configs.from_mindformers import from_mindformers_dict
-                bundle = from_mindformers_dict(mf)
+                # 捕获解析期 Python 警告(PP overlap 近似欠估 / CE 融合架构默认等)→ 汇入 UI 警示,
+                # 让用户看见「峰值可能略偏低」这类诚实口径边界(此前只进服务端日志、UI 不可见)。
+                import warnings as _pywarn
+                with _pywarn.catch_warnings(record=True) as _wrec:
+                    _pywarn.simplefilter("always")
+                    bundle = from_mindformers_dict(mf)
+                for _w in _wrec:
+                    warnings.append(f"{_w.message}")
                 fields = _bundle_to_fields(bundle)
                 # P1-17/§4.8 闭环（2026-07-15）：**完整 round-trip**——页面评估按解析出的完整
                 # bundle 算（dp_replicate/reshard/offload/prefetch、设备容量、优化器 dtype 均生效,

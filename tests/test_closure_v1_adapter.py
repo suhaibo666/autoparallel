@@ -54,16 +54,24 @@ def _dsv4_mf(dsa_fused=True):
 
 
 # ── ① P0-02.1 bool True 泄漏（§4.1.1）────────────────────────────────────────────────
-def test_par_overlap_p2p_true_rejected():
-    """`pipeline_parallel_overlap_p2p=True`（未建模布尔键）必须 fail-loud——此前 True==1 静默放行。"""
-    with pytest.raises(NotImplementedError, match="pipeline_parallel_overlap_p2p"):
-        from_mindformers_dict(_mf(parallelism={"pipeline_parallel_overlap_p2p": True}))
+def test_par_overlap_p2p_true_warns():
+    """`pipeline_parallel_overlap_p2p=True`：P2P 双缓冲(有界二阶量)未建模 → **近似 warn 放行**
+    （2026-07-21 现场 DSv4-Flash 修：生产 PP 几乎必开，硬 fail-loud 会挡住所有真实 pp>1 配置；改为
+    放行 + 警示欠估，与 A2/A3/A4 近似-warn 一致）。此前是 fail-loud（True==1 静默放行的订正版）。"""
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        b = from_mindformers_dict(_mf(parallelism={"pipeline_parallel_overlap_p2p": True}))
+    assert b is not None
+    assert any("pipeline_parallel_overlap_p2p" in str(w.message) for w in rec)
 
 
-def test_par_overlap_p2p_int_one_rejected():
-    """整数 1 也是真值（True==1）——必须与 True 同拒,不得漏过。"""
-    with pytest.raises(NotImplementedError, match="pipeline_parallel_overlap_p2p"):
-        from_mindformers_dict(_mf(parallelism={"pipeline_parallel_overlap_p2p": 1}))
+def test_par_overlap_p2p_int_one_warns():
+    """整数 1 也是真值（True==1）——与 True 同样触发 warn（不漏过）。"""
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        b = from_mindformers_dict(_mf(parallelism={"pipeline_parallel_overlap_p2p": 1}))
+    assert b is not None
+    assert any("pipeline_parallel_overlap_p2p" in str(w.message) for w in rec)
 
 
 def test_par_context_parallel_async_true_rejected():

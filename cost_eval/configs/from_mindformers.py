@@ -53,6 +53,8 @@ _MAPPED_MODEL_KEYS = {
     "kv_lora_rank", "q_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim",
     "csa_compress_ratios", "csa_window_size", "sliding_window",
     "dsa_indexer_n_heads", "dsa_indexer_head_dim", "dsa_indexer_topk",
+    # 现场 DSv4-Flash 异名（经 _MODEL_KEY_ALIASES 规范化后被消费）——旧名须在 _MAPPED 内否则 fail-loud
+    "num_residual_streams", "index_n_heads", "index_head_dim", "index_topk", "compress_ratios",
     "o_groups", "o_lora_rank",
     "apply_dsa_kernel_fusion", "force_unfused_dsa", "use_flash_attention",
     "gated_linear_unit", "moe_intermediate_size", "moe_capacity_factor",
@@ -89,6 +91,13 @@ _IGNORED_MODEL_KEYS = {
     "csa_compress_rotary_base", "csa_dense_mode",
     "dsa_indexer_loss_coeff", "dsa_indexer_use_sparse_loss",
     "hc_sinkhorn_iters", "hc_eps", "use_fused_mhc",
+    # ── 现场 DSv4-Flash yaml 的数值/算法旋钮（不改 op 图、不改驻留字节）──────────────────────
+    "activation_func_clamp_value",   # 激活函数数值 clamp（数值稳定，不改张量形）
+    "compress_rotary_base",          # 压缩注意力 rotary base（同 csa_compress_rotary_base，数值）
+    "mhc_init_gating_factor",        # mHC 门控初值（数值 init）
+    "mhc_sinkhorn_iterations",       # mHC sinkhorn 迭代次数（同 hc_sinkhorn_iters，计算时非驻留）
+    "moe_router_score_function",     # router 打分函数名（logits 形不变，同 scoring_func）
+    "num_hash_layers",               # 哈希路由层数（无学习参数的确定性哈希，假设结构中性）
     "mtp_loss_scaling_factor",
     "scaling_factor", "beta_fast", "beta_slow", "mscale", "mscale_all_dim", "rope_theta",
     "router_dense_type", "routed_scaling_factor",
@@ -304,6 +313,12 @@ _MODEL_KEY_ALIASES = {
     "multi_query_group_num": "num_key_value_heads",   # glm4 GQA 组数
     "layernorm_compute_type": "layernorm_compute_dtype",  # glm4
     "param_init_type": "params_dtype",            # glm4
+    # ── 现场 DSv4-Flash yaml（TorchTitan/新命名）→ 评估器读的规范名（同概念异名，内存相关，必须映射）──
+    "num_residual_streams": "hc_mult",            # mHC 残差流数 n（hidden ×n）——评估器读 hc_mult
+    "index_n_heads": "dsa_indexer_n_heads",       # DSA lightning indexer 头数
+    "index_head_dim": "dsa_indexer_head_dim",     # DSA indexer 头维
+    "index_topk": "dsa_indexer_topk",             # DSA indexer topk
+    "compress_ratios": "csa_compress_ratios",     # dsv4_hybrid 每层压缩比 {0/1,4=CSA,128=HCA}
 }
 _REQUIRED_MODEL_KEYS = ("num_hidden_layers", "num_attention_heads", "hidden_size",
                         "vocab_size", "seq_length")
@@ -568,6 +583,8 @@ _PAR_NEUTRAL = {
     "data_parallel_shard_strategy",     # 死键：pynative 全库无消费点（2026-07-14 核查）
     "enable_loss_parallel",             # 死键：pynative 无消费者（config.py:444-449 旧 DTensor 流残留;
                                         # TP>1 恒 vocab-parallel、无开关，loss.py:326-336）
+    "moe_token_dispatcher_type",        # MoE 分发实现(alltoall/alltoall_deredundancy)——评估器按标准
+                                        # alltoall staging 建模,dedup 变体只更省;与 model 段同名键同口径中性
 }
 # 影响内存但未建模 → 出现即 fail-loud。**布尔开关类**：任何**真值**都拒（True/1/任意非零/非空串）——
 # 此前允许集含 `1`，而 Python `True==1`，致 `pipeline_parallel_overlap_p2p=True` 被静默接受（探针
@@ -578,10 +595,16 @@ _PAR_NEUTRAL = {
 # 错——已移出，改由 `_check_dense_fsdp_shard_size` 按完整 FSDP 域 `fsdp=dp_shard·cp` 判定。
 _PAR_UNSUPPORTED_TRUTHY = {
     "context_parallel_async": "cp 通信异步 overlap 的在飞双缓冲未建模（二阶内存效应）",
-    "pipeline_parallel_overlap_p2p": "PP p2p overlap 的 send/recv 双缓冲未建模",
-    "pipeline_parallel_overlap_b_f": "PP B/F overlap 的额外在飞激活未建模",
     "pipeline_parallel_enable_dxdw_split": "dx/dw 拆分使 dw 图延迟释放，生命周期未建模",
     "expert_parallel_async_d2h": "EP 异步 D2H 的 staging 缓冲未建模",
+}
+# **近似 warn（非阻断）**：这些 PP overlap 开关的内存效应是**有界二阶量**（overlap_p2p=多一份 P2P
+# send 缓冲，base p2p_buf 已建模；overlap_b_f=B/F overlap 多约 1 微批在飞激活）——生产 PP 配置几乎必开，
+# 硬 fail-loud 会挡住所有真实 pp>1 配置导入。改为**放行 + 警示欠估**（与 A2/A3/A4 的近似-warn 一致），
+# 让用户拿到估计（略偏低）而非被拦死。真机若偏高即此二阶量所致。
+_PAR_APPROX_WARN = {
+    "pipeline_parallel_overlap_p2p": "PP p2p overlap 多一份 send/recv 双缓冲(base p2p_buf 已建、增量约 1 份)未建模",
+    "pipeline_parallel_overlap_b_f": "PP B/F overlap 多约 1 微批在飞激活未建模",
 }
 # **上下文相关键**（closure-audit F1/F6，2026-07-15）：合法性依赖 dp_shard/cp/method——不能在这里
 # 静态分流，必须在 `_build_parallel` 里等这些量确定后由专门函数联合判定。此集只用于 unknown-key
@@ -688,9 +711,14 @@ def _parse_pp_layers_per_stage(spec: str, pp: int) -> list:
 
     格式：stage 间 `|` 分隔；stage 内多个 interleave chunk 用 `,` 分隔；每段是 `a-b` 闭区间或
     单层号。本函数只取每 stage 的**层数和**（chunk 边界的 round-robin 放置由 parallel_model
-    处理，显式配额下 per-chunk ranges 仍为文档化近似——P1-15 残留）。"""
+    处理，显式配额下 per-chunk ranges 仍为文档化近似——P1-15 残留）。
+
+    **两种写法都吃**（现场 DSv4-Flash yaml，config.py:397 两支持）：
+      · 字符串 `"0-3|4-8|9-13"`（stage 间 `|`）；
+      · YAML **list** `["0-3","4-8","9-13"]`（每元素=一个 stage 的区间，等价于 `|` 连接）。"""
+    parts = [str(x) for x in spec] if isinstance(spec, (list, tuple)) else str(spec).split("|")
     stages = []
-    for stage_part in str(spec).split("|"):
+    for stage_part in parts:
         n = 0
         for seg in stage_part.split(","):
             seg = seg.strip()
@@ -715,7 +743,7 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
     train = mf.get("training", {}) or {}
     # P0-02：schema fail-loud——未知键（含拼错）不静默丢弃。
     unknown = (set(par) - _PAR_MAPPED - _PAR_NEUTRAL
-               - set(_PAR_UNSUPPORTED_TRUTHY) - _PAR_CONTEXT_DEPENDENT)
+               - set(_PAR_UNSUPPORTED_TRUTHY) - set(_PAR_APPROX_WARN) - _PAR_CONTEXT_DEPENDENT)
     if unknown:
         raise NotImplementedError(
             f"未识别的 parallelism 字段（可能改变内存但未映射/拼错）：{sorted(unknown)}。"
@@ -727,6 +755,12 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
         v = par.get(k)
         if v not in (None, False, 0, ""):
             raise NotImplementedError(f"parallelism.{k}={v!r} 未建模：{why}——拒绝静默近似导入。")
+    # 近似 warn（放行）：PP overlap 二阶量未建模 → 估计略偏低,发 UserWarning（serve 会收集进 UI 警示）。
+    for k, why in _PAR_APPROX_WARN.items():
+        v = par.get(k)
+        if v not in (None, False, 0, ""):
+            warnings.warn(f"parallelism.{k}={v!r}：{why}——已放行,但**峰值可能略偏低**(二阶量未建模)。",
+                          UserWarning)
     sched = par.get("pipeline_parallel_schedule")
     if sched not in (None, "", "1f1b", "interleaved_1f1b"):
         raise NotImplementedError(
@@ -906,6 +940,11 @@ _OPTIMIZER_KEYS = {
     "lr_decay_style", "decay_steps", "total_steps", "momentum", "use_nesterov",
     "loss_scale", "amsgrad", "maximize", "weight_decay_kwargs",
     "apply_decay_param_filter", "param_groups",
+    # ── Muon / AdamW-fallback 数值超参（现场 DSv4-Flash yaml，type: Muon）——**内存无关**：
+    #   优化器状态占用由 `type`（Muon 2D 矩阵 momentum-only / 其余 AdamW）决定，下列均为数值/算法
+    #   旋钮（Newton-Schulz 系数、QK-clip 阈值、fused/nesterov 开关、通信策略），不改状态形状。
+    "adamw_betas", "adamw_eps", "matched_adamw_rms", "nesterov", "ns_coefficients",
+    "qk_clip_enabled", "qk_clip_threshold", "comm_strategy", "use_fused_adamw",
 }
 # 顶层段白名单（V1 §4.1.2）：mindformers **顶层已知段**——新式 pynative 段 + 老式 legacy 顶层键
 # （本地 mindformers/configs/**/*.yaml 全量扫描收集）。顶层未知段（如整段拼错 `optimzier`）会让
@@ -916,6 +955,9 @@ _TOP_LEVEL_SEGMENTS = {
     # ── 新式 pynative 段（本转换器实际消费/校验）──
     "model", "parallelism", "training", "context", "swap", "optimizer",
     "recompute", "recompute_comm",
+    # ── 新式 pynative（TorchTitan 命名）**内存无关**段——识别但不消费（现场 DSv4-Flash yaml）──
+    #   checkpoint（ckpt 存/载路径、remove_redundancy 等）、lr_scheduler（学习率调度）均不影响显存峰值。
+    "checkpoint", "lr_scheduler",
     # ── 老式 legacy 顶层键（configs/ 扫描 + mindformers 惯用）──
     "auto_trans_ckpt", "auto_tune", "autotune_per_step", "blip", "callbacks",
     "do_eval", "eval_dataset", "eval_dataset_task", "eval_epoch_interval",
@@ -959,15 +1001,21 @@ def _check_segment_keys(mf: dict, seg: str, allowed: set) -> None:
 
 
 def _build_optimizer(mf: dict) -> OptimizerSpec:
-    """`optimizer` + `model.params_dtype` → `OptimizerSpec`。params_dtype=float32 → params_fp32（state=12）。"""
+    """`optimizer` + `model.params_dtype` → `OptimizerSpec`。params_dtype=float32 → params_fp32（state=12）。
+
+    AdamW：master+m+v（fp32=12/bf16=14）。**Muon**（现场 DSv4-Flash yaml，type: Muon）：2D 矩阵权重
+    momentum-only（master+momentum=8/bf16=10，省一份 v），embed/head/norm/router/bias 仍走 AdamW——
+    见 specs.OptimizerSpec.muon。per_head（注意力投影 NS 按头切）无独立 mindformers 键 → 默认关。"""
     opt = mf.get("optimizer", {}) or {}
     model = mf.get("model", {}) or {}
-    otype = str(opt.get("type", "AdamW"))
-    if otype.lower() not in ("adamw", "adam"):
-        raise NotImplementedError(
-            f"optimizer.type={otype!r} 暂未映射（评估器持久量模型按 AdamW：master+m+v）。")
+    otype = str(opt.get("type", "AdamW")).lower()
     params_fp32 = _dtype_bytes(model.get("params_dtype"), 4) == 4
-    return OptimizerSpec.adamw(params_fp32=params_fp32, grad_dtype_bytes=4)
+    if otype in ("adamw", "adam"):
+        return OptimizerSpec.adamw(params_fp32=params_fp32, grad_dtype_bytes=4)
+    if otype == "muon":
+        return OptimizerSpec.muon(params_fp32=params_fp32, grad_dtype_bytes=4)
+    raise NotImplementedError(
+        f"optimizer.type={otype!r} 暂未映射（评估器支持 AdamW / Muon）。")
 
 
 def _build_hardware(mf: dict) -> HardwareSpec:

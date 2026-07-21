@@ -219,22 +219,19 @@ def estimate_structure_memory(
         for s in op.saves:
             saves[s.name] = s
 
-    # 持久 = param+opt（按 fsdp/efsdp 切）。**切分不整除即报错，不静默 floor**（I1，OOM 安全）：
-    # 静默截断会低估每卡显存 → OOM 风险，且与 resolve_tensor 对 sharded 维不整除即 raise 的
-    # 口径不一致（shape_eval.py:59-63）。opt_state_bytes==0（mem_timeline 只取瞬态桶）时不查。
+    # 持久 = param+opt（按 fsdp/efsdp 切）。切分不整除 → **FSDP2 flat-param 补齐**：每卡持
+    # `ceil(numel/divisor)`（PyTorch/mindformers FSDP2 把展平参数 pad 到 world 倍数再切）——ceil≥floor
+    # **OOM 安全**（不低估），且天然处理 **tiny param**（numel<divisor，如 dsv4_hybrid 的 attn_sink
+    # =n_heads、fsdp=256）：每卡 1 元素，不再 fail-loud（现场 DSv4-Flash 修，2026-07-21）。整除时
+    # ceil==floor → **逐字节不变**（所有锚点 fsdp 小、param 大，均整除）。opt_state_bytes==0 时不算。
     persistent = 0
     persist_numel_matrix = persist_numel_other = 0   # 驻留参数计数(分量拆解用,见 static_mem.persistent_breakdown)
     if opt_state_bytes or matrix_opt_state_bytes:
         for w in params.values():
             divisor = efsdp if w.is_expert else fsdp
-            if w.local_numel % divisor != 0:
-                raise ValueError(
-                    f"{w.name} local_numel={w.local_numel} 不被 "
-                    f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
-                    f"（切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
             # Muon:2D 矩阵权重用 matrix_opt_state_bytes(momentum-only,较小)，其余走 opt_state_bytes。
             #   AdamW/uniform 时 muon_matrix_names 空 → 全走 opt_state_bytes（逐字节不变）。
-            _cnt = w.local_numel // divisor
+            _cnt = -(-w.local_numel // divisor)         # ceil(numel/divisor)：FSDP2 补齐，OOM 安全
             _osb = matrix_opt_state_bytes if w.name in muon_matrix_names else opt_state_bytes
             persistent += _align_up(_cnt * _osb, blk)
             if w.name in muon_matrix_names:      # 计数按 Muon-矩阵分类(AdamW 也分类,但同倍数;
@@ -247,17 +244,12 @@ def estimate_structure_memory(
                            for s in saves.values())
     param_full_bytes = sum(_align_up(w.local_numel * w.dtype_bytes, blk) for w in params.values())
     grad_full_bytes = sum(_align_up(w.local_numel * grad_dtype_bytes, blk) for w in params.values())
-    # P0-01（2026-07-14 review）：已规约梯度分片（step-scoped cumulative）。divisor 与上方
-    # persistent 完全同口径（dense÷fsdp、expert÷efsdp），不整除同样 fail-loud（I1，OOM 安全）。
+    # P0-01（2026-07-14 review）：已规约梯度分片（step-scoped cumulative）。divisor 与上方 persistent
+    # 完全同口径（dense÷fsdp、expert÷efsdp），不整除同样按 **FSDP2 补齐 ceil**（OOM 安全，整除时不变）。
     grad_shard_bytes = 0
     for w in params.values():
         divisor = efsdp if w.is_expert else fsdp
-        if w.local_numel % divisor != 0:
-            raise ValueError(
-                f"{w.name} local_numel={w.local_numel} 不被 "
-                f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
-                f"（grad shard 切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
-        grad_shard_bytes += _align_up((w.local_numel // divisor) * grad_dtype_bytes, blk)
+        grad_shard_bytes += _align_up((-(-w.local_numel // divisor)) * grad_dtype_bytes, blk)
     # P1-08：bwd_scratch 由「求和上界」精化为 backward **max-live**（逆序滑窗 window=2）。
     # 单 scratch op 层（loss 的 nll / DSA·dsv4 的 indexer）逐字节不变 == 旧 sum；分离/相邻的多
     # scratch op 层取更紧的 max-live（OOM 安全，≤ sum 恒成立）。见 `_backward_max_live` docstring。
