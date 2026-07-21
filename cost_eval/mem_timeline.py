@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .structure_mem import estimate_structure_memory, estimate_select_memory
+from .specs import is_muon_matrix_weight, is_attn_projection, _MUON_NS_WORKSPACE_MULT
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +226,9 @@ class MemTimeline:
                  norm_compute_dtype_bytes: int = 0,
                  kept_frag_factor: float = 0.0,
                  nr_moe_frag_factor: float = 0.0,
-                 bwd_scratch_conservative: bool = False) -> dict:
+                 bwd_scratch_conservative: bool = False,
+                 muon: bool = False, muon_per_head: bool = False,
+                 muon_n_heads: int = 0) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -654,15 +657,37 @@ class MemTimeline:
             #   offload_optimizer（P1-19）时优化器 step 在 CPU、无设备瞬态 → 该项 0（旧 cpu_offload
             #   一次卸全部；现独立于 param/grad 卸载）。
             K_OPT = 4
-            max_w = 0 if offload_optimizer else max(
-                (w.local_numel // (efsdp_d if getattr(w, "is_expert", False) else fsdp_d)
-                 for l in layers for op in l.ops for w in op.params),
-                default=0)
-            if max_w > 0:
+
+            def _shard(w):
+                return w.local_numel // (efsdp_d if getattr(w, "is_expert", False) else fsdp_d)
+
+            if offload_optimizer:
+                optstep_bytes = 0
+            elif muon:
+                # Muon optstep = 逐参瞬态取最大：**2D 矩阵权重走 Newton-Schulz workspace**
+                #   (≈ _MUON_NS_WORKSPACE_MULT × 分片 numel × 4，**估值,无真机锚点**；per-head 时注意力
+                #   投影按头切、一次一头 → 该投影 NS 单元 = 整块/n_heads);**embed/head/norm 走 AdamW**
+                #   (K_OPT×分片×4)。取二者最大——大 vocab head/embed 的 AdamW 瞬态常与最大专家 NS 争峰。
+                def _muon_transient(op, w):
+                    shard = _shard(w)
+                    if is_muon_matrix_weight(op.type, getattr(op, "name", "")):
+                        unit = shard
+                        if (muon_per_head and muon_n_heads > 1
+                                and is_attn_projection(getattr(op, "name", ""))):
+                            unit = max(1, shard // muon_n_heads)
+                        return round(_MUON_NS_WORKSPACE_MULT * unit * 4)   # NS workspace(fp32 temp)
+                    return K_OPT * shard * 4                                # 非矩阵 → AdamW
+                optstep_bytes = max(
+                    (_muon_transient(op, w) for l in layers for op in l.ops for w in op.params),
+                    default=0)
+            else:
+                optstep_bytes = K_OPT * max(
+                    (_shard(w) for l in layers for op in l.ops for w in op.params), default=0) * 4
+            if optstep_bytes > 0:
                 B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
                 B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
                 B.p2p_buf = 0                          # P1-15：step 在所有反向后、P2P 已收尾
-                B.optstep = K_OPT * max_w * 4          # fp32 瞬态（grad_accum 保持驻留，与之共存）
+                B.optstep = optstep_bytes              # fp32 瞬态（grad_accum 保持驻留，与之共存）
                 rec("optstep")
                 B.optstep = 0
             B.grad_accum = 0                           # zero_grad 语义：optimizer 后释放（真机探针）

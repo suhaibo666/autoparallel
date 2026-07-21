@@ -633,7 +633,14 @@ def _build_eval_specs(p, pa):
         layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None))
     # 优化器 dtype(缺省 fp32,历史手配假设):bf16 params 多存一份 compute 副本(state 14 vs 12)。
     opt_fp32 = str(p.get("opt_dtype", "fp32")).strip().lower() != "bf16"
-    opt = OptimizerSpec.adamw(params_fp32=opt_fp32, grad_dtype_bytes=_x_int(p, "grad_bytes", 4))
+    _gb = _x_int(p, "grad_bytes", 4)
+    # 优化器选择(2026-07-20)：AdamW(精确)或 Muon(标准口径:2D 矩阵 momentum-only、embed/head/norm
+    #   走 AdamW;optstep 的 NS workspace 为估值)。Muon 带 per-head 开关(砍注意力投影 NS 估值)。
+    if str(p.get("optimizer", "adamw")).strip().lower() == "muon":
+        opt = OptimizerSpec.muon(params_fp32=opt_fp32, grad_dtype_bytes=_gb,
+                                 per_head=_x_flag(p, "muon_per_head", False))
+    else:
+        opt = OptimizerSpec.adamw(params_fp32=opt_fp32, grad_dtype_bytes=_gb)
     # 设备容量(缺省 64GiB,历史手配假设):UI 以 GiB 输入 → bytes。
     mg = p.get("maxdev_gib")
     if mg is None or (isinstance(mg, str) and not str(mg).strip()):
@@ -1090,6 +1097,8 @@ h1{font-size:19px;margin:5px 0 8px}
     <div class="fld"><label>微批/梯度累积</label><input name="mbs" placeholder="auto(pp>1=pp,pp=1=1)" style="width:112px" title="num_microbatches = 每次 optimizer step 的微批数 = 梯度累积步数。空=auto(pp>1 取 pp;pp=1 取 1=无累积)。pp=1 时它就是**纯梯度累积**：每微批 F/B 后其 reduced 梯度分片常驻(grad_accum 桶)直到 optimizer step——设 >1 才建模非-PP 梯度累积驻留(否则欠估)。pp>1 时同时驱动 1F1B 流水(warmup/在飞深度随 m 分化)。按**正常/省显存**语义估:激活恒单微批 + 多一份累计梯度;个别 mindformers 版本 pp=1 若激活未随微批释放(显存∝m),真机会更高——见 analysis/grad_accum_realmachine_validation_2026-07-20.md。"></div>
     <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
     <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
+    <div class="fld"><label>优化器</label><select name="optimizer" title="AdamW(精确建模:master+m+v)或 Muon(标准口径:2D 矩阵权重只 momentum+master 省一份 v;embedding/lm_head/norm/router/bias 仍走 AdamW)。Muon 持久态更省;optstep 的 Newton-Schulz workspace 为**估值**(无真机锚点)"><option value="adamw" selected>AdamW</option><option value="muon">Muon</option></select></div>
+    <div class="fld"><label>Muon per-head</label><select name="muon_per_head" title="仅 Muon 生效:per-head Muon 把注意力投影(qkv/o)的 Newton-Schulz 按头切、一次一头 → 该投影 optstep NS 单元 ÷ n_heads(估值)。FFN/专家非头结构不受影响,故若 optstep 峰在 head/embed(AdamW)或大专家,per-head 不改峰"><option value="0" selected>关</option><option value="1">开</option></select></div>
     <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
     <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
     <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8;12-13;23-25" style="width:150px" title="重算作用的层（1..N,含端点）——对 full / select / custom 均生效;空=全部层。&#10;**支持多段不连续**:1-8;12-13;23-25(分隔符 , 或 ; 皆可,全角亦可)。&#10;例:full+「1-2」=只前 2 层整层重算;select+「1-8;23-25」=这 11 层按 select 模块重算"></div>

@@ -58,6 +58,13 @@ class StaticMem:
             mult += opt.param_persist_bytes()
         if not offload_optimizer:
             mult += opt.optimizer_state_bytes()
+        # Muon:2D 矩阵权重（momentum-only）单独的有效倍数（同 offload 口径）。AdamW 时 matrix_* 分量
+        #   == 非矩阵 → matrix_mult == mult → estimate_structure_memory 全 uniform、逐字节复现旧值。
+        matrix_mult = 0
+        if not offload_params:
+            matrix_mult += opt.matrix_param_persist_bytes()
+        if not offload_optimizer:
+            matrix_mult += opt.matrix_optimizer_state_bytes()
 
         # dense（非专家）权重分母：grouped-FSDP 子域（Z3）——配了 dense_fsdp_shard_size 时用子域
         # （< 完整 fsdp → 每卡 dense 持久更大），否则完整 fsdp。`estimate_structure_memory` 对**非专家**
@@ -68,7 +75,7 @@ class StaticMem:
         out: dict = {}
 
         for stage, layers in g.stages.items():
-            if mult == 0:
+            if mult == 0 and matrix_mult == 0:
                 out[stage] = 0                       # 全卸（含 fp32+offload_optimizer 的 param=0 情形）
                 continue
 
@@ -78,6 +85,7 @@ class StaticMem:
                 estimate_structure_memory(
                     layer.ops, fsdp=fsdp, efsdp=efsdp,
                     opt_state_bytes=mult,
+                    matrix_opt_state_bytes=matrix_mult,   # Muon 2D 矩阵倍数（AdamW==mult → uniform）
                     alloc_block_bytes=alloc_block_bytes,
                 ).persistent
                 for layer in layers

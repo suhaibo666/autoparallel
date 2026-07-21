@@ -132,34 +132,81 @@ class ParallelConfig:
 # （剔 param 副本与 grad）。fp32 params 时整个 state_bytes_per_param(12) 即此、无独立 param 副本；
 # bf16 params 时 state_bytes_per_param(14) = 2 param 副本 + 12 opt 状态。P1-19 分离卸载据此拆分。
 _ADAMW_OPT_STATE_BYTES = 12
+_MUON_MATRIX_OPT_STATE_BYTES = 8   # Muon 2D 矩阵权重:fp32 master4 + momentum4（**无 v**，比 AdamW 少 4B）
+# Muon optstep 的 Newton-Schulz workspace 倍数（**估值,无真机锚点**）:NS 迭代 X=aX+bXX^TX 每步物化
+#   X(numel)+XX^T(min²)+XX^TX(numel)，峰 live ≈ 2·numel+min² ≤ 3·numel → 取 3×最大矩阵(fp32 temp)。
+_MUON_NS_WORKSPACE_MULT = 3
+# 注意力投影 op 名标记（per-head Muon:NS 按头切,一次处理一头 → 该投影 NS 单元 = 整块/n_heads）。
+_ATTN_PROJ_MARKERS = ("qkv", "qb", "kvb", "o_proj", "linear_q", "linear_kv", "wq", "wk", "wv", "wo")
+
+
+def is_attn_projection(op_name) -> bool:
+    """Muon per-head NS 只砍**注意力投影**(qkv/q/kv/o)——它们按头切;FFN/expert 非头结构不受影响。"""
+    n = (op_name or "").lower()
+    return any(m in n for m in _ATTN_PROJ_MARKERS)
+
+
+def is_muon_matrix_weight(op_type, op_name) -> bool:
+    """标准 Muon 口径（2026-07-20）:**2D 隐藏矩阵权重走 Muon(momentum-only)**——即 `matmul`/`moe_gemm`
+    op 的权重（注意力投影 qkv/qb/kvb/o、FFN fc1/fc2、共享专家 sh、MoE 专家 e_w）；**embedding /
+    lm_head / RMSNorm gamma / router / bias 走 AdamW**。
+
+    分类只用 op 类型+名(resolved 权重 shape 为 None,不可用):matmul/moe_gemm 的权重恒为 2D 矩阵
+    （bias 未建 param，见 N4）；op 名含 "head"（lm_head）/"embed" 的排除；norm/moe_router/
+    embedding(elementwise) 因 op 类型不在 {matmul,moe_gemm} 而排除。"""
+    t = getattr(op_type, "value", op_type)
+    if t not in ("matmul", "moe_gemm"):
+        return False                         # norm / moe_router / embedding(elementwise) → AdamW
+    n = (op_name or "").lower()
+    return ("head" not in n) and ("embed" not in n)   # lm_head / embedding 权重 → AdamW
 
 
 @dataclass
 class OptimizerSpec:
     type: str = "AdamW"
     # 持久 = param + optimizer state（**剔除 grad**，真机修正 §8.4）
-    state_bytes_per_param: int = 14          # bf16 params: bf16 2 + fp32 master4 + m4 + v4
+    state_bytes_per_param: int = 14          # 非矩阵(embed/head/norm)或全部(AdamW)：bf16 2+master4+m4+v4
     grad_dtype_bytes: int = 4                # 反向瞬态 grad(grad_buf) 的 dtype：fp32=4 / bf16=2
+    # Muon:2D 矩阵权重每元素持久字节（0=同 state_bytes_per_param → AdamW 全 uniform、逐字节不变）。
+    matrix_state_bytes: int = 0
+    per_head: bool = False                   # Muon per-head NS（仅影响 optstep 的 NS workspace 估值）
 
     @classmethod
     def adamw(cls, params_fp32: bool = False, grad_dtype_bytes: int = 4) -> "OptimizerSpec":
         # 持久(剔grad): fp32 params=master4+m4+v4=12; bf16 params=bf16 2+master4+m4+v4=14
         return cls("AdamW", 12 if params_fp32 else 14, grad_dtype_bytes)
 
-    def optimizer_state_bytes(self) -> int:
-        """持久里**纯优化器状态**每元素字节（AdamW master4+m4+v4=12；剔 param 副本/grad）。
+    @classmethod
+    def muon(cls, params_fp32: bool = False, grad_dtype_bytes: int = 4,
+             per_head: bool = False) -> "OptimizerSpec":
+        """标准 Muon:2D 矩阵权重 momentum-only(master4+momentum4=8;bf16 +2副本=10),比 AdamW 每参省 4B;
+        embedding/lm_head/norm/router/bias 仍走 AdamW(12/14)。per_head 只减 optstep 的 NS workspace 估值。"""
+        nonmat = 12 if params_fp32 else 14                     # embed/head/norm → AdamW
+        mat = 8 if params_fp32 else 10                         # 2D 矩阵 → master+momentum(+bf16 副本)
+        return cls("Muon", nonmat, grad_dtype_bytes, matrix_state_bytes=mat, per_head=per_head)
 
-        P1-19 分离卸载：`offload_optimizer` 归零的正是这一分量。clamp 到 `state_bytes_per_param`
-        以保证 `param_persist_bytes() >= 0`（若某优化器 state<12 的极端配置也不产负 param 副本）。"""
+    # ── 非矩阵(embed/head/norm;AdamW 全部)口径 ───────────────────────────────────────────
+    def optimizer_state_bytes(self) -> int:
+        """持久里**纯优化器状态**每元素字节（AdamW master4+m4+v4=12；剔 param 副本/grad）。P1-19
+        分离卸载：`offload_optimizer` 归零此项。clamp 到 state_bytes_per_param 保 param_persist≥0。"""
         return min(_ADAMW_OPT_STATE_BYTES, self.state_bytes_per_param)
 
     def param_persist_bytes(self) -> int:
-        """持久里 **compute-dtype param 副本** 每元素字节 = state_bytes_per_param − 优化器状态。
-
-        bf16 params → 14−12 = 2（bf16 副本）；fp32 params → 12−12 = 0（master fp32 即 param，
-        无独立副本，故 offload_params 对 fp32 持久无效）。P1-19：`offload_params` 归零这一分量。
-        恒有 `param_persist_bytes() + optimizer_state_bytes() == state_bytes_per_param`。"""
+        """持久里 compute-dtype param 副本每元素字节 = state_bytes_per_param − 优化器状态。
+        bf16→14−12=2;fp32→12−12=0。P1-19：`offload_params` 归零此项。"""
         return self.state_bytes_per_param - self.optimizer_state_bytes()
+
+    # ── 2D 矩阵权重口径（Muon momentum-only;AdamW 时 == 非矩阵，故 uniform 逐字节不变）──────────
+    def _matrix_state_total(self) -> int:
+        return self.matrix_state_bytes if self.matrix_state_bytes > 0 else self.state_bytes_per_param
+
+    def matrix_optimizer_state_bytes(self) -> int:
+        """2D 矩阵权重的纯优化器状态字节：Muon=master4+momentum4=8;AdamW=12（== 非矩阵）。"""
+        cap = _MUON_MATRIX_OPT_STATE_BYTES if self.type == "Muon" else _ADAMW_OPT_STATE_BYTES
+        return min(cap, self._matrix_state_total())
+
+    def matrix_param_persist_bytes(self) -> int:
+        return self._matrix_state_total() - self.matrix_optimizer_state_bytes()
 
 
 @dataclass

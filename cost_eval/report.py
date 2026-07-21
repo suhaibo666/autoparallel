@@ -93,12 +93,13 @@ def feasibility_errors(pc, optimizer, swap) -> list:
         errs.append("tensor_parallel>1 强制 sequence_parallel=True（config.py:471-477）——"
                     "SP=false 时评的是跑不起来的无 SP 配置，拒绝评估（如确需绕过用 "
                     "Evaluator(..., check_feasibility=False)）。")
-    # [优化器] 仅 Adam/AdamW 已建模（P1-19）。
+    # [优化器] 已建模：Adam/AdamW（精确）+ Muon（标准口径，2026-07-20：2D 矩阵 momentum-only、
+    #   embed/head/norm 走 AdamW；optstep 的 NS workspace 为**估值**）。其余仍 fail-loud。
     otype = str(getattr(optimizer, "type", "AdamW")).lower()
-    if otype not in ("adamw", "adam"):
+    if otype not in ("adamw", "adam", "muon"):
         errs.append(f"optimizer.type={getattr(optimizer, 'type', None)!r} 未建模："
-                    "K_OPT/optstep 瞬态与 persistent 均自 AdamW 导出，非 Adam 会全错——"
-                    "请用 OptimizerSpec.adamw() 或补对应优化器建模。")
+                    "持久/optstep 均自 AdamW/Muon 导出，其它优化器会全错——"
+                    "请用 OptimizerSpec.adamw()/muon() 或补对应优化器建模。")
     return errs
 
 
@@ -325,7 +326,10 @@ class Evaluator:
             norm_compute_dtype_bytes=getattr(self.spec.dims, "norm_compute_dtype_bytes", 0),
             kept_frag_factor=getattr(self.spec.dims, "kept_frag_factor", 0.0),
             nr_moe_frag_factor=getattr(self.spec.dims, "nr_moe_frag_factor", 0.0),
-            bwd_scratch_conservative=getattr(self.hw, "bwd_scratch_conservative", False))
+            bwd_scratch_conservative=getattr(self.hw, "bwd_scratch_conservative", False),
+            muon=(str(getattr(self.opt, "type", "")).lower() == "muon"),
+            muon_per_head=getattr(self.opt, "per_head", False),
+            muon_n_heads=getattr(self.spec.dims, "n_heads", 0))
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。

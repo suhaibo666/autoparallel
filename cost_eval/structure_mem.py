@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .specs import is_muon_matrix_weight
+
 
 @dataclass(frozen=True)
 class StructureMemory:
@@ -181,6 +183,7 @@ def estimate_structure_memory(
     alloc_block_bytes: int = 1,
     norm_compute_dtype_bytes: int = 0,
     bwd_scratch_conservative: bool = False,
+    matrix_opt_state_bytes: int = 0,   # Muon:2D 矩阵权重每元素持久字节(0=同 opt_state_bytes → uniform)
 ) -> StructureMemory:
     """把一段属于同一结构的 ResolvedOp 汇总成 `StructureMemory`（按名去重）。
 
@@ -198,9 +201,16 @@ def estimate_structure_memory(
     # ── 按名去重：params / saves（结构内同名 = 同一物理张量，只算一次）──────────────
     params: dict = {}
     saves: dict = {}
+    # Muon:2D 矩阵权重名集（matmul/moe_gemm 的权重，排除 lm_head/embedding）——分类需 op 上下文，
+    #   故在 walk 时按 op 类型/名判定（resolved 权重 shape 为 None，不能靠 shape）。matrix_opt_state_bytes
+    #   ==0（AdamW/uniform）时不分类、集恒空 → 逐字节复现旧值。
+    muon_matrix_names: set = set()
     for op in resolved_ops:
+        _is_muon_op = matrix_opt_state_bytes and is_muon_matrix_weight(op.type, getattr(op, "name", ""))
         for w in op.params:
             params[w.name] = w
+            if _is_muon_op:
+                muon_matrix_names.add(w.name)
         for s in op.saves:
             saves[s.name] = s
 
@@ -208,7 +218,7 @@ def estimate_structure_memory(
     # 静默截断会低估每卡显存 → OOM 风险，且与 resolve_tensor 对 sharded 维不整除即 raise 的
     # 口径不一致（shape_eval.py:59-63）。opt_state_bytes==0（mem_timeline 只取瞬态桶）时不查。
     persistent = 0
-    if opt_state_bytes:
+    if opt_state_bytes or matrix_opt_state_bytes:
         for w in params.values():
             divisor = efsdp if w.is_expert else fsdp
             if w.local_numel % divisor != 0:
@@ -216,7 +226,10 @@ def estimate_structure_memory(
                     f"{w.name} local_numel={w.local_numel} 不被 "
                     f"{'efsdp' if w.is_expert else 'fsdp'}={divisor} 整除"
                     f"（切分不整除，静默截断会低估显存→OOM 不安全，改为报错）")
-            persistent += _align_up((w.local_numel // divisor) * opt_state_bytes, blk)
+            # Muon:2D 矩阵权重用 matrix_opt_state_bytes(momentum-only,较小)，其余走 opt_state_bytes。
+            #   AdamW/uniform 时 muon_matrix_names 空 → 全走 opt_state_bytes（逐字节不变）。
+            _osb = matrix_opt_state_bytes if w.name in muon_matrix_names else opt_state_bytes
+            persistent += _align_up((w.local_numel // divisor) * _osb, blk)
     # norm 激活 fp32（真机 layernorm_compute_dtype=fp32 → 保留输入 fp32 cast，profiler 的 Cast 大头）
     norm_names = _norm_save_names(resolved_ops) if norm_compute_dtype_bytes else frozenset()
     activation_saves = sum(_align_up(s.local_numel * _dt(s, norm_names, norm_compute_dtype_bytes), blk)
