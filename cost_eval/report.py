@@ -11,7 +11,7 @@ from .parallel_model import ParallelModel
 from .shape_eval import ShapeEval
 from .static_mem import StaticMem
 from .mem_timeline import MemTimeline, StagePeak
-from .framework import framework_reserve, hccl_reserved_buffer
+from .framework import framework_reserve, hccl_reserved_buffer, communicator_breakdown
 
 # round3 A(F3)：缩层真机锚点最大 8L（DSv3）/ 4L(+MTP, DSv4）。n_layers 超过此"已验证尺度"数倍即视为
 #   **外推**——累计每层残差（欠方向）随层数增长、无全尺寸验证点。阈值取 16（远超最大锚点、不误报小配置）。
@@ -196,6 +196,7 @@ class PeakMemoryReport:
     tightest_stage: int    # peak_bytes 最大的 stage
     oom: bool              # 任意 stage OOM（allocated 口径）——= allocated_oom，保留旧名兼容
     hccl_reserved_bytes: int = 0   # D-2：HCCL 通信缓冲（reserved 池，按通信域数；world-level 同值）
+    hccl_communicators: tuple = ()  # 去重后 size>1 的通信域清单 [(name,size),...]（framework.communicator_breakdown）
     max_device_memory: int = 0     # P2-01（C4）：设备容量，供 reserved 口径 OOM 判定
 
     def reserved_estimate_bytes(self, stage: int) -> int:
@@ -336,4 +337,5 @@ class Evaluator:
         hccl = hccl_reserved_buffer(self.pc)
         return PeakMemoryReport(per_stage, tightest,
                                 any(p.oom for p in per_stage), hccl_reserved_bytes=hccl,
+                                hccl_communicators=communicator_breakdown(self.pc),   # 去重后通信域清单
                                 max_device_memory=self.hw.max_device_memory)   # P2-01：reserved 口径判定

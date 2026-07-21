@@ -32,30 +32,69 @@ MIB = 2 ** 20
 HCCL_BYTES_PER_GROUP = 200 * MIB   # 真机日志 hcclBufferSize=200MB（CANN 9.0）；属 reserved 池
 
 
-def num_distinct_communicators(pc) -> int:
-    """启用的**不同** HCCL 子通信器数（world + 各启用并行域的子组）。
+def communicator_breakdown(pc) -> list:
+    """真机会建的 HCCL 通信域枚举（**去重后**，源忠实 mindformers/TorchTitan
+    `pynative/distributed/parallel_dims.py` `build_mesh`）。返回 `[(name, size), ...]`，**仅** size>1
+    的通信器（size==1 无跨卡通信、不占 `hcclBufferSize`；单卡 → 空）。
 
-    ⚠ 这些子域**复用同一 rank 网格**（`parallel_dims.py`: EP/CP/TP 从 dp_shard·cp·tp 区
-    carve 出，非新增 rank）——即都是 world group 的**子通信器**，**不是独立叠加的**。
-    每个不同子通信器在 **reserved** 池里预留一份缓冲，但因域重叠、buffer 可部分共享，
-    **不是干净的 ×200MB**；且这一切只影响 reserved、**不进 allocated 峰值**（ep=2 真机证实）。
+    `build_mesh` 从 1D world mesh unflatten 出三张网格 + 一个 flatten，各命名轴建独立进程组：
+      - dataloading `["pp","batch","cp","tp"]`；dense `["pp","dp_replicate","fsdp","tp"]`；
+        sparse `["pp","dp_replicate","efsdp","ep"]`；`loss`=flatten(batch,cp)。
+    真正建 HCCL 通信器的轴（`_mesh_exist`）→ 本函数逐个列出：
+
+      | 通信域 | size | 说明 |
+      |---|---|---|
+      | world | Πdegrees | 全局组，恒建 |
+      | fsdp | dp_shard·cp | dense，**恒 real**（MixedPrecision）；size>1 才占 buffer |
+      | loss | dp_replicate·dp_shard·cp | flatten(batch,cp)，**恒 real**（每步 all-reduce loss/aux）|
+      | tp / cp / pp / dp_replicate | 各自 | size>1 才建 |
+      | ep / efsdp | ep / dp_shard·cp·tp//ep | ep>1 才建 |
+
+    **去重规则**（你要求的 groups 去重）：
+      1. `pp`/`tp`/`dp_replicate` 在三张网格里**都出现，但是同一个进程组** → 各只列一次（此处天然不重列）。
+      2. **只计做「大张量集合」的域**（真占 ~200MB `hcclBufferSize`）：`fsdp`/`dp_replicate`（param/grad
+         all-gather·reduce-scatter）、`tp`（激活 all-reduce）、`cp`（KV all-gather/ring）、`ep`（token
+         all-to-all）、`efsdp`（专家 FSDP）、`pp`（激活 P2P）+ `world`（全局屏障/global 归约，沿用 DSv4
+         标定）。**`loss`（仅标量 loss/aux all-reduce，缓冲可忽略）与 `batch`（纯数据加载、无集合）不计。**
+      3. `fsdp`/`cp`/`ep`/`efsdp` 各自独立域 → 分别计（**此前旧模型把 cp 误折进 fsdp、漏 efsdp**）。
+      4. **rank 集重叠不去重**：框架按轴各建一个进程组，即便两组覆盖同一批 rank（如 pure-FSDP 下 world
+         与 fsdp 同为全体 rank）也**各占一份** buffer——DSv4 真机 reserved 佐证（world+fsdp 各 200MB）。
+      5. 仅 **size>1** 才有跨卡通信/占 buffer（单卡 → 空、0 HCCL）。
     """
-    n = 1  # hccl_world_group
-    if pc.dp_shard * pc.cp > 1:   # FSDP 组（dp_shard·cp）——已含 cp，勿再单列 cp（Task 8 去重）
-        n += 1
-    if pc.tp > 1:
-        n += 1
-    if pc.ep > 1:
-        n += 1
-    if pc.pp > 1:
-        n += 1
-    if pc.dp_replicate > 1:
-        n += 1
-    return n
+    dp_r, dp_s = pc.dp_replicate, pc.dp_shard
+    cp, tp, pp, ep = pc.cp, pc.tp, pc.pp, pc.ep
+    world = dp_r * dp_s * cp * tp * pp
+    fsdp = dp_s * cp
+    comms = [
+        ("world", world),                      # 全局组（沿用 DSv4 world+fsdp=2 标定）
+        ("fsdp", fsdp),                        # dense：param/grad all-gather·RS（大集合）
+    ]
+    if pp > 1:
+        comms.append(("pp", pp))
+    if tp > 1:
+        comms.append(("tp", tp))
+    if cp > 1:
+        comms.append(("cp", cp))               # dataloading 轴，**独立于 fsdp**（旧模型误折）
+    if dp_r > 1:
+        comms.append(("dp_replicate", dp_r))
+    if ep > 1:
+        comms.append(("ep", ep))
+        comms.append(("efsdp", fsdp * tp // ep))
+    return [(n, s) for n, s in comms if s > 1]   # 仅 size>1 才真占 hcclBufferSize
+
+
+def num_distinct_communicators(pc) -> int:
+    """去重后 size>1 的**不同** HCCL 通信器数（见 `communicator_breakdown` 的枚举与去重规则）。"""
+    return len(communicator_breakdown(pc))
 
 
 def hccl_reserved_buffer(pc) -> int:
-    """HCCL 缓冲粗估（**reserved** 池，不进 allocated）。仅 reserved 预测用，且因域复用为上界估计。"""
+    """HCCL 缓冲估计（**reserved** 池，不进 allocated）。= 200MB × 去重后 size>1 通信器数。
+
+    诚实边界：`HCCL_BYTES_PER_GROUP` 是 CANN 默认 hcclBufferSize（可按 config 调）；每域是否满 200MB
+    随集合类型/消息量波动，故为口径估计。**只影响 reserved 预测、不进 allocated 峰值**（ep=2 真机证实）。
+    reserved 的 HCCL/pool 分账未被独立真机锚点约束（见 §pool 注释），本次把通信器**枚举**做忠实，绝对
+    分账仍是标定近似。"""
     return HCCL_BYTES_PER_GROUP * num_distinct_communicators(pc)
 
 

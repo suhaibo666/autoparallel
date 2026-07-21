@@ -40,7 +40,13 @@ def test_moe_tlocal_includes_capacity_factor():
     assert n2 == 2 * n1
 
 
-# ── 8.4 num_distinct_communicators 不重复计 cp（cp 已含在 dp_shard*cp FSDP 组）──────
-def test_num_communicators_no_cp_double_count():
-    # cp=2, 其余=1：world(1) + FSDP 组 dp_shard*cp=2(>1) = 2 个；cp 不再单列。
-    assert num_distinct_communicators(ParallelConfig(cp=2)) == 2
+# ── 8.4 num_distinct_communicators：cp 是**独立**通信域（2026-07-20 源忠实订正）──────
+def test_num_communicators_cp_is_distinct_domain():
+    # cp=2, 其余=1：world(2) + fsdp(dp_shard·cp=2) + cp(2) = **3** 个。cp 是 dataloading_mesh 的
+    # 独立轴(parallel_dims.py build_mesh)，**不再折进 fsdp**——旧模型误折为 2，现修正为 3。
+    from cost_eval.framework import communicator_breakdown
+    assert num_distinct_communicators(ParallelConfig(cp=2)) == 3
+    assert {n for n, _ in communicator_breakdown(ParallelConfig(cp=2))} == {"world", "fsdp", "cp"}
+    # 去重仍生效：pp/tp/dp_replicate 跨三网格是同一组、各只列一次（此处 pp/tp/dp_repl 都=1、不出现）。
+    # 单卡 → 无跨卡通信 → 0 域。
+    assert num_distinct_communicators(ParallelConfig()) == 0

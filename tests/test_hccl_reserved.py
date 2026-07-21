@@ -23,19 +23,31 @@ def _report(**pcargs):
     return ev.evaluate()
 
 
-def test_hccl_world_only_single_config():
-    # 全 1：只有 world 通信器 → 1×200MB
-    assert _report().hccl_reserved_bytes == HCCL_BYTES_PER_GROUP
+def test_hccl_single_card_no_comm():
+    # 全 1（单卡）：无跨卡通信 → **0 HCCL 缓冲**（2026-07-20 源忠实订正:size==1 的组不占 buffer）。
+    assert _report().hccl_reserved_bytes == 0
 
 
 def test_hccl_scales_with_tp():
-    # tp>1 多一个 tp 子通信器 → 2×200MB
+    # tp>1：world(2) + tp(2) → 2×200MB
     assert _report(tp=2).hccl_reserved_bytes == 2 * HCCL_BYTES_PER_GROUP
 
 
 def test_hccl_scales_with_fsdp():
-    # dp_shard*cp>1 多一个 FSDP 子通信器 → 2×200MB
+    # dp_shard>1：world(2) + fsdp(2) → 2×200MB（DSv4 标定同口径）
     assert _report(dp_shard=2).hccl_reserved_bytes == 2 * HCCL_BYTES_PER_GROUP
+
+
+def test_hccl_cp_is_distinct_domain():
+    # cp=2：world(2) + fsdp(dp_shard·cp=2) + **cp(2)** → 3×200MB（cp 独立于 fsdp,旧模型误折）。
+    assert _report(dp_shard=1, cp=2).hccl_reserved_bytes == 3 * HCCL_BYTES_PER_GROUP
+
+
+def test_hccl_ep_adds_ep_and_efsdp():
+    # ep>1 的 sparse mesh：world + fsdp + ep + efsdp(dp_shard·cp·tp//ep) → efsdp 仅 size>1 才计。
+    from cost_eval.framework import communicator_breakdown
+    names = {n for n, _ in communicator_breakdown(ParallelConfig(dp_shard=4, tp=2, ep=2))}
+    assert {"ep", "efsdp"} <= names        # dp_shard4·tp2//ep2 = efsdp 4 > 1 → 计入
 
 
 def test_hccl_not_in_allocated_peak():

@@ -757,6 +757,8 @@ def eval_config(p):
             "micro_batch": d.B, "dp_total": _dp_total,
             "grad_accum_mib": grad_accum_mib,            # 峰值断面的梯度累积驻留（m≥2 才 >0）
             "hccl_mib": round(rep.hccl_reserved_bytes / MiB, 0),
+            "hccl_comms": [f"{n}×{s}" for n, s in rep.hccl_communicators],   # 去重后通信域清单
+            "hccl_ndomains": len(rep.hccl_communicators),
             "allocated_oom": rep.allocated_oom,   # P2-01 顶层：任一 stage allocated 峰值超容
             "reserved_oom": rep.reserved_oom,     # P2-01 顶层：任一 stage reserved 估计超容（含 pool 近似）
             "reserved_oom_is_calibrated_estimate": True,  # 含 pool 碎片近似(1.8% 单点标定),非严格上界
@@ -1157,7 +1159,8 @@ async function refresh(){
   cur=d;curStage=d.tightest;openLayers=new Set();
   document.getElementById("kpeak").textContent=fmib(d.device_peak);
   const gaTxt=d.num_microbatches>1?`梯度累积 ${d.num_microbatches}步(+${fmib(d.grad_accum_mib)}驻留)`:"无梯度累积(微批=1)";
-  document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · ${gaTxt} · 有效batch ${d.eff_batch}(micro ${d.micro_batch}×dp ${d.dp_total}×m ${d.num_microbatches}) · hccl+${d.hccl_mib}M · 余量 ${d.reserved_margin_mib}M`;
+  const hcclTxt=d.hccl_ndomains>0?`hccl ${d.hccl_ndomains}域[${d.hccl_comms.join("+")}]+${d.hccl_mib}M`:"hccl 0(单卡无跨卡通信)";
+  document.getElementById("kmeta").textContent=`设备峰值 · world=${d.world} · ${gaTxt} · 有效batch ${d.eff_batch}(micro ${d.micro_batch}×dp ${d.dp_total}×m ${d.num_microbatches}) · ${hcclTxt} · 余量 ${d.reserved_margin_mib}M`;
   document.getElementById("tabs").innerHTML=d.stages.map(s=>`<div class="tab ${s.stage===curStage?"on":""} ${s.oom?"oom":(s.reserved_oom?"rsv":"")}" data-s="${s.stage}">Stage ${s.stage} · ${fmib(s.peak)}${s.oom?" ⚠OOM":(s.reserved_oom?" ⚠reserved":"")}<span style="color:${s.stage===curStage?'#dde':'#999'};font-weight:400"> · ${s.n_layers}层${s.extras&&s.extras.length?" +"+s.extras.map(e=>e==="embedding"?"emb":e==="lm_head"?"head":e).join("+"):""}</span></div>`).join("");
   document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{curStage=+t.dataset.s;openLayers=new Set();drawStage();}));
   drawStage();
