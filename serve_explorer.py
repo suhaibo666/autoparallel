@@ -988,29 +988,71 @@ class H(BaseHTTPRequestHandler):
 
 PAGE = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>LLM 内存实验台 v2</title>
 <style>
-:root{--bg:#f5f6f8;--card:#fff;--ink:#161b24;--mut:#6a7280;--line:#e3e6ec;--blue:#2f4b7c;--saved:#c0392b;--mono:ui-monospace,Consolas,Menlo,monospace}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
-.top{padding:14px 20px 10px;border-bottom:1px solid var(--line);background:var(--card)}
-.eyebrow{font:600 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--blue)}
-h1{font-size:19px;margin:5px 0 8px}
-.cfgrow{display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-top:6px}
-.cfgrow .cap{font:600 10px/1 var(--mono);color:var(--mut);letter-spacing:.08em;text-transform:uppercase;width:64px;align-self:center}
-.fld{display:flex;flex-direction:column;gap:2px}
-.fld label{font:600 9.5px/1 var(--mono);letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
-.fld input,.fld select{font:13px var(--mono);padding:4px 7px;border:1px solid var(--line);border-radius:6px;background:#fff;width:76px}
-.fld select{width:auto;min-width:76px}
-.kpi{margin-left:auto;background:#fafbfc;border:1px solid var(--line);border-radius:9px;padding:6px 14px;text-align:right}
-.kpi .n{font:700 20px/1.2 var(--mono);color:var(--saved)}.kpi .t{color:var(--mut);font-size:10.5px}
-.errbox{background:#fdf0ef;border:1px solid #ecc;border-radius:8px;color:#a33;font:12.5px/1.7 var(--mono);padding:8px 14px;margin-top:8px;display:none}
-.wrap{padding:12px 20px 40px}
-.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-.tab{padding:5px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;font:600 12px var(--mono)}
-.tab.on{background:var(--blue);color:#fff;border-color:var(--blue)}.tab.oom{border-color:#c0392b;color:#c0392b}.tab.on.oom{background:#c0392b;color:#fff}.tab.rsv{border-color:#e67e22;color:#e67e22}.tab.on.rsv{background:#e67e22;color:#fff}
-.grid{display:grid;grid-template-columns:1fr 340px;gap:14px;align-items:start}
+:root{--bg:#f4f5f7;--card:#fff;--ink:#1a1f28;--mut:#6b7280;--line:#e4e7ec;--line2:#eef0f3;
+  --blue:#2f4b7c;--blue-soft:#eaf0f8;--saved:#c0392b;--amber:#e67e22;
+  --mono:ui-monospace,"SF Mono",Consolas,Menlo,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --ease:cubic-bezier(.23,1,.32,1);--sw:286px;--r:11px;
+  --sh:0 1px 2px rgba(20,25,35,.04),0 2px 6px rgba(20,25,35,.05)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+/* ── app shell: sidebar | (mainhead + content) ── */
+.app{display:flex;align-items:stretch;min-height:100vh}
+.side{width:var(--sw);flex:0 0 var(--sw);background:var(--card);border-right:1px solid var(--line);
+  height:100vh;position:sticky;top:0;overflow-y:auto;overflow-x:hidden;transition:margin-left .32s var(--ease)}
+.side.closed{margin-left:calc(-1 * var(--sw))}
+.side::-webkit-scrollbar{width:9px}.side::-webkit-scrollbar-thumb{background:#dfe3e9;border-radius:9px;border:2px solid var(--card)}
+.side-h{position:sticky;top:0;z-index:2;background:var(--card);padding:15px 17px 12px;border-bottom:1px solid var(--line)}
+.eyebrow{font:600 10px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--blue)}
+.side-h h1{font-size:15.5px;margin:7px 0 0;letter-spacing:-.01em;font-weight:650}
+/* collapsible category section */
+.sec{border-bottom:1px solid var(--line2)}
+.sec>.sh{display:flex;align-items:center;gap:9px;padding:11px 17px;cursor:pointer;user-select:none;transition:background .15s var(--ease)}
+.sec>.sh:hover{background:#f7f8fa}
+.sec>.sh .car{color:var(--mut);font-size:9px;width:9px;transition:transform .24s var(--ease)}
+.sec.closed>.sh .car{transform:rotate(-90deg)}
+.sec>.sh .st{font:650 12.5px/1 var(--sans);letter-spacing:.01em}
+.sec>.sh .sc{margin-left:auto;font:600 9px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--mut);opacity:.65}
+.sec>.sb{padding:3px 17px 15px;display:flex;flex-direction:column;gap:10px}
+.sec.closed>.sb{display:none}
+.subhead{font:600 8.5px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;color:#a7adb6;margin:5px 0 -3px}
+/* fields */
+.fld{display:flex;flex-direction:column;gap:3px;min-width:0}
+.fld label{font:600 9px/1.25 var(--mono);letter-spacing:.04em;text-transform:uppercase;color:var(--mut)}
+.fld input,.fld select{font:12.5px var(--mono);padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:#fff;width:100%;color:var(--ink);transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}
+.fld input:hover,.fld select:hover{border-color:#cdd3db}
+.fld input:focus,.fld select:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px var(--blue-soft)}
+.fld input[type=file]{font:10.5px var(--mono);padding:4px}
+.fld.hidden{display:none}
+.grp{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.grp .fld.wide{grid-column:1 / -1}
+/* ── main region ── */
+.wrap{flex:1;min-width:0;transition:opacity .2s var(--ease)}
+.mainhead{position:sticky;top:0;z-index:5;background:rgba(244,245,247,.82);backdrop-filter:saturate(1.4) blur(9px);border-bottom:1px solid var(--line);padding:12px 20px 11px}
+.mh-top{display:flex;align-items:center;gap:14px}
+.mh-title{min-width:0}.mh-title .a{font:650 13.5px/1.2 var(--sans)}.mh-title .b{font:11px/1.4 var(--mono);color:var(--mut);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
+.sidebtn{flex:0 0 auto;border:1px solid var(--line);background:#fff;border-radius:8px;width:31px;height:31px;cursor:pointer;font-size:14px;color:var(--mut);line-height:1;transition:transform .12s var(--ease),background .15s var(--ease),border-color .15s}
+.sidebtn:hover{background:#f2f4f7;border-color:#c2cad6}.sidebtn:active{transform:scale(.93)}
+.kpi{margin-left:auto;text-align:right;flex:0 0 auto}
+.kpi .n{font:700 23px/1 var(--mono);color:var(--saved);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.kpi .t{color:var(--mut);font-size:10px;margin-top:2px;letter-spacing:.03em;text-transform:uppercase}
+.kmeta{font:11px/1.5 var(--mono);color:var(--mut);margin-top:9px;word-break:break-word}
+.errbox{background:#fdf0ef;border:1px solid #ecc;border-radius:9px;color:#a33;font:12px/1.65 var(--mono);padding:9px 14px;margin-top:9px;display:none}
+.tabs{display:flex;gap:7px;flex-wrap:wrap;margin-top:11px}
+.tab{padding:5px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;font:600 11.5px var(--mono);transition:transform .12s var(--ease),background .15s var(--ease),border-color .15s,color .15s}
+.tab:hover{border-color:#c2cad6}.tab:active{transform:scale(.97)}
+.tab.on{background:var(--blue);color:#fff;border-color:var(--blue)}
+.tab.oom{border-color:var(--saved);color:var(--saved)}.tab.on.oom{background:var(--saved);color:#fff}
+.tab.rsv{border-color:var(--amber);color:var(--amber)}.tab.on.rsv{background:var(--amber);color:#fff}
+.content{padding:15px 20px 48px}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 342px;gap:14px;align-items:start}
 .maincol{display:flex;flex-direction:column;gap:14px;min-width:0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.card>header{padding:11px 15px;border-bottom:1px solid var(--line);font-weight:600;font-size:13.5px}
-.gpane{max-height:56vh;overflow:auto;padding:10px 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);overflow:hidden}
+.card>header{padding:11px 15px;border-bottom:1px solid var(--line);font-weight:650;font-size:13px;display:flex;align-items:center;gap:8px}
+.detailcard{position:sticky;top:150px}
+.oplegend{display:flex;flex-wrap:wrap;gap:4px 13px;padding:8px 15px;border-bottom:1px solid var(--line2);font:10px var(--mono);color:var(--mut)}
+.oplegend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.tltip{position:fixed;z-index:20;display:none;pointer-events:none;background:#1a1f28;color:#fff;border-radius:7px;padding:5px 9px;font:11px/1.45 var(--mono);box-shadow:0 4px 14px rgba(0,0,0,.22);white-space:nowrap}
+.gpane{max-height:60vh;overflow:auto;padding:11px 12px}
 .lay{border:1px solid var(--line);border-radius:9px;margin-bottom:8px;overflow:hidden}
 .lay>.hd{display:flex;align-items:center;gap:9px;padding:7px 11px;background:#fafbfc;cursor:pointer;font:12.5px var(--mono)}
 .lay>.hd:hover{background:#f0f3f7}
@@ -1052,86 +1094,141 @@ h1{font-size:19px;margin:5px 0 8px}
 .busy{opacity:.45;pointer-events:none}
 .legend{font:10px var(--mono);color:var(--mut);padding:4px 15px 10px}.legend span{margin-right:9px;white-space:nowrap}
 </style></head><body>
-<div class="top">
-  <div class="eyebrow">pynative-cost-evaluator · interactive v2</div>
-  <h1>LLM 内存实验台 — 结构可配 · 切分自由 · op-DAG + timeline</h1>
-  <div class="cfgrow"><span class="cap">模型结构</span>
-    <div class="fld"><label>模型预设</label><select id="preset" name="preset" style="min-width:170px">
-      <option value="custom">Custom（自定义）</option>
-      <option value="dsv3_mini" selected>DSv3-mini（仓库锚点）</option>
-      <option value="dsv3_671b">DeepSeek-V3 671B</option>
-      <option value="dsv32_exp">DeepSeek-V3.2-Exp</option>
-      <option value="dsv4_flash">DeepSeek-V4-Flash</option>
-      <option value="dsv4_pro">DeepSeek-V4-Pro</option>
-      <option value="glm5">GLM-5 (zai-org)</option>
-    </select></div>
-    <div class="fld"><label>yaml 导入</label><input type="file" id="yamlfile" accept=".yaml,.yml" style="font-size:11px;width:170px" title="选 mindformers 训练 yaml → 解析回填到对话框(不改动 yaml 文件本身)"></div>
-    <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsa">DSA(预估计)</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
-    <div class="fld"><label>layers</label><input name="layers" type="number" min="1" value="8"></div>
-    <div class="fld"><label>dense 层数</label><input name="dense_k" type="number" min="0" value="1" title="前 K 层 dense,其余 MoE(first_k_dense_replace);=layers 则纯 dense"></div>
-    <div class="fld"><label>experts</label><input name="experts" type="number" min="0" value="8"></div>
-    <div class="fld"><label>topk</label><input name="topk" type="number" min="1" value="4"></div>
-    <div class="fld"><label>heads</label><input name="heads" type="number" min="1" value="8"></div>
-    <div class="fld"><label>kv_groups</label><input name="kv_groups" type="number" min="1" value="8" title="gqa 的 KV 组数(=heads 即 MHA)"></div>
-    <div class="fld"><label>seq</label><input name="seq" type="number" min="1" value="4096"></div>
-    <div class="fld"><label>batch</label><input name="batch" type="number" min="1" value="1"></div>
-    <div class="fld"><label>mtp 层数</label><input name="mtp" type="number" min="0" value="0" title="MTP(num_nextn_predict_layers);计入可切分总层数(pp 分配的和=layers+mtp),位于层序列末端"></div>
-    <div class="fld"><label>mHC残差流</label><input name="hc" type="number" min="1" value="1" style="width:70px" title="mHC(HyperConnection)残差流数 num_residual_streams：1=无 mHC(plain);≥2=开 mHC，hidden 状态 ×n 条残差流(DeepSeek-V4=4)。选 DSv4 预设自动填 4。留 1=按普通残差估。mHC 主要抬持久态(×n 残差流参数/激活)"></div>
+<div class="app">
+<aside class="side" id="side">
+  <div class="side-h">
+    <div class="eyebrow">pynative-cost-evaluator · v2</div>
+    <h1>LLM 内存实验台</h1>
   </div>
-  <div class="cfgrow"><span class="cap">结构维度</span>
-    <div class="fld"><label>hidden</label><input name="hidden" type="number" min="1" value="1792"></div>
-    <div class="fld"><label>ffn</label><input name="ffn" type="number" min="1" value="3072"></div>
-    <div class="fld"><label>moe_ffn</label><input name="moe_ffn" type="number" min="1" value="1024"></div>
-    <div class="fld"><label>q_lora</label><input name="q_lora" type="number" min="1" value="1536"></div>
-    <div class="fld"><label>kv_lora</label><input name="kv_lora" type="number" min="1" value="512"></div>
-    <div class="fld"><label>qk_nope</label><input name="qk_nope" type="number" min="1" value="128"></div>
-    <div class="fld"><label>qk_rope</label><input name="qk_rope" type="number" min="1" value="64"></div>
-    <div class="fld"><label>v_head</label><input name="v_head" type="number" min="1" value="192"></div>
-    <div class="fld"><label>vocab</label><input name="vocab" type="number" min="1" value="129280" style="width:90px"></div>
-  </div>
-  <div class="cfgrow"><span class="cap">并行切分</span>
-    <div class="fld"><label>dp_shard</label><input name="dp" type="number" min="1" value="2"></div>
-    <div class="fld"><label>tp</label><input name="tp" type="number" min="1" value="1"></div>
-    <div class="fld"><label>ep</label><input name="ep" type="number" min="1" value="1"></div>
-    <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
-    <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" style="width:96px" title="每 stage 的可切分层数(transformer+mtp,mindformers num_layer_list 口径),段数=pp、和=layers+mtp;embedding/head 是伪层自动归 stage0/末 stage、不占配额也不计入显示层数"></div>
-    <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num);>1 时每个物理 stage 持 vpp 个非连续 chunk(round-robin: 虚拟 stage=chunk*pp+rank),微批数需≥pp,更深 warmup→更多在飞激活。例:pp=2,vpp=2,8 层→stage0 持 chunk0(L1,2)+chunk2(L5,6),stage1 持 chunk1(L3,4)+chunk3(L7,8)"></div>
-    <div class="fld"><label>微批/梯度累积</label><input name="mbs" placeholder="auto(pp>1=pp,pp=1=1)" style="width:112px" title="num_microbatches = 每次 optimizer step 的微批数 = 梯度累积步数。空=auto(pp>1 取 pp;pp=1 取 1=无累积)。pp=1 时它就是**纯梯度累积**：每微批 F/B 后其 reduced 梯度分片常驻(grad_accum 桶)直到 optimizer step——设 >1 才建模非-PP 梯度累积驻留(否则欠估)。pp>1 时同时驱动 1F1B 流水(warmup/在飞深度随 m 分化)。按**正常/省显存**语义估:激活恒单微批 + 多一份累计梯度;个别 mindformers 版本 pp=1 若激活未随微批释放(显存∝m),真机会更高——见 analysis/grad_accum_realmachine_validation_2026-07-20.md。"></div>
-    <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
-    <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
-    <div class="fld"><label>优化器</label><select name="optimizer" title="AdamW(精确建模:master+m+v)或 Muon(标准口径:2D 矩阵权重只 momentum+master 省一份 v;embedding/lm_head/norm/router/bias 仍走 AdamW)。Muon 持久态更省;optstep 的 Newton-Schulz workspace 为**估值**(无真机锚点)"><option value="adamw" selected>AdamW</option><option value="muon">Muon</option></select></div>
-    <div class="fld"><label>Muon per-head</label><select name="muon_per_head" title="仅 Muon 生效:per-head Muon 把注意力投影(qkv/o)的 Newton-Schulz 按头切、一次一头 → 该投影 optstep NS 单元 ÷ n_heads(估值)。FFN/专家非头结构不受影响,故若 optstep 峰在 head/embed(AdamW)或大专家,per-head 不改峰"><option value="0" selected>关</option><option value="1">开</option></select></div>
-    <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
-    <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
-    <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8;12-13;23-25" style="width:150px" title="重算作用的层（1..N,含端点）——对 full / select / custom 均生效;空=全部层。&#10;**支持多段不连续**:1-8;12-13;23-25(分隔符 , 或 ; 皆可,全角亦可)。&#10;例:full+「1-2」=只前 2 层整层重算;select+「1-8;23-25」=这 11 层按 select 模块重算"></div>
-    <div class="fld"><label>细粒度重算</label><input name="sel_cfg" placeholder="s0:both; s2-3:mlp   或   self_attention:0-7,11-12,22-24" style="width:360px" title="统一入口,按段自动识别两种写法(不可混用),非空即优先于图上勾选/select 模块:&#10;① 按 PP stage —— s0:both; s1-2:self_attention; s3:none (stage 号支持多段 s0,2-3;stage→层跟当前 pp 切分)&#10;② 按绝对层号(mf select_module,0-indexed) —— self_attention:0-7,11-12,22-24; flash:4-7 (**每 pattern 的层范围支持多段不连续**,逗号分隔)&#10;模式/pattern = none | self_attention | mlp | both(≈full) | 任意 op 名子串;分号分隔多条 pattern"></div>
-    <input type="hidden" name="sel_ops" value="">
-    <div class="kpi"><div class="n" id="kpeak">—</div><div class="t" id="kmeta">设备峰值</div></div>
-  </div>
-  <div class="cfgrow"><span class="cap">运行时/硬件</span>
-    <div class="fld"><label>dp_replicate</label><input name="dp_replicate" type="number" min="1" value="1" title="纯数据并行度(权重/优化器逐 rank 复制、不切分);单卡峰值与 dp_shard=1 相同,进 world/HCCL 域。yaml 导入按解析值回填"></div>
-    <div class="fld"><label>reshard</label><select name="reshard" title="reshard_after_forward_policy:default(PP 整体不 reshard,非 PP 除 output 均前向后即 reshard) / always(前向后即 reshard,反向 re-gather) / never(unsharded 权重驻留至本模块反向) —— 改 gather 生命周期(fsdp=dp_shard·cp>1 时生效)"><option value="default" selected>default</option><option value="always">always</option><option value="never">never</option></select></div>
-    <div class="fld"><label>cpu_offload</label><select name="cpu_offload" title="参数/优化器状态卸载 CPU:开 → 该 stage 持久态=0、优化器 step 无设备瞬态"><option value="0" selected>关</option><option value="1">开</option></select></div>
-    <div class="fld"><label>prefetch</label><input name="prefetch" type="number" min="0" value="1" title="FSDP 参数预取深度(prefetch_depth);0=无预取(单缓冲),≥1=下 N 层双缓冲。yaml 导入按解析值回填"></div>
-    <div class="fld"><label>设备容量(GiB)</label><input name="maxdev_gib" type="number" min="1" step="1" value="64" title="设备 HBM 容量(HardwareSpec.max_device_memory);OOM 判据用它。yaml 导入按 context.max_device_memory 回填(缺省 54GiB),手配默认 64GiB"></div>
-    <div class="fld"><label>优化器 dtype</label><select name="opt_dtype" title="AdamW params dtype:fp32(state=master+m+v=12B/param) / bf16(+compute 副本 2B=14B/param)。yaml 导入按 model.params_dtype 回填"><option value="fp32" selected>fp32</option><option value="bf16">bf16</option></select></div>
-    <input type="hidden" name="sp" value="">
-    <input type="hidden" name="grad_bytes" value="4">
-  </div>
-  <div class="cfgrow" id="rcrow" style="display:none"><span class="cap">重算 op</span><div id="rcchips" style="font:11.5px var(--mono);color:var(--mut)">（在左图 op 节点上点 <b>↻</b> 勾选;再点取消）</div></div>
-  <div class="errbox" id="err"></div>
-</div>
-<div class="wrap">
-  <div class="tabs" id="tabs"></div>
-  <div class="grid">
-    <div class="maincol">
-      <div class="card"><header id="ghdr">模型结构 · op-DAG（点层展开）</header><div class="gpane" id="gpane"></div></div>
-      <div class="card"><header id="tlhdr">内存时间线（FWD→BWD,按时间顺序）</header>
-        <div class="tlpane"><p class="desc" id="tldesc"></p><div id="tl"></div></div>
-        <div class="legend" id="leg"></div></div>
+
+  <section class="sec" data-sec="model">
+    <div class="sh"><span class="car">▾</span><span class="st">模型</span><span class="sc">base</span></div>
+    <div class="sb">
+      <div class="fld"><label>模型预设</label><select id="preset" name="preset">
+        <option value="custom">Custom（自定义）</option>
+        <option value="dsv3_mini" selected>DSv3-mini（仓库锚点）</option>
+        <option value="dsv3_671b">DeepSeek-V3 671B</option>
+        <option value="dsv32_exp">DeepSeek-V3.2-Exp</option>
+        <option value="dsv4_flash">DeepSeek-V4-Flash</option>
+        <option value="dsv4_pro">DeepSeek-V4-Pro</option>
+        <option value="glm5">GLM-5 (zai-org)</option>
+      </select></div>
+      <div class="fld"><label>yaml 导入（解析回填,不改文件）</label><input type="file" id="yamlfile" accept=".yaml,.yml" title="选 mindformers 训练 yaml → 解析回填到对话框(不改动 yaml 文件本身)"></div>
+      <div class="grp">
+        <div class="fld"><label>attn</label><select name="attn"><option value="mla" selected>MLA</option><option value="gqa">GQA</option><option value="mha">MHA</option><option value="dsa">DSA(预估计)</option><option value="dsv4_hybrid">DSv4-hybrid</option></select></div>
+        <div class="fld"><label>layers</label><input name="layers" type="number" min="1" value="8"></div>
+        <div class="fld"><label>seq</label><input name="seq" type="number" min="1" value="4096"></div>
+        <div class="fld"><label>batch</label><input name="batch" type="number" min="1" value="1"></div>
+        <div class="fld"><label>hidden</label><input name="hidden" type="number" min="1" value="1792"></div>
+        <div class="fld"><label>vocab</label><input name="vocab" type="number" min="1" value="129280"></div>
+        <div class="fld"><label>mtp 层数</label><input name="mtp" type="number" min="0" value="0" title="MTP(num_nextn_predict_layers);计入可切分总层数(pp 分配的和=layers+mtp),位于层序列末端"></div>
+      </div>
     </div>
-    <div class="card"><header id="dhdr">详情</header><div class="dpane" id="detail"><p class="ph">悬停/点击左侧算子 → 算子详情（存的激活/上下游）；点 timeline → 该刻各桶。</p></div></div>
+  </section>
+
+  <section class="sec" data-sec="attn">
+    <div class="sh"><span class="car">▾</span><span class="st">注意力</span><span class="sc" id="sc-attn"></span></div>
+    <div class="sb"><div class="grp">
+      <div class="fld"><label>heads</label><input name="heads" type="number" min="1" value="8"></div>
+      <div class="fld"><label>kv_groups</label><input name="kv_groups" type="number" min="1" value="8" title="gqa 的 KV 组数(=heads 即 MHA)"></div>
+      <div class="fld"><label>q_lora</label><input name="q_lora" type="number" min="1" value="1536"></div>
+      <div class="fld"><label>kv_lora</label><input name="kv_lora" type="number" min="1" value="512"></div>
+      <div class="fld"><label>qk_nope</label><input name="qk_nope" type="number" min="1" value="128"></div>
+      <div class="fld"><label>qk_rope</label><input name="qk_rope" type="number" min="1" value="64"></div>
+      <div class="fld"><label>v_head</label><input name="v_head" type="number" min="1" value="192"></div>
+      <div class="fld"><label>mHC残差流</label><input name="hc" type="number" min="1" value="1" title="mHC(HyperConnection)残差流数 num_residual_streams：1=无 mHC(plain);≥2=开 mHC，hidden 状态 ×n 条残差流(DeepSeek-V4=4)。选 DSv4 预设自动填 4。留 1=按普通残差估。mHC 主要抬持久态(×n 残差流参数/激活)"></div>
+    </div></div>
+  </section>
+
+  <section class="sec" data-sec="moe">
+    <div class="sh"><span class="car">▾</span><span class="st">FFN / MoE</span><span class="sc" id="sc-moe"></span></div>
+    <div class="sb"><div class="grp">
+      <div class="fld"><label>ffn</label><input name="ffn" type="number" min="1" value="3072"></div>
+      <div class="fld"><label>experts</label><input name="experts" type="number" min="0" value="8"></div>
+      <div class="fld"><label>dense 层数</label><input name="dense_k" type="number" min="0" value="1" title="前 K 层 dense,其余 MoE(first_k_dense_replace);=layers 则纯 dense"></div>
+      <div class="fld"><label>topk</label><input name="topk" type="number" min="1" value="4"></div>
+      <div class="fld"><label>moe_ffn</label><input name="moe_ffn" type="number" min="1" value="1024"></div>
+    </div></div>
+  </section>
+
+  <section class="sec" data-sec="parallel">
+    <div class="sh"><span class="car">▾</span><span class="st">并行切分</span><span class="sc" id="sc-par"></span></div>
+    <div class="sb">
+      <div class="grp">
+        <div class="fld"><label>dp_shard</label><input name="dp" type="number" min="1" value="2"></div>
+        <div class="fld"><label>tp</label><input name="tp" type="number" min="1" value="1"></div>
+        <div class="fld"><label>pp</label><input name="pp" type="number" min="1" value="1"></div>
+        <div class="fld"><label>cp</label><input name="cp" type="number" min="1" value="1"></div>
+        <div class="fld"><label>ep</label><input name="ep" type="number" min="1" value="1"></div>
+        <div class="fld"><label>vpp</label><input name="vpp" type="number" min="1" value="1" title="虚拟流水交错数(mindformers pp_interleave_num);>1 时每个物理 stage 持 vpp 个非连续 chunk(round-robin: 虚拟 stage=chunk*pp+rank),微批数需≥pp,更深 warmup→更多在飞激活。例:pp=2,vpp=2,8 层→stage0 持 chunk0(L1,2)+chunk2(L5,6),stage1 持 chunk1(L3,4)+chunk3(L7,8)"></div>
+      </div>
+      <div class="fld"><label>cp 算法</label><select name="method"><option selected>colossal</option><option>ulysses</option><option>ring</option><option>hybrid</option></select></div>
+      <div class="fld"><label>pp 层分配</label><input name="pp_split" placeholder="如 3,5(空=均匀)" title="每 stage 的可切分层数(transformer+mtp,mindformers num_layer_list 口径),段数=pp、和=layers+mtp;embedding/head 是伪层自动归 stage0/末 stage、不占配额也不计入显示层数"></div>
+      <div class="fld"><label>微批 / 梯度累积</label><input name="mbs" placeholder="auto(pp>1=pp,pp=1=1)" title="num_microbatches = 每次 optimizer step 的微批数 = 梯度累积步数。空=auto(pp>1 取 pp;pp=1 取 1=无累积)。pp=1 时它就是**纯梯度累积**：每微批 F/B 后其 reduced 梯度分片常驻(grad_accum 桶)直到 optimizer step——设 >1 才建模非-PP 梯度累积驻留(否则欠估)。pp>1 时同时驱动 1F1B 流水(warmup/在飞深度随 m 分化)。按**正常/省显存**语义估:激活恒单微批 + 多一份累计梯度;个别 mindformers 版本 pp=1 若激活未随微批释放(显存∝m),真机会更高——见 analysis/grad_accum_realmachine_validation_2026-07-20.md。"></div>
+    </div>
+  </section>
+
+  <section class="sec closed" data-sec="opt">
+    <div class="sh"><span class="car">▾</span><span class="st">优化器</span><span class="sc" id="sc-opt"></span></div>
+    <div class="sb">
+      <div class="fld"><label>优化器</label><select name="optimizer" title="AdamW(精确建模:master+m+v)或 Muon(标准口径:2D 矩阵权重只 momentum+master 省一份 v;embedding/lm_head/norm/router/bias 仍走 AdamW)。Muon 持久态更省;optstep 的 Newton-Schulz workspace 为**估值**(无真机锚点)"><option value="adamw" selected>AdamW</option><option value="muon">Muon</option></select></div>
+      <div class="fld"><label>优化器 dtype</label><select name="opt_dtype" title="AdamW params dtype:fp32(state=master+m+v=12B/param) / bf16(+compute 副本 2B=14B/param)。yaml 导入按 model.params_dtype 回填"><option value="fp32" selected>fp32</option><option value="bf16">bf16</option></select></div>
+      <div class="fld"><label>Muon per-head</label><select name="muon_per_head" title="仅 Muon 生效:per-head Muon 把注意力投影(qkv/o)的 Newton-Schulz 按头切、一次一头 → 该投影 optstep NS 单元 ÷ n_heads(估值)。FFN/专家非头结构不受影响,故若 optstep 峰在 head/embed(AdamW)或大专家,per-head 不改峰"><option value="0" selected>关</option><option value="1">开</option></select></div>
+    </div>
+  </section>
+
+  <section class="sec closed" data-sec="recompute">
+    <div class="sh"><span class="car">▾</span><span class="st">重算</span><span class="sc" id="sc-rc"></span></div>
+    <div class="sb">
+      <div class="fld"><label>recompute</label><select name="recompute"><option value="None" selected>无</option><option value="full">full</option><option value="select">select(模块)</option><option value="custom">custom(图上选 op)</option></select></div>
+      <div class="fld"><label>select 模块</label><select name="select"><option value="attn" selected>self_attn</option><option value="mlp">mlp</option><option value="both">both</option></select></div>
+      <div class="fld"><label>重算层范围</label><input name="sel_layers" placeholder="1-8;12-13;23-25" title="重算作用的层（1..N,含端点）——对 full / select / custom 均生效;空=全部层。&#10;**支持多段不连续**:1-8;12-13;23-25(分隔符 , 或 ; 皆可,全角亦可)。&#10;例:full+「1-2」=只前 2 层整层重算;select+「1-8;23-25」=这 11 层按 select 模块重算"></div>
+      <div class="fld"><label>细粒度重算</label><input name="sel_cfg" placeholder="s0:both; s2-3:mlp  或  self_attention:0-7,11-12" title="统一入口,按段自动识别两种写法(不可混用),非空即优先于图上勾选/select 模块:&#10;① 按 PP stage —— s0:both; s1-2:self_attention; s3:none (stage 号支持多段 s0,2-3;stage→层跟当前 pp 切分)&#10;② 按绝对层号(mf select_module,0-indexed) —— self_attention:0-7,11-12,22-24; flash:4-7 (**每 pattern 的层范围支持多段不连续**,逗号分隔)&#10;模式/pattern = none | self_attention | mlp | both(≈full) | 任意 op 名子串;分号分隔多条 pattern"></div>
+      <div class="fld" id="rcrow" style="display:none"><label>重算 op（图上勾选）</label><div id="rcchips" style="font:11px/1.5 var(--mono);color:var(--mut)">（在左图 op 节点上点 <b>↻</b> 勾选;再点取消）</div></div>
+      <input type="hidden" name="sel_ops" value="">
+    </div>
+  </section>
+
+  <section class="sec closed" data-sec="runtime">
+    <div class="sh"><span class="car">▾</span><span class="st">运行时 / 硬件</span></div>
+    <div class="sb">
+      <div class="grp">
+        <div class="fld"><label>设备容量 GiB</label><input name="maxdev_gib" type="number" min="1" step="1" value="64" title="设备 HBM 容量(HardwareSpec.max_device_memory);OOM 判据用它。yaml 导入按 context.max_device_memory 回填(缺省 54GiB),手配默认 64GiB"></div>
+        <div class="fld"><label>dp_replicate</label><input name="dp_replicate" type="number" min="1" value="1" title="纯数据并行度(权重/优化器逐 rank 复制、不切分);单卡峰值与 dp_shard=1 相同,进 world/HCCL 域。yaml 导入按解析值回填"></div>
+        <div class="fld"><label>prefetch</label><input name="prefetch" type="number" min="0" value="1" title="FSDP 参数预取深度(prefetch_depth);0=无预取(单缓冲),≥1=下 N 层双缓冲。yaml 导入按解析值回填"></div>
+        <div class="fld"><label>cpu_offload</label><select name="cpu_offload" title="参数/优化器状态卸载 CPU:开 → 该 stage 持久态=0、优化器 step 无设备瞬态"><option value="0" selected>关</option><option value="1">开</option></select></div>
+      </div>
+      <div class="fld"><label>reshard 策略</label><select name="reshard" title="reshard_after_forward_policy:default(PP 整体不 reshard,非 PP 除 output 均前向后即 reshard) / always(前向后即 reshard,反向 re-gather) / never(unsharded 权重驻留至本模块反向) —— 改 gather 生命周期(fsdp=dp_shard·cp>1 时生效)"><option value="default" selected>default</option><option value="always">always</option><option value="never">never</option></select></div>
+      <input type="hidden" name="sp" value="">
+      <input type="hidden" name="grad_bytes" value="4">
+    </div>
+  </section>
+</aside>
+
+<div class="wrap" id="wrap">
+  <div class="mainhead">
+    <div class="mh-top">
+      <button class="sidebtn" id="sidebtn" title="折叠 / 展开配置栏">☰</button>
+      <div class="mh-title"><div class="a">模型结构 · op-DAG + 内存时间线</div><div class="b" id="srcline">结构可配 · 切分自由 · op-DAG + timeline</div></div>
+      <div class="kpi"><div class="n" id="kpeak">—</div><div class="t">设备峰值 allocated</div></div>
+    </div>
+    <div class="kmeta" id="kmeta"></div>
+    <div class="tabs" id="tabs"></div>
+    <div class="errbox" id="err"></div>
   </div>
+  <div class="content">
+    <div class="grid">
+      <div class="maincol">
+        <div class="card"><header id="ghdr">模型结构 · op-DAG（点层展开）</header><div class="oplegend" id="oplegend"></div><div class="gpane" id="gpane"></div></div>
+        <div class="card"><header id="tlhdr">内存时间线（FWD→BWD,按时间顺序）</header>
+          <div class="tlpane"><p class="desc" id="tldesc"></p><div id="tl"></div></div>
+          <div class="legend" id="leg"></div></div>
+      </div>
+      <div class="card detailcard"><header id="dhdr">详情</header><div class="dpane" id="detail"><p class="ph">悬停/点击左侧算子 → 算子详情（存的激活/上下游）；点 timeline → 该刻各桶。</p></div></div>
+    </div>
+  </div>
+</div>
+<div class="tltip" id="tltip"></div>
 </div>
 <script>
 const PRESETS=__PRESETS__;
@@ -1143,10 +1240,43 @@ const BKD={persistent:"参数+优化器状态",act_live:"存活激活",kept_frag
 let cur=null,curStage=0,openLayers=new Set();
 function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function fmib(m){return m>=1024?(m/1024).toFixed(1)+" GiB":m.toFixed(0)+" MiB";}
-function qs(){const o={};document.querySelectorAll(".top [name]").forEach(e=>o[e.name]=e.value);return o;}
+function qs(){const o={};document.querySelectorAll("#side [name]").forEach(e=>o[e.name]=e.value);return o;}
+/* ── 条件显隐(progressive disclosure):字段只在与当前配置相关时才显示,否则整项隐藏 ── */
+function _cv(name){const e=document.querySelector(`#side [name=${name}]`);return e?e.value:"";}
+function _iv(name){return parseInt(_cv(name)||"0",10)||0;}
+function fldShow(name,on){const e=document.querySelector(`#side [name=${name}]`);if(!e)return;const f=e.closest(".fld");if(f)f.classList.toggle("hidden",!on);}
+function applyVisibility(){
+  const attn=_cv("attn");
+  const mla=(attn==="mla"||attn==="dsa"||attn==="dsv4_hybrid");   // MLA 家族 → lora 维度
+  const gqa=(attn==="gqa"||attn==="mha");                          // GQA/MHA → kv_groups
+  ["q_lora","kv_lora","qk_nope","qk_rope","v_head"].forEach(n=>fldShow(n,mla));
+  fldShow("kv_groups",gqa);
+  const moe=_iv("experts")>0;                                     // 有专家才有 MoE 相关项
+  ["dense_k","topk","moe_ffn"].forEach(n=>fldShow(n,moe));
+  fldShow("ep",moe);
+  const pp=_iv("pp");
+  ["pp_split","vpp"].forEach(n=>fldShow(n,pp>1));                  // 流水切分仅 pp>1
+  fldShow("method",_iv("cp")>1);                                  // cp 算法仅 cp>1
+  const opt=_cv("optimizer");
+  fldShow("muon_per_head",opt==="muon");
+  fldShow("opt_dtype",opt==="adamw");
+  const rc=_cv("recompute");
+  fldShow("select",rc==="select");
+  fldShow("sel_layers",rc!=="None");
+  fldShow("sel_cfg",rc!=="None");
+  const fsdp=_iv("dp")*_iv("cp")>1;                               // FSDP 生效才有 reshard/prefetch
+  ["reshard","prefetch"].forEach(n=>fldShow(n,fsdp));
+  const sc=(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};   // 分区角标
+  sc("sc-attn",(attn||"").toUpperCase());
+  sc("sc-moe",moe?`${_iv("experts")}E·top${_iv("topk")}`:"dense");
+  sc("sc-par",`world ${_iv("dp")*_iv("tp")*_iv("pp")*_iv("cp")*_iv("ep")*_iv("dp_replicate")}`);
+  sc("sc-opt",opt==="muon"?"Muon":"AdamW");
+  sc("sc-rc",rc==="None"?"off":rc);
+}
 let timer=null;
 function refreshSoon(){clearTimeout(timer);timer=setTimeout(refresh,350);}
 async function refresh(){
+  applyVisibility();
   document.querySelector(".wrap").classList.add("busy");
   let d;
   try{const r=await fetch("/api/eval?"+new URLSearchParams(qs()));d=await r.json();}
@@ -1214,6 +1344,9 @@ function cellSvg(L){
 }
 function drawGraph(st){
   document.getElementById("ghdr").textContent=`模型结构 · Stage ${st.stage}（${st.n_layers} 可切分层${st.extras&&st.extras.length?" + "+st.extras.map(e=>e==="embedding"?"embedding":e==="lm_head"?"head":e).join("/")+"(伪层,不占配额)":""},点层展开 op-DAG）`;
+  {const ts=[];st.graph.forEach(L=>L.ops.forEach(o=>{if(!ts.includes(o.type))ts.push(o.type);}));   // op 类型图例(仅本 stage 出现的)
+   document.getElementById("oplegend").innerHTML=ts.map(t=>`<span><i style="background:${OPC[t]||"#8b93a0"}"></i>${esc(t)}</span>`).join("")
+     +`<span style="margin-left:auto"><i style="background:#c0392b"></i>💾 存激活</span><span><i style="background:#d9a7ec"></i>↻ 重算</span>`;}
   if(openLayers.size===0){const seen=new Set();st.graph.forEach(L=>{if(!seen.has(L.type)){seen.add(L.type);openLayers.add(L.id);}});}
   document.getElementById("gpane").innerHTML=st.graph.map((L,idx)=>{
     const open=openLayers.has(L.id);
@@ -1324,14 +1457,18 @@ function bindTl(st){
   const W=640,PL=52,PR=10,pw=W-PL-PR;
   const svg=document.getElementById(`tlsvg_${st.stage}`),hit=document.getElementById(`tlhit_${st.stage}`);
   if(!svg||!hit)return;
-  function pick(evt){const r=svg.getBoundingClientRect();const fx=(evt.clientX-r.left)/r.width*W;
-    let i=Math.round((fx-PL)/(n<2?1:pw/(n-1)));i=Math.max(0,Math.min(n-1,i));
-    const c=document.getElementById(`cursor_${st.stage}`);
-    const X=PL+(n<2?0:i/(n-1)*pw); c.setAttribute("x1",X);c.setAttribute("x2",X);
-    document.getElementById("dhdr").textContent=`各桶开销 · Stage ${st.stage}`;
-    showBuckets(ev[i]);}
-  hit.addEventListener("click",e=>{e.stopPropagation();pick(e);});
-  hit.addEventListener("mousemove",e=>{if(e.buttons)pick(e);});
+  const tip=document.getElementById("tltip");
+  function idxAt(evt){const r=svg.getBoundingClientRect();const fx=(evt.clientX-r.left)/r.width*W;
+    return Math.max(0,Math.min(n-1,Math.round((fx-PL)/(n<2?1:pw/(n-1)))));}
+  function moveCursor(i){const c=document.getElementById(`cursor_${st.stage}`);
+    const X=PL+(n<2?0:i/(n-1)*pw); c.setAttribute("x1",X);c.setAttribute("x2",X);}
+  function pick(i){moveCursor(i);document.getElementById("dhdr").textContent=`各桶开销 · Stage ${st.stage}`;showBuckets(ev[i]);}
+  hit.addEventListener("mousemove",e=>{const i=idxAt(e);moveCursor(i);          // hover:游标+气泡即时跟随(<无延迟)
+    tip.style.display="block";tip.style.left=(e.clientX+13)+"px";tip.style.top=(e.clientY+13)+"px";
+    tip.innerHTML=`<b>${esc(ev[i].event)}</b> · ${fmib(ev[i].total)}`;
+    if(e.buttons)pick(i);});                                                      // 按住拖动:同时更新右侧各桶
+  hit.addEventListener("mouseleave",()=>{tip.style.display="none";});
+  hit.addEventListener("click",e=>{e.stopPropagation();tip.style.display="none";pick(idxAt(e));});
 }
 function showBuckets(e){
   const bs=Object.entries(e.buckets).sort((a,b)=>b[1]-a[1]);const mx=Math.max(...bs.map(x=>x[1]),1);
@@ -1344,14 +1481,14 @@ function showBuckets(e){
    选模型预设=手配路径 → 复位这些 extra,不残留上次 yaml 导入的解析值(非导入路径保持现状)。*/
 const RT_DEFAULTS={dp_replicate:"1",reshard:"default",cpu_offload:"0",prefetch:"1",maxdev_gib:"64",opt_dtype:"fp32",sp:"",grad_bytes:"4"};
 function resetRuntimeExtras(){
-  Object.entries(RT_DEFAULTS).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el)el.value=v;});
+  Object.entries(RT_DEFAULTS).forEach(([k,v])=>{const el=document.querySelector(`#side [name=${k}]`);if(el)el.value=v;});
 }
 /* 模型预设:选中即填充结构字段(HF config.json 值),用户仍可手改覆盖 */
 function applyPreset(key){
   const pr=PRESETS[key]; if(!pr)return;
-  Object.entries(pr.ui).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el)el.value=v;});
+  Object.entries(pr.ui).forEach(([k,v])=>{const el=document.querySelector(`#side [name=${k}]`);if(el)el.value=v;});
   // mHC 残差流：预设 ui 未显式给 hc 时按基座推(v4 基座=deepseek_v4→4 条残差流,v3=1=无 mHC)。
-  const _hc=document.querySelector(".top [name=hc]");
+  const _hc=document.querySelector("#side [name=hc]");
   if(_hc)_hc.value=(pr.ui.hc!==undefined?pr.ui.hc:(pr.base==="v4"?4:1));
   resetRuntimeExtras();      // 手配路径 → extra 回到固定假设(64GiB/AdamW-fp32/...)
   document.getElementById("kmeta").textContent="来源: "+pr.source;
@@ -1367,7 +1504,7 @@ document.getElementById("yamlfile").addEventListener("change",async e=>{
   if(!d.ok){eb.style.display="block";eb.innerHTML="✗ yaml 解析失败: "+esc(d.error);e.target.value="";return;}
   if(d.warnings&&d.warnings.length){eb.style.display="block";eb.innerHTML="⚠ yaml 导入警告:<br>· "+d.warnings.map(esc).join("<br>· ");}
   else eb.style.display="none";
-  Object.entries(d.fields).forEach(([k,v])=>{const el=document.querySelector(`.top [name=${k}]`);if(el&&v!==null&&v!==undefined)el.value=v;});
+  Object.entries(d.fields).forEach(([k,v])=>{const el=document.querySelector(`#side [name=${k}]`);if(el&&v!==null&&v!==undefined)el.value=v;});
   document.getElementById("preset").value="custom";
   document.getElementById("kmeta").textContent="来源: yaml 导入("+f.name+"),已按完整解析值回填并评估(dp_replicate/reshard/offload/prefetch/设备容量/优化器 dtype 均生效,可改;不写回文件)";
   e.target.value="";       // 允许重选同一文件
@@ -1378,10 +1515,14 @@ const STRUCT_FIELDS=["attn","layers","dense_k","experts","topk","heads","kv_grou
   "mtp","hc","hidden","ffn","moe_ffn","q_lora","kv_lora","qk_nope","qk_rope","v_head","vocab"];
 function markCustom(){const sel=document.getElementById("preset");if(sel.value!=="custom"){sel.value="custom";
   document.getElementById("kmeta").textContent="来源: "+PRESETS.custom.source;}}
-document.querySelectorAll(".top [name]").forEach(e=>{if(e.id==="preset")return;
-  e.addEventListener("change",()=>{if(STRUCT_FIELDS.includes(e.name))markCustom();syncChips();refreshSoon();});});
-document.querySelectorAll(".top input[type=number]").forEach(e=>e.addEventListener("input",()=>{
+document.querySelectorAll("#side [name]").forEach(e=>{if(e.id==="preset")return;
+  e.addEventListener("change",()=>{if(STRUCT_FIELDS.includes(e.name))markCustom();applyVisibility();syncChips();refreshSoon();});});
+document.querySelectorAll("#side input[type=number]").forEach(e=>e.addEventListener("input",()=>{
   if(STRUCT_FIELDS.includes(e.name))markCustom();refreshSoon();}));
+/* 分区折叠(点标题栏) + 侧栏整体折叠(☰) */
+document.querySelectorAll("#side .sec>.sh").forEach(h=>h.addEventListener("click",()=>h.parentElement.classList.toggle("closed")));
+document.getElementById("sidebtn").addEventListener("click",()=>document.getElementById("side").classList.toggle("closed"));
+applyVisibility();
 refresh();
 </script></body></html>"""
 
