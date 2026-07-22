@@ -107,6 +107,14 @@ class TensorRef:
     #   到 **full-S**（不 ÷cp），其余 cp 算法（ulysses/ring/hybrid）仍随 body ÷cp。默认 False。
     cp_shard: bool = True
     cp_kv: bool = False
+    # ── 重算免疫（2026-07-22，185 pp4+全重算锚点定标）─────────────────────────────
+    # pin_under_recompute=True：该 save 由**自定义算子的 `ctx.save_for_backward`** 持有
+    #   （如 fused SparseFlashMla 的 11 张量 ctx 集，csa.py:224-235），MindSpore
+    #   use_reentrant=False 全重算（activation_checkpoint.py:151）**不释放**这类 ctx 状态
+    #   → 全重算下仍随微批常驻 act_live（mem_timeline `saved = checkpoint_input +
+    #   Σ免疫saves`），至该微批该层反向才释。默认 False = 普通激活（全重算即释放），
+    #   全部既有 spec 惰性、逐字节不变。
+    pin_under_recompute: bool = False
 
     def has_ep(self) -> bool:
         return "ep" in self.shard.values()

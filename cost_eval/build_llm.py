@@ -309,6 +309,16 @@ def _use_mhc(cfg: LLMConfig) -> bool:
     return cfg.residual_variant == "mhc" and cfg.num_residual_streams > 1
 
 
+def _mhc_fused_ctx_pin(cfg: LLMConfig, dims: DimTable) -> bool:
+    """fused mHC ctx 的全重算免疫门（2026-07-22，185 pp4+全重算锚点定标）。
+
+    fork 里 `use_fused_mhc` 与 `apply_dsa_kernel_fusion` 生产同开同关（交接 §7 真机切换
+    口径:两开关一起切 fused/unfused）→ 以 dsv4_hybrid + dsa_fused 作为 fused mHC 的判据。
+    非 dsv4 的 mHC（mha/gqa/mla 包 mHC，小算子路径）不 pin → 既有 spec 全重算行为逐字节不变。
+    """
+    return cfg.attn_type == "dsv4_hybrid" and bool(getattr(dims, "dsa_fused", True))
+
+
 def _build_decoder_body(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> list:
     """组装一个 decoder 层的 body op（attn 段 + ffn 段，未套 mHC）。
 
@@ -354,7 +364,8 @@ def _build_layer_ops(ctx: LayerContext, cfg: LLMConfig, dims: DimTable) -> list:
 
     body = _build_decoder_body(ctx, cfg, dims)
     if _use_mhc(cfg):
-        body = mhc_wrap(body, cfg.num_residual_streams, dims)
+        body = mhc_wrap(body, cfg.num_residual_streams, dims,
+                        fused_ctx_pin=_mhc_fused_ctx_pin(cfg, dims))
     return body
 
 

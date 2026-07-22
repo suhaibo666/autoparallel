@@ -56,6 +56,14 @@ class StructureMemory:
     checkpoint_input: int = 0
     forward_max_live: int = 0
     grad_shard_bytes: int = 0
+    # ── 重算免疫 saves（2026-07-22，185 pp4+全重算锚点定标）────────────────────────
+    # `recompute_pinned_saves`：saves 中标 `pin_under_recompute=True` 的张量（去重、块对齐）
+    #   字节和——**自定义算子 `ctx.save_for_backward` 持有的状态**（fused SparseFlashMla 11
+    #   张量集，csa.py:224-235），MindSpore use_reentrant=False 全重算不释放（activation_
+    #   checkpoint.py:151）→ 全重算下该层仍随微批 pin `checkpoint_input + 此值` 进 act_live
+    #   （mem_timeline full 分支）。是 `activation_saves` 的子集口径（同 dedup/对齐；norm-fp32
+    #   bump 不适用——ctx 张量按 kernel 实际 dtype 计）。无标记 spec 恒 0（惰性）。
+    recompute_pinned_saves: int = 0
     # persistent 组成分解用：本结构内、按 fsdp/efsdp 切后的**驻留参数量**（去重、未乘倍数、未块对齐）。
     #   matrix = Muon 分类的 2D 矩阵权重（is_muon_matrix_weight）；other = 其余。persistent 分量拆解
     #   （参数副本/master/momentum/v）= 这两个计数 × 每分量每元素字节（static_mem.persistent_breakdown）。
@@ -242,6 +250,11 @@ def estimate_structure_memory(
     norm_names = _norm_save_names(resolved_ops) if norm_compute_dtype_bytes else frozenset()
     activation_saves = sum(_align_up(s.local_numel * _dt(s, norm_names, norm_compute_dtype_bytes), blk)
                            for s in saves.values())
+    # 重算免疫 saves（fused 自定义算子 ctx 集，见 StructureMemory docstring）：同一 dedup 字典、
+    # 同块对齐;按张量自身 dtype（ctx 持有的是 kernel 实际张量，无 norm-fp32 cast 语义）。
+    recompute_pinned_saves = sum(
+        _align_up(s.local_numel * s.dtype_bytes, blk)
+        for s in saves.values() if getattr(s, "pin_under_recompute", False))
     param_full_bytes = sum(_align_up(w.local_numel * w.dtype_bytes, blk) for w in params.values())
     grad_full_bytes = sum(_align_up(w.local_numel * grad_dtype_bytes, blk) for w in params.values())
     # P0-01（2026-07-14 review）：已规约梯度分片（step-scoped cumulative）。divisor 与上方 persistent
@@ -279,6 +292,7 @@ def estimate_structure_memory(
         grad_shard_bytes=grad_shard_bytes,
         persist_numel_matrix=persist_numel_matrix,
         persist_numel_other=persist_numel_other,
+        recompute_pinned_saves=recompute_pinned_saves,
     )
 
 

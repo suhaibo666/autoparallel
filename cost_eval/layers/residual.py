@@ -75,10 +75,16 @@ def _scale_op(op: OpSpec) -> OpSpec:
     )
 
 
-def build_hyper_connection_ops(prefix: str, d: DimTable) -> list:
+def build_hyper_connection_ops(prefix: str, d: DimTable, fused_ctx_pin: bool = False) -> list:
     """单个 mHC HyperConnection 模块的 op 列表（3 op，源：`hyper_connection.py:178-233`）。
 
     prefix ∈ {"attn","ffn"}（`transformer_layer.py:278-285` 的 attn_hc / ffn_hc）。
+
+    fused_ctx_pin（2026-07-22，185 pp4+全重算锚点定标）：fused mHC（fork `use_fused_mhc`，
+    hyper_parallel 自定义算子，与 `apply_dsa_kernel_fusion` 同开同关——交接 §7 真机切换口径）
+    的 `ctx.save_for_backward` 状态在 MindSpore use_reentrant=False 全重算下**不释放**（与
+    fused SparseFlashMla 同机制）→ hc_norm / h_res 标 `pin_under_recompute`。默认 False =
+    非 fused mHC（普通小算子路径，全重算正常释放），全部既有 spec 逐字节不变。
 
     op 序列（吃打包残差流 `streams [S,B,n*H]`）：
       1. `{prefix}_hc_norm`（NORM）: RMSNorm(n·H, fp32) → `hc_norm [S,B,n*H]` fp32（saved，
@@ -96,6 +102,12 @@ def build_hyper_connection_ops(prefix: str, d: DimTable) -> list:
     hc_norm = TensorRef(f"{prefix}_hc_norm", ("S", "B", NH), dtype_bytes=4)
     h_proj = TensorRef(f"{prefix}_hc_proj", ("S", "B", PROJ_OUT), dtype_bytes=4)
     h_res = TensorRef(f"{prefix}_h_res", ("S", "B", "num_residual_streams", "num_residual_streams"))
+
+    if fused_ctx_pin:
+        # fused mHC ctx 持有：RMSNorm fp32 输出（反向 mapping_proj 需之）+ h_res（output_cell
+        # 反向 `h_res @ streams` 需之）。流输入(streams=body 承载张量 x_xn/h1_xn)在 mhc_wrap 标。
+        hc_norm.pin_under_recompute = True
+        h_res.pin_under_recompute = True
 
     # rms_weight：fp32 buffer（requires_grad=False），量级 n*H（hyper_connection.py:157-161）
     rms_w = TensorRef(f"{prefix}_hc_rms_w", (NH,), is_weight=True, dtype_bytes=4)
@@ -157,7 +169,8 @@ def _ffn_split_index(body_ops: list) -> int:
     return len(body_ops)
 
 
-def mhc_wrap(body_ops: list, n_streams: int, d: DimTable) -> list:
+def mhc_wrap(body_ops: list, n_streams: int, d: DimTable,
+             fused_ctx_pin: bool = False) -> list:
     """把 decoder body 包装成 mHC（设计 §9）。
 
     - `n_streams <= 1`：**no-op**，原样返回 `body_ops`（plain 残差，无 mHC）。
@@ -174,16 +187,30 @@ def mhc_wrap(body_ops: list, n_streams: int, d: DimTable) -> list:
         残差流数 n；仅用于 no-op 门（`<=1` 直接返回）。×n 的符号量来自 `d.num_residual_streams`。
     d : DimTable
         需含 `num_residual_streams`（与 `n_streams` 一致）。
+    fused_ctx_pin : bool
+        fused mHC（fork `use_fused_mhc` 自定义算子）→ HC 模块 ctx 状态（hc_norm/h_res +
+        流输入 x_xn/h1_xn）标 `pin_under_recompute`（全重算不释放，2026-07-22 185 pp4 锚点；
+        与 dsv4 `apply_dsa_kernel_fusion` 同开同关）。默认 False 全部既有 spec 逐字节不变。
     """
     if n_streams <= 1:
         return body_ops
 
     split = _ffn_split_index(body_ops)
     scaled = [_scale_op(op) for op in body_ops]
+    if fused_ctx_pin:
+        # fused mHC ctx 还持有**流输入**（HC 模块吃的打包残差流 = attn 段入口 x_xn / ffn 段
+        # 入口 h1_xn，RMSNorm 反向需其输入）。二者本就被 body 的 ln1/ln2 save（按名去重，
+        # activation_saves/OFF 路径零变化）——此处仅补 pin 标志（bf16 原 dtype 计入免疫和;
+        # 其 norm-fp32 cast 属重算瞬态、不随 ctx 常驻）。
+        for _op in scaled:
+            for _s in _op.saves:
+                if _s.name in ("x_xn", "h1_xn"):
+                    _s.pin_under_recompute = True
+
     attn_seg, ffn_seg = scaled[:split], scaled[split:]
 
-    attn_hc = build_hyper_connection_ops("attn", d)
-    ffn_hc = build_hyper_connection_ops("ffn", d)
+    attn_hc = build_hyper_connection_ops("attn", d, fused_ctx_pin)
+    ffn_hc = build_hyper_connection_ops("ffn", d, fused_ctx_pin)
 
     # ── 数据流衔接边（2026-07-11 补边;按上方 docstring 已声明的语义,inputs 追加引用、
     #    saves/输出不动 → 零字节;此前名字断链致 mHC 段在 op 图成孤立叶节点）──

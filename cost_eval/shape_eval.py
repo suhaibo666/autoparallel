@@ -65,6 +65,9 @@ class ResolvedTensor:
     dtype_bytes: int
     is_weight: bool
     is_expert: bool = False
+    # 重算免疫标志直通（TensorRef.pin_under_recompute，2026-07-22）：fused 自定义算子
+    # ctx 保存集在全重算下不释放 → structure_mem.recompute_pinned_saves 按此聚合。
+    pin_under_recompute: bool = False
 
 
 def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
@@ -103,7 +106,8 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
                 break
     numel = prod(sizes) if sizes else 1
     dtype_bytes = t.dtype_bytes if t.dtype_bytes is not None else dims.dtype_bytes
-    return ResolvedTensor(t.name, numel, dtype_bytes, t.is_weight, t.has_ep())
+    return ResolvedTensor(t.name, numel, dtype_bytes, t.is_weight, t.has_ep(),
+                          getattr(t, "pin_under_recompute", False))
 
 
 # ---------------------------------------------------------------------------

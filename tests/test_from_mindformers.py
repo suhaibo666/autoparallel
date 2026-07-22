@@ -131,8 +131,12 @@ def test_dsv4align_roundtrip_same_peak():
     # 与 validate_dsv4align.evaluate 同 bundle（dp_shard=2 / no-recompute / SP）→ 逐字节同峰。
     # 峰值 14971.8（2026-07-16 pre-FFN norm(ln2) 补建：无重算下 DSv4 MoE 各层 ln2 fp32-cast 常驻 →
     #   14929.8→14971.8，真机 15415 → 0.968→0.971，欠预测收窄）。
+    # → 15020.6（2026-07-22 fused SparseFlashMla ctx 保存集补齐,185 pp4 全重算锚点定标：fused
+    #   分支 sparse_attn/core_attn 补 ori_kv/query_index/key_index/weights/cmp_residual/
+    #   softmax_lse（csa.py:224-235 的 11 张量 ctx）→ 4L@seq2048 共 +48.8 MiB,真机 15415.5
+    #   → 0.974,欠预测再收窄。见 tests/test_pp4_recompute_anchor.py）。
     assert bundle.parallel.dp_shard == 2 and bundle.recompute.mode == "None"
-    assert abs(_peak(bundle) - 14971.8) < 1.0
+    assert abs(_peak(bundle) - 15020.6) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────

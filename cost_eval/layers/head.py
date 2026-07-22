@@ -196,7 +196,11 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         collapse_out = TensorRef("h_final", ("S", "B", "H"), shard={0: "sp"})
         collapse = OpSpec("mtp_hc_collapse", OpType.ELEMENTWISE, [mtp_streams], collapse_out, saves=[])
         # collapse 的真实入流 = mhc 层尾更新后的残差流(wrapped 末 op 输出);此处先占位,wrap 后补依赖。
-        wrapped = mhc_wrap(body, cfg.num_residual_streams, dims)
+        # fused mHC ctx 免疫门与主干 _mhc_fused_ctx_pin 同判据(dsv4_hybrid+dsa_fused,内联避免
+        # 循环 import):MTP 内层 decoder 的 HC ctx 在全重算下同样不释放(2026-07-22)。
+        wrapped = mhc_wrap(body, cfg.num_residual_streams, dims,
+                           fused_ctx_pin=(cfg.attn_type == "dsv4_hybrid"
+                                          and bool(getattr(dims, "dsa_fused", True))))
         # expand→attn_hc_norm 补边(2026-07-11):expand 输出 mtp_hc_streams 即 mhc 段入口流
         # (名字断链;inputs 追加引用,saves 不变零字节)。
         w0 = wrapped[0]

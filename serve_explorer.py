@@ -441,6 +441,12 @@ def parse_and_validate(p):
         #   此前 eval_config 不透传 → 无论 yaml apply_dsa_kernel_fusion 与否恒按 fused 估(dsv4_hybrid 欠估)。
         dsa_fused=_x_flag(p, "dsa_fused", True),
         mtp_num_layers=max(0, mtp))
+    # 融合 CE（cross_entropy_fused，隐藏字段 ce_fused）：yaml 导入侧 from_mindformers 对
+    #   dsv4_hybrid 推断 True（lean CE，真机锚 15415.5 背书），但此前 _bundle_to_fields 不回填、
+    #   此处不解析 → UI round-trip 静默降级回 False（unfused fat K_CE）→ dsv4 无重算 loss stage
+    #   过估 ~10GiB（2026-07-22 185 pp4 锚点定标时修）。缺省不传 → 保留基座/默认（历史行为不变）。
+    if (p.get("ce_fused") or "").strip() != "":
+        cfg = dataclasses.replace(cfg, cross_entropy_fused=_x_flag(p, "ce_fused", cfg.cross_entropy_fused))
     # mHC（HyperConnection 残差变体）：hc 显式设时覆盖基座——1=plain、≥2=mhc(hidden×n 残差流)。
     #   空(hc=0)则保留基座（v4 预设 base=deepseek_v4→num_residual_streams=4、v3→plain）→ 不误关预设 mHC。
     if hc >= 1:
@@ -920,6 +926,9 @@ def _bundle_to_fields(b):
     # DSA/CSA 融合开关(apply_dsa_kernel_fusion)：此前遗漏 → yaml unfused 在 UI round-trip 被静默按 fused
     #   估(dsv4_hybrid 激活大幅欠估,现场 DSv4-Flash 实证 unfused 真机 45557 vs fused 估 ~27k)。
     f["dsa_fused"] = int(bool(getattr(llm, "dsa_fused", True)))
+    # 融合 CE(cross_entropy_fused)：此前遗漏 → yaml 导入推断的 dsv4 lean-CE(True)在 round-trip
+    #   被静默降级为 unfused fat(K_CE)→ 无重算 loss stage 过估(2026-07-22 修,与 parse 侧成对)。
+    f["ce_fused"] = int(bool(getattr(llm, "cross_entropy_fused", False)))
     return f
 
 

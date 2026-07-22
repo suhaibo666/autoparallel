@@ -503,7 +503,14 @@ class MemTimeline:
                             B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
-                            saved = sm.checkpoint_input               # 仅保留层入口
+                            # 全重算保留 = 层入口 checkpoint_input + **重算免疫 saves**
+                            # （2026-07-22，185 pp4+全重算锚点）：fused 自定义算子的
+                            # `ctx.save_for_backward` 状态（SparseFlashMla 11 张量集，
+                            # csa.py:224-235）在 MindSpore use_reentrant=False checkpoint
+                            # 下**不被释放**（真机 ON−OFF 净省仅 6.2GB vs 修前模型 16-23GB），
+                            # 随 1F1B warmup 在途微批累积、至该微批该层反向才释。
+                            # 无免疫标记的 spec `recompute_pinned_saves=0` → 逐字节复现旧行为。
+                            saved = sm.checkpoint_input + sm.recompute_pinned_saves
                         elif recompute.is_select(lid):
                             # 选择性重算：非选中 op 的 saves（去重）+ 层入口边界常驻；
                             # 选中 op 的 saves 丢弃（反向重物化）。介于 full 与全量之间。
