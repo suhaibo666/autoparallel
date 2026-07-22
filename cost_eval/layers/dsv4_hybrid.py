@@ -132,8 +132,12 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     if sparse:
         # compressed_kv / kv_gathered 亦 KV 侧（cp_kv=True，D-1 修正）：colossal 下 all-gather 到 full-S。
         compressed_kv = TensorRef("compressed_kv", (S_DIV_R, "B", "1", "v_head_dim"), cp_kv=True)  # :221
-        kv_gathered   = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"), cp_kv=True)  # csa.py:208
-        attn_weights  = TensorRef("attn_weights", ("B", "n_heads", "S", TOPK_DIM))               # csa.py:237
+        kv_gathered   = TensorRef("kv_gathered",  ("B", "S", TOPK_DIM, "v_head_dim"), cp_kv=True)  # csa.py:485
+        # kv_g = **fp32 副本** of kv_gathered（csa.py:490 `ops.cast(kv_gathered, float32)`）——unfused 小算子
+        #   路径把 gather 后的 KV 升 fp32 做打分/加权和,反向常驻。是 unfused 最大瞬态（seq²·topk·vd 级）。
+        kv_g_fp32     = TensorRef("kv_g_fp32",    ("B", "S", TOPK_DIM, "v_head_dim"), cp_kv=True, dtype_bytes=4)  # csa.py:490
+        # attn_weights = softmax 输出 **fp32**（csa.py:519-534 exp/sum/除全在 fp32）。
+        attn_weights  = TensorRef("attn_weights", ("B", "n_heads", "S", TOPK_DIM), dtype_bytes=4)  # csa.py:531
         topk_indices  = TensorRef("topk_indices", ("B", "S", TOPK_DIM), dtype_bytes=4)           # :241 int32
         idx_wq_b  = TensorRef("idx_wq_b",  ("q_lora_rank", IDX_QB_OUT),         is_weight=True)   # indexer.py:109-117
         idx_wproj = TensorRef("idx_wproj", ("H", "dsa_indexer_n_heads"),        is_weight=True)   # indexer.py:126-134
@@ -141,17 +145,26 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         cmp_wgate = TensorRef("cmp_wgate", ("H", CMP_PROJ_OUT),                 is_weight=True)    # compressor.py:107-115
         cmp_ape   = TensorRef("cmp_ape",   (str(compress_ratio), CMP_PROJ_OUT), is_weight=True, dtype_bytes=4)  # :117-120 fp32
         attn_sink = TensorRef("attn_sink", ("n_heads",), is_weight=True, dtype_bytes=4)          # csa.py:304-308
-        # indexer（仅 CSA ratio==4）：index_scores [B,S,S] fp32 建为 bwd_scratch（可重算不 save，indexer.py:227-236）
+        # indexer（仅 CSA ratio==4）。**fused**：`npu_lightning_indexer` 只返 topk_scores、全阵 [B,S,n,S] 走
+        #   kernel scratch 不物化（真机 15415 查无）→ 保持旧 `4*B*S*S` bwd_scratch 口径,fused 锚点不动。
+        # **unfused**：`index_scores = bmm(q,k).reshape(b, sq, n_idx, sk)`（indexer.py:245-246）**前向物化**
+        #   [B,S,dsa_indexer_n_heads,S]、为 indexer KL loss 反向常驻（dsa_indexer_loss.py）——**含 n_idx_heads
+        #   维**（此前 [B,S,S] 漏了 ×n_idx=64,是 unfused 大欠算之一）→ 前向 save,不再当小 scratch。
         if enable_indexer:
-            ops.append(OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
-                              params=[idx_wq_b, idx_wproj], saves=[topk_indices], bwd_scratch="4*B*S*S"))
+            if fused:
+                ops.append(OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
+                                  params=[idx_wq_b, idx_wproj], saves=[topk_indices], bwd_scratch="4*B*S*S"))
+            else:
+                index_scores = TensorRef("index_scores", ("B", "S", "dsa_indexer_n_heads", "S"))  # indexer.py:246 bf16 bmm
+                ops.append(OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
+                                  params=[idx_wq_b, idx_wproj], saves=[topk_indices, index_scores]))
         # compressor：门控池化 → compressed_kv [S//ratio,B,1,vd]（compressor.py）
         ops.append(OpSpec("compressor", OpType.MATMUL, [ln1], compressed_kv,
                           params=[cmp_wkv, cmp_wgate, cmp_ape], saves=[compressed_kv]))
         # sparse attention：save Q(=q_hnorm fp32)+O(core_out)；fused kernel 不物化 kv_gathered/
         # attn_weights（走 scratch）；unfused 才 save 它们。
         sparse_saves = ([q_hnorm, core_out] if fused
-                        else [q_hnorm, kv_gathered, attn_weights, core_out])
+                        else [q_hnorm, kv_gathered, kv_g_fp32, attn_weights, core_out])
         # inputs 含 topk_indices（仅 CSA）= 稀疏选 KV 的**数据流依赖**（indexer→sparse_attn 边;
         # 2026-07-11 补边:此前缺此边致 indexer 成 op 图孤立叶节点。saves/字节不变）。
         sparse_ins = ([q_hnorm, kv_a_out, compressed_kv, topk_indices] if enable_indexer

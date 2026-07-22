@@ -436,6 +436,10 @@ def parse_and_validate(p):
         first_k_dense_replace=dense_k,
         num_moe_experts=(E if has_moe else None),
         moe_router_topk=topk,
+        # DSA/CSA 融合开关(dsa/dsv4_hybrid 生效):True=fused kernel(稀疏中间量走 scratch 不物化);
+        #   False=unfused 小算子(物化 kv_g fp32/index_scores[B,S,n_idx,S]/attn_weights fp32,激活大得多)。
+        #   此前 eval_config 不透传 → 无论 yaml apply_dsa_kernel_fusion 与否恒按 fused 估(dsv4_hybrid 欠估)。
+        dsa_fused=_x_flag(p, "dsa_fused", True),
         mtp_num_layers=max(0, mtp))
     # mHC（HyperConnection 残差变体）：hc 显式设时覆盖基座——1=plain、≥2=mhc(hidden×n 残差流)。
     #   空(hc=0)则保留基座（v4 预设 base=deepseek_v4→num_residual_streams=4、v3→plain）→ 不误关预设 mHC。
@@ -913,6 +917,9 @@ def _bundle_to_fields(b):
     #   在 round-trip 被静默降级为 plain(hc=1)→ 持久/激活欠算 ×n。residual_variant≠mhc → 1(无 mHC)。
     f["hc"] = (int(getattr(llm, "num_residual_streams", 1) or 1)
                if getattr(llm, "residual_variant", "plain") == "mhc" else 1)
+    # DSA/CSA 融合开关(apply_dsa_kernel_fusion)：此前遗漏 → yaml unfused 在 UI round-trip 被静默按 fused
+    #   估(dsv4_hybrid 激活大幅欠估,现场 DSv4-Flash 实证 unfused 真机 45557 vs fused 估 ~27k)。
+    f["dsa_fused"] = int(bool(getattr(llm, "dsa_fused", True)))
     return f
 
 
@@ -1257,6 +1264,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
       <div class="fld"><label>reshard 策略</label><select name="reshard" title="reshard_after_forward_policy:default(PP 整体不 reshard,非 PP 除 output 均前向后即 reshard) / always(前向后即 reshard,反向 re-gather) / never(unsharded 权重驻留至本模块反向) —— 改 gather 生命周期(fsdp=dp_shard·cp>1 时生效)"><option value="default" selected>default</option><option value="always">always</option><option value="never">never</option></select></div>
       <input type="hidden" name="sp" value="">
       <input type="hidden" name="grad_bytes" value="4">
+      <input type="hidden" name="dsa_fused" value="1">
     </div>
   </section>
 </aside>
