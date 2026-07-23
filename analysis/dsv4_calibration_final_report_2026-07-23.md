@@ -109,6 +109,18 @@ ON:185 实测释放远少于 116(同 yaml,116 shim ON s0=5413 vs 185 ON s0=11132
 - **深 PP(pp≥8)+全重算**:warmup/尾 stage 准,中部按保守上界读(不会 OOM 误判)。
 - OOM 判断始终以评估器值(保守侧)为准;评估器已不存在系统性欠估路径。
 
+## 七.5、⟪2026-07-23 追补⟫ 全重算驻留体身份定案(两轮机制排查)
+
+用户质疑「ctx.save_for_backward 在重算下应不驻留(torch 语义)」→ 两轮受控实验 + 真实层隔离二分,最终定案:
+
+1. **「ctx 逃逸 hooks」假设证伪**:185 单变量 A/B(8块×512MiB,唯一变量=保存路径),裸 `ms.recompute(use_reentrant=False)` 与生产 wrapper(hyper-parallel checkpoint+context_fn)下,普通算子 saves 与自定义 `_Function` ctx saves **均被正常释放**(ctx+重算 1024MiB vs 无重算 5120MiB)。用户的 torch 直觉在 MS2.10 的裸机制上成立。
+2. **驻留体 = 层前向激活主体(层内,非并行机器)**:单卡(无 FSDP/PP)真实层 L1/L2 差分复现——std 408MiB/层激活+1024 持久@seq4096;fused 1241/层@seq2048(∝seq → ~2483@seq4096)+3754 持久。算术闭合:pp4 s0 瞬态 15326÷8 微批层=1916 ≈ 层激活主体;R1 相位 8×408+累积梯度 ≈ 5813 ✓。
+3. **多卡 wrap 生效时(日志 "Set full recompute at layer" 为证),全重算只释放层激活的 ~30% 小切片**(pp4 s0 ON−OFF=6.2GB / 激活 ~22GB),大头以非 hookable 方式被持有;逐张量指名受限于 MS 无 per-tensor 存活 API(gc 清点实测盲,memory_stats 仅池级)。
+4. **新发现框架 bug 候选:某些配置下 full recompute 静默不生效**——单卡 pp1×dp1 的 ON 组 config 带 recompute 段但日志无 "Set full recompute at layer",ON≡OFF 逐 MiB(repro:185 `log_bisect_sc_{std,fused}_L*_on`);多卡组有日志、ON≠OFF(正对照)。
+5. **评估器含义**:数值零变化(pinned 集字节≈层激活主体,已锚 −0.2%);概念标签由「ctx 免疫」订正为「全重算驻留的层激活主体」(model_spec/mem_timeline 注释)。
+
+**给 MindSpore/mindformers 的 issue 素材(三条)**:① full recompute 在部分配置静默不生效(附 repro 配置与日志);② 全重算生效时仅释放层激活小切片,与 torch checkpoint 语义差距大(repro=pp4 ON/OFF 锚点);③ 缺 per-tensor 设备内存归属/存活 API(gc 对 C++ 持有张量盲)。
+
 ## 八、复核方式
 
 ```bash
