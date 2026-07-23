@@ -129,3 +129,78 @@ def test_device_peak_stage0_within_5pct(peaks_on):
     """设备峰值 stage(ON=s0,1F1B warmup 最深)是 OOM 判定的锚——必须 ±5%。"""
     ratio = max(peaks_on.values()) / max(REAL_ON.values())
     assert 0.95 <= ratio <= 1.05
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 追加锚点（2026-07-23）：MTP 尾 stage（185 pp4+mtp=1 全重算）与 pp8 饱和探针（185 pp8）
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+# ── MTP 锚（185,pp4/dp2/ep2,fused dsv4,seq4096,全重算["0-8"],num_nextn_predict_layers=1,
+#    3 步真 loss mtp_1_loss≈3.59;log_dsv4h_pp4_mtp）:mtp=1 仅尾 stage 净增 +16390,
+#    s0-s2 与无 MTP 锚**逐 MiB 重合**（复现性完美）───────────────────────────────────────
+REAL_MTP = {0: 24153.0, 1: 14641.0, 2: 14100.0, 3: 39898.0}
+# 机制（mem_timeline.mtp_resident 桶）：mtp 层 loss 段激活（h_last/h_final/logits/logsm ≈
+# 3126 MiB/微批@seq4096·vocab129280）每微批前向后驻留至 step 末（mtp_k_loss 逐步聚合的反向图
+# 跨微批持有）→ m=4 × 3126 = 12504 ≈ 真机净增 16390 − mtp 层自身 ci/ctx/持久增量。
+BAND_MTP = {0: (0.95, 1.05), 1: (0.95, 1.22), 2: (0.95, 1.05), 3: (0.95, 1.05)}
+
+
+@pytest.fixture(scope="module")
+def peaks_mtp():
+    p = dict(_BASE)
+    p.update({"mtp": "1", "recompute": "full", "pp_split": "2,2,2,3"})   # MTP 归尾 stage(真机口径)
+    r = S.eval_config(p)
+    assert r.get("ok"), r.get("errors")
+    return {st["stage"]: st["peak"] for st in r["stages"]}
+
+
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
+def test_mtp_tail_stage_anchor(peaks_mtp, stage):
+    sim, real = peaks_mtp[stage], REAL_MTP[stage]
+    ratio = sim / real
+    lo, hi = BAND_MTP[stage]
+    assert lo <= ratio <= hi, (
+        f"pp4+MTP ON stage{stage}: sim={sim:.1f} vs 真机 alloc={real:.1f}, ratio={ratio:.3f} "
+        f"越出 ({lo},{hi})。修前 s3 =27166(0.681,漏 MTP loss 链步内驻留 ~12.5GB);"
+        f"s0-s2 必须与无 MTP 锚一致(真机逐 MiB 重合)。")
+
+
+def test_mtp_front_stages_unchanged(peaks_mtp, peaks_on):
+    """真机:加 MTP 后 s0-s2 逐 MiB 不变——仿真同款守卫(mtp_resident 只作用尾 stage)。"""
+    for s in (0, 1, 2):
+        assert abs(peaks_mtp[s] - peaks_on[s]) < 1.0, (
+            f"stage{s}: mtp=1({peaks_mtp[s]:.1f}) ≠ mtp=0({peaks_on[s]:.1f}) —— "
+            f"MTP 驻留泄漏到前部 stage")
+
+
+# ── pp8 饱和探针锚（185,fused dsv4 8L,pp8/dp1/ep1,1层/stage,seq4096,全重算,m=8）────────
+# 真机 rank0-7 alloc。关键发现:s0(warmup8×1层=8 单元)=24759 ≈ pp4 s0(warmup4×2层=8 单元)
+# =24153 → **per-(mb,layer) 线性 pin 成立到 warmup 深度 8**;但 steady 段中部 stage 真机
+# 扁平(s1-s6≈10-12GB,在途 7→2 无线性增长)→ 死 ctx 在 steady 期被流同步/压力回收,饱和
+# ≈3-4 单元——评估器按调度代数线性给在途数 → 中部 stage 过估 +30~62%(保守/OOM 安全侧,
+# band 上界文档化;s0/s6/s7 ±5-15%)。现场 256 卡 s0 +65% 过估即同一来源(warmup 深度 8×
+# 4层/stage=32 单元线性 vs 真机 ~17 单元有效)。
+REAL_PP8 = {0: 24759.0, 1: 12324.0, 2: 11678.0, 3: 11919.0,
+            4: 10867.0, 5: 11113.0, 6: 10074.0, 7: 26449.0}
+BAND_PP8 = {0: (0.95, 1.15), 1: (0.95, 1.70), 2: (0.95, 1.55), 3: (0.95, 1.40),
+            4: (0.95, 1.40), 5: (0.95, 1.15), 6: (0.95, 1.05), 7: (0.90, 1.05)}
+
+
+@pytest.fixture(scope="module")
+def peaks_pp8():
+    p = dict(_BASE)
+    p.update({"dp": "1", "ep": "1", "pp": "8", "mbs": "8", "recompute": "full"})
+    r = S.eval_config(p)
+    assert r.get("ok"), r.get("errors")
+    return {st["stage"]: st["peak"] for st in r["stages"]}
+
+
+@pytest.mark.parametrize("stage", list(range(8)))
+def test_pp8_saturation_anchor(peaks_pp8, stage):
+    sim, real = peaks_pp8[stage], REAL_PP8[stage]
+    ratio = sim / real
+    lo, hi = BAND_PP8[stage]
+    assert lo <= ratio <= hi, (
+        f"pp8 ON stage{stage}: sim={sim:.1f} vs 真机 alloc={real:.1f}, ratio={ratio:.3f} "
+        f"越出 ({lo},{hi})。s0 线性(warmup)/中部饱和(steady 死 ctx 回收)见 band 注释——"
+        f"欠侧漂移(尤其 s0/s7)是 OOM 不安全方向。")

@@ -37,12 +37,13 @@ class Buckets:
     kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）。**两作用域共用此桶**：① select-kept-MoE（kept_frag_factor×kept_act）；② 无重算-MoE（D1，nr_moe_frag_factor×_nr_moe_act，仅 pp==1 单 stage 无重算 loss-BWD）——同族碎片、不同 gate，互斥不双算
     grad_accum: int = 0       # **已规约梯度累计驻留**（P0-01，2026-07-14）：真机证实 step-scoped cumulative——每层首次反向后其 reduced 本地分片常驻，至 optimizer 后 zero_grad 释放（两卡探针 1889.5 MiB 吻合）。与 grad_buf（当前层 reduce-scatter 前 full 瞬态）正交
     p2p_buf: int = 0          # **PP stage 间 P2P send 激活缓冲**（P1-15，Task A）：非末 stage 前向把本 stage 输出激活 [S,B,H] send 给下 stage，send 通信期间驻留（1 份；overlap_p2p 时 2 份双缓冲）。recv 侧（非首 stage 首层输入）已隐含在 act_live 首层 pin → 不双算。pp=1 恒 0。仅 FWD 事件驻留、BWD/optstep 清零（pp2 峰在 BWD，不移锚点）
+    mtp_resident: int = 0     # **MTP loss 链 per-微批步内驻留**（2026-07-23，185 pp4+MTP 锚点）：mtp 层的 loss 段激活（h_last/h_final/logits/logsm）每微批前向后**不随该微批反向释放**、驻留至 step 末（真机 mtp_1_loss 逐步聚合;185 实测 mtp=1 仅尾 stage 净增 +16.4GB ≈ m×3.1GB,前 stage 逐 MiB 不变）。仅 **full-recompute 的 mtp 层** 计入（该层 saved 已塌缩到 ci+ctx,无双算;无重算 mtp 的同款驻留未有锚点,见 gate 注释）。optstep 前清零
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
                 + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
                 + self.swap_buf + self.workspace + self.optstep + self.kept_frag
-                + self.grad_accum + self.p2p_buf)
+                + self.grad_accum + self.p2p_buf + self.mtp_resident)
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class MemBreakdown:
     kept_frag: int = 0
     grad_accum: int = 0       # P0-01 尾部追加（default=0，序不破，照 kept_frag 先例）
     p2p_buf: int = 0          # P1-15 尾部追加（default=0，序不破，照 grad_accum 先例）
+    mtp_resident: int = 0     # 2026-07-23 尾部追加（default=0,序不破）:MTP loss 链步内驻留
 
 
 @dataclass(frozen=True)
@@ -327,6 +329,20 @@ class MemTimeline:
             _moe_lids = {l.layer_id for l in layers
                          if any(getattr(op.type, "value", op.type) == "moe_gemm"
                                 for op in l.ops)}
+            # ── MTP loss 链步内驻留（2026-07-23，185 pp4+MTP 锚点:尾 stage +16.4GB≈m×3.1GB）──
+            # mtp 层 loss 段（final_norm/lm_head/logsoftmax/nll 的 saves = h_last/h_final/
+            # logits_lm/logsm）每微批前向后**驻留至 step 末**（真机 mtp_k_loss 逐步聚合,其反向图
+            # 跨微批持有——185 实测 mtp=1 只尾 stage 净增,s0-s2 逐 MiB 不变）。仅 **full-recompute
+            # 的 mtp 层**计入（其 saved 已塌缩到 ci+ctx,loss 段不在 act_live → 无双算;无重算 mtp
+            # 的同款驻留无锚点,不外推——OFF 下 loss 段本就在 act_live 逐微批计 1 份,保持既有口径）。
+            _MTP_LOSS_OPS = ("final_norm", "lm_head", "logsoftmax", "nll")
+            _mtp_loss_bytes = {
+                l.layer_id: estimate_structure_memory(
+                    [op for op in l.ops if getattr(op, "name", "") in _MTP_LOSS_OPS],
+                    alloc_block_bytes=alloc_block_bytes,
+                    norm_compute_dtype_bytes=norm_compute_dtype_bytes).activation_saves
+                for l in layers
+                if getattr(l, "layer_type", "") == "mtp" and recompute.is_full(l.layer_id)}
 
             # ── P0-03（2026-07-14 review）：reshard_after_forward 接线 ─────────────────
             # 语义（hyper_parallel fsdp.py:42-74 / hsdp_scheduler.py:225-250 / parallelize.py:1172-1182）:
@@ -408,6 +424,7 @@ class MemTimeline:
                         B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
                         B.swap_buf, B.workspace, B.optstep,
                         framework_reserve, B.kept_frag, B.grad_accum, B.p2p_buf,
+                        B.mtp_resident,
                     )
                 if record_timeline:
                     series.append(TimelineSample(len(series), lbl, t, bd, mb, chunk))
@@ -532,6 +549,9 @@ class MemTimeline:
                             saved = sm.activation_saves               # 全量 saves（去重）
                         pinned[(ev_mb, lid)] = saved
                         B.act_live += saved
+                        # MTP loss 链步内驻留（见 _mtp_loss_bytes 注释）：每微批前向累加,
+                        # 不随该微批反向释放,至 optstep 前清零。
+                        B.mtp_resident += _mtp_loss_bytes.get(lid, 0)
                         if _is_kept(lid):
                             kept_act += saved
                         # D1：无重算-MoE 非 loss 层的全量驻留激活累计（margin 标定基）。仅 nr margin
@@ -709,9 +729,11 @@ class MemTimeline:
                 B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
                 B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
                 B.p2p_buf = 0                          # P1-15：step 在所有反向后、P2P 已收尾
+                B.mtp_resident = 0                     # MTP loss 图随全部反向完成释放（step 末）
                 B.optstep = optstep_bytes              # fp32 瞬态（grad_accum 保持驻留，与之共存）
                 rec("optstep")
                 B.optstep = 0
+            B.mtp_resident = 0                         # 无 optstep 事件路径同样清零（跨 stage 复用 B）
             B.grad_accum = 0                           # zero_grad 语义：optimizer 后释放（真机探针）
 
             res[stage] = StagePeak(

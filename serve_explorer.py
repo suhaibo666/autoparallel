@@ -25,7 +25,7 @@ from cost_eval.report import Evaluator
 MiB = 2 ** 20
 BK = ["persistent", "act_live", "kept_frag", "gather_buf", "grad_buf", "recomp_scratch",
       "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "optstep",
-      "grad_accum", "p2p_buf", "framework"]   # grad_accum/p2p_buf(2026-07-20):此前遗漏→HTML 不展示
+      "grad_accum", "p2p_buf", "mtp_resident", "framework"]   # grad_accum/p2p_buf(2026-07-20):此前遗漏→HTML 不展示;mtp_resident(2026-07-23):MTP loss 链步内驻留
 _CP_METHODS = ("colossal", "ulysses", "ring", "hybrid")
 # select 选择器:**单一来源** = 转换器 _SELECT_MODULE_OPS（2026-07-14 review P1.5:此前双维护
 # 导致口径漂移——serve 多 "qkv" 而转换器没有,GQA yaml select 静默漏选）。
