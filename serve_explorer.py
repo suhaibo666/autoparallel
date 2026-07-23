@@ -553,14 +553,17 @@ def graph_json(layers, norm_dtype, spec, dims, recompute=None):
         _optype = lambda op: getattr(op.type, "value", op.type)
         # 该层重算态 → 层头 stored 总量（与 mem_timeline FWD `saved=...` 逐字节同口径）。
         #   - none  ：`activation_saves`（全量 saves 常驻）。
-        #   - full  ：`checkpoint_input`（仅保层入口锚点，层内所有 op 反向重物化）。
+        #   - full  ：`checkpoint_input + recompute_pinned_saves`（层入口锚点 + **重算免疫 ctx**
+        #     ——fused 自定义算子 `ctx.save_for_backward` 状态在全重算下不释放，mem_timeline.py:569
+        #     同式；2026-07-23 修显示不同步：此前只显 checkpoint_input（256M/层），与 timeline 每微批
+        #     +~1.8G/层 差 ~7×，用户现场实证误读）。饱和 cap 外微批只留层入口（timeline 语义，见其注释）。
         #   - select：`act_live_pinned`（非选中 op saves ∪ 层入口锚点）。
-        # per-op stored 判定则更朴素——**被重算的 op 前向不存任何 saves**（stored=not op_recomp）；
-        # 层入口 checkpoint_input 是**层级重算锚点**（上一层输出，非本层某 op 的激活），单列 `entry_mib`
-        # 于层头解释 stored 总量与 per-op 之差，不摊到某个被重算 op（否则「此 op 重算却仍显 X MiB」易误读）。
+        # per-op stored 判定：被重算 op 前向不存 saves，**除** full 态下 pin_under_recompute 的
+        # ctx 免疫 save（自定义算子持有，标注区分）；层入口 checkpoint_input 是**层级重算锚点**
+        # （上一层输出，非本层某 op 的激活），单列 `entry_mib` 于层头解释 stored 总量与 per-op 之差。
         if rc.is_full(lid):
             recomp_state = "full"
-            layer_act = sm.checkpoint_input
+            layer_act = sm.checkpoint_input + sm.recompute_pinned_saves
         elif rc.is_select(lid):
             recomp_state = "select"
             layer_act = estimate_select_memory(
@@ -589,8 +592,11 @@ def graph_json(layers, norm_dtype, spec, dims, recompute=None):
                                 and norm_dtype > t.dtype_bytes)
                 eff_dtype = norm_dtype if is_norm_fp32 else t.dtype_bytes
                 b = t.local_numel * eff_dtype
-                # 被重算的 op 前向不存任何 saves（反向重物化）；否则常驻。
-                stored = not op_recomp
+                # 被重算的 op 前向不存任何 saves（反向重物化）；**例外**：full 态下 ctx 免疫
+                # save（pin_under_recompute，自定义算子 ctx 持有）仍常驻——与 timeline 同口径。
+                pin_kept = (recomp_state == "full" and op_recomp
+                            and getattr(t, "pin_under_recompute", False))
+                stored = (not op_recomp) or pin_kept
                 if stored:
                     stored_b += b
                 else:
@@ -598,7 +604,9 @@ def graph_json(layers, norm_dtype, spec, dims, recompute=None):
                 acts.append({"name": t.name, "mib": round(b / MiB, 2), "stored": stored,
                              "calc": _shape_info(ot, t, dims, eff_dtype)
                                      + (" ←norm 存 fp32 输入" if is_norm_fp32 else "")
-                                     + ("" if stored else " ←重算:反向重物化,前向不存")})
+                                     + (" ←ctx免疫:自定义算子 save_for_backward,全重算不释放"
+                                        if pin_kept else
+                                        ("" if stored else " ←重算:反向重物化,前向不存"))})
             ops.append({"i": i, "name": op.name, "type": op.type,
                         "act_mib": round(stored_b / MiB, 2), "acts": acts,
                         "recomp": op_recomp, "recomp_mib": round(recomp_b / MiB, 2),
@@ -614,6 +622,8 @@ def graph_json(layers, norm_dtype, spec, dims, recompute=None):
                     "full_act_mib": round(sm.activation_saves / MiB, 1),   # 无重算全量（对照）
                     "recomp": recomp_state,                                 # none|full|select
                     "entry_mib": entry_mib,                                 # 重算态层入口锚点（stored）
+                    # full 态 ctx 免疫量（层头拆分显示 = entry + pinned；非 full 恒 0）
+                    "pinned_mib": round(sm.recompute_pinned_saves / MiB, 1) if recomp_state == "full" else 0,
                     "param_mib": round(sum(o["param_mib"] for o in ops), 1),
                     "ops": ops, "edges": edges})
     return out
@@ -1485,7 +1495,7 @@ function drawGraph(st){
     const conn=idx<st.graph.length-1?`<div style="text-align:center;color:#9aa2ad;font:12px var(--mono);line-height:1">↓</div>`:"";
     const rcOnL=(L.recomp&&L.recomp!=="none");
     const amH=rcOnL
-      ? `<span class="am" style="color:#8e44ad" title="重算态:仅存下方标注为「存」的激活;被重算 op 的 saves 前向不存(反向重物化)。层入口锚点=上一层输出,重算必须保留">↻${L.recomp==="full"?"全重算":"选择性重算"} · 存 ${L.act_mib} MiB${L.entry_mib>0?"（层入口锚点 "+L.entry_mib+"M）":""} / 全量 ${L.full_act_mib}</span>`
+      ? `<span class="am" style="color:#8e44ad" title="重算态:仅存下方标注为「存」的激活;被重算 op 的 saves 前向不存(反向重物化)。层入口锚点=上一层输出,重算必须保留;ctx免疫=fused 自定义算子 save_for_backward 状态,MindSpore 全重算不释放、随在途微批累积(timeline 同口径;超饱和 cap 的微批只留层入口)">↻${L.recomp==="full"?"全重算":"选择性重算"} · 存 ${L.act_mib} MiB${L.pinned_mib>0?"（层入口 "+L.entry_mib+"M + ctx免疫 "+L.pinned_mib+"M）":(L.entry_mib>0?"（层入口锚点 "+L.entry_mib+"M）":"")} / 全量 ${L.full_act_mib}</span>`
       : `<span class="am">激活 ${L.act_mib} MiB</span>`;
     return `<div class="lay ${open?"open":""}" data-l="${L.id}"><div class="hd" data-l="${L.id}"><span class="car">${open?"▾":"▸"}</span><span class="lt">L${L.id} ${esc(L.type)}</span><span class="pm2">${L.ops.length} ops · ${L.edges.length} edges</span>${amH}</div>${opsH}</div>${conn}`;
   }).join("");

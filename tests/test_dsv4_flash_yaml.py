@@ -115,3 +115,43 @@ def test_dsv4_flash_evaluates_via_ui_roundtrip():
     assert r["device_peak"] > 0 and len(r["stages"]) == 8         # pp=8
     st = max(r["stages"], key=lambda s: s["peak"])
     assert st["persist_breakdown"]["optimizer"] == "Muon"         # 持久分解按 Muon
+
+
+def test_dsv4_flash_structure_graph_matches_timeline_pin():
+    """结构页层卡与 timeline 全重算口径一致（2026-07-23 现场误读修）。
+
+    此前结构页 full 态只显 `checkpoint_input`（256M/层），而 timeline 每微批 pin
+    `checkpoint_input + recompute_pinned_saves`（~1.8G/层，fused ctx 免疫），差 ~7×
+    ——用户对照两处数字误判"激活多算 10 倍"。修后层卡 act_mib = entry + pinned，
+    且与 timeline 逐微批 act_live 增量同口径（fused ctx 免疫层 pinned>0）。
+    """
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import serve_explorer as S
+    fields = S._bundle_to_fields(from_mindformers_dict(_dsv4_flash()))
+    DEF = {"preset": "custom", "ffn": "3072", "select": "attn", "sel_layers": "",
+           "sel_ops": "", "vpp": "1", "mbs": "", "grad_bytes": "4"}
+    q = dict(DEF)
+    q.update({k: str(v) for k, v in fields.items() if v is not None})
+    r = S.eval_config(q)
+    assert r["ok"], r.get("errors")
+    g0 = [L for L in r["stages"][0]["graph"] if L["recomp"] == "full"]
+    assert g0, "stage0 应有全重算层"
+    for L in g0:
+        # 层卡 stored = 层入口 + ctx 免疫（与 mem_timeline.py:569 同式；容差=两处独立 round 0.1M）
+        assert abs(L["act_mib"] - (L["entry_mib"] + L["pinned_mib"])) < 0.2, L
+        assert L["pinned_mib"] > 0, "fused dsv4 全重算层应有 ctx 免疫量"
+        assert L["act_mib"] < L["full_act_mib"], "全重算存量仍应小于无重算全量"
+    # 与 timeline 对账:首微批各层 fwd 的 act_live 逐层增量 == 层卡 act_mib（同口径）
+    tl = r["stages"][0]["timeline"]
+    incs, prev = [], 0.0
+    for e in tl:
+        if e["event"].startswith("fwd:"):
+            cur = e["buckets"].get("act_live", 0.0)
+            incs.append(cur - prev); prev = cur
+        elif not e["event"].startswith("fwd"):
+            break
+    # 跳过伪层(embedding,增量≈0),取与全重算层数相同的非零增量段比对
+    nonzero = [i for i in incs if i > 1.0][:len(g0)]
+    for inc, L in zip(nonzero, g0):
+        assert abs(inc - L["act_mib"]) < 1.0, (inc, L["act_mib"])
