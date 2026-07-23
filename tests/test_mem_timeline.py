@@ -138,7 +138,11 @@ def test_none_full_byte_identical_anchor():
     小幅增：none 3768320→3777024、full（optstep 峰）3211264→3220480。"""
     none = _sim(RecomputeSpec("None"))
     full = _sim(RecomputeSpec("full", {0, 1, 2, 3}))
-    assert none.peak_bytes == 3777024
+    # 2026-07-23（std census）：none 3777024 → 5284352——标准路径 pynative 全保留 census 补齐
+    # （split/rope-fp32/TND/mask/ctx/残差保留,116 stdL1/2/4/8 逐层差分 728.0(MHA) 实测背书,
+    # attention.py build_gqa_attn_ops ①-⑥）→ 无重算 act_live 每层净增;full 锚不动（saves 被
+    # 丢弃重物化,census 追加成员默认无 pin_under_recompute → 全重算行为不变）。
+    assert none.peak_bytes == 5284352
     assert full.peak_bytes == 3220480
 
 

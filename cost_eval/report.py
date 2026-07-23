@@ -330,6 +330,7 @@ class Evaluator:
             grad_dtype_bytes=getattr(self.opt, "grad_dtype_bytes", 4),
             record_timeline=record_timeline, alloc_block_bytes=block,
             cross_entropy_fused=getattr(self.spec.dims, "cross_entropy_fused", False),
+            ce_pynative_lean=getattr(self.spec.dims, "ce_pynative_lean", False),
             norm_compute_dtype_bytes=getattr(self.spec.dims, "norm_compute_dtype_bytes", 0),
             kept_frag_factor=getattr(self.spec.dims, "kept_frag_factor", 0.0),
             nr_moe_frag_factor=getattr(self.spec.dims, "nr_moe_frag_factor", 0.0),

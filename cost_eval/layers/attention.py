@@ -163,24 +163,68 @@ def build_gqa_attn_ops(d: DimTable) -> list:
             OpSpec("k_norm", OpType.NORM, [qkv], qkv, params=[k_norm_g], saves=[k_norm_in]),
         ]
 
+    # ── 标准路径 pynative 全保留 census（2026-07-23，116 std MHA/GQA 锚点定标）──────────────
+    # 真机（116/MS2.9 pynative）标准注意力的反向图**保留每个 op 的输入与输出**（MindSpore bprop
+    # 签名 (x, y, out, dout)——非 PyTorch 式"仅 save 所需"），逐层差分实测（stdL1/2/4/8 探针,
+    # 每层边际 1240.1 MiB = 持久 512.0 + **saves 728.0(MHA)/584.0(GQA)**,四点零漂移）。此前只建
+    # "PyTorch 式最小 save 集"(360/336) → s0 欠估 ~2×。补齐成员全部按 shape 推字节、逐条对应
+    # mindformers/pynative 源码（transformers/attention.py + base_models/common/embeddings/
+    # rope_utils.py），MHA−GQA 差 = 144.0 MiB/层 亦与真机差分吻合（pp1 实测 1152/8 层）：
+    #   ① split 出的 q/k/v 复本（attention.py:187-200 mint.split→reshape,新张量,被 rope/sbh2tnd
+    #      持有）：q [S,B,n_heads·d] + k/v [S,B,n_kv·d] bf16。
+    #   ② RoPE fp32 中间量（rope_utils.py:169 `cast(t, rotary_dtype=fp32)`、:211-227 _rotate_half、
+    #      :186-187 `add(mul(t,cos), mul(t_rot,sin))`——Mul/Add 的 bprop 持有其全部输入与输出）：
+    #      q/k 各 3 份 fp32（cast 入、rotate_half、输出）。
+    #   ③ TND 重排复本（attention.py:154-166 sbh2tnd reshape+permute → FlashAttentionScore 实际
+    #      输入,与 ①/qkv 是不同张量）：q/k/v 各一份 bf16。
+    #   ④ attn_mask uint8 复本（attention.py:224-226 `cast(attention_mask, uint8)` 每层每微批
+    #      新张量,FA bprop 持有）：[S,S] 1B。
+    #   ⑤ TND→SBH 回排复本（attention.py:236-240 reshape+permute,linear_proj 实际输入）：
+    #      ctx [S,B,n_heads·d] bf16。
+    #   ⑥ 残差/输出保留（o=linear_proj 输出、fc2 输出、两个残差 add 输出之属,bprop 持出参）：
+    #      o_ret/f2_ret/h2_ret 各 [S,B,H] bf16（fc2/add2 物理属 FFN 段;为不动 MLA/DSv3 冻结
+    #      golden 的共享 FFN builder,统一记账在标准 attn 段——字节等价,文档化归位）。
+    # MLA 路径（build_mla_attn_ops,DSv3 锚 12 项冻结）与 DSv4 路径不动。
+    KHD = "n_kv*head_dim"
+    q_split = TensorRef("q_split", ("S", "B", NHD), shard={2: "tp"})
+    k_split = TensorRef("k_split", ("S", "B", KHD), shard={2: "tp"})
+    v_split = TensorRef("v_split", ("S", "B", KHD), shard={2: "tp"})
+    rope_q_f32 = TensorRef("rope_q_f32", ("S", "B", NHD), shard={2: "tp"}, dtype_bytes=4)
+    rope_q_rot = TensorRef("rope_q_rot", ("S", "B", NHD), shard={2: "tp"}, dtype_bytes=4)
+    rope_q_out = TensorRef("rope_q_out", ("S", "B", NHD), shard={2: "tp"}, dtype_bytes=4)
+    rope_k_f32 = TensorRef("rope_k_f32", ("S", "B", KHD), shard={2: "tp"}, dtype_bytes=4)
+    rope_k_rot = TensorRef("rope_k_rot", ("S", "B", KHD), shard={2: "tp"}, dtype_bytes=4)
+    rope_k_out = TensorRef("rope_k_out", ("S", "B", KHD), shard={2: "tp"}, dtype_bytes=4)
+    q_tnd = TensorRef("q_tnd", ("S", "B", NHD), shard={2: "tp"})
+    k_tnd = TensorRef("k_tnd", ("S", "B", KHD), shard={2: "tp"})
+    v_tnd = TensorRef("v_tnd", ("S", "B", KHD), shard={2: "tp"})
+    mask_u8 = TensorRef("attn_mask_u8", ("S", "S"), dtype_bytes=1)
+    ctx_tnd = TensorRef("ctx_tnd", ("S", "B", NHD), shard={2: "tp"})
+    o_ret = TensorRef("o_ret", ("S", "B", "H"))
+    f2_ret = TensorRef("f2_ret", ("S", "B", "H"))
+    h2_ret = TensorRef("h2_ret", ("S", "B", "H"))
+
     ops += [
-        # 3. RoPE（in-place，输出复用 qkv 张量引用）
+        # 3. RoPE（split 复本①与 fp32 中间量②在此保留;in-place 输出复用 qkv 引用）
         OpSpec("rope",   OpType.ROPE,        [qkv],        qkv,
-               saves=[]),
-        # 4. FlashAttention（saves 存 q/k/v 与 softmax max/sum 统计——FlashAttentionScoreGrad
-        #    的输入，驻留至反向；workspace = 重算路径再物化瞬态，见 FLASH_LSE_WS 注释）
+               saves=[q_split, k_split, v_split,
+                      rope_q_f32, rope_q_rot, rope_q_out,
+                      rope_k_f32, rope_k_rot, rope_k_out]),
+        # 4. FlashAttention（saves 存 q/k/v(qkv 融合代理 + TND 复本③) 与 softmax max/sum 统计——
+        #    FlashAttentionScoreGrad 的输入，驻留至反向；mask uint8 复本④；ctx 回排复本⑤;
+        #    workspace = 重算路径再物化瞬态，见 FLASH_LSE_WS 注释）
         #    attrs["colossal_kv_ws"]（P1-13/Y1，无条件挂）：GQA fused-qkv 的 colossal CP KV all-gather
         #    full-S buffer 字节表达式；实际是否计入由 shape_eval 三重门决定（见 GQA_COLOSSAL_KV_WS 注释）。
         OpSpec("flash",  OpType.FLASH_ATTN,  [qkv],        attn,
-               saves=[qkv, attn, fa_st],
+               saves=[qkv, attn, fa_st, q_tnd, k_tnd, v_tnd, mask_u8, ctx_tnd],
                workspace_ref=_fa_workspace(),
                attrs={"colossal_kv_ws": GQA_COLOSSAL_KV_WS}),
         # 5. Output 投影（列并行→行并行）
         OpSpec("o_proj", OpType.MATMUL,      [attn, o_w],  o,
                params=[o_w], saves=[attn]),
-        # 6. Residual add（all-reduce 在此隐式完成）
+        # 6. Residual add（all-reduce 在此隐式完成;⑥ 残差/输出保留记账在此）
         OpSpec("add1",   OpType.ELEMENTWISE, [o],          h1,
-               saves=[]),
+               saves=[o_ret, f2_ret, h2_ret]),
     ]
     return ops
 

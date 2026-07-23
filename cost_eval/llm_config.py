@@ -101,6 +101,11 @@ class LLMConfig:
     # 旧默认 4（"fp32"）从未生效（builder 未传，恒 resolve 成 2）——属 dead config + 文档漂移，
     # 现改默认 2 = 已验证行为、字段真实接线；fp32 直存场景显式置 4。
     embedding_params_dtype_bytes: int = 2
+    # unfused CE 链 lean 口径（2026-07-23，116 std MHA/GQA 锚点定标）：True = 无重算 loss stage 的
+    # CE fat 取 K_CE=4（≈3 份满 vocab fp32 co-live + 1 保守——116 std pp1 与 pp2-s1 差分实测一致,
+    # 与 pp 无关）；False = 制度常数（pp>1→8 / pp==1→4——DSv3-era 在含未建模效应的旧探针上标定的
+    # 混合常数,该族锚点冻结在此口径,勿动）。仅 cross_entropy_fused=False 且无重算 loss stage 有差异。
+    ce_pynative_lean: bool = False
 
     # ---- ③ 残差变体（横切）----
     residual_variant: str = "plain"         # plain | mhc
@@ -180,6 +185,7 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         num_residual_streams=cfg.num_residual_streams,
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
         cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
+        ce_pynative_lean=cfg.ce_pynative_lean,         # unfused CE lean K=4（116 std 实测口径）
         norm_compute_dtype_bytes=cfg.layernorm_compute_dtype_bytes,   # norm 激活 fp32（真机 layernorm_compute_dtype）
         kept_frag_factor=cfg.kept_frag_factor,   # B 标定 margin（select-kept-MoE loss 峰碎片长尾）
         nr_moe_frag_factor=cfg.nr_moe_frag_factor,   # D1 标定 margin（无重算-MoE loss 峰碎片长尾，pp==1）

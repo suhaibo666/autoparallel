@@ -51,6 +51,14 @@ class ParallelConfig:
     layers_per_stage: Optional[list] = None
     prefetch_depth: int = 1
     num_microbatches: int = 1                # m = global_batch/(dp*microbatch)，由 adapter 算好
+    # ── hyper_parallel Schedule1F1B 深 warmup（2026-07-23，116 std MHA/GQA 锚点定标）────────
+    # 真机 fork 调度器 warmup = **min(pp−stage, m)**（hyper_parallel/core/pipeline_parallel/
+    # scheduler.py:957）——比 Megatron 的 pp−stage−1（schedule.py build_1f1b）深 1。实测（116 std
+    # pp2, m∈{2,4,8} 差分探针）：非末 stage 峰值在途激活组数 = min(m, pp−stage+1)——m=2→2、
+    # m=4→3、m=8→3（与 m=4 逐 MiB 相同,饱和）,即 steady 期上一微批 BWD 的释放与下一微批 FWD 的
+    # 分配跨流不即时复用,有效在途 = warmup+1。True 时 mem_timeline 非末 stage 改用深 warmup 事件
+    # 序列（_1f1b_from_warmup）。默认 False = Megatron 口径（DSv3 pp2 锚点在此口径标定,逐字节不变）。
+    sched_warmup_plus_one: bool = False
     # grouped-FSDP 子域大小（Z3，2026-07-15，忠实 mindformers `pynative/distributed/parallel_dims.py:443-470`
     # `get_fsdp_shard_mesh`）：dense（非专家）权重在**子域**（size = dense_fsdp_shard_size）上分片,
     # 而非完整 FSDP 域 `fsdp = dp_shard·cp`。子域外的 dp 维对 dense 是**复制** → 每卡 dense 持久 =

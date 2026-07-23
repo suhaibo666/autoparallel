@@ -223,6 +223,7 @@ class MemTimeline:
                  framework_reserve: int, max_device_memory: int,
                  grad_dtype_bytes: int = 4, record_timeline: bool = False,
                  alloc_block_bytes: int = 1, cross_entropy_fused: bool = False,
+                 ce_pynative_lean: bool = False,
                  norm_compute_dtype_bytes: int = 0,
                  kept_frag_factor: float = 0.0,
                  nr_moe_frag_factor: float = 0.0,
@@ -455,6 +456,16 @@ class MemTimeline:
                 chunks = pm.stage_chunks(stage)
                 steps = [(kind, mb, chunks[c], c)                    # C4：保留 chunk id c
                          for kind, mb, c in interleaved_virtual_order(stage, pp, m, v, pp)]
+            elif getattr(pm.pc, "sched_warmup_plus_one", False) and pp > 1 and stage < pp - 1:
+                # hyper_parallel Schedule1F1B 深 warmup（2026-07-23，specs.ParallelConfig
+                # `sched_warmup_plus_one` docstring）：fork 调度器 warmup = min(pp−stage, m)
+                # （scheduler.py:957,比 Megatron 深 1）,116 std m∈{2,4,8} 差分实测非末 stage
+                # 峰值在途 = min(m, pp−stage+1) 组（m=warmup 时无 steady → 恰 warmup 组;
+                # m>warmup 时 steady 首 F 与上一 B 的释放跨流共存 → warmup+1 组,饱和）。
+                # 末 stage warmup=1、在途 1,与 Megatron 口径同 → 不改（走下方分支）。
+                _wu = min(pp - stage, m)
+                steps = [(ev.kind, ev.mb, layer_ids, -1)
+                         for ev in _1f1b_from_warmup(_wu, m)]
             else:
                 steps = [(ev.kind, ev.mb, layer_ids, -1)
                          for ev in build_interleaved_1f1b(stage, pp, m, v)]
@@ -568,7 +579,11 @@ class MemTimeline:
                         #   per-stage select（如 s0:both;s1:none）时未重算的 loss stage 恢复 fat
                         #   （修前被全局 mode=='select' 误关,低估 45%）。
                         if _stage_no_recompute and lid in loss_lids and sm.bwd_scratch > 0:
-                            K_CE = 8 if pp > 1 else 4
+                            #   **ce_pynative_lean（2026-07-23，116 std MHA/GQA 锚点定标）**：该 build
+                            #   的 unfused CE 链实测 ~3.3-4 份 co-live 且 **与 pp 无关**（std pp1 与
+                            #   pp2-s1 差分一致）→ lean K=4。制度常数 8/4 保留为默认（DSv3-era 冻结
+                            #   口径——那批探针的 K=8 是含当时未建模效应的混合常数,勿动其锚点）。
+                            K_CE = 4 if ce_pynative_lean else (8 if pp > 1 else 4)
                             B.bwd_scratch = sm.bwd_scratch // 2 * (K_CE - 1)
                         # 激活 swap（§8.1 swap_buf="从 CPU 预取回的激活"）：被卸载层反向前 H2D 取回，
                         #   swap_buf = 复原当前层 saves（不在 act_live）+ 反向序后 swap_depth 层在飞预取窗

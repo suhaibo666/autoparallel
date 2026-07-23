@@ -50,6 +50,28 @@ def dense_saves(d: DimTable, tp: int = 1, cp: int = 1, sp_on: bool = True) -> in
         + (d.S // cp) * d.B * d.H * 2                          # ln2 （fc1 保留）
         + (d.S // cp) * d.B * (2 * d.F // tp) * 2              # g   （swiglu 保留）
         + (d.S // cp) * d.B * (d.F // tp) * 2                  # act （fc2 保留）
+        + _std_retention_bytes(d, tp, cp)                      # 2026-07-23 census 追加（见下）
+    )
+
+
+def _std_retention_bytes(d: DimTable, tp: int = 1, cp: int = 1) -> int:
+    """标准路径 pynative 全保留 census 追加成员（2026-07-23，116 std 锚点定标——
+    attention.py build_gqa_attn_ops 注释①-⑥）：split q/k/v 复本、RoPE fp32 三元组
+    （q/k 各 cast入/rotate_half/输出）、TND 重排复本、attn_mask uint8、ctx 回排复本、
+    残差/输出保留(o/f2/h2)。全部按 shape 手工列式（与实现独立）。"""
+    nhd = d.n_heads * d.head_dim
+    khd = d.n_kv * d.head_dim
+    row = (d.S // cp) * d.B
+    return (
+        row * (nhd // tp) * 2                # q_split（rope 保留）
+        + 2 * row * (khd // tp) * 2          # k_split + v_split
+        + 3 * row * (nhd // tp) * 4          # rope_q_f32 / rope_q_rot / rope_q_out（fp32）
+        + 3 * row * (khd // tp) * 4          # rope_k_f32 / rope_k_rot / rope_k_out（fp32）
+        + row * (nhd // tp) * 2              # q_tnd（flash 保留）
+        + 2 * row * (khd // tp) * 2          # k_tnd + v_tnd
+        + (d.S // cp) * d.S * 1              # attn_mask_u8 [S,S] uint8（首 S 维 ÷cp）
+        + row * (nhd // tp) * 2              # ctx_tnd（TND→SBH 回排复本）
+        + 3 * (d.S // cp) * d.B * d.H * 2    # o_ret + f2_ret + h2_ret（残差/输出保留）
     )
 
 
@@ -72,11 +94,25 @@ def checkpoint_input(d: DimTable, tp: int = 1, cp: int = 1, sp_on: bool = True) 
     return (d.S // (sp * cp)) * d.B * d.H * 2
 
 
+def _flash_only_retention(d: DimTable, tp: int = 1, cp: int = 1) -> int:
+    """census 追加成员中**仅被 flash 保留**的部分（选中 flash 重算时随之丢弃）：
+    q/k/v TND 复本、attn_mask uint8、ctx 回排复本。rope 保留的 split/fp32 三元组与
+    add1 保留的残差/输出属非选中 op → 仍常驻。"""
+    nhd = d.n_heads * d.head_dim
+    khd = d.n_kv * d.head_dim
+    row = (d.S // cp) * d.B
+    return (row * (nhd // tp) * 2 + 2 * row * (khd // tp) * 2   # q/k/v_tnd
+            + (d.S // cp) * d.S * 1                             # attn_mask_u8
+            + row * (nhd // tp) * 2)                            # ctx_tnd
+
+
 def select_flash_pinned(d: DimTable, tp: int = 1, cp: int = 1, sp_on: bool = True) -> int:
-    """select {"flash"} 时每层常驻激活 = 全 saves − 仅被 flash 保留的 {qkv, fa_stats}
+    """select {"flash"} 时每层常驻激活 = 全 saves − 仅被 flash 保留的
+    {qkv, fa_stats, q/k/v_tnd, attn_mask_u8, ctx_tnd}
     （attn 由非选中 o_proj 保留仍常驻；层入口 x 本就在非选中 ln1 的 saves 里）。"""
     return (dense_saves(d, tp, cp, sp_on)
-            - _qkv_bytes(d, tp, cp) - _fa_bytes(d, tp, cp))
+            - _qkv_bytes(d, tp, cp) - _fa_bytes(d, tp, cp)
+            - _flash_only_retention(d, tp, cp))
 
 
 def select_flash_recomp(d: DimTable, tp: int = 1, cp: int = 1) -> int:
@@ -136,7 +172,11 @@ def test_tp2_shards_exactly_the_sharded_tensors_only():
     """tp=2（sp 同开）相对 tp=1 的削减恰好 = 被 tp 切的张量之半（qkv/attn/fa/g/act）
     加 sp 切的 x/h1 之半——非均匀 ÷2（ln1/ln2 不随 tp 切），防「全体一刀切」类错误建模。"""
     s1, s2 = dense_saves(D_HY, 1, 1), dense_saves(D_HY, 2, 1)
-    unsharded = 2 * (D_HY.S * D_HY.B * D_HY.H * 2)          # ln1 + ln2 不切
+    # 不随 tp/sp 切的 saves：ln1/ln2 + census 追加的 attn_mask_u8 [S,S] 与 o/f2/h2 残差保留
+    # （[S,B,H] 无 shard 标注,2026-07-23 census,见 _std_retention_bytes）。
+    unsharded = (2 * (D_HY.S * D_HY.B * D_HY.H * 2)         # ln1 + ln2 不切
+                 + D_HY.S * D_HY.S * 1                       # attn_mask_u8
+                 + 3 * (D_HY.S * D_HY.B * D_HY.H * 2))      # o_ret + f2_ret + h2_ret
     assert s2 == unsharded + (s1 - unsharded) // 2
     # 仿真侧同款（间接经 test_tp_cp_activation_saves_analytic 的字节相等保证，此处锁关系式）
     pc1 = ParallelConfig(tp=1, sequence_parallel=True, num_microbatches=1)

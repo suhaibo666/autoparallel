@@ -336,8 +336,20 @@ def parse_and_validate(p):
             errs.append(f"{uik} 必须是 ≥1 的整数")
         elif v >= 1:
             dim_over[field] = v
-    if "qk_nope_head_dim" in dim_over and "qk_rope_head_dim" in dim_over:
+    # head_dim = qk_nope+qk_rope 是 **MLA 族语义**（每头 nope+rope 拼接）。标准 mha/gqa 的
+    # head_dim = hidden/heads,与 qk_nope/qk_rope 无关——而 yaml 导入回填(_bundle_to_fields)对
+    # 非 MLA 模型发 qk_nope=1/qk_rope=1(缺省占位),此前无脑相加把 head_dim 覆盖成 2(应 64)
+    # → 标准注意力段激活/权重全线缩水 32×(116 std 锚点 s0 欠估 57% 的主根因,2026-07-23 修)。
+    if (attn in ("mla", "dsa", "dsv4_hybrid")
+            and "qk_nope_head_dim" in dim_over and "qk_rope_head_dim" in dim_over):
         dim_over["head_dim"] = dim_over["qk_nope_head_dim"] + dim_over["qk_rope_head_dim"]
+    elif attn in ("mha", "gqa"):
+        # 标准注意力 head_dim = hidden/heads(attention.py:112-115 hidden_size%num_heads 校验即此
+        # 语义)。不推导则残留预设基座的 MLA head_dim(deepseek_v3 = nope128+rope64 = 192)→ 标准
+        # 路径 qkv/attn 激活与权重按 3× 高估(与上面 qk 相加覆盖成 2 的缩水 bug 同段,一并修)。
+        _hid = dim_over.get("hidden_size", 0)
+        if _hid and heads and _hid % heads == 0:
+            dim_over["head_dim"] = _hid // heads
 
     for name, v, lo in [("layers", N, 1), ("batch", B, 1), ("seq", S, 1), ("heads", heads, 1),
                         ("dp_shard", dp, 1), ("tp", tp, 1), ("ep", ep, 1), ("pp", pp, 1), ("cp", cp, 1),
@@ -447,6 +459,16 @@ def parse_and_validate(p):
     #   过估 ~10GiB（2026-07-22 185 pp4 锚点定标时修）。缺省不传 → 保留基座/默认（历史行为不变）。
     if (p.get("ce_fused") or "").strip() != "":
         cfg = dataclasses.replace(cfg, cross_entropy_fused=_x_flag(p, "ce_fused", cfg.cross_entropy_fused))
+    # unfused CE lean 口径（隐藏字段 ce_lean,2026-07-23 std 锚点）：K_CE=4 与 pp 无关（116 std
+    # pp1/pp2-s1 实测一致）。缺省 → 制度常数 8/4（DSv3-era 冻结口径）。
+    if (p.get("ce_lean") or "").strip() != "":
+        cfg = dataclasses.replace(cfg, ce_pynative_lean=_x_flag(p, "ce_lean", cfg.ce_pynative_lean))
+    # embedding/head 权重 dtype 字节（隐藏字段 emb_bytes）：116 std fork 的 TransformerConfig 默认
+    # embedding_params_dtype=float32（shim 配置转储实证）→ 4;缺省 2 = 全部既有锚点口径。
+    if (p.get("emb_bytes") or "").strip() != "":
+        _eb = _i(p, "emb_bytes", 2)
+        if _eb in (2, 4):
+            cfg = dataclasses.replace(cfg, embedding_params_dtype_bytes=_eb)
     # mHC（HyperConnection 残差变体）：hc 显式设时覆盖基座——1=plain、≥2=mhc(hidden×n 残差流)。
     #   空(hc=0)则保留基座（v4 预设 base=deepseek_v4→num_residual_streams=4、v3→plain）→ 不误关预设 mHC。
     if hc >= 1:
@@ -644,7 +666,11 @@ def _build_eval_specs(p, pa):
         sequence_parallel=seq_par, num_microbatches=mbs,
         context_parallel_method=pa["method"], interleave=pa["vpp"],
         reshard_after_forward=reshard, cpu_offload=offload, prefetch_depth=prefetch,
-        layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None))
+        layers_per_stage=(list(pa["pp_split"]) if pa["pp_split"] and pa["pp"] > 1 else None),
+        # 隐藏字段 sched_wp1（2026-07-23 std 锚点）：hyper_parallel Schedule1F1B 深 warmup
+        # （scheduler.py:957 warmup=pp−stage）→ 非末 stage 在途 = min(m, pp−stage+1)。
+        # 缺省 False = Megatron 口径（DSv3 pp2 锚点冻结口径）。
+        sched_warmup_plus_one=_x_flag(p, "sched_wp1", False))
     # 优化器 dtype(缺省 fp32,历史手配假设):bf16 params 多存一份 compute 副本(state 14 vs 12)。
     opt_fp32 = str(p.get("opt_dtype", "fp32")).strip().lower() != "bf16"
     _gb = _x_int(p, "grad_bytes", 4)
@@ -908,6 +934,10 @@ def _bundle_to_fields(b):
     #（不再固定假设 64GiB/AdamW-fp32/dp_replicate=1/reshard=default/offload 关/prefetch=1）。
     # 这些键随 qs() 回传给 eval_config → `_build_eval_specs` 消费 → 真 round-trip。
     f["dp_replicate"] = pc.dp_replicate                       # 纯数据并行度(复制,不切分)
+    # num_microbatches 回填（2026-07-23 修）：此前不回填 → eval 端 auto=pp（116 std pp2 yaml 真值
+    # m=4=gbs/(dp·mbs) 被静默当 2,warmup/grad_accum/act 在途全错）。m==pp 时与 auto 相同（既有
+    # 锚点/现场 yaml 均 m==pp → 逐字节不变）。
+    f["mbs"] = pc.num_microbatches
     f["reshard"] = pc.reshard_after_forward                   # always|never|default(gather 生命周期)
     f["cpu_offload"] = int(bool(pc.cpu_offload))              # 参数/优化器态卸载 CPU
     f["prefetch"] = getattr(pc, "prefetch_depth", 1)          # FSDP 参数预取深度

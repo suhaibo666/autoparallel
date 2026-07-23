@@ -52,10 +52,16 @@ def test_flash_saves_softmax_stats_is_BNS8_fp32():
 
 
 def test_flash_saves_no_SxS_matrix():
-    """任一 flash save 不得含 S 出现两次（真 FA softmax_out 为空、不物化 S×S）。"""
+    """任一 flash save 不得含 S 出现两次（真 FA softmax_out 为空、不物化 S×S 分数矩阵）。
+
+    例外（2026-07-23 std census）：`attn_mask_u8` [S,S] **uint8**（dtype_bytes=1）是真机
+    attention.py:224-226 `cast(attention_mask, uint8)` 的每层复本（FA bprop 持有）——合法
+    S×S 保留;本合约只禁 **≥2B**（bf16/fp32）的 S×S 分数/概率矩阵物化。"""
     for tag, spec in _flash_specs():
         for lt, op in _flash_ops(spec):
             for t in op.saves:
+                if (t.dtype_bytes or 2) == 1:
+                    continue          # uint8 mask 复本（真机保留,非分数矩阵）
                 s_count = sum(1 for d in t.shape if "S" in str(d))
                 assert s_count <= 1, (tag, lt, t.name, t.shape, "疑似 S×S 矩阵")
 
