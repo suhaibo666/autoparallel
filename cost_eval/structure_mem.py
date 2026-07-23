@@ -82,6 +82,42 @@ def _align_up(nbytes: int, block: int) -> int:
     return ((nbytes + block - 1) // block) * block
 
 
+def _fsdp_local_count(w, divisor: int, ep_degree: int = 1) -> int:
+    """单参数的 FSDP 后本地元素数——runtime 切分口径（P0-3，2026-07-23，mindformers
+    commit 377c9c344）。
+
+    runtime 按 TP/EP placement 后参数**首维**切 FSDP（parallelize.py:331-350）：
+      - `shape[0] % divisor == 0` → 正常 shard：`numel // divisor`（整除时与旧 ceil 相等，
+        全部真机锚点逐字节不变）。
+      - 不可整除（dense 路径,或 ep=1 时 expert 随父层走 dense wrap）→ **整参
+        replicate_params**（不做 FSDP,全量驻留;特殊小参数 :353-378 亦显式复制）——
+        旧 total-numel ceil 假设（FSDP2 flat-param pad）被 runtime 源码推翻,ceil 对整参
+        复制可低估 divisor 倍,并非 OOM 安全（audit §6）。
+      - expert 独立 wrap（`is_expert and ep_degree>1`,:1109-1113 未传 replicate_params）
+        不可整除 → **fail-loud**（runtime 无 replicate/pad 语义,不静默猜）。
+    `dim0==0`（旧构造/测试 stub 无首维信息）→ 退回 total-numel 整除判定（可整除 shard/
+    不可整除 replicate,与首维判定在无 TP 的常见形状下同值）。divisor<=1 → 全量。
+    """
+    if divisor <= 1:
+        return w.local_numel
+    d0 = getattr(w, "dim0", 0)
+    if getattr(w, "is_expert", False):
+        # expert 权重 runtime 按**扁平 grouped 存储**切（GroupedMLP weight1 [e·H, F]，
+        # expert_parallel.py Shard(0) 作用在 e·H 维）——评估器 3D shape (E,H,F) 的首维 e 不是
+        # runtime shard 维,故以 local_numel 整除为判定粒度（e·H·F ∝ e·H,常见形状同判）。
+        key = w.local_numel
+    else:
+        key = d0 if d0 else w.local_numel
+    if key % divisor == 0:
+        return w.local_numel // divisor
+    if getattr(w, "is_expert", False) and ep_degree > 1:
+        raise ValueError(
+            f"expert 权重 {w.name}（dim0={d0}, numel={w.local_numel}）不被 efsdp={divisor} 整除："
+            f"runtime expert 独立 wrap（parallelize.py:1109-1113）无 replicate_params/pad 语义,"
+            f"该配置真机会拒绝——fail-loud,不静默估算。")
+    return w.local_numel                       # replicate_params：整参驻留
+
+
 def _norm_save_names(resolved_ops) -> set:
     """norm-type op（layernorm/RMSNorm）**保留的输入**激活名集合——真机 fp32 compute 下保留输入的
     fp32 cast 供反向（profiler 的 Cast 大头）。**只标 op.saves**（保留的输入 fp32）：norm 输出会被
@@ -197,6 +233,7 @@ def estimate_structure_memory(
     norm_compute_dtype_bytes: int = 0,
     bwd_scratch_conservative: bool = False,
     matrix_opt_state_bytes: int = 0,   # Muon:2D 矩阵权重每元素持久字节(0=同 opt_state_bytes → uniform)
+    ep_degree: int = 1,                # P0-3(2026-07-23):expert 独立 wrap 是否激活(>1)——不可整除时 fail-loud vs replicate
 ) -> StructureMemory:
     """把一段属于同一结构的 ResolvedOp 汇总成 `StructureMemory`（按名去重）。
 
@@ -227,11 +264,13 @@ def estimate_structure_memory(
         for s in op.saves:
             saves[s.name] = s
 
-    # 持久 = param+opt（按 fsdp/efsdp 切）。切分不整除 → **FSDP2 flat-param 补齐**：每卡持
-    # `ceil(numel/divisor)`（PyTorch/mindformers FSDP2 把展平参数 pad 到 world 倍数再切）——ceil≥floor
-    # **OOM 安全**（不低估），且天然处理 **tiny param**（numel<divisor，如 dsv4_hybrid 的 attn_sink
-    # =n_heads、fsdp=256）：每卡 1 元素，不再 fail-loud（现场 DSv4-Flash 修，2026-07-21）。整除时
-    # ceil==floor → **逐字节不变**（所有锚点 fsdp 小、param 大，均整除）。opt_state_bytes==0 时不算。
+    # 持久 = param+opt（按 fsdp/efsdp 切）。**不可整除口径（P0-3 修，2026-07-23,runtime
+    # 377c9c344）**：runtime 按 TP/EP 后参数**首维**判定 `shape[0] % shard_size`
+    # （parallelize.py:331-350），不可整除 → **整参不做 FSDP、全量驻留**（replicate_params;
+    # 特殊小参数 :353-378 亦显式复制）。旧「total-numel ceil（FSDP2 flat-param 补齐）」假设被
+    # runtime 源码推翻（audit 报告 §6：ceil 对 replicate 整参可低估 K 倍,并非 OOM 安全）。
+    # expert 独立 wrap（ep>1）runtime 未传 replicate_params（:1109-1113）→ 不可整除 fail-loud。
+    # 整除时 numel//divisor 与旧 ceil 相等 → 全部真机锚点逐字节不变。见 `_fsdp_local_count`。
     persistent = 0
     persist_numel_matrix = persist_numel_other = 0   # 驻留参数计数(分量拆解用,见 static_mem.persistent_breakdown)
     if opt_state_bytes or matrix_opt_state_bytes:
@@ -239,7 +278,7 @@ def estimate_structure_memory(
             divisor = efsdp if w.is_expert else fsdp
             # Muon:2D 矩阵权重用 matrix_opt_state_bytes(momentum-only,较小)，其余走 opt_state_bytes。
             #   AdamW/uniform 时 muon_matrix_names 空 → 全走 opt_state_bytes（逐字节不变）。
-            _cnt = -(-w.local_numel // divisor)         # ceil(numel/divisor)：FSDP2 补齐，OOM 安全
+            _cnt = _fsdp_local_count(w, divisor, ep_degree)
             _osb = matrix_opt_state_bytes if w.name in muon_matrix_names else opt_state_bytes
             persistent += _align_up(_cnt * _osb, blk)
             if w.name in muon_matrix_names:      # 计数按 Muon-矩阵分类(AdamW 也分类,但同倍数;
@@ -258,11 +297,13 @@ def estimate_structure_memory(
     param_full_bytes = sum(_align_up(w.local_numel * w.dtype_bytes, blk) for w in params.values())
     grad_full_bytes = sum(_align_up(w.local_numel * grad_dtype_bytes, blk) for w in params.values())
     # P0-01（2026-07-14 review）：已规约梯度分片（step-scoped cumulative）。divisor 与上方 persistent
-    # 完全同口径（dense÷fsdp、expert÷efsdp），不整除同样按 **FSDP2 补齐 ceil**（OOM 安全，整除时不变）。
+    # 完全同口径（dense÷fsdp、expert÷efsdp）；不可整除同按 P0-3 replicate_params 口径
+    # （整参驻留,`_fsdp_local_count`——replicate 参数梯度不 reduce-scatter,全量 DDP all-reduce 后驻留）。
     grad_shard_bytes = 0
     for w in params.values():
         divisor = efsdp if w.is_expert else fsdp
-        grad_shard_bytes += _align_up((-(-w.local_numel // divisor)) * grad_dtype_bytes, blk)
+        grad_shard_bytes += _align_up(
+            _fsdp_local_count(w, divisor, ep_degree) * grad_dtype_bytes, blk)
     # P1-08：bwd_scratch 由「求和上界」精化为 backward **max-live**（逆序滑窗 window=2）。
     # 单 scratch op 层（loss 的 nll / DSA·dsv4 的 indexer）逐字节不变 == 旧 sum；分离/相邻的多
     # scratch op 层取更紧的 max-live（OOM 安全，≤ sum 恒成立）。见 `_backward_max_live` docstring。

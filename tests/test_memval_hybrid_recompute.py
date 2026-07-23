@@ -383,4 +383,10 @@ def test_cluster_param_conservation_across_hybrid_configs(kw):
     ranks_per_stage = pc.dp_replicate * pc.dp_shard * pc.cp * pc.tp
     cluster_el = sum((p.breakdown.persistent // 14) * ranks_per_stage
                      for p in rep.per_stage)
-    assert cluster_el == pc.dp_replicate * (TP_SHARDED_EL + TP_REPLICATED_EL * pc.tp)
+    expected = pc.dp_replicate * (TP_SHARDED_EL + TP_REPLICATED_EL * pc.tp)
+    # P0-2(2026-07-23,runtime 377c9c344):**ep=1** 时 expert 权重随父层 dense wrap、TP 上复制
+    # (parallelize.py:700-716/:1030-1037)→ tp>1 且 ep=1 的组合多出 expert_global×(tp−1) 份;
+    # ep>1 时 experts 走 EP+eFSDP,cluster 守恒(原式)。
+    if pc.ep <= 1:
+        expected += pc.dp_replicate * (4 * sum(_W_DEC_EXPERT.values())) * (pc.tp - 1)
+    assert cluster_el == expected

@@ -232,10 +232,12 @@ def build_moe_merge_op(d: DimTable) -> "OpSpec":
     """
     comb = TensorRef("comb", ("S", "B", "H"), shard={0: "sp"})
     h2   = TensorRef("h2",   ("S", "B", "H"), shard={0: "sp"})
+    # P0-1（2026-07-23）：shared 输出随权重 TP 复制改为 seq-SP 分布（见 build_shared_expert_ops
+    # 注释;同名张量须与产出侧同分布——ShapeEval P1-03 同名同 numel 不变量）。
     if getattr(d, "moe_shared_gate", False):
-        shared_in = TensorRef("sh_o_gated", ("S", "B", "H"), partial="tp")
+        shared_in = TensorRef("sh_o_gated", ("S", "B", "H"))
     else:
-        shared_in = TensorRef("sh_o", ("S", "B", "H"), partial="tp")
+        shared_in = TensorRef("sh_o", ("S", "B", "H"))
     return OpSpec("moe_add", OpType.ELEMENTWISE, [comb, shared_in], h2, saves=[])
 
 
@@ -258,14 +260,25 @@ def build_shared_expert_ops(d: DimTable) -> list:
 
     # ── Shared expert 激活 / 权重 ─────────────────────────────────────────
     # shared expert 与 routed 共同吃 **ln2**（pre-FFN norm 输出）——2026-07-16 修（此前吃裸 h1）。
+    #
+    # ── P0-1（2026-07-23，runtime 377c9c344）：shared-expert **权重 TP 复制、激活按序列 SP 切** ──
+    # runtime `parallelize.py:718-724`：shared expert 参数在 TP 上 **replicated**（注释明言
+    # "shared expert weights are replicated across TP"），只对 token 激活用
+    # `SequenceParallel(sequence_dim=0)`;权重随后属 dense FSDP wrap（:1063-1068）。修前把
+    # sh_w1/sh_w2 按 tp 切（列/行并行）→ 持久/优化器态/梯度/gather 全部欠估 T 倍（audit §4.4,
+    # OOM 不安全）。修后:权重去 tp shard（复制,persistent 从 P/(TK)→P/K）;激活 sh_g/sh_act 改
+    # 按序列维 {0:"sp"} 切（sequence_dim=0,numel 与旧末维 ÷tp 等价——sp==tp 时;tp=1 锚点两者
+    # 恒等,逐字节不变）;输出 sh_o 权重复制下无 partial-sum（各 rank 算自己的 seq 分片）→ 去
+    # partial、改 {0:"sp"}。
+    # 注:输出 sh_o 真机同为 seq-SP 分布,但 [S,B,H]+{0:"sp"} 恰是 mHC 残差承载签名
+    # (residual.py _is_residual_carrier 会将其 ×n 重命名)——sh_o 非 saves、只影响 fml,
+    # 故取**全量口径**(≥真实,保守;tp=1 恒等),不标 sp、不标 partial(权重复制下无部分和)。
     hin_sh     = TensorRef("ln2",    ("S", "B", "H"))
-    sh_g       = TensorRef("sh_g",   ("S", "B", sh_fc1_out),     shard={2: "tp"})
-    sh_act     = TensorRef("sh_act", ("S", "B", "moe_shared_F"),  shard={2: "tp"})
-    sh_o       = TensorRef("sh_o",   ("S", "B", "H"),             partial="tp")
-    sh_fc1_w   = TensorRef("sh_w1",  ("H",            sh_fc1_out),
-                            shard={1: "tp"}, is_weight=True)
-    sh_fc2_w   = TensorRef("sh_w2",  ("moe_shared_F", "H"),
-                            shard={0: "tp"}, is_weight=True)
+    sh_g       = TensorRef("sh_g",   ("S", "B", sh_fc1_out),      shard={0: "sp"})
+    sh_act     = TensorRef("sh_act", ("S", "B", "moe_shared_F"),  shard={0: "sp"})
+    sh_o       = TensorRef("sh_o",   ("S", "B", "H"))
+    sh_fc1_w   = TensorRef("sh_w1",  ("H",            sh_fc1_out), is_weight=True)
+    sh_fc2_w   = TensorRef("sh_w2",  ("moe_shared_F", "H"),        is_weight=True)
 
     ops = [
         # shared fc1（列并行：H → gated 2*moe_shared_F / ungated moe_shared_F）
@@ -297,7 +310,7 @@ def build_shared_expert_ops(d: DimTable) -> list:
         # dtype_bytes → 解析后默认 2B/BF16（[H,1] 极小、字节可忽略，但 dtype 应正确）。
         sh_gate_w = TensorRef("sh_gate_w", ("H", "1"), is_weight=True, dtype_bytes=4)
         sh_gate_o = TensorRef("sh_gate", ("S", "B", "1"))
-        sh_o_gated = TensorRef("sh_o_gated", ("S", "B", "H"), partial="tp")
+        sh_o_gated = TensorRef("sh_o_gated", ("S", "B", "H"))   # P0-1:随 sh_o 同口径(全量,见上注)
         # ── P1-01（任务 A，2026-07-15）：gate 输入的 **FP32 hidden cast 瞬态** ─────────────
         # 真机 `gate = sigmoid(shared_experts_gate(self.cast(hidden_states, router_dense_type)))`
         # （shared_experts.py:70-71 pynative / :82-83 training_graph）：gate Dense **之前**把

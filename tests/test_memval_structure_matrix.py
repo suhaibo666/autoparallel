@@ -157,7 +157,31 @@ def test_invariant_param_conservation_per_structure(sname):
     # tp=1 的配置必须逐一守恒到基线
     for name in ("dp2", "pp2", "cp2", "vpp2"):
         assert cluster_el(pcs[name]) == base, name
-    # tp=2：复制权重多出一份 → 差值 = 复制量 rep_el ≥ 0；hybrid（也 tp=2）须与 tp2sp 一致
+    # tp=2：复制权重多出一份 → 差值 = 复制量 rep_el ≥ 0。
     rep_el = cluster_el(pcs["tp2sp"]) - base
     assert rep_el >= 0
-    assert cluster_el(pcs["hybrid"]) == base + rep_el, "hybrid 与 tp2sp 的 tp 复制量必须一致"
+    # P0-2(2026-07-23,runtime 377c9c344):tp2sp 是 **ep=1** → expert 权重 TP 复制(随父层
+    # dense wrap,parallelize.py:700-716),其复制量含在 rep_el;hybrid 是 **ep=2** → experts
+    # 走 EP 切、无 TP 复制 → 期望 = base + rep_el − expert_global×(tp−1)。非 MoE 结构
+    # expert_global=0,退化回原式「hybrid 与 tp2sp 复制量一致」。
+    exp_g = _expert_global_el(cfg)
+    assert cluster_el(pcs["hybrid"]) == base + rep_el - exp_g * (2 - 1),         "hybrid(ep=2) 与 tp2sp(ep=1) 的 tp 复制量差应恰为 expert 全量(P0-2 ep 退化语义)"
+
+
+def _expert_global_el(cfg) -> int:
+    """结构的 expert 权重全局 numel（并行全 1 时 local==global;按名去重/层）。"""
+    from cost_eval.parallel_model import ParallelModel
+    from cost_eval.shape_eval import ShapeEval
+    spec = build_llm_spec(cfg)
+    pm = ParallelModel(ParallelConfig(), spec.dims.n_layers, world_size=1)
+    g = ShapeEval().resolve(spec, pm)
+    total = 0
+    for layers in g.stages.values():
+        for layer in layers:
+            seen = {}
+            for op in layer.ops:
+                for w in op.params:
+                    if getattr(w, "is_expert", False):
+                        seen[w.name] = w.local_numel
+            total += sum(seen.values())
+    return total

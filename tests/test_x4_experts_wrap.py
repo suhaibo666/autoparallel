@@ -75,7 +75,9 @@ def _gather_at(sp, event):
 # ---------------------------------------------------------------------------
 
 def test_moe_forward_emits_experts_gather_event():
-    r, g = _sim_dsv3(dp=2)
+    # P0-2(2026-07-23):expert 独立 wrap 仅 ep>1 存在(runtime parallelize.py:1496-1520)→
+    # 拆分用例改 dp=4/ep=2(efsdp=2>1);ep=1 不再拆(见 test_ep1_no_experts_split)。
+    r, g = _sim_dsv3(dp=4, ep=2)
     events = {s.event for s in r[0].timeline}
     moe = _moe_layer_ids(g)
     assert moe
@@ -85,7 +87,7 @@ def test_moe_forward_emits_experts_gather_event():
 
 
 def test_experts_gather_delta_equals_expert_params():
-    r, g = _sim_dsv3(dp=2)
+    r, g = _sim_dsv3(dp=4, ep=2)   # P0-2:ep>1 才有 expert wrap
     by_id = {l.layer_id: l for l in g.stages[0]}
     for lid in _moe_layer_ids(g):
         non, exp = _param_split(by_id[lid])
@@ -98,7 +100,7 @@ def test_experts_gather_delta_equals_expert_params():
 
 def test_attn_segment_excludes_expert_weights():
     """attn 段 gather 不含专家权重：== 非专家 + 预取（预取=下一层整层，depth=1）。"""
-    r, g = _sim_dsv3(dp=2, depth=0)   # depth=0 关预取 → attn gather 恰 = 非专家
+    r, g = _sim_dsv3(dp=4, ep=2, depth=0)   # depth=0 关预取 → attn gather 恰 = 非专家(P0-2:ep>1)
     by_id = {l.layer_id: l for l in g.stages[0]}
     for lid in _moe_layer_ids(g):
         non, exp = _param_split(by_id[lid])
@@ -108,11 +110,20 @@ def test_attn_segment_excludes_expert_weights():
 def test_experts_segment_is_full_layer_gather():
     """experts 段 gather = 非专家 + 专家 = 整层 param_full（depth=0）→ 复现旧单事件口径。"""
     from cost_eval.structure_mem import estimate_structure_memory
-    r, g = _sim_dsv3(dp=2, depth=0)
+    r, g = _sim_dsv3(dp=4, ep=2, depth=0)   # P0-2:ep>1 才有 expert wrap
     by_id = {l.layer_id: l for l in g.stages[0]}
     for lid in _moe_layer_ids(g):
         full = estimate_structure_memory(by_id[lid].ops, alloc_block_bytes=BLK).param_full_bytes
         assert _gather_at(r[0], f"fwd:{lid}#experts") == full, lid
+
+
+def test_ep1_no_experts_split():
+    """P0-2(2026-07-23,runtime 377c9c344):ep=1 无 expert mesh、不单独 fully_shard experts
+    (parallelize.py:1030-1037/:1106-1113/:1496-1520)→ 专家随父层 dense wrap,**无** #experts
+    gather 段(修前 efsdp=dp>1 时误拆)。"""
+    r, g = _sim_dsv3(dp=2, ep=1)
+    events = {s.event for s in r[0].timeline}
+    assert not any(e.endswith("#experts") for e in events)
 
 
 # ---------------------------------------------------------------------------

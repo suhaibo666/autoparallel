@@ -806,8 +806,16 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
                     "（trainer.py:449-454 的 dp_replicate 派生要求整除）。")
             dp_repl = max(dp_repl, int(dp_total) // dp_shard)
     elif dp_total is not None:
-        # 只给总 dp、无 shard → 全 replicate（无 zero/FSDP 切分）。
-        dp_shard, dp_repl = 1, max(dp_repl, int(dp_total))
+        # P0-4（2026-07-23 修，runtime 377c9c344）：`data_parallel` 给定且 `data_parallel_shard<=0`
+        # → **纯 FSDP**：trainer.py:449-454 `shard<0 → dp_replicate=1, dp_shard=data_parallel`
+        # （ParallelDims.from_config 同义,parallel_dims.py:65-96）。修前映射成 dp_shard=1/
+        # dp_repl=D（纯复制 DP）——持久态方向性全错（audit §7:把 pure FSDP 当无 ZeRO,每卡持久
+        # 高估 D 倍,且 OOM 判定语义相反）。`shard>0` 分支不动。
+        dp_shard, dp_repl = max(1, int(dp_total)), 1
+        warnings.warn(
+            f"data_parallel={dp_total} 且 data_parallel_shard<=0：按 trainer.py:449-454 归一化"
+            f"语义解释为**纯 FSDP**（dp_shard={dp_shard}, dp_replicate=1）。若该 yaml 意图是"
+            f"纯复制 DP（无 ZeRO 切分）,请显式给 data_parallel_replicate。")
     elif global_bs is not None:
         dp_shard = max(1, int(global_bs) // (local_bs * num_microbatches * dp_repl))
         # data_parallel_shard=-1（纯 FSDP,「用掉所有剩余卡」）**真值取决于总卡数**,而总卡数不在 yaml 里。

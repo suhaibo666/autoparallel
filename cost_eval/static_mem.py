@@ -87,6 +87,7 @@ class StaticMem:
                     opt_state_bytes=mult,
                     matrix_opt_state_bytes=matrix_mult,   # Muon 2D 矩阵倍数（AdamW==mult → uniform）
                     alloc_block_bytes=alloc_block_bytes,
+                    ep_degree=pm.degree("ep"),            # P0-3:expert wrap 不可整除 fail-loud 门
                 ).persistent
                 for layer in layers
             )
@@ -142,7 +143,8 @@ class StaticMem:
                 sm = estimate_structure_memory(
                     layer.ops, fsdp=fsdp, efsdp=efsdp,
                     opt_state_bytes=mult, matrix_opt_state_bytes=matrix_mult,
-                    alloc_block_bytes=alloc_block_bytes)
+                    alloc_block_bytes=alloc_block_bytes,
+                    ep_degree=pm.degree("ep"))            # P0-3 同口径
                 n_mat += sm.persist_numel_matrix
                 n_oth += sm.persist_numel_other
                 aligned += sm.persistent

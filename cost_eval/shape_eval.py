@@ -68,6 +68,11 @@ class ResolvedTensor:
     # 重算免疫标志直通（TensorRef.pin_under_recompute，2026-07-22）：fused 自定义算子
     # ctx 保存集在全重算下不释放 → structure_mem.recompute_pinned_saves 按此聚合。
     pin_under_recompute: bool = False
+    # TP/EP placement 后的**本地首维**（2026-07-23 P0-3，replicate_params 判定）：runtime FSDP
+    # 按参数首维切（parallelize.py:331-350, commit 377c9c344），`shape[0] % shard_size != 0` →
+    # 整参不做 FSDP（replicate_params，全量驻留）。structure_mem 以此替代 total-numel ceil。
+    # 0 = 未知（旧构造/测试 stub → structure_mem 退回 numel 整除判定,兼容）。
+    dim0: int = 0
 
 
 def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
@@ -107,7 +112,8 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
     numel = prod(sizes) if sizes else 1
     dtype_bytes = t.dtype_bytes if t.dtype_bytes is not None else dims.dtype_bytes
     return ResolvedTensor(t.name, numel, dtype_bytes, t.is_weight, t.has_ep(),
-                          getattr(t, "pin_under_recompute", False))
+                          getattr(t, "pin_under_recompute", False),
+                          int(sizes[0]) if sizes else 1)
 
 
 # ---------------------------------------------------------------------------

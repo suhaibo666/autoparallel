@@ -285,7 +285,8 @@ class MemTimeline:
                     fsdp=fsdp_d, efsdp=efsdp_d,
                     alloc_block_bytes=alloc_block_bytes,
                     norm_compute_dtype_bytes=norm_compute_dtype_bytes,
-                    bwd_scratch_conservative=bwd_scratch_conservative)   # F10 双模式
+                    bwd_scratch_conservative=bwd_scratch_conservative,   # F10 双模式
+                    ep_degree=pm.degree("ep"))            # P0-3:与 persistent 同口径
                 for l in layers
             }
             # 选择性重算：每层按选择器（op 名/类型子串）把 op 划分为选中/非选中，预算三桶
@@ -498,7 +499,11 @@ class MemTimeline:
                         #    （FSDP2 前向隐式 depth-1 overlap）+ workspace → 采样。
                         #    no-reshard 层（P0-03）：本层 gather 进 resident（驻留到其 post_backward）。
                         _exp_pf = expert_pf_by_id[lid]
-                        _split_experts = (efsdp_d > 1 and _exp_pf > 0
+                        # P0-2（2026-07-23，runtime 377c9c344）：expert 独立 wrap 只在 **ep>1** 存在
+                        # （parallelize.py:1030-1037/:1106-1113/:1496-1520——无 expert mesh 不单独
+                        # fully_shard）;ep==1 时 expert 随父层走 dense wrap → 不拆 gather 两段
+                        # （修前按 efsdp_d>1 误判,ep=1+tp>1 时会建不存在的专家 gather 段）。
+                        _split_experts = (pm.degree("ep") > 1 and efsdp_d > 1 and _exp_pf > 0
                                           and lid not in no_reshard)
                         if _split_experts:
                             # P1-14（Task B）：experts 独立 wrap → 前向 gather 两段生命周期。
@@ -701,7 +706,11 @@ class MemTimeline:
             K_OPT = 4
 
             def _shard(w):
-                return w.local_numel // (efsdp_d if getattr(w, "is_expert", False) else fsdp_d)
+                # P0-3（2026-07-23）：optstep 分片口径与 persistent/grad_shard 统一
+                # （runtime 首维判定,不可整除 → replicate_params 整参;旧 floor 与 ceil 口径不一致）。
+                from .structure_mem import _fsdp_local_count
+                return _fsdp_local_count(
+                    w, efsdp_d if getattr(w, "is_expert", False) else fsdp_d, pm.degree("ep"))
 
             if offload_optimizer:
                 optstep_bytes = 0

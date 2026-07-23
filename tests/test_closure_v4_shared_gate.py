@@ -132,7 +132,9 @@ def test_build_shared_expert_ops_gate_on_adds_gate_and_mul():
     mul = ops[-1]
     assert [t.name for t in mul.inputs] == ["sh_o", "sh_gate"]
     assert mul.output.name == "sh_o_gated"
-    assert mul.output.partial == "tp"   # 与 sh_o 同分布（行并行部分和）
+    # P0-1(2026-07-23):shared 权重 TP 复制(parallelize.py:718-724, 377c9c344)→ 输出无
+    # partial-sum(各 rank 全量计算)——旧断言 partial=="tp" 属修前 TP-shard 建模。
+    assert mul.output.partial is None
 
 
 def test_build_moe_merge_op_gate_off_consumes_sh_o():

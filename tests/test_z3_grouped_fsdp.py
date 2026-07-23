@@ -147,13 +147,46 @@ def _dense_global_numel(g):
     return total
 
 
-def test_experts_unaffected_only_dense_scales():
-    """MoE 层：配 dense 子域后，总持久增量 == 仅 dense 缩放（experts 走 efsdp,不变）。
+def test_ep1_experts_follow_dense_subdomain():
+    """MoE 层 **ep=1**：expert 权重随父层走 **dense** FSDP（含子域 K）——P0-2 重写(2026-07-23)。
 
-    ep=1 → efsdp=8；dense_fsdp: 8(full) vs 2(sub)。delta = dense_global·(1/2−1/8)·14。
-    若 experts 被误缩放,delta 不会等于纯 dense 公式。"""
+    runtime 377c9c344：ep=1 不进 EP phase（parallelize.py:1496-1520）,expert 权重 TP
+    Replicate()（:700-716）,且无 expert mesh **不单独 fully_shard experts**（:1030-1037/
+    :1106-1113）→ N = P/K（dense 子域分母）。旧测试(2026-07-15)锁的「ep=1 仍走 efsdp=SCT、
+    不受 dense 子域影响」是 evaluator 自身假设,与 runtime 相反(audit §4.3/§10.1),已按
+    runtime 语义重写：dense 子域 8→2 时 **dense+expert 全部**按 1/2−1/8 缩放。"""
     pm_full = ParallelModel(ParallelConfig(dp_shard=8, ep=1), n_layers=1, world_size=8)
     pm_sub = ParallelModel(ParallelConfig(dp_shard=8, ep=1, dense_fsdp_shard_size=2),
+                           n_layers=1, world_size=8)
+    g_full = ShapeEval().resolve(_moe_spec(), pm_full)
+    g_sub = ShapeEval().resolve(_moe_spec(), pm_sub)
+    p_full = StaticMem().compute(g_full, OptimizerSpec.adamw(), pm_full, cpu_offload=False)[0]
+    p_sub = StaticMem().compute(g_sub, OptimizerSpec.adamw(), pm_sub, cpu_offload=False)[0]
+
+    # ep=1 → expert 与 dense 同分母：delta = (dense+expert)_global·(1/2−1/8)·_STATE。
+    all_g = _all_param_global_numel(g_full)
+    expect_delta = ((all_g // 2) - (all_g // 8)) * _STATE
+    assert p_sub - p_full == expect_delta
+
+
+def _all_param_global_numel(g):
+    """resolved graph 全部权重(dense+expert) numel 之和（按名去重/层）。"""
+    total = 0
+    for layers in g.stages.values():
+        for layer in layers:
+            seen = {}
+            for op in layer.ops:
+                for w in op.params:
+                    seen[w.name] = w.local_numel
+            total += sum(seen.values())
+    return total
+
+
+def test_ep2_experts_unaffected_by_dense_subdomain():
+    """MoE 层 **ep>1**：experts 走独立 efsdp,不受 dense 子域影响（原语义仅对 ep>1 成立——
+    P0-2 保留半边:audit §4.2 ep>1 路径 runtime/evaluator 一致）。"""
+    pm_full = ParallelModel(ParallelConfig(dp_shard=8, ep=2), n_layers=1, world_size=8)
+    pm_sub = ParallelModel(ParallelConfig(dp_shard=8, ep=2, dense_fsdp_shard_size=2),
                            n_layers=1, world_size=8)
     g_full = ShapeEval().resolve(_moe_spec(), pm_full)
     g_sub = ShapeEval().resolve(_moe_spec(), pm_sub)

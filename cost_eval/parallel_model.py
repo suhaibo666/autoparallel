@@ -63,6 +63,17 @@ class ParallelModel:
         return s if s else self.fsdp_degree()
 
     def efsdp_degree(self) -> int:
+        """routed-expert 权重的有效 FSDP 分母。
+
+        ep>1：独立 expert wrap，efsdp = dp_shard·cp·tp/ep（runtime parallel_dims.py:234-270）。
+        **ep==1（2026-07-23 P0-2 修，runtime 377c9c344）**：不进入 EP phase
+        （parallelize.py:1496-1520），expert 权重 TP 显式 Replicate()（:700-716），且无 expert
+        mesh 时**不单独 fully_shard experts**（:1030-1037/:1106-1113）→ expert 参数**随父层走
+        dense FSDP**：分母 = dense_fsdp_degree()=K（含 grouped-FSDP 子域）。修前恒用
+        SCT/E=SCT → ep=1,tp>1 时 expert 持久/优化器态/梯度分片欠估 T 倍（audit 报告 §4.3）。
+        ep>1 行为逐字节不变。"""
+        if self.pc.ep <= 1:
+            return self.dense_fsdp_degree()
         return self._efsdp
 
     def stage_of(self, layer_id: int) -> int:
