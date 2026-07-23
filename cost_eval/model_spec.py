@@ -112,13 +112,17 @@ class TensorRef:
     #   到 **full-S**（不 ÷cp），其余 cp 算法（ulysses/ring/hybrid）仍随 body ÷cp。默认 False。
     cp_shard: bool = True
     cp_kv: bool = False
-    # ── 重算免疫（2026-07-22，185 pp4+全重算锚点定标）─────────────────────────────
-    # pin_under_recompute=True：该 save 由**自定义算子的 `ctx.save_for_backward`** 持有
-    #   （如 fused SparseFlashMla 的 11 张量 ctx 集，csa.py:224-235），MindSpore
-    #   use_reentrant=False 全重算（activation_checkpoint.py:151）**不释放**这类 ctx 状态
-    #   → 全重算下仍随微批常驻 act_live（mem_timeline `saved = checkpoint_input +
-    #   Σ免疫saves`），至该微批该层反向才释。默认 False = 普通激活（全重算即释放），
-    #   全部既有 spec 惰性、逐字节不变。
+    # ── 重算免疫（2026-07-22 185 pp4+全重算锚点定标；2026-07-23 机制表述订正）──────
+    # pin_under_recompute=True：该 save 属于**全重算下经验驻留集**——真机三组独立测量
+    #   （pp4 ON−OFF 净省仅 6.2GB、warmup 每微批层 ~1.9GB 随在途数线性累积、相位分解
+    #   fwd 末驻留 5.8GB）证实 fused dsv4 层在全重算下每微批层仍驻留 ~ctx 集尺寸的激活,
+    #   至该微批该层反向才释（mem_timeline `saved = checkpoint_input + Σ免疫saves`）。
+    #   ⚠ 机制归因订正（2026-07-23 受控 A/B 实验,185）：裸 `ms.recompute(use_reentrant=
+    #   False)` 与生产 wrapper(hyper-parallel checkpoint+context_fn)下,自定义 _Function 的
+    #   `ctx.save_for_backward` **均被正常释放**（8块×512MiB 单变量实验,ctx+重算=1024MiB
+    #   vs 无重算 5120MiB）——「ctx 逃逸 saved_tensors_hooks」假设**证伪**。驻留集的字节
+    #   量/生命周期为真机锚定的经验事实,其真实身份（输入/输出 saver 持有、FSDP×重算交互
+    #   或未覆盖段）待真实层隔离二分。默认 False = 普通激活,全部既有 spec 惰性、逐字节不变。
     pin_under_recompute: bool = False
 
     def has_ep(self) -> bool:

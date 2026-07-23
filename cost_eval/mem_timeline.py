@@ -559,12 +559,14 @@ class MemTimeline:
                             B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
-                            # 全重算保留 = 层入口 checkpoint_input + **重算免疫 saves**
-                            # （2026-07-22，185 pp4+全重算锚点）：fused 自定义算子的
-                            # `ctx.save_for_backward` 状态（SparseFlashMla 11 张量集，
-                            # csa.py:224-235）在 MindSpore use_reentrant=False checkpoint
-                            # 下**不被释放**（真机 ON−OFF 净省仅 6.2GB vs 修前模型 16-23GB），
-                            # 随 1F1B warmup 在途微批累积、至该微批该层反向才释。
+                            # 全重算保留 = 层入口 checkpoint_input + **经验驻留集**
+                            # （2026-07-22 185 pp4 锚点定标;2026-07-23 机制表述订正）：真机实测
+                            # fused dsv4 层全重算下每微批层仍驻留 ~ctx 集尺寸激活（ON−OFF 净省
+                            # 仅 6.2GB vs 全释放模型 16-23GB），随 1F1B warmup 在途微批累积、至该
+                            # 微批该层反向才释。⚠ 驻留机制归因已订正:受控 A/B 实验证伪「自定义
+                            # _Function ctx.save_for_backward 逃逸 hooks」（裸 API 与生产 wrapper
+                            # 下 ctx saves 均正常释放,见 model_spec.pin_under_recompute 注释）;
+                            # 字节量/生命周期为真机锚定经验事实,真实驻留体待层级二分。
                             # 无免疫标记的 spec `recompute_pinned_saves=0` → 逐字节复现旧行为。
                             saved = sm.checkpoint_input + sm.recompute_pinned_saves
                             # 微批饱和 cap（185 探针,见上方 _ctx_cap 注释）:超 cap 微批的死 ctx
