@@ -491,6 +491,29 @@ class MemTimeline:
             # P0-01：已完成首次反向的层集（其 reduced grad shard 已常驻 grad_accum）。
             grad_done: set = set()
 
+            # ── 重算免疫 ctx 的**微批饱和 cap**（2026-07-23，185 pp8/pp4-m8(P3-P)/pp4-m4 三组
+            # 探针联合定标）──免疫 pin（fused ctx / std 保留集）是**死内存**（重算会重建），真机在
+            # steady 1F1B 期被 P2P 同步点回收：
+            #   - **stage0 不回收**（fork 调度 stage0 无 BWD_SEND/FWD_RECV,scheduler.py:960/985
+            #     `if stage_index != 0` —— 无同步窗）：pp8-s0 8 组线性=24759、pp4-m8-s0 ≡m4+纯梯度
+            #     增长(+1190) 双实证 → cap = W。
+            #   - **中间/末 stage**（steady 每迭代 BWD_SEND+FWD_RECV 同步）：驻留饱和为
+            #     min(W, ceil((W+1)/2)),且 **m 无关**（pp4-m8 s1-s3 ≡m4 实证;pp8 中部实测
+            #     [4.3,4.0,3.8,3.0,2.8,2.0] vs 该式 [4,4,3,3,2,2],±1 组内,pp8-s5 欠 6% 已 band 注明）。
+            #   - m ≤ W（无 steady）→ 不截。
+            # 超出微批仍 pin checkpoint_input（活内存,重算起点必须留），其免疫 ctx 记 0。
+            # 无免疫 pin 的 spec（DSv3 等）saved==ci → cap 天然无效,逐字节不变。
+            _W_win = min(m, (pp - stage + 1)
+                         if (getattr(pm.pc, "sched_warmup_plus_one", False)
+                             and pp > 1 and stage < pp - 1)
+                         else max(1, pp - stage))
+            if m <= _W_win or stage == 0:
+                _ctx_cap = _W_win
+            else:
+                _ctx_cap = min(_W_win, -(-(_W_win + 1) // 2))
+            _ctx_mbs: set = set()          # 当前持有免疫 ctx 的微批
+            _ctx_denied: set = set()       # 超 cap 被回收（只留 ci）的微批
+
             for ev_kind, ev_mb, ev_layers, ev_chunk in steps:
                 if ev_kind == "FWD":
                     for idx, lid in enumerate(ev_layers):
@@ -544,6 +567,17 @@ class MemTimeline:
                             # 随 1F1B warmup 在途微批累积、至该微批该层反向才释。
                             # 无免疫标记的 spec `recompute_pinned_saves=0` → 逐字节复现旧行为。
                             saved = sm.checkpoint_input + sm.recompute_pinned_saves
+                            # 微批饱和 cap（185 探针,见上方 _ctx_cap 注释）:超 cap 微批的死 ctx
+                            # 被 steady 期回收 → 只留 checkpoint_input（活内存）。
+                            if sm.recompute_pinned_saves > 0:
+                                if ev_mb in _ctx_denied:
+                                    saved = sm.checkpoint_input
+                                elif ev_mb not in _ctx_mbs:
+                                    if len(_ctx_mbs) >= _ctx_cap:
+                                        _ctx_denied.add(ev_mb)
+                                        saved = sm.checkpoint_input
+                                    else:
+                                        _ctx_mbs.add(ev_mb)
                         elif recompute.is_select(lid):
                             # 选择性重算：非选中 op 的 saves（去重）+ 层入口边界常驻；
                             # 选中 op 的 saves 丢弃（反向重物化）。介于 full 与全量之间。
@@ -690,6 +724,9 @@ class MemTimeline:
                             grad_done.add(lid)
                             if not offload_grads:
                                 B.grad_accum += sm.grad_shard_bytes
+                    # 该微批反向完成 → 其免疫 ctx 席位释放（饱和 cap 计数,见 _ctx_cap 注释）。
+                    _ctx_mbs.discard(ev_mb)
+                    _ctx_denied.discard(ev_mb)
 
             # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
             #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥（**累计梯度 grad_accum

@@ -104,14 +104,17 @@ def anchors() -> list:
                note="已知轻微欠预测（±5% 带内）；lo=0.94 仅防进一步漂移"),
         Anchor("select both (=full,退化端)", "select",
                lambda: dsv3(8, RecomputeSpec("select", select_ops=BOTH)), 13953.3, (0.98, 1.05)),
+        # 2026-07-23(185 F 差分): +core_out 逆 RoPE 保留(hybrid:277)入账 → 0.974→1.024(转
+        # 保守侧;185 F0/F1 同源差分 ±2% 背书)。band 上移,仍紧(±4%)。
         Anchor("DSv4-fused (base)", "dsv4+norecomp",
-               _dsv4_sim(0, 0), 15415.5, (0.95, 1.02),
+               _dsv4_sim(0, 0), 15415.5, (0.97, 1.05),
                note="已知轻微欠预测；lo=0.95 仅防进一步漂移"),
         # D2（2026-07-16）：mHC+MTP 锚点入卡。真机 21153.1（2026-07-01 采）；MTP tie 修复后由 1.088
         #   翻转为 0.920 欠预测，**此前不在记分卡故翻转无人察觉**（Z2）。D1 无重算 margin **不覆盖**它
         #   （DSv4 fused-CE → loss_lids 空 → margin 不触发）→ 独立残差，留待单独诊断（band 仅防进一步漂移，
         #   hi=0.96 使若回到 1.088 过预测立即触红）。
+        # 2026-07-23: 逆 RoPE 入账 0.923→0.968(欠预测收窄)。band 收紧上移,仍排除历史翻转 1.088。
         Anchor("DSv4 mHC(x4)+MTP", "dsv4+mhc+mtp",
-               _dsv4_sim(4, 1), 21153.1, (0.90, 0.96),
+               _dsv4_sim(4, 1), 21153.1, (0.92, 0.99),
                note="D2：OOM-不安全欠预测 0.920，不在 D1 覆盖内；band 防漂移/翻转，非 OOM-安全通过"),
     ]

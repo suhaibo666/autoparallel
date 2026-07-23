@@ -76,6 +76,8 @@ class DimTable:
     # unfused CE lean 口径（2026-07-23 std 锚点定标,详见 llm_config.ce_pynative_lean）：True →
     # 无重算 loss stage K_CE=4（pp 无关,116 std pp1/pp2-s1 实测一致）；False → 制度常数 8/4（冻结）。
     ce_pynative_lean: bool = False
+    # std 全重算保留集(185 基准,2026-07-23,详见 llm_config.std_recompute_ctx_pin)。
+    std_recompute_ctx_pin: bool = False
     # **标定 margin 因子**（B 方案，2026-07-09；非 op 图导出）：保留(非重算)模块在 loss 峰的
     #   fp32-cast 横切 + 小张量长尾占「当前 kept 激活」的比例。源码级 op-DAG 提取证实此残差**在 op 图
     #   粒度之下**（profiler live-set 313 个 <100MiB 碎片，`analysis/realmachine/opdag_validation.md`），

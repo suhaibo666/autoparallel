@@ -65,7 +65,9 @@ def test_unfused_much_larger_than_fused():
 def test_unfused_calibrated_toward_real():
     # 真机 45557;修复后 ~36276(闭掉约一半)。锁区间[33000,50000](含改进值与真机,残差待 micro-anchor)。
     pu, _ = _peak(False)
-    assert 33000 <= pu <= 50000, pu
+    # 2026-07-23(185 U1 相位合账): unfused 反向图 fp32 复本群/naive-r0 链/KL 链入账后
+    # 本配置(116 真机 45557)从 36276 收敛到 ~50.8k(+11%,185 U1 同源配置已 ±5%)。
+    assert 40000 <= pu <= 54000, pu
 
 
 def test_fused_path_unchanged_small_moe_still_ok():

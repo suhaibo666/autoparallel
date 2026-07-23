@@ -186,7 +186,30 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
                 _t.pin_under_recompute = True                  # ctx 状态：全重算免疫（不释放）
             sparse_saves = [q_hnorm, kv_a_out, compressed_kv, core_out] + _ctx_new
         else:
-            sparse_saves = [q_hnorm, kv_gathered, kv_g_fp32, attn_weights, core_out]
+            # ── unfused 反向图 fp32 复本群（2026-07-23,185 U1 相位合账;DAG 审计嫌疑①②）────────
+            # 真机 `unfused_compressed_sparse_attn`（csa.py:187-250）逐 op 的 bprop 持有其输入/输出:
+            #   q fp32 cast(:213) + q_bm 重排复本(:218) → 2×[B,n,S,vd] fp32;
+            #   kv_bm 重排复本(:219)               → 又一份 [B,S,topk,vd] fp32(kv_g 之外);
+            #   scores(:220) + 其 permute(:221) + exp_scores(:235) + aw_bm(:241) → 4×[B,n,S,topk] fp32;
+            #   output fp32 + permute(:243-249)     → 2×[B,n,S,vd] fp32。
+            # KL 链(仅 r4,csa.py:503-516 unfused_indexer_loss 对全阵 softmax/log fp32,training 每步):
+            #   2×[B,S,n_idx,S/r] fp32。185 U1 相位:fwd 末每层驻留实测均值 4990 MiB,修前 census
+            #   均值 2827 → 缺口正是本复本群(合账表见 probe 报告)。
+            uq_f32   = TensorRef("uq_f32",   ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            uq_bm    = TensorRef("uq_bm",    ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            ukv_bm   = TensorRef("ukv_bm",   ("B", "S", TOPK_DIM, "v_head_dim"), cp_kv=True, dtype_bytes=4)
+            uscore1  = TensorRef("uscore1",  ("B", "n_heads", "S", TOPK_DIM), dtype_bytes=4)
+            uscore2  = TensorRef("uscore2",  ("B", "n_heads", "S", TOPK_DIM), dtype_bytes=4)
+            uexp     = TensorRef("uexp",     ("B", "n_heads", "S", TOPK_DIM), dtype_bytes=4)
+            uaw_bm   = TensorRef("uaw_bm",   ("B", "n_heads", "S", TOPK_DIM), dtype_bytes=4)
+            uout_f32 = TensorRef("uout_f32", ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            uout_pm  = TensorRef("uout_pm",  ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            _ucopies = [uq_f32, uq_bm, ukv_bm, uscore1, uscore2, uexp, uaw_bm, uout_f32, uout_pm]
+            if enable_indexer:
+                ukl1 = TensorRef("ukl1", ("B", "S", "dsa_indexer_n_heads", S_DIV_R), dtype_bytes=4)
+                ukl2 = TensorRef("ukl2", ("B", "S", "dsa_indexer_n_heads", S_DIV_R), dtype_bytes=4)
+                _ucopies += [ukl1, ukl2]
+            sparse_saves = [q_hnorm, kv_gathered, kv_g_fp32, attn_weights, core_out] + _ucopies
         # inputs 含 topk_indices（仅 CSA）= 稀疏选 KV 的**数据流依赖**（indexer→sparse_attn 边;
         # 2026-07-11 补边:此前缺此边致 indexer 成 op 图孤立叶节点。saves/字节不变）。
         sparse_ins = ([q_hnorm, kv_a_out, compressed_kv, topk_indices] if enable_indexer
@@ -206,8 +229,40 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
                               saves=[q_hnorm, kv_a_out, core_out, sw_lse],
                               workspace_ref=_fa_workspace()))
         else:
+            # unfused 滑窗（r0/1）真机同样走 `_construct_naive`（csa.py:438-449:ratio==0 →
+            # kv_full=ori_kv、topk=window_idxs → 仍进 unfused_compressed_sparse_attn 的
+            # gather+fp32 复本链,TOPK=csa_window_size）——修前按纯 flash 建,漏整个 naive 链
+            # (185 U1 相位:r0 层也在 4990 均值口径内)。gather 家族+复本群按 window 尺寸补齐。
+            W0 = "csa_window_size"
+            r0_kvg  = TensorRef("kv_gathered", ("B", "S", W0, "v_head_dim"), cp_kv=True)
+            r0_kvg32 = TensorRef("kv_g_fp32", ("B", "S", W0, "v_head_dim"), cp_kv=True, dtype_bytes=4)
+            r0_aw   = TensorRef("attn_weights", ("B", "n_heads", "S", W0), dtype_bytes=4)
+            r0_q32  = TensorRef("uq_f32", ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            r0_qbm  = TensorRef("uq_bm", ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            r0_kvbm = TensorRef("ukv_bm", ("B", "S", W0, "v_head_dim"), cp_kv=True, dtype_bytes=4)
+            r0_sc1  = TensorRef("uscore1", ("B", "n_heads", "S", W0), dtype_bytes=4)
+            r0_sc2  = TensorRef("uscore2", ("B", "n_heads", "S", W0), dtype_bytes=4)
+            r0_exp  = TensorRef("uexp", ("B", "n_heads", "S", W0), dtype_bytes=4)
+            r0_awbm = TensorRef("uaw_bm", ("B", "n_heads", "S", W0), dtype_bytes=4)
+            r0_o32  = TensorRef("uout_f32", ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
+            r0_opm  = TensorRef("uout_pm", ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
             ops.append(OpSpec("core_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out], core_out,
-                              saves=[q_hnorm, core_out], workspace_ref=_fa_workspace()))
+                              saves=[q_hnorm, core_out, r0_kvg, r0_kvg32, r0_aw,
+                                     r0_q32, r0_qbm, r0_kvbm, r0_sc1, r0_sc2, r0_exp,
+                                     r0_awbm, r0_o32, r0_opm],
+                              workspace_ref=_fa_workspace()))
+
+    # ── core_out 逆 RoPE（2026-07-23,185 F 差分合账;DAG 审计嫌疑③）────────────────────
+    # 真机对 core attention 输出做 inverse-RoPE（deepseek_v4_hybrid_attention.py:277
+    # `_apply_forward_rope(core_out, freqs, inverse=True)`,fused/unfused 两分支都有;inverse
+    # 恒走非融合旋转 rope_utils.py:182）。bprop 保留:输出 bf16 复本 [S,B,n·vd] + 旋转 lane 的
+    # fp32 cast/rotate_half 各一份 [S,B,n·rope_dim]。185 F 差分:fused 每层真机 3109 vs 修前
+    # sim 2960(+149)——本成员 seq2048 记账 128+2×16=160,闭合到 +1.4%。
+    inv_out = TensorRef("inv_rope_out", ("S", "B", Q_OUT))
+    inv_f32 = TensorRef("inv_rope_f32", ("S", "B", "n_heads*qk_rope_head_dim"), dtype_bytes=4)
+    inv_rot = TensorRef("inv_rope_rot", ("S", "B", "n_heads*qk_rope_head_dim"), dtype_bytes=4)
+    ops.append(OpSpec("inv_rope", OpType.ROPE, [core_out], core_out,
+                      saves=[inv_out, inv_f32, inv_rot]))
 
     # ── 分组输出：linear_o_group_proj（bmm，fp32 cg save）→ linear_proj → 残差 ────
     ops += [

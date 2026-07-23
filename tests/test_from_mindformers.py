@@ -135,8 +135,10 @@ def test_dsv4align_roundtrip_same_peak():
     #   分支 sparse_attn/core_attn 补 ori_kv/query_index/key_index/weights/cmp_residual/
     #   softmax_lse（csa.py:224-235 的 11 张量 ctx）→ 4L@seq2048 共 +48.8 MiB,真机 15415.5
     #   → 0.974,欠预测再收窄。见 tests/test_pp4_recompute_anchor.py）。
+    # → 15788.6（2026-07-23 185 F 差分:+core_out 逆 RoPE 保留(hybrid:277,每层 +192@seq2048),
+    #   真机 15415.5 → 1.024 转保守侧;F0/F1 每层差分 3152 vs 真机 3109(+1.4%)背书）。
     assert bundle.parallel.dp_shard == 2 and bundle.recompute.mode == "None"
-    assert abs(_peak(bundle) - 15020.6) < 1.0
+    assert abs(_peak(bundle) - 15788.6) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────

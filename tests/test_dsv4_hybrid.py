@@ -244,9 +244,10 @@ def test_ratio1_same_as_ratio0():
 def test_op_counts_per_branch():
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
     # base8 = ln1,q_down,q_a_norm,q_up,q_hnorm,kv,kv_a_norm,rope；尾 3 = o_group_proj,o_proj,add1
-    assert len(build_dsv4_hybrid_attn_ops(DS, 0)) == 12     # base8 + core_attn + 尾3
-    assert len(build_dsv4_hybrid_attn_ops(DS, 128)) == 13   # base8 + compressor + sparse_attn + 尾3
-    assert len(build_dsv4_hybrid_attn_ops(DS, 4)) == 14     # + indexer
+    # 2026-07-23(185 F 差分合账): 每分支 +1 inv_rope op(core_out 逆 RoPE,hybrid:277)。
+    assert len(build_dsv4_hybrid_attn_ops(DS, 0)) == 13     # base8 + core_attn + inv_rope + 尾3
+    assert len(build_dsv4_hybrid_attn_ops(DS, 128)) == 14   # base8 + compressor + sparse_attn + inv_rope + 尾3
+    assert len(build_dsv4_hybrid_attn_ops(DS, 4)) == 15     # + indexer
 
 
 def test_fused_drops_kv_gathered_and_attn_weights():

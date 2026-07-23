@@ -463,6 +463,10 @@ def parse_and_validate(p):
     # pp1/pp2-s1 实测一致）。缺省 → 制度常数 8/4（DSv3-era 冻结口径）。
     if (p.get("ce_lean") or "").strip() != "":
         cfg = dataclasses.replace(cfg, ce_pynative_lean=_x_flag(p, "ce_lean", cfg.ce_pynative_lean))
+    # std 全重算保留集(隐藏字段 std_pin,185 基准——R1 相位+R-L 差分):MS2.10 全重算只释放
+    # h1-fp32/g/act,注意段 bprop 保留不释放。缺省 关(116-shim 全释放口径)。
+    if (p.get("std_pin") or "").strip() != "":
+        cfg = dataclasses.replace(cfg, std_recompute_ctx_pin=_x_flag(p, "std_pin", cfg.std_recompute_ctx_pin))
     # embedding/head 权重 dtype 字节（隐藏字段 emb_bytes）：116 std fork 的 TransformerConfig 默认
     # embedding_params_dtype=float32（shim 配置转储实证）→ 4;缺省 2 = 全部既有锚点口径。
     if (p.get("emb_bytes") or "").strip() != "":
