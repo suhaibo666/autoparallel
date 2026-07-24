@@ -212,6 +212,29 @@ dp_shard=32/cp1、mHC×4、mtp=1、全重算 [0-43]；理论 alloc MiB）：
 **这是设计意图**：缺口是 mindformers+hyper_parallel+MindSpore 框架问题的度量，不再用经验补偿顶平数字；
 **OOM 余量判断须以真机平台（max_device_memory=58G）为准，勿采用理论峰值。**
 
+## 八.5、⟪2026-07-24⟫ unfused 真机内存池逐块对账 — 框架缺口首次源码级指名
+
+现场提供 unfused 配置(`apply_dsa_kernel_fusion: False`,余同 test.yaml)+ MS 内存池逐块 dump(`memory_block_sync_fixed.csv`,UTF-16,63860 块,**带 python_stack 分配点归属**——此前认定 MS 无此能力,现场 dump 补上了)。独立复核已验证(存活集重建逐字节 == `actual_used_memory` 38390 MiB)。
+
+**CSV 语义**:全程分配日志;此池 `DefaultEnhancedAscendMemoryPool` **仅瞬态工作内存**,持久参数+优化器在独立池(`is_persistent=1` 仅 59 块 29.5 KiB);属**末 stage(stage7)**(峰值存活集 MTP+CE+MTP-emb 三者共存)。真机瞬态峰 used 38390 / reserved 39442 MiB;+ 独立持久 ~12 GiB ≈ 50.5 GiB(与 58G cap 自洽)。
+
+**逐桶对账(瞬态池 vs 评估器 stage7 纯理论)**:
+
+| 桶 | 理论 | 真机 CSV | Δ | 归因 |
+|---|---|---|---|---|
+| gather_buf | 5510 | **10491**(`param.py:519`) | +4981 | **结构桶可改进**:预取深度欠估(真机同驻 ~5 unit) |
+| grad_buf+grad_accum | 6827 | 6845(`param.py:862`) | **+18 ✓** | 梯度路径近乎完美 |
+| 激活+重算+bwd_scratch | 7838 | **18373** | +10535 | **框架缺口** |
+| Muon optstep(异步重叠) | 0 | 2264(`muon.py`) | +2264 | 结构桶可改进:Muon 与反向重叠、理论按 step 独占漏计 |
+| **瞬态合计** | **20175** | **38390** | **+18215** | 结构桶 40% + 框架缺口 58% |
+
+**框架缺口 +10535 MiB 首次逐张量指名(CSV 分配点 × mindformers 源码双确认)**:
+- unfused DSA/CSA 小算子物化(fused 不产生)≈5 GiB:`indexer.py:245-246` index_scores O(S²) 1024 + `indexer.py:380` KL-loss fp32 softmax 1024 + `csa.py:791/796` 2195;
+- CSA 稀疏注意力 fp32 cast ≈7 GiB:`csa.py:488-489` q/kv cast fp32 **5120** + `csa.py:510-512` softmax 内部 1280;
+- MoE FFN 反向 GroupedMatmul 6192;mHC 多流 `hyper_connection.py:108/124/262/297` 447。
+
+**关键机制(§八「全重算释放缺口」的源码级实证)**:评估器 unfused 分支**结构上认得**这些张量(`dsv4_hybrid.py:26-35`),但纯理论口径全重算只 pin checkpoint_input、清零 saves → 理论 fused==unfused 逐字节相等。真机 MS2.10 全重算**不真的释放它们** → 整块落进框架缺口。**缺口不再抽象**:就是 `csa.py`/`indexer.py` 这些具名 fp32 物化块在全重算下未释放。此外发现两个**结构桶可改进项**(非框架缺口,评估器自身可修):gather_buf 预取深度(+4981)、Muon 异步重叠 optstep(+2264)。
+
 ## 九、复核方式
 
 ```bash
