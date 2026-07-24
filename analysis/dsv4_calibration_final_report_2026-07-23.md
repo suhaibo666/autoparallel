@@ -121,6 +121,12 @@ ON:185 实测释放远少于 116(同 yaml,116 shim ON s0=5413 vs 185 ON s0=11132
 
 **给 MindSpore/mindformers 的 issue 素材(三条)**:① full recompute 在部分配置静默不生效(附 repro 配置与日志);② 全重算生效时仅释放层激活小切片,与 torch checkpoint 语义差距大(repro=pp4 ON/OFF 锚点);③ 缺 per-tensor 设备内存归属/存活 API(gc 对 C++ 持有张量盲)。
 
+### 7.6 ⟪2026-07-24 追补⟫ 模式 A/B 矩阵(V0-V7)最终判决
+
+单变量矩阵(8块×512MiB,生产 wrapper,167):**裸 ctx 属性挂张量(`ctx.x = tensor`)绕过 `use_reentrant=False` 重算钩子被整体钉死(V3 驻留 4096MiB);`save_for_backward` 正常释放(V2/V3fix 驻留 0);AutoScaler 梯度注入/stop_gradient 旁支/参数 matmul 均释放**。组合实验精确定位:同区域内 save 半边释放、裸属性半边钉死。
+
+对真机代码:**`dsa` 注意力变体存在真实泄漏**——`_DSAIndexerGradFunction`(dsa_indexer_loss.py:70-72)**前向预计算 KL-loss 梯度**并裸挂 ctx(用户假设二命中)、`_DSAIndexerFunction`(dsa_indexer.py:55-57)q/k/weights 同病;一行修复=改 `save_for_backward`。**dsv4_hybrid 路径不中此病**(FusedSparseFlashMla* 全走 save_for_backward、KL 梯度在 backward,call-site grep 验证)——其 1.9GB/微批层驻留组成仍未逐张量指名(部分归 mHC 多流 checkpoint-input,余量待 MS per-tensor API)。第四条 issue:**重算区域内裸 ctx 挂张量应告警/修复**(repro=167 `bisect_patterns*.py`,V3 vs V3fix)。评估器 TODO:若跑 `dsa` 变体需加重算免疫桶(indexer q/k/w+前向预计算梯度)。
+
 ## 八、复核方式
 
 ```bash
