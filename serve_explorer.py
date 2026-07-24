@@ -636,6 +636,17 @@ def _x_int(p, k, default):
         return default
 
 
+def _x_float(p, k, default):
+    """extra 浮点:键缺省/空串 → default;非法 → default(不阻断评估)。"""
+    v = p.get(k)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _x_flag(p, k, default):
     """extra 布尔:键缺省/空串 → default;'1'/true/on/yes → True;'0'/false/off/no → False。"""
     v = p.get(k)
@@ -683,7 +694,8 @@ def _build_eval_specs(p, pa):
     #   走 AdamW;optstep 的 NS workspace 为估值)。Muon 带 per-head 开关(砍注意力投影 NS 估值)。
     if str(p.get("optimizer", "adamw")).strip().lower() == "muon":
         opt = OptimizerSpec.muon(params_fp32=opt_fp32, grad_dtype_bytes=_gb,
-                                 per_head=_x_flag(p, "muon_per_head", False))
+                                 per_head=_x_flag(p, "muon_per_head", False),
+                                 ns_workspace_mult=_x_float(p, "muon_ns_mult", 3.0))
     else:
         opt = OptimizerSpec.adamw(params_fp32=opt_fp32, grad_dtype_bytes=_gb)
     # 设备容量(缺省 64GiB,历史手配假设):UI 以 GiB 输入 → bytes。
@@ -954,6 +966,7 @@ def _bundle_to_fields(b):
     #（现场 DSv4-Flash 修）。Muon 持久更省(2D 矩阵 momentum-only)、per-head 改 NS workspace。
     f["optimizer"] = "muon" if str(getattr(b.optimizer, "type", "")).lower() == "muon" else "adamw"
     f["muon_per_head"] = int(bool(getattr(b.optimizer, "per_head", False)))
+    f["muon_ns_mult"] = getattr(b.optimizer, "ns_workspace_mult", 3.0)   # Muon NS workspace 倍数(可配)
     # mHC 残差流(num_residual_streams):此前遗漏 → yaml enable_hyper_connections+num_residual_streams=4
     #   在 round-trip 被静默降级为 plain(hc=1)→ 持久/激活欠算 ×n。residual_variant≠mhc → 1(无 mHC)。
     f["hc"] = (int(getattr(llm, "num_residual_streams", 1) or 1)
@@ -1281,6 +1294,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
       <div class="fld"><label>优化器</label><select name="optimizer" title="AdamW(精确建模:master+m+v)或 Muon(标准口径:2D 矩阵权重只 momentum+master 省一份 v;embedding/lm_head/norm/router/bias 仍走 AdamW)。Muon 持久态更省;optstep 的 Newton-Schulz workspace 为**估值**(无真机锚点)"><option value="adamw" selected>AdamW</option><option value="muon">Muon</option></select></div>
       <div class="fld"><label>优化器 dtype</label><select name="opt_dtype" title="AdamW params dtype:fp32(state=master+m+v=12B/param) / bf16(+compute 副本 2B=14B/param)。yaml 导入按 model.params_dtype 回填"><option value="fp32" selected>fp32</option><option value="bf16">bf16</option></select></div>
       <div class="fld"><label>Muon per-head</label><select name="muon_per_head" title="仅 Muon 生效:per-head Muon 把注意力投影(qkv/o)的 Newton-Schulz 按头切、一次一头 → 该投影 optstep NS 单元 ÷ n_heads(估值)。FFN/专家非头结构不受影响,故若 optstep 峰在 head/embed(AdamW)或大专家,per-head 不改峰"><option value="0" selected>关</option><option value="1">开</option></select></div>
+      <div class="fld"><label>Muon NS workspace 倍数</label><input name="muon_ns_mult" type="number" step="0.5" min="0" value="3" title="仅 Muon 生效:Newton-Schulz 正交化(X=aX+bXX^TX)的 workspace 倍数(×分片 numel×4B fp32)。默认 3(峰 live≈2·numel+min²≤3·numel 的保守推导);真机 NS 实现/融合不同(是否物化 XX^T、fp32 vs bf16 temp)可调此值贴合。影响 Muon optstep 与全重算反向的 NS 重叠估值。CSV 校准:stage7 真机 optstep 2264,mult=3 给一份 NS 1536(68%,余多专家并发)"></div>
     </div>
   </section>
 
@@ -1368,6 +1382,7 @@ function applyVisibility(){
   fldShow("method",_iv("cp")>1);                                  // cp 算法仅 cp>1
   const opt=_cv("optimizer");
   fldShow("muon_per_head",opt==="muon");
+  fldShow("muon_ns_mult",opt==="muon");
   fldShow("opt_dtype",opt==="adamw");
   const rc=_cv("recompute");
   fldShow("select",rc==="select");

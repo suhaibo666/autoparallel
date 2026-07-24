@@ -178,6 +178,11 @@ class OptimizerSpec:
     # Muon:2D 矩阵权重每元素持久字节（0=同 state_bytes_per_param → AdamW 全 uniform、逐字节不变）。
     matrix_state_bytes: int = 0
     per_head: bool = False                   # Muon per-head NS（仅影响 optstep 的 NS workspace 估值）
+    # Muon Newton-Schulz workspace 倍数（**用户可配**，默认 `_MUON_NS_WORKSPACE_MULT`=3；见其定义处
+    #   推导:NS 迭代 X=aX+bXX^TX 峰 live ≈ 2·numel+min² ≤ 3·numel）。仅影响 Muon optstep / 反向重叠 NS
+    #   估值——真机 NS 实现/融合程度不同(如是否物化 XX^T、fp32 vs bf16 temp)可调此值贴合;非 Muon 不用。
+    #   CSV 校准参考(§8.5,stage7):真机 optstep 2264,一份 NS(mult=3)给 1536(68%);余为多专家并发。
+    ns_workspace_mult: float = 3.0
 
     @classmethod
     def adamw(cls, params_fp32: bool = False, grad_dtype_bytes: int = 4) -> "OptimizerSpec":
@@ -186,12 +191,15 @@ class OptimizerSpec:
 
     @classmethod
     def muon(cls, params_fp32: bool = False, grad_dtype_bytes: int = 4,
-             per_head: bool = False) -> "OptimizerSpec":
+             per_head: bool = False,
+             ns_workspace_mult: float = _MUON_NS_WORKSPACE_MULT) -> "OptimizerSpec":
         """标准 Muon:2D 矩阵权重 momentum-only(master4+momentum4=8;bf16 +2副本=10),比 AdamW 每参省 4B;
-        embedding/lm_head/norm/router/bias 仍走 AdamW(12/14)。per_head 只减 optstep 的 NS workspace 估值。"""
+        embedding/lm_head/norm/router/bias 仍走 AdamW(12/14)。per_head 只减 optstep 的 NS workspace 估值。
+        ns_workspace_mult:NS workspace 倍数,用户可配(默认 3=`_MUON_NS_WORKSPACE_MULT`),贴合真机 NS 实现。"""
         nonmat = 12 if params_fp32 else 14                     # embed/head/norm → AdamW
         mat = 8 if params_fp32 else 10                         # 2D 矩阵 → master+momentum(+bf16 副本)
-        return cls("Muon", nonmat, grad_dtype_bytes, matrix_state_bytes=mat, per_head=per_head)
+        return cls("Muon", nonmat, grad_dtype_bytes, matrix_state_bytes=mat, per_head=per_head,
+                   ns_workspace_mult=float(ns_workspace_mult))
 
     # ── 非矩阵(embed/head/norm;AdamW 全部)口径 ───────────────────────────────────────────
     def optimizer_state_bytes(self) -> int:

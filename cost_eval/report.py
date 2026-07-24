@@ -11,6 +11,7 @@ from .parallel_model import ParallelModel
 from .shape_eval import ShapeEval
 from .static_mem import StaticMem
 from .mem_timeline import MemTimeline, StagePeak
+from .specs import _MUON_NS_WORKSPACE_MULT
 from .framework import framework_reserve, hccl_reserved_buffer, communicator_breakdown
 
 # round3 A(F3)：缩层真机锚点最大 8L（DSv3）/ 4L(+MTP, DSv4）。n_layers 超过此"已验证尺度"数倍即视为
@@ -348,7 +349,8 @@ class Evaluator:
             bwd_scratch_conservative=getattr(self.hw, "bwd_scratch_conservative", False),
             muon=(str(getattr(self.opt, "type", "")).lower() == "muon"),
             muon_per_head=getattr(self.opt, "per_head", False),
-            muon_n_heads=getattr(self.spec.dims, "n_heads", 0))
+            muon_n_heads=getattr(self.spec.dims, "n_heads", 0),
+            muon_ns_workspace_mult=getattr(self.opt, "ns_workspace_mult", _MUON_NS_WORKSPACE_MULT))
         per_stage = [peaks[s] for s in sorted(peaks)]
         tightest = max(per_stage, key=lambda p: p.peak_bytes).stage
         # D-2：HCCL 通信缓冲（reserved 池，按启用的通信域数估计；不进 allocated 峰值）→ 接入报告。

@@ -1033,7 +1033,12 @@ def _build_optimizer(mf: dict) -> OptimizerSpec:
     if otype in ("adamw", "adam"):
         return OptimizerSpec.adamw(params_fp32=params_fp32, grad_dtype_bytes=4)
     if otype == "muon":
-        return OptimizerSpec.muon(params_fp32=params_fp32, grad_dtype_bytes=4)
+        # NS workspace 倍数:yaml optimizer 段可选键 `ns_workspace_mult`(无独立 mindformers 键 → 默认 3);
+        #   用户可在 yaml 里显式配以贴合真机 NS 实现(见 OptimizerSpec.muon 注释、报告 §8.5 CSV 校准)。
+        _nsm = opt.get("ns_workspace_mult")
+        return OptimizerSpec.muon(
+            params_fp32=params_fp32, grad_dtype_bytes=4,
+            ns_workspace_mult=float(_nsm) if _nsm not in (None, "") else 3.0)
     raise NotImplementedError(
         f"optimizer.type={otype!r} 暂未映射（评估器支持 AdamW / Muon）。")
 

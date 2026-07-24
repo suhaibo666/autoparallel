@@ -231,7 +231,8 @@ class MemTimeline:
                  nr_moe_frag_factor: float = 0.0,
                  bwd_scratch_conservative: bool = False,
                  muon: bool = False, muon_per_head: bool = False,
-                 muon_n_heads: int = 0) -> dict:
+                 muon_n_heads: int = 0,
+                 muon_ns_workspace_mult: float = _MUON_NS_WORKSPACE_MULT) -> dict:
         """仿真各 stage 峰值。
 
         参数
@@ -358,7 +359,7 @@ class MemTimeline:
             if muon and _pp_full_recomp and _recomp_regather_stage > 0:   # 仅 Muon + PP + 全重算层
                 from .structure_mem import _fsdp_local_count as _flc
                 _muon_ns_overlap = max(
-                    (round(_MUON_NS_WORKSPACE_MULT
+                    (round(muon_ns_workspace_mult
                            * _flc(w, efsdp_d if getattr(w, "is_expert", False) else fsdp_d, pm.degree("ep"))
                            * 4)
                      for l in layers for op in l.ops for w in op.params
@@ -786,7 +787,7 @@ class MemTimeline:
                         if (muon_per_head and muon_n_heads > 1
                                 and is_attn_projection(getattr(op, "name", ""))):
                             unit = max(1, shard // muon_n_heads)
-                        return round(_MUON_NS_WORKSPACE_MULT * unit * 4)   # NS workspace(fp32 temp)
+                        return round(muon_ns_workspace_mult * unit * 4)   # NS workspace(fp32 temp,mult 可配)
                     return K_OPT * shard * 4                                # 非矩阵 → AdamW
                 optstep_bytes = max(
                     (_muon_transient(op, w) for l in layers for op in l.ops for w in op.params),
