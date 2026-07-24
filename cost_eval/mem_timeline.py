@@ -330,6 +330,45 @@ class MemTimeline:
             _moe_lids = {l.layer_id for l in layers
                          if any(getattr(op.type, "value", op.type) == "moe_gemm"
                                 for op in l.ops)}
+            # ── 全重算反向阶段三桶结构量（2026-07-24，unfused stage7 CSV 逐块对账 §8.5）──────────
+            # 这三项是**评估器可建准的结构桶**（非框架缺口——框架缺口=csa/indexer fp32 物化,保持纯
+            # 理论清零+FrameworkGapWarning）：真机全重算 **反向阶段** 峰值同驻的量,理论前向/独占口径漏计。
+            # 全部只在 **PP(pp>1) + `recompute.is_full`**（及 Fix②的 muon）下激活 → OFF/select/无重算/
+            # 非 Muon / **pp1** 逐字节不变（安全网:DSv3 golden 12409、cp2、scorecard-DSv3-full、
+            # ce_optstep、DSv4-align 全为 pp1,不受影响;这三桶的同驻是 **PP 1F1B 反向** 现象——pp1 单
+            # stage 反向逐层 reshard、无跨层/跨 stage 重叠,旧口径已验证匹配真机,故 pp1 排除）。
+            _pp_full_recomp = (pp > 1)
+            #
+            # ① FSDP re-gather（gather_buf）：MS 全重算 backward 先重跑该层 forward(须 re-gather 参数)
+            #    再算梯度;PP 下 `_wrap_cell_recompute` 包整层、checkpoint 区整段重算,区内各全重算层 param
+            #    在反向峰**同驻**（recompute-forward re-gather 与 backward-resident 两份共存,FSDP 不中途
+            #    reshard）。前向「当前层+预取深度1≈2unit」口径对全重算反向欠估。**结构量 = Σ 本 stage
+            #    全重算层 param_full**（recompute-forward 整段 re-gather）。CSV stage7:真机 gather 10491
+            #    (`param.py:519`,102 块 含 2048×3+1024×3) vs 理论 5510 → 欠 4981;本式补 Σ=4499 → 10009
+            #    (−4.6%,残差=块对齐/小权重)。§8.5。
+            _recomp_regather_stage = (sum(
+                sm_by_id[l.layer_id].param_full_bytes
+                for l in layers if recompute.is_full(l.layer_id)) if _pp_full_recomp else 0)
+            # ② Muon NS 反向重叠（optstep 桶,反向事件）：Muon 正交化对早完成反向的参数异步启动、与
+            #    后续层反向重叠 → 反向峰值时已驻 NS 临时。理论按「step 独占、与反向互斥」漏计。**结构量
+            #    = 一份最大矩阵 NS workspace**（`_MUON_NS_WORKSPACE_MULT×分片×4`,与 optstep 事件同符号,
+            #    非裸常数）。CSV stage7:真机 optstep 2264(`muon.py`,877 块) vs 理论 0(峰外) → 本式补
+            #    1536(单份 NS,68%;余为多专家 NS 并发,未拟合)。AdamW step 互斥假设对 Muon 异步不成立。§8.5。
+            _muon_ns_overlap = 0
+            if muon and _pp_full_recomp and _recomp_regather_stage > 0:   # 仅 Muon + PP + 全重算层
+                from .structure_mem import _fsdp_local_count as _flc
+                _muon_ns_overlap = max(
+                    (round(_MUON_NS_WORKSPACE_MULT
+                           * _flc(w, efsdp_d if getattr(w, "is_expert", False) else fsdp_d, pm.degree("ep"))
+                           * 4)
+                     for l in layers for op in l.ops for w in op.params
+                     if is_muon_matrix_weight(op.type, getattr(op, "name", ""))),
+                    default=0)
+            # ③ 全重算反向工作集（bwd_working_set,full-recompute 层）：反向除重跑 forward(recomp_scratch)
+            #    外,还需算全层激活梯度 dL/dact(与激活同形共存)+ MoE grouped-gemm 反向临时(dgrad/wgrad)。
+            #    旧口径全重算只建 recomp_scratch(单层重物化)、bwd_scratch 只有 loss-probs。**结构量 =
+            #    forward_max_live**(dL/dact 与前向激活同规模;MoE 反向临时含在 fml 的专家中间量内)。CSV
+            #    stage7:真机 `autograd_compat.py:204`=7366 + `linear.py:135`=269 vs 理论 bwd_scratch 4040。§8.5。
             # ── MTP loss 链步内驻留（**2026-07-24 口径切换后恒 0**）─────────────────────────
             # 旧口径把 mtp 层 loss 段（~m×3.1GB）经验建成「驻留至 step 末」以对齐真机尾 stage +16.4GB。
             # 纯理论核查真机代码（116 multi_token_prediction.py，只读）后**归 0**——**代码不支撑任何
@@ -596,7 +635,7 @@ class MemTimeline:
                         #   仅 reshard_after_forward=True 才 re-gather 自身）——其 param_full 已在 _res()。
                         _regather = 0 if lid in resident_gather else sm.param_full_bytes
                         B.gather_buf = _res() + _regather + _prefetch_nonres(
-                            bwd_order, idx, depth)
+                            bwd_order, idx, depth) + _recomp_regather_stage   # Fix① §8.5
                         B.grad_buf = sm.grad_full_bytes
                         B.bwd_scratch = sm.bwd_scratch
                         # ① 无重算下 loss 层：unfused CE 链共存 k_ce 份满 vocab fp32。现 bwd_scratch
@@ -632,6 +671,16 @@ class MemTimeline:
                             # 多中间量层 max-live 常 < Σsaves，旧式高估）。
                             B.recomp_scratch = max(
                                 0, sm.forward_max_live - sm.checkpoint_input)
+                            # Fix③（§8.5）：全重算反向工作集 = 激活梯度 dL/dact + MoE grouped-gemm
+                            # 反向临时(dgrad/wgrad)——与重物化 forward 共存,旧口径漏。结构量 =
+                            # **max(0, forward_max_live − bwd_scratch)**（与无重算路径同式,§8.5②）：
+                            # loss/head 层 bwd_scratch=满 vocab fp32(≥fml) → 0(其反向工作集已在
+                            # bwd_scratch,不双算,对 fused-CE loss_lids 空亦鲁棒);transformer/MoE 层
+                            # bwd_scratch 小 → =fml−bwd_scratch(此前全重算漏的 dL/dact + 专家反向临时)。
+                            # CSV autograd_compat.py:204=7366 + linear.py:135=269 vs 理论 bwd_scratch 4040。
+                            # 仅 PP(pp>1) 全重算(_pp_full_recomp)——pp1 旧口径已验证匹配真机,不加。
+                            if _pp_full_recomp:
+                                B.bwd_working_set = max(0, sm.forward_max_live - sm.bwd_scratch)
                         elif recompute.is_select(lid):
                             # 选择性重算：选中 op 反向重物化（recomp_scratch，= 选中段 forward_max_live
                             # 扣段边界）与非选中 op 反向工作集（bwd_working_set，= 非选中段
@@ -669,8 +718,12 @@ class MemTimeline:
                         if (nr_moe_frag_factor and pp == 1 and _stage_no_recompute
                                 and lid in loss_lids and _nr_moe_act > 0):
                             B.kept_frag += round(nr_moe_frag_factor * _nr_moe_act)
+                        # Fix②（§8.5）：Muon NS 反向重叠——反向事件叠加一份 NS workspace（optstep 桶,
+                        # 与真正 optstep 事件互斥:此处在反向、彼处在 step 末,不同事件不双计）。仅 Muon +
+                        # 本 stage 有全重算层(_muon_ns_overlap>0)时非零 → 非 Muon/OFF 恒 0,锚点保护。
+                        B.optstep = _muon_ns_overlap
                         rec(f"bwd@{lid}", ev_mb, ev_chunk)
-                        B.grad_buf = B.recomp_scratch = 0
+                        B.grad_buf = B.recomp_scratch = B.optstep = 0
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
                         # post_backward：resident 层此刻 reshard（reshard_after_backward 默认 True，
                         # state.py:505-537）→ 从 resident 集移除；gather_buf 回落到其余 resident。

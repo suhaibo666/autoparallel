@@ -244,3 +244,41 @@ python -m pytest tests/test_pp4_recompute_anchor.py tests/test_std_attn_anchor.p
   tests/test_scorecard_anchors.py tests/test_dsv4_flash_yaml.py tests/test_probe185_recon.py -q
 ```
 真机日志:185 `/home/suhaibo/workspace/log_dsv4h_pp{4,8}_*、log_dsv4h_pp4_mtp、log_std_*`;116 `log_std*_*`、层差分/m 判别探针产物。
+
+## 八.6、⟪2026-07-24⟫ 三结构桶修复 — §8.5 CSV「结构桶可改进项」落地（非框架缺口）
+
+§8.5 逐块对账把 stage7 缺口拆成**框架缺口**(csa/indexer fp32 物化,纯理论清零+FrameworkGapWarning
+不动)与**评估器可建准的结构桶**。后者三处已修(`cost_eval/mem_timeline.py`,**仅 `pp>1` 全重算
+反向 / Muon 激活**——pp1 安全网 DSv3 golden 12409/cp2/scorecard-DSv3-full/ce_optstep/DSv4-align
+逐字节不变):
+
+| # | 桶 | 修前(理论) | 修后(结构量) | CSV 锚 | 机制 + 源码 |
+|---|---|---|---|---|---|
+| ① | gather_buf | 5510 | **10010** | 10491(`param.py:519`) | 全重算 backward 先 re-gather 参数重跑 forward;PP checkpoint 区整段重算、区内各全重算层 param 反向峰同驻。结构量=Σ本 stage 全重算层 `param_full`(−4.6%,残差=块对齐) |
+| ② | Muon optstep(反向重叠) | 0 | **1536** | 2264(`muon.py`) | Muon NS 正交化对早完成反向的参数异步启动、与后续层反向重叠。结构量=一份最大矩阵 NS workspace(`_MUON_NS_WORKSPACE_MULT×分片×4`,68%;余多专家 NS 并发未拟合) |
+| ③ | bwd_working_set(全重算) | 0(仅 recomp_scratch) | **max(0,fml−bwd_scratch)/层** | autograd 7366+linear 269 | 反向除重跑 forward 外需算 dL/dact + MoE grouped-gemm 反向临时。结构量=`forward_max_live−bwd_scratch`(loss 层=0,不双算) |
+
+**修后现场逐 stage 理论 vs 真机 vs 剩余框架缺口**(fused==unfused,差=框架缺口 csa/indexer fp32):
+
+| stage | 修前理论 | 修后理论 | 真机 | 剩余框架缺口 |
+|---|---|---|---|---|
+| 0 | 22454◦ | 23830 | 43964 | 20134 |
+| 3 | 27363 | 33919 | 58650 | 24731 |
+| 7 | 32257 | 38293 | 58652 | 20359 |
+| device_peak | 32257 | **38293** | 58652 | 20359 |
+
+（◦ s0 修前值取自 §八 表;device_peak 32257→38293,更接近真机,剩余缺口即 §8.5 具名的 csa/indexer
+fp32 未释放块,纯理论口径不追、FrameworkGapWarning 显式暴露。）
+
+**受影响 ON 锚点理论期望更新**(双断言:理论 pin + 框架缺口文档化;全部 pp>1):
+
+| 锚点 | 修前理论 | 修后理论 | 真机 | 备注 |
+|---|---|---|---|---|
+| pp4 ON s0/s3 | 12168/19343 | 14551/21038 | 24153/23508 | test_pp4 THEO_ON |
+| pp4+MTP s3 | 22121 | 24360 | 39898 | test_pp4 THEO_MTP |
+| pp8 s0/s7 | 19698/23097 | 19698/25305 | 24759/26449 | s0 无 re-gather 窗(无 BWD-SEND) |
+| std MHA ON s0/s1 | 6677/14291 | 7363/14803 | 11132/15370 | AdamW→无 Muon 项 |
+| P3-P m8 s0 | 12817 | 15208 | 25343 | 中部 s1-s3 仍 m 无关 |
+
+回归:全量 1459→**1459 passed**(pp1 安全网不动;pp>1 ON 锚点理论 pin 全部更新;新增
+`tests/test_unfused_stage7_buckets.py` 四桶对 CSV 锚)。

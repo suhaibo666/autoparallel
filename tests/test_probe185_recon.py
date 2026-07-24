@@ -98,7 +98,9 @@ def _std_on_q(kv):
 _STD_ON_REAL = {32: {0: 11131.6, 1: 15370.0}, 8: {0: 10747.6, 1: 14986.0}}
 # 纯理论值（全重算只留层入口 checkpoint_input，注意段 bprop 张量不再 pin）。理论 << 真机,
 #   差距=框架释放缺口（MS2.10 全重算实际不释放注意段 bprop 保留，~500/层，双探针交叉背书）。
-_STD_ON_THEO = {32: {0: 6676.6, 1: 14290.7}, 8: {0: 6460.6, 1: 14026.7}}
+# 2026-07-24 §8.5 三结构桶(pp2>1 全重算反向:re-gather/bwd_ws;AdamW→无 Muon 项)入账后上移。
+#   理论仍 < 真机,差距=注意段 bprop 保留框架缺口(缩小)。
+_STD_ON_THEO = {32: {0: 7362.8, 1: 14802.8}, 8: {0: 7026.8, 1: 14490.8}}
 
 
 @pytest.mark.parametrize("kv,stage", [(32, 0), (32, 1), (8, 0), (8, 1)])
@@ -127,7 +129,7 @@ def test_p3p_m8_theoretical_and_gap():
     非 cap 造出的）。s0 理论 << 真机 25343.5——差距=框架释放缺口。"""
     pk = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="8", split="2,2,2,2"))
-    assert abs(pk[0] - 12816.8) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 12816.8"
+    assert abs(pk[0] - 15207.9) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 15207.9"  # 2026-07-24 §8.5 三桶
     assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="4", split="2,2,2,2"))
