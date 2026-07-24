@@ -127,6 +127,19 @@ ON:185 实测释放远少于 116(同 yaml,116 shim ON s0=5413 vs 185 ON s0=11132
 
 对真机代码:**`dsa` 注意力变体存在真实泄漏**——`_DSAIndexerGradFunction`(dsa_indexer_loss.py:70-72)**前向预计算 KL-loss 梯度**并裸挂 ctx(用户假设二命中)、`_DSAIndexerFunction`(dsa_indexer.py:55-57)q/k/weights 同病;一行修复=改 `save_for_backward`。**dsv4_hybrid 路径不中此病**(FusedSparseFlashMla* 全走 save_for_backward、KL 梯度在 backward,call-site grep 验证)——其 1.9GB/微批层驻留组成仍未逐张量指名(部分归 mHC 多流 checkpoint-input,余量待 MS per-tensor API)。第四条 issue:**重算区域内裸 ctx 挂张量应告警/修复**(repro=167 `bisect_patterns*.py`,V3 vs V3fix)。评估器 TODO:若跑 `dsa` 变体需加重算免疫桶(indexer q/k/w+前向预计算梯度)。
 
+## 七.7、⟪2026-07-24 终判⟫ 全重算驻留归属判决(E1-E4 判决实验,167)
+
+"~70% 不释放"实为**四件事**,逐一归属(全部有判决实验,产物 167 `log_verdict/`):
+
+| # | 问题 | 归属 | file:line | 判决证据 |
+|---|---|---|---|---|
+| 1 | 单卡等配置全重算**静默不生效** | **mindformers** | `trainer.py:166,209-211`(`enable_parallel = world_size>1` 门)→ 跳过 `parallelize.py:1743-1751` → `activation_checkpoint.py:655` | wrap 日志计数:单卡 **0**、pp4-s0 **2**、pp8-s0 **1**;单卡 ON≡OFF 是伪象 |
+| 2 | aclnn 自定义算子(mHC/MLA,经 HP DFunction)是否钉死 | **无罪**(MS/HP 均无问题) | `dfunction.py:46,110-135`;saves 全走 `save_for_backward`(custom_op_impl.py:331,390,588) | E1b:真实 FusedHyperConnectionModule 重算 ON fwd 末 **0**(OFF 821)——释放 |
+| 3 | 裸 ctx 属性挂张量(唯一算子级钉死) | **mindformers『dsa』变体**(非 dsv4_hybrid) | `dsa_indexer.py:55-57`、`dsa_indexer_loss.py:70-72`(**前向预计算 KL 梯度**裸挂) | V3 ON=4096 钉死 / V3fix(改 save_for_backward)ON=0;Combo 半释半钉 |
+| 4 | pp4 下 ~70% 驻留 | **非泄漏——1F1B+重算的结构性合法驻留** | 重算区=mHC 包装层(activation_checkpoint.py:655) | 重算确实释放层内部(6.2GB);残余=**mHC 包装层 checkpoint-input(多边界张量 aggregated+h_res/h_post)× warmup 在途深度**,至各微批反向方可释;算术闭合 1916/微批层 |
+
+**一句话结论**:dsv4_hybrid 重算路径**没有神秘框架泄漏**——自定义算子全部正常释放;所谓"不释放"=①单卡时 mindformers 压根没打 wrap(伪象)+②多卡时的合法 1F1B checkpoint-input 驻留。树内唯一真实的"存了且重算免疫"bug 是 dsa 变体的裸 ctx 模式(一行修复)。诚实残留:1.9GB 边界的逐张量拆分需 MS per-tensor profiler(Python 侧无此 API);2 卡 DTensor 派发 A/B 为可选的最后字节级确证。补充(用户质询核查):"含梯度"的 KL 接口确在 dsv4_hybrid 使用——**sparse 变体在 backward 调**(csa.py:284-296),正向为其携带 q_index/k_index/weights 的开销在 11 张量集内已入账;dense 前向梯度变体(npu_dense_lightning_indexer_grad_kl_loss)在可见两树 pynative 侧仅 dsa 变体可达。
+
 ## 八、复核方式
 
 ```bash
