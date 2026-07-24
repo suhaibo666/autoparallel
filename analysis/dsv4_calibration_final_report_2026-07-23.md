@@ -158,6 +158,16 @@ ON:185 实测释放远少于 116(同 yaml,116 shim ON s0=5413 vs 185 ON s0=11132
 
 s1/s2 为首次获得的真机值(此前未知),+15-16% 保守。s5/s6 的仿真"欠"要辩证读:真机尾段平台=分配器池贴容量的惰性回收形态(死 ctx 在压力下才回收),仿真值更接近"必需驻留";但按 alloc 口径逐 stage 判余量时须以真机平台为准。
 
+## 七.9、⟪2026-07-24 终局⟫ E5 两卡 DTensor 判决 — "释放 vs 驻留"矛盾消解
+
+用户质疑"ctx 保存的前向激活重算时会重新算出,为何还缓存"——**质疑成立,且矛盾已消解**:
+
+**E5(两卡 DTensor 版重算 A/B,167 `log_e5/`)**:local_save / dtensor_save / dtensor_localsave / framework_dt 四变体,OFF 均 2048、**ON 均 0(两 rank 一致)**——DTensor 派发层(_op_dispatch.py:907)**不**绕开重算钩子,证据错位假设证伪。至此全部嫌疑穷尽:单卡纯张量✓释放、DTensor✓释放、aclnn 算子(E1b 真实 mHC)✓释放、save_for_backward(V2)✓释放。
+
+**1916 MiB/微批层的真实身份 = 重算区域的 checkpoint-input(层边界)**——重算的起点,**设计上永远不能释放**;每在途微批持一份至其反向。跨配置常数为证:pp4(4微批×2层=8实例)1916/实例,pp8(8微批×1层=8实例)1892/实例——per-instance 边界的签名。**矛盾不存在**:释放证据(层内部被重算)与驻留测量(边界被 pin)描述的是**不同的张量集**,两者都对。~1900 的边界大于单份流(128-256),因 mHC 区域跨 aggregated+h_res+h_post 多份流(hc_mult=4)+fp32 副本;逐张量拆分需 MS per-tensor profiler(Python 侧无,如实声明)。
+
+**终版归属**:①dsv4_hybrid 重算路径**无框架泄漏**,1916=合法 1F1B+重算结构代价,被 mHC hc_mult=4 的**模型设计**放大(mindformers 模型侧,非 bug);②唯一钩子旁路 bug=dsa 变体裸 ctx(V3);③单卡静默不 wrap=mindformers trainer.py:209-211。评估器 pinned 桶语义定名:**「重算边界驻留 = checkpoint-input(mHC 多流边界)× min(pp,m) warmup 深度」**,具名张量清单为字节代理(总量锚定 pp4 −0.2%/pp8 1892)。
+
 ## 八、复核方式
 
 ```bash
