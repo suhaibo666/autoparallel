@@ -121,11 +121,7 @@ def build_dense_ffn_ops(d: DimTable) -> list:
     fc1_w  = TensorRef("fc1_w", ("H", fc1_out), shard={1: "tp"}, is_weight=True)
     fc2_w  = TensorRef("fc2_w", ("F",  "H"),    shard={0: "tp"}, is_weight=True)
 
-    # std 全重算保留集(185 基准,见 attention.py 同名注释):ln2(fc1 保留输入 bf16)在真机全重算
-    # 下不释放(g/act/h1-fp32 才释放)→ flag 开启时标 pin。默认关,逐字节不变。
-    if getattr(d, "std_recompute_ctx_pin", False):
-        ln2.pin_under_recompute = True
-
+    # 2026-07-24 口径切换：去除 std_recompute_ctx_pin（ln2 不再 pin，见 attention.py 同名注释）。
     return [
         # FFN 上投影（gated→2F gate+up；ungated→F）
         OpSpec("fc1",    OpType.MATMUL,      [ln2, fc1_w], g,

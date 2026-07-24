@@ -164,15 +164,18 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         # sparse attention：save Q(=q_hnorm fp32)+O(core_out)；fused kernel 不物化 kv_gathered/
         # attn_weights（走 scratch）；unfused 才 save 它们。
         #
-        # ── fused ctx 保存集（2026-07-22，185 pp4+全重算锚点定标，交接 §11.5）────────────────
+        # ── fused ctx 保存集（fused 自定义算子 SparseFlashMla 的 save_for_backward，交接 §11.5）──
         # fused 自定义算子 SparseFlashMla 每次调用 `ctx.save_for_backward` 存 **11 个张量**
         # （csa.py:224-235：query/ori_kv/cmp_kv/sparse_indices/query_index/key_index/weights/
         # cmp_residual/sinks/output/softmax_lse）。其中 query→q_hnorm、output→core_out、
         # cmp_kv→compressed_kv、sparse_indices→topk_indices 已建；此前缺 ori_kv(→kv_a_out)、
         # query_index/key_index/weights（indexer 内部 Q/K/头权重）、cmp_residual（压缩器残差）、
         # softmax_lse —— 仅 fused 分支补齐（unfused 走小算子路径、锚点 45557 已另标定，不动）。
-        # 全部 ctx 张量标 `pin_under_recompute`：MindSpore use_reentrant=False 全重算不释放
-        # 自定义 _Function 的 ctx 状态（真机 ON−OFF 净省仅 6.2GB 证实）→ 全重算下仍逐微批常驻。
+        # 这些是 **save_for_backward** 张量：无重算(OFF)口径下真实驻留(锚点背书)。
+        # ⚠ 2026-07-24 口径切换：**不再** pin_under_recompute。受控 A/B(E5/V2/E1b,报告§7.9)证
+        # save_for_backward 在 MS use_reentrant=False 全重算下**正常释放** → 纯理论口径全重算只留
+        # 层入口 checkpoint_input。真机每微批层驻留 ~1.9G 是「重算边界×在途深度」的框架释放缺口,
+        # 显式暴露(见 report §八/FrameworkGapWarning),不再用经验 pin 顶到具名张量上。
         if fused:
             idx_query = TensorRef("idx_query", ("B", "S", "dsa_indexer_n_heads", "dsa_indexer_head_dim"))  # indexer.py:112 wq_b 输出
             idx_key = TensorRef("idx_key", ("B", "S", "dsa_indexer_head_dim"), cp_kv=True)   # indexer.py:126 单头 K
@@ -180,10 +183,6 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
             cmp_residual = TensorRef("cmp_residual", ("S", "B", CMP_PROJ_OUT), cp_kv=True)   # compressor 残差（coff·vd）
             softmax_lse = TensorRef("softmax_lse", ("B", "n_heads", "S"), dtype_bytes=4)     # csa.py:235 fp32
             _ctx_new = ([idx_query, idx_key, idx_weights] if enable_indexer else []) + [cmp_residual, softmax_lse]
-            _ctx_all = ([q_hnorm, kv_a_out, compressed_kv, core_out]
-                        + ([topk_indices] if enable_indexer else []) + _ctx_new)
-            for _t in _ctx_all:
-                _t.pin_under_recompute = True                  # ctx 状态：全重算免疫（不释放）
             sparse_saves = [q_hnorm, kv_a_out, compressed_kv, core_out] + _ctx_new
         else:
             # ── unfused 反向图 fp32 复本群（2026-07-23,185 U1 相位合账;DAG 审计嫌疑①②）────────
@@ -218,13 +217,11 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
                           params=[attn_sink], saves=sparse_saves, workspace_ref=_fa_workspace()))
     else:
         # 滑窗（ratio 0/1）：纯 flash（sliding-window），saves Q(=q_hnorm)/O(core_out)+lse（[S,S] 从不物化，§7.4）
-        # fused（2026-07-22）：滑窗层同走 hyper_parallel 融合注意力 kernel 家族（自定义 _Function），
-        # 其 ctx 集 {query, ori_kv, output, softmax_lse} 同样全重算不释放（185 pp4 锚点:含 r0 层的
-        # stage0/1/3 欠估仅在 r0 也 pin 时闭合）→ 补 lse/ori_kv save + 全部标 pin。
+        # fused：滑窗层同走 hyper_parallel 融合注意力 kernel 家族（自定义 _Function），其 ctx 集
+        # {query, ori_kv, output, softmax_lse} 为 save_for_backward → 补 lse/ori_kv save（OFF 口径真实
+        # 驻留）。2026-07-24 口径切换：**不再** pin（save_for_backward 全重算正常释放，报告§7.9）。
         if fused:
             sw_lse = TensorRef("softmax_lse", ("B", "n_heads", "S"), dtype_bytes=4)
-            for _t in (q_hnorm, kv_a_out, core_out, sw_lse):
-                _t.pin_under_recompute = True
             ops.append(OpSpec("core_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out], core_out,
                               saves=[q_hnorm, kv_a_out, core_out, sw_lse],
                               workspace_ref=_fa_workspace()))

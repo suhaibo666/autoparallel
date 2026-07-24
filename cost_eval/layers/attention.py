@@ -204,17 +204,9 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     f2_ret = TensorRef("f2_ret", ("S", "B", "H"))
     h2_ret = TensorRef("h2_ret", ("S", "B", "H"))
 
-    # ── std 全重算保留集(2026-07-23,185 R1 相位+R-L 差分定标;llm_config.std_recompute_ctx_pin)──
-    # MS2.10 pynative 全重算实际只释放 {x 的 fp32 cast(=ci 已恒留)、h1 fp32 cast、g、act}
-    # (FFN 大激活),注意段全部 bprop 保留(ln1/qkv/splits/rope-fp32/tnd/mask/ctx/fa/o_ret 等
-    # ≈472/层@std8L)**不释放**——185 双探针交叉(536/498 每层)。仅 flag 开启时标 pin(默认关,
-    # 全部既有锚点/toy 逐字节不变)。
-    if getattr(d, "std_recompute_ctx_pin", False):
-        for _t in (ln1, qkv, attn, fa_st, q_split, k_split, v_split,
-                   rope_q_f32, rope_q_rot, rope_q_out, rope_k_f32, rope_k_rot, rope_k_out,
-                   q_tnd, k_tnd, v_tnd, mask_u8, ctx_tnd, o_ret, f2_ret, h2_ret):
-            _t.pin_under_recompute = True
-
+    # 2026-07-24 口径切换：去除 std_recompute_ctx_pin。原经验保留集(注意段 bprop 张量标 pin
+    # 顶住真机全重算「只释放 FFN 大激活」的现象)属经验补偿——纯理论口径下这些 save_for_backward
+    # 张量在全重算正常释放(报告§7.9)，全重算只留层入口 checkpoint_input；真机残留归框架释放缺口。
     ops += [
         # 3. RoPE（split 复本①与 fp32 中间量②在此保留;in-place 输出复用 qkv 引用）
         OpSpec("rope",   OpType.ROPE,        [qkv],        qkv,

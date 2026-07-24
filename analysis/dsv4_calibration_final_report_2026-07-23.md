@@ -168,11 +168,56 @@ s1/s2 为首次获得的真机值(此前未知),+15-16% 保守。s5/s6 的仿真
 
 **终版归属**:①dsv4_hybrid 重算路径**无框架泄漏**,1916=合法 1F1B+重算结构代价,被 mHC hc_mult=4 的**模型设计**放大(mindformers 模型侧,非 bug);②唯一钩子旁路 bug=dsa 变体裸 ctx(V3);③单卡静默不 wrap=mindformers trainer.py:209-211。评估器 pinned 桶语义定名:**「重算边界驻留 = checkpoint-input(mHC 多流边界)× min(pp,m) warmup 深度」**,具名张量清单为字节代理(总量锚定 pp4 −0.2%/pp8 1892)。
 
-## 八、复核方式
+## 八、⟪2026-07-24⟫ 口径切换声明 + 框架缺口清单（纯理论口径）
+
+**口径切换声明**：自 2026-07-24 起，评估器改为**纯理论口径**——按 mindformers / hyper_parallel /
+MindSpore 的**真实代码语义**做纯理论显存估计，**去除全部经验 pin 补偿**（fused ctx 免疫 pin、std
+全重算保留集 pin、MTP loss 链步内驻留、微批饱和 cap 均删除）。理论 vs 真机的差距**不吸收进数字**，
+而是作为框架缺口**显式暴露**（评估器发 `FrameworkGapWarning`，report §八 列清单）。全重算下评估器只留
+**每微批层入口 checkpoint_input**（已修正为 bf16 层 construct 入参 128MiB/微批层，非旧口径被 norm-fp32
+污染的 256MiB）。**理论峰值显著低于真机实测，OOM 判断勿直接采用理论值。**
+
+代码落点（本次改动）：`layers/dsv4_hybrid.py`（去 CSA/滑窗 fused ctx pin）、`layers/residual.py`
+（去 mHC `fused_ctx_pin`）、`layers/attention.py` + `layers/ffn.py`（去 `std_recompute_ctx_pin`）、
+`build_llm.py`（去 `_mhc_fused_ctx_pin`）、`structure_mem.py`（checkpoint_input 取 bf16 construct 入参）、
+`mem_timeline.py`（去饱和 cap、`saved = checkpoint_input`、`mtp_resident = 0`）、`advisories.py`
+（新增 `FrameworkGapWarning`）、`report.py`（full-recompute 时发缺口警示）。
+
+**框架缺口清单（四条，每条附证据 file:line；差距为框架缺口，非模型/建模误差）**：
+
+| # | 框架缺口 | 证据 file:line | 归属 / 处置 |
+|---|---|---|---|
+| ① | **全重算释放缺口**：理论边界 128M/微批层 vs 真机每微批层驻留 ~1.9G；MS2.10 全重算实际只释 ~30% 激活 | pp4 ON−OFF 仅省 6.2/21.6GB（§7.7-4）；E5 两卡 DTensor 判决证**非钩子旁路**（`_op_dispatch.py:907` 不绕重算钩子，§7.9）；E1b 真实 mHC 重算 ON fwd 末 0（§7.7）| **归属待 MS per-tensor 设备内存 API 终裁**；1.9G = 重算边界 checkpoint-input × 在途深度 + mHC hc_mult=4 多流放大（模型设计侧非 bug） |
+| ② | **单卡/非并行静默不 wrap**：单卡等配置 full recompute 静默不生效（ON≡OFF 伪象） | `trainer.py:166,209-211`（`enable_parallel = world_size>1` 门）→ 跳过 `parallelize.py:1743-1751` → `activation_checkpoint.py:655`（§7.7-1）| **mindformers bug**（wrap 日志计数：单卡 0 / pp4-s0 2 / pp8-s0 1）|
+| ③ | **dsa 变体裸 ctx 挂张量**（唯一算子级钩子旁路真实泄漏，dsv4_hybrid 不中此病）| `dsa_indexer.py:55-57`、`dsa_indexer_loss.py:70-72`（前向预计算 KL 梯度裸挂 `ctx.x=tensor`，§7.6/§7.7-3）| **mindformers bug，一行修复**（改 `save_for_backward`；V3 ON=4096 钉死 / V3fix ON=0）|
+| ④ | **MS 缺 per-tensor 设备内存归属 / 存活 API**：C++ 侧持有张量对 Python gc 清点不可见 | `memory_stats` 仅池级；gc 清点实测盲（§7.5-3）| **MindSpore 能力缺失**（阻碍 1.9G 逐张量拆分的字节级确证）|
+
+**现场 256 卡 DSv4-Flash 逐 stage 理论值 vs 真机 vs 缺口**（config = `test.yaml` 逐字节；pp8/ep32/
+dp_shard=32/cp1、mHC×4、mtp=1、全重算 [0-43]；理论 alloc MiB）：
+
+| stage | 理论(纯) | 真机 alloc | 缺口(真机−理论) |
+|---|---|---|---|
+| 0 | 18784.0 | 43964 | 25180.0 |
+| 1 | 24451.2 | 52326 | 27874.8 |
+| 2 | 23858.0 | 50982 | 27124.0 |
+| 3 | 27362.5 | 58650 | 31287.5 |
+| 4 | 26594.5 | 58648 | 32053.5 |
+| 5 | 25826.5 | 58650 | 32823.5 |
+| 6 | 25058.5 | 58390 | 33331.5 |
+| 7 | 32256.6 | 58652 | 26395.4 |
+| **device_peak** | **32256.6**（s7）| **58652** | **26395.4** |
+
+理论峰值 32257 MiB ≈ 真机 58652 的 55%——差距 26395 MiB 即上表①（全重算释放缺口，随 44 层×8 stage
+的在途微批 checkpoint-input 驻留 + mHC ×n 放大）叠加 MTP loss 链框架累积（尾 stage +16.4G，§7.9）。
+**这是设计意图**：缺口是 mindformers+hyper_parallel+MindSpore 框架问题的度量，不再用经验补偿顶平数字；
+**OOM 余量判断须以真机平台（max_device_memory=58G）为准，勿采用理论峰值。**
+
+## 九、复核方式
 
 ```bash
-python -m pytest -q                      # 1421 passed
+python -m pytest -q                      # 1459 passed（2026-07-24 口径切换后；OFF 锚点全绿=安全网,
+                                         # ON 锚点改双断言：理论值 pin 住 + 框架缺口文档化）
 python -m pytest tests/test_pp4_recompute_anchor.py tests/test_std_attn_anchor.py \
-  tests/test_scorecard_anchors.py tests/test_dsv4_flash_yaml.py -q   # 51 passed
+  tests/test_scorecard_anchors.py tests/test_dsv4_flash_yaml.py tests/test_probe185_recon.py -q
 ```
 真机日志:185 `/home/suhaibo/workspace/log_dsv4h_pp{4,8}_*、log_dsv4h_pp4_mtp、log_std_*`;116 `log_std*_*`、层差分/m 判别探针产物。

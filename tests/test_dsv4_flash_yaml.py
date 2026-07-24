@@ -117,13 +117,15 @@ def test_dsv4_flash_evaluates_via_ui_roundtrip():
     assert st["persist_breakdown"]["optimizer"] == "Muon"         # 持久分解按 Muon
 
 
-def test_dsv4_flash_structure_graph_matches_timeline_pin():
-    """结构页层卡与 timeline 全重算口径一致（2026-07-23 现场误读修）。
+def test_dsv4_flash_structure_graph_matches_timeline_pure_theory():
+    """结构页层卡与 timeline 全重算**纯理论口径**一致（2026-07-24 口径切换后重写）。
 
-    此前结构页 full 态只显 `checkpoint_input`（256M/层），而 timeline 每微批 pin
-    `checkpoint_input + recompute_pinned_saves`（~1.8G/层，fused ctx 免疫），差 ~7×
-    ——用户对照两处数字误判"激活多算 10 倍"。修后层卡 act_mib = entry + pinned，
-    且与 timeline 逐微批 act_live 增量同口径（fused ctx 免疫层 pinned>0）。
+    去经验 ctx 免疫 pin 后：full 态层卡只存**层入口 checkpoint_input**（bf16，无 pinned 免疫量）。
+      - `pinned_mib == 0`（免疫量已删）；
+      - `act_mib == entry_mib`（= checkpoint_input）；
+      - `act_mib < full_act_mib`（全重算仍省激活）；
+      - 与 timeline 逐微批 act_live 增量同口径（每层 pin checkpoint_input）。
+    真机每微批层 ~1.9G 驻留是框架释放缺口，显式暴露、不进层卡/timeline 数字。
     """
     import os, sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -138,11 +140,11 @@ def test_dsv4_flash_structure_graph_matches_timeline_pin():
     g0 = [L for L in r["stages"][0]["graph"] if L["recomp"] == "full"]
     assert g0, "stage0 应有全重算层"
     for L in g0:
-        # 层卡 stored = 层入口 + ctx 免疫（与 mem_timeline.py:569 同式；容差=两处独立 round 0.1M）
-        assert abs(L["act_mib"] - (L["entry_mib"] + L["pinned_mib"])) < 0.2, L
-        assert L["pinned_mib"] > 0, "fused dsv4 全重算层应有 ctx 免疫量"
+        assert L["pinned_mib"] == 0, "纯理论口径:full 态无 ctx 免疫量"
+        # 层卡 stored = 层入口 checkpoint_input（与 mem_timeline full 分支同式；容差=独立 round 0.1M）
+        assert abs(L["act_mib"] - L["entry_mib"]) < 0.2, L
         assert L["act_mib"] < L["full_act_mib"], "全重算存量仍应小于无重算全量"
-    # 与 timeline 对账:首微批各层 fwd 的 act_live 逐层增量 == 层卡 act_mib（同口径）
+    # 与 timeline 对账:首微批各层 fwd 的 act_live 逐层增量 == 层卡 act_mib（= checkpoint_input）
     tl = r["stages"][0]["timeline"]
     incs, prev = [], 0.0
     for e in tl:

@@ -8,12 +8,11 @@
      sim 49886 误判可放下,修后必须 >56010（OOM 翻正）**。
   B. **fused 每层差分**（F 相位）：L4=26499(锚)/L8=38936 → 每层 3109。修=core_out 逆 RoPE 保留
      （hybrid:277,嫌疑③）→ sim 每层 3152(+1.4%)。
-  C. **std 全重算释放改 185 基准**（R1 相位+R-L 差分）：MS2.10 全重算只释放 h1-fp32/g/act,
-     注意段 bprop 保留不释放(~500/层双探针交叉)。116 原生跑不了全重算(context_fn 崩),其 shim
-     ON=人造物 → 185 为唯一真跑 build,阳性基准（llm_config.std_recompute_ctx_pin）。
-  D. **微批饱和 cap**（pp8/pp4-m8(P3-P) 探针）：死 ctx 在 steady 期被 P2P 同步回收——stage0 无
-     同步窗不回收(P3-P s0 ≡m4+纯梯度;pp8-s0 8 组线性),中间 stage 饱和 min(W,ceil((W+1)/2)) 且
-     m 无关(P3-P s1-s3 ≡m4)（mem_timeline _ctx_cap）。
+  C. **std 全重算（2026-07-24 口径切换：纯理论）**：全重算只留层入口 checkpoint_input,注意段
+     bprop 张量不再 pin（去 std_recompute_ctx_pin 经验保留集）。真机全重算不释放注意段 bprop 保留
+     (~500/层双探针交叉)——理论 < 真机的差距为**框架释放缺口**,双断言(理论值+缺口)。
+  D. **pp4 ON m=8（纯理论：去经验饱和 cap）**：saved=checkpoint_input 与 m 无关（结构性质,非 cap
+     造出的）→ s1-s3 仍 m 无关;s0 理论 pin 住。真机 25343.5 与理论差=框架缺口。
 """
 import os
 import sys
@@ -79,7 +78,7 @@ def test_fused_per_layer_increment():
     assert 0.95 <= p4 / 26499.0 <= 1.02, f"F0 绝对 sim={p4:.1f} vs 锚 26499"
 
 
-# ── C. std 全重算 185 基准（R1 相位）────────────────────────────────────────────────
+# ── C. std 全重算 **纯理论**（2026-07-24 口径切换：去 std_recompute_ctx_pin 经验保留集）─────
 def _std_on_q(kv):
     q = dict(_DEF)
     q.update({
@@ -91,38 +90,47 @@ def _std_on_q(kv):
         "dp": "2", "tp": "1", "ep": "1", "pp": "2", "cp": "1", "method": "colossal",
         "optimizer": "adamw", "opt_dtype": "bf16", "grad_bytes": "4",
         "maxdev_gib": "58", "recompute": "full", "mbs": "4", "pp_split": "4,4",
-        "emb_bytes": "4", "std_pin": "1",   # 185 build 事实:emb fp32 + 全重算保留集
+        "emb_bytes": "4",   # 185 build 事实:emb fp32（std_pin 保留集已随口径切换删除）
     })
     return q
 
 
-# MHA s0 −6.3%(欠,band 保底 0.93 注明:185 ON floor 较 sim 高 ~0.5G+保留集下界口径);
-# GQA s0 −16%(残差①同源:真机 GQA 深 warmup 段驻留≈MHA,kv 缩水未兑现)。s1 双双 ~±5%。
 _STD_ON_REAL = {32: {0: 11131.6, 1: 15370.0}, 8: {0: 10747.6, 1: 14986.0}}
-_STD_ON_BAND = {(32, 0): (0.93, 1.05), (32, 1): (0.95, 1.07),
-                (8, 0): (0.82, 1.05), (8, 1): (0.95, 1.07)}
+# 纯理论值（全重算只留层入口 checkpoint_input，注意段 bprop 张量不再 pin）。理论 << 真机,
+#   差距=框架释放缺口（MS2.10 全重算实际不释放注意段 bprop 保留，~500/层，双探针交叉背书）。
+_STD_ON_THEO = {32: {0: 6676.6, 1: 14290.7}, 8: {0: 6460.6, 1: 14026.7}}
 
 
 @pytest.mark.parametrize("kv,stage", [(32, 0), (32, 1), (8, 0), (8, 1)])
-def test_std_recompute_on_185(kv, stage):
+def test_std_recompute_on_185_theoretical(kv, stage):
+    """(a) 纯理论值 pin 住防漂移（全重算只留 checkpoint_input）。"""
+    sim = _peaks(_std_on_q(kv))[stage]
+    theo = _STD_ON_THEO[kv][stage]
+    assert abs(sim - theo) < 0.5, (
+        f"185 std {'MHA' if kv == 32 else 'GQA'} ON stage{stage} 理论漂移: sim={sim:.1f} vs {theo:.1f}")
+
+
+@pytest.mark.parametrize("kv,stage", [(32, 0), (32, 1), (8, 0), (8, 1)])
+def test_std_recompute_on_185_framework_gap(kv, stage):
+    """(b) 框架缺口：真机全重算不释放注意段 bprop 保留(~500/层)——理论 < 真机,差距为框架缺口。"""
     sim = _peaks(_std_on_q(kv))[stage]
     real = _STD_ON_REAL[kv][stage]
-    lo, hi = _STD_ON_BAND[(kv, stage)]
-    ratio = sim / real
-    assert lo <= ratio <= hi, (
-        f"185 std {'MHA' if kv == 32 else 'GQA'} ON stage{stage}: sim={sim:.1f} vs "
-        f"real={real}, ratio={ratio:.3f} 越出 ({lo},{hi})。修前 [6741,14291,6525,14027]"
-        f"（s0 −39% 红区——116-shim 全释放口径,185 唯一真跑 build 证伪）")
+    assert sim < real, (
+        f"185 std {'MHA' if kv == 32 else 'GQA'} ON stage{stage}: 理论 {sim:.1f} 应 < 真机 {real}"
+        f"（框架释放缺口={real-sim:.0f}MiB，注意段 bprop 保留 MS 全重算不释放，非模型误差）。")
 
 
-# ── D. 微批饱和 cap（P3-P:pp4 ON m=8）───────────────────────────────────────────────
-def test_p3p_m8_saturation():
-    """P3-P:s0=25343.5(≡m4+纯梯度 +1190),s1-s3 ≡m4——stage0 不回收+中间 stage cap m 无关。"""
+# ── D. pp4 ON m=8 **纯理论**（去经验饱和 cap）────────────────────────────────────────
+def test_p3p_m8_theoretical_and_gap():
+    """纯理论口径去经验饱和 cap（cap 是死 ctx 的经验回收模型；纯理论无免疫 ctx 可回收）。
+    s0 理论 pin 住；中间 stage s1-s3 仍 **m 无关**（saved=checkpoint_input 与 m 无关，是结构性质，
+    非 cap 造出的）。s0 理论 << 真机 25343.5——差距=框架释放缺口。"""
     pk = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="8", split="2,2,2,2"))
-    assert abs(pk[0] / 25343.5 - 1) <= 0.05, f"P3-P s0 sim={pk[0]:.1f} vs 真机 25343.5"
+    assert abs(pk[0] - 12816.8) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 12816.8"
+    assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="4", split="2,2,2,2"))
     for s in (1, 2, 3):
         assert abs(pk[s] - m4[s]) < 1.0, (
-            f"stage{s}: m8({pk[s]:.1f}) ≠ m4({m4[s]:.1f})——真机 s1-s3 逐 MiB ≡m4(饱和,cap 应 m 无关)")
+            f"stage{s}: m8({pk[s]:.1f}) ≠ m4({m4[s]:.1f})——中间 stage saved=ci 应 m 无关")

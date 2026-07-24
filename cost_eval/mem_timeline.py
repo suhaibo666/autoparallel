@@ -330,20 +330,21 @@ class MemTimeline:
             _moe_lids = {l.layer_id for l in layers
                          if any(getattr(op.type, "value", op.type) == "moe_gemm"
                                 for op in l.ops)}
-            # ── MTP loss 链步内驻留（2026-07-23，185 pp4+MTP 锚点:尾 stage +16.4GB≈m×3.1GB）──
-            # mtp 层 loss 段（final_norm/lm_head/logsoftmax/nll 的 saves = h_last/h_final/
-            # logits_lm/logsm）每微批前向后**驻留至 step 末**（真机 mtp_k_loss 逐步聚合,其反向图
-            # 跨微批持有——185 实测 mtp=1 只尾 stage 净增,s0-s2 逐 MiB 不变）。仅 **full-recompute
-            # 的 mtp 层**计入（其 saved 已塌缩到 ci+ctx,loss 段不在 act_live → 无双算;无重算 mtp
-            # 的同款驻留无锚点,不外推——OFF 下 loss 段本就在 act_live 逐微批计 1 份,保持既有口径）。
-            _MTP_LOSS_OPS = ("final_norm", "lm_head", "logsoftmax", "nll")
-            _mtp_loss_bytes = {
-                l.layer_id: estimate_structure_memory(
-                    [op for op in l.ops if getattr(op, "name", "") in _MTP_LOSS_OPS],
-                    alloc_block_bytes=alloc_block_bytes,
-                    norm_compute_dtype_bytes=norm_compute_dtype_bytes).activation_saves
-                for l in layers
-                if getattr(l, "layer_type", "") == "mtp" and recompute.is_full(l.layer_id)}
+            # ── MTP loss 链步内驻留（**2026-07-24 口径切换后恒 0**）─────────────────────────
+            # 旧口径把 mtp 层 loss 段（~m×3.1GB）经验建成「驻留至 step 末」以对齐真机尾 stage +16.4GB。
+            # 纯理论核查真机代码（116 multi_token_prediction.py，只读）后**归 0**——**代码不支撑任何
+            # 步内跨微批驻留**：
+            #   ① `_MTPLossAutoScaler`（:53-97）是 `_Function`：`apply(output, mtp_loss)` 把 mtp_loss
+            #      backward **挂到当前微批 hidden_states/output 的反向**（backward 返回 scaled 梯度）→
+            #      随**该微批**反向执行并释放，非延迟到 step 末；
+            #   ② `save_to_mtp_losses_tracker`（:107-143）只累加 **`.detach()`** 的标量 loss（:141）
+            #      供日志——**不持有反向图/激活**（"mtp_k_loss 逐步聚合"是 detached 标量和）；
+            #   ③ `process_mtp_loss`（:611-674）逐微批算 loss+注梯度，无 graph-carrying loss 列表留到
+            #      step 末。
+            # 故 MTP loss 段无「步内跨微批常驻」——在途微批的 loss 段已由该 mtp 层全重算反向的
+            # recomp_scratch（forward_max_live−ci，含 loss 段 op）在其反向峰计入，不欠算。真机尾
+            # stage +16.4GB（MS 未及时释放逐微批 MTP 反向图的 m 份累积）是**框架释放缺口**，显式暴露。
+            _mtp_loss_bytes: dict = {}
 
             # ── P0-03（2026-07-14 review）：reshard_after_forward 接线 ─────────────────
             # 语义（hyper_parallel fsdp.py:42-74 / hsdp_scheduler.py:225-250 / parallelize.py:1172-1182）:
@@ -491,28 +492,10 @@ class MemTimeline:
             # P0-01：已完成首次反向的层集（其 reduced grad shard 已常驻 grad_accum）。
             grad_done: set = set()
 
-            # ── 重算免疫 ctx 的**微批饱和 cap**（2026-07-23，185 pp8/pp4-m8(P3-P)/pp4-m4 三组
-            # 探针联合定标）──免疫 pin（fused ctx / std 保留集）是**死内存**（重算会重建），真机在
-            # steady 1F1B 期被 P2P 同步点回收：
-            #   - **stage0 不回收**（fork 调度 stage0 无 BWD_SEND/FWD_RECV,scheduler.py:960/985
-            #     `if stage_index != 0` —— 无同步窗）：pp8-s0 8 组线性=24759、pp4-m8-s0 ≡m4+纯梯度
-            #     增长(+1190) 双实证 → cap = W。
-            #   - **中间/末 stage**（steady 每迭代 BWD_SEND+FWD_RECV 同步）：驻留饱和为
-            #     min(W, ceil((W+1)/2)),且 **m 无关**（pp4-m8 s1-s3 ≡m4 实证;pp8 中部实测
-            #     [4.3,4.0,3.8,3.0,2.8,2.0] vs 该式 [4,4,3,3,2,2],±1 组内,pp8-s5 欠 6% 已 band 注明）。
-            #   - m ≤ W（无 steady）→ 不截。
-            # 超出微批仍 pin checkpoint_input（活内存,重算起点必须留），其免疫 ctx 记 0。
-            # 无免疫 pin 的 spec（DSv3 等）saved==ci → cap 天然无效,逐字节不变。
-            _W_win = min(m, (pp - stage + 1)
-                         if (getattr(pm.pc, "sched_warmup_plus_one", False)
-                             and pp > 1 and stage < pp - 1)
-                         else max(1, pp - stage))
-            if m <= _W_win or stage == 0:
-                _ctx_cap = _W_win
-            else:
-                _ctx_cap = min(_W_win, -(-(_W_win + 1) // 2))
-            _ctx_mbs: set = set()          # 当前持有免疫 ctx 的微批
-            _ctx_denied: set = set()       # 超 cap 被回收（只留 ci）的微批
+            # 2026-07-24 口径切换：删除「重算免疫 ctx 微批饱和 cap」——纯理论口径下无任一张量 pin
+            # （recompute_pinned_saves 恒 0，见 model_spec.pin_under_recompute），全重算 saved 恒 =
+            # checkpoint_input，cap 无对象。真机每微批层 ~1.9G 驻留 = 重算边界×在途深度的框架释放
+            # 缺口，显式暴露（不再用经验 cap 建模其 steady 回收）。
 
             for ev_kind, ev_mb, ev_layers, ev_chunk in steps:
                 if ev_kind == "FWD":
@@ -559,27 +542,15 @@ class MemTimeline:
                             B.gather_buf = _res()   # reshard_after_forward：非 resident 部分用完即释
                         # 2. 决定该层 pin 多少 activation
                         if recompute.is_full(lid):
-                            # 全重算保留 = 层入口 checkpoint_input + **经验驻留集**
-                            # （2026-07-22 185 pp4 锚点定标;2026-07-23 机制表述订正）：真机实测
-                            # fused dsv4 层全重算下每微批层仍驻留 ~ctx 集尺寸激活（ON−OFF 净省
-                            # 仅 6.2GB vs 全释放模型 16-23GB），随 1F1B warmup 在途微批累积、至该
-                            # 微批该层反向才释。⚠ 驻留机制归因已订正:受控 A/B 实验证伪「自定义
-                            # _Function ctx.save_for_backward 逃逸 hooks」（裸 API 与生产 wrapper
-                            # 下 ctx saves 均正常释放,见 model_spec.pin_under_recompute 注释）;
-                            # 字节量/生命周期为真机锚定经验事实,真实驻留体待层级二分。
-                            # 无免疫标记的 spec `recompute_pinned_saves=0` → 逐字节复现旧行为。
-                            saved = sm.checkpoint_input + sm.recompute_pinned_saves
-                            # 微批饱和 cap（185 探针,见上方 _ctx_cap 注释）:超 cap 微批的死 ctx
-                            # 被 steady 期回收 → 只留 checkpoint_input（活内存）。
-                            if sm.recompute_pinned_saves > 0:
-                                if ev_mb in _ctx_denied:
-                                    saved = sm.checkpoint_input
-                                elif ev_mb not in _ctx_mbs:
-                                    if len(_ctx_mbs) >= _ctx_cap:
-                                        _ctx_denied.add(ev_mb)
-                                        saved = sm.checkpoint_input
-                                    else:
-                                        _ctx_mbs.add(ev_mb)
+                            # 全重算保留 = **层入口 checkpoint_input**（重算边界，纯理论口径）。
+                            # 2026-07-24 口径切换：去除经验驻留集（recompute_pinned_saves 恒 0，见
+                            # model_spec.pin_under_recompute）——受控 A/B 证 save_for_backward /
+                            # DTensor / aclnn 自定义算子 ctx 全重算均正常释放（报告§7.9），全重算只
+                            # 留边界。真机每微批层 ~1.9G 驻留（= 重算边界 checkpoint_input × 在途深度
+                            # + mHC hc_mult 多流放大）是**框架释放缺口**，显式暴露（FrameworkGapWarning
+                            # /报告§八），不吸收进数字。checkpoint_input 已修正为 bf16 层入口（128MiB/
+                            # 微批层，非 fp32 256；见 structure_mem）。
+                            saved = sm.checkpoint_input
                         elif recompute.is_select(lid):
                             # 选择性重算：非选中 op 的 saves（去重）+ 层入口边界常驻；
                             # 选中 op 的 saves 丢弃（反向重物化）。介于 full 与全量之间。
@@ -726,9 +697,6 @@ class MemTimeline:
                             grad_done.add(lid)
                             if not offload_grads:
                                 B.grad_accum += sm.grad_shard_bytes
-                    # 该微批反向完成 → 其免疫 ctx 席位释放（饱和 cap 计数,见 _ctx_cap 注释）。
-                    _ctx_mbs.discard(ev_mb)
-                    _ctx_denied.discard(ev_mb)
 
             # ② 优化器-step 事件（真机 profiler：pp=2 stage0 峰 = AdamW 更新 embedding 的瞬态，
             #   非层反向）。step 在**所有反向之后**、激活已释 → 与激活桶互斥（**累计梯度 grad_accum

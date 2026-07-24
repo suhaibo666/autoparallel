@@ -76,8 +76,6 @@ class DimTable:
     # unfused CE lean 口径（2026-07-23 std 锚点定标,详见 llm_config.ce_pynative_lean）：True →
     # 无重算 loss stage K_CE=4（pp 无关,116 std pp1/pp2-s1 实测一致）；False → 制度常数 8/4（冻结）。
     ce_pynative_lean: bool = False
-    # std 全重算保留集(185 基准,2026-07-23,详见 llm_config.std_recompute_ctx_pin)。
-    std_recompute_ctx_pin: bool = False
     # **标定 margin 因子**（B 方案，2026-07-09；非 op 图导出）：保留(非重算)模块在 loss 峰的
     #   fp32-cast 横切 + 小张量长尾占「当前 kept 激活」的比例。源码级 op-DAG 提取证实此残差**在 op 图
     #   粒度之下**（profiler live-set 313 个 <100MiB 碎片，`analysis/realmachine/opdag_validation.md`），
@@ -112,19 +110,14 @@ class TensorRef:
     #   到 **full-S**（不 ÷cp），其余 cp 算法（ulysses/ring/hybrid）仍随 body ÷cp。默认 False。
     cp_shard: bool = True
     cp_kv: bool = False
-    # ── 重算免疫（2022-07-22 定标;07-23 两轮机制排查后**定案**,完整链见 analysis 报告）──
-    # pin_under_recompute=True：该 save 属于**全重算下仍驻留的层前向激活主体**。定案依据:
-    #   ① 受控 A/B（185,8块×512MiB 单变量）:裸 ms.recompute 与生产 wrapper 下,hookable
-    #     saves 与自定义 _Function ctx saves **均正常释放** → 「ctx 逃逸 hooks」假设证伪;
-    #   ② 真实层单卡隔离(无 FSDP/PP)差分:每层前向激活驻留可复现(std 408MiB/层@seq4096、
-    #     fused ~2483MiB/层折算)→ 驻留是**层内激活本体**,非并行机器;
-    #   ③ 多卡 wrap 确认生效(日志 "Set full recompute at layer")时,pp4 s0 每在途微批层
-    #     仍 pin ~1916MiB ≈ 层激活主体,ON−OFF 净省仅 ~30% 小切片 → MS2.10 全重算实际只
-    #     释放层激活的少数派,大头以非 hookable 方式被持有(逐张量指名受限于 MS 无
-    #     per-tensor 存活 API,gc 清点实测盲)。
-    #   本标志按 shape 记账该驻留主体(数值≈ctx 集尺寸,pp4 锚 −0.2%),per-(mb,layer)
-    #   生命周期至该微批该层反向;超饱和 cap 微批只留 checkpoint_input(mem_timeline)。
-    #   默认 False = 普通激活,全部既有 spec 惰性、逐字节不变。
+    # ── 重算免疫标志（**2026-07-24 口径切换后已惰性**）──────────────────────────────────
+    # pin_under_recompute=True：历史上表示「全重算下仍驻留的层激活主体」，由经验 pin 桶顶住真机
+    # 每微批层 ~1.9G 驻留。2026-07-24 口径切换为**纯理论**：受控 A/B（报告§7.9 E5/E1b/V2）证
+    # save_for_backward / DTensor / aclnn 自定义算子 ctx 在 MS use_reentrant=False 全重算下**均
+    # 正常释放** → 全重算只留层入口 checkpoint_input。**当前代码无任一 spec 设此标志**（经验补偿
+    # 已删除，见 dsv4_hybrid/residual/attention/ffn），故 `structure_mem.recompute_pinned_saves`
+    # 恒 0、`mem_timeline` 全重算 saved 恒 = checkpoint_input。字段保留作通用机制占位。真机残留
+    # （1.9G/微批层 = 重算边界×在途深度）归**框架释放缺口**，显式暴露（FrameworkGapWarning/报告§八）。
     pin_under_recompute: bool = False
 
     def has_ep(self) -> bool:

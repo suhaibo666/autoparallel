@@ -22,9 +22,24 @@ class OOMSafetyWarning(UserWarning):
     """预估可能欠预测(OOM-不安全方向)的咨询——提示留安全余量,不改数值。"""
 
 
+class FrameworkGapWarning(UserWarning):
+    """**框架缺口**咨询（2026-07-24 口径切换）：评估器按 MindSpore/mindformers 真实代码语义做
+    **纯理论**估计，不做任何经验补偿；理论 vs 真机的差距作为框架缺口**显式暴露**、不吸收进数字。
+
+    典型场景：full-recompute 下评估器按 MS checkpoint 理论语义只留每微批层的重算边界（~128MiB
+    层入口），但 MS2.10 真机每微批层实际驻留约 1.9GB、全重算只释放约 30% 激活——差距是**框架释放
+    缺口**，非模型/建模误差。**这类警示务必让用户看见：理论峰值显著低于真机实测，OOM 判断勿直接
+    采用此理论值。**"""
+
+
 def warn_oom_safety(msg: str, *, stacklevel: int = 2) -> None:
     """发一条 OOM-安全咨询(欠预测风险)。薄封装,便于统一 stacklevel 与测试断言。"""
     warnings.warn(msg, OOMSafetyWarning, stacklevel=stacklevel + 1)
+
+
+def warn_framework_gap(msg: str, *, stacklevel: int = 2) -> None:
+    """发一条框架缺口咨询（纯理论 vs 真机差距，显式暴露、不进数字）。"""
+    warnings.warn(msg, FrameworkGapWarning, stacklevel=stacklevel + 1)
 
 
 def warn_modeling_approx(msg: str, *, stacklevel: int = 2) -> None:

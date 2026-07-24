@@ -6,7 +6,7 @@ Evaluator 是整个评估器的对外入口：接收 ModelSpec + 并行/优化�
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from .advisories import warn_oom_safety
+from .advisories import warn_oom_safety, warn_framework_gap
 from .parallel_model import ParallelModel
 from .shape_eval import ShapeEval
 from .static_mem import StaticMem
@@ -282,6 +282,17 @@ class Evaluator:
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
         g = ShapeEval().resolve(self.spec, pm)
         _validate_recompute_against_graph(self.recompute, g)     # C1：full 空集/select 零命中 fail-loud
+        # ── 框架缺口显式暴露（2026-07-24 口径切换）：任一层 full-recompute 时，评估器按 MindSpore
+        #    checkpoint 理论语义只留每微批层重算边界（~128MiB 层入口 bf16），而 MS2.10 真机每微批层
+        #    实际驻留约 1.9GB、全重算实际只释放约 30% 激活——差距为**框架释放缺口**，不吸收进数字。
+        _any_full = any(self.recompute.is_full(l.layer_id)
+                        for layers in g.stages.values() for l in layers)
+        if _any_full:
+            warn_framework_gap(
+                "按 MindSpore checkpoint 理论语义估计全重算(每微批层仅保留区域边界 ~128MiB 层入口)。"
+                "MS2.10 真机实测每微批层驻留约 1.9GB、全重算实际仅释放约 30% 激活——差距为**框架释放"
+                "缺口**(证据:pp4 ON−OFF 仅省 6.2/21.6GB;判决实验 E5/E1b 证机制上应释放)。**理论峰值"
+                "显著低于真机实测,OOM 判断勿直接采用此值。**")
         # ── round3 A：OOM-安全咨询（不改数值,只提示欠预测风险；欠预测=误报"放得下"却 OOM）──
         n_layers = self.spec.dims.n_layers
         # F3：缩层锚点外推全尺寸风险——n_layers 远超已验证尺度时,累计每层残差（欠方向）无全尺寸验证点。

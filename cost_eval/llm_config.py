@@ -106,12 +106,6 @@ class LLMConfig:
     # 与 pp 无关）；False = 制度常数（pp>1→8 / pp==1→4——DSv3-era 在含未建模效应的旧探针上标定的
     # 混合常数,该族锚点冻结在此口径,勿动）。仅 cross_entropy_fused=False 且无重算 loss stage 有差异。
     ce_pynative_lean: bool = False
-    # std(mha/gqa) 全重算释放口径改 185 基准(2026-07-23,185 R1 相位+R-L 差分):MS2.10 pynative
-    # 全重算实际只释放 pre-FFN fp32 cast(h1)与 FFN 大激活(g/act),注意段/残差段的 bprop 保留
-    # **不释放**(≈470/层@std8L 两探针交叉:R-L 差分 1048−静态512≈536;R1 相位 (5813−梯度2086)/8
-    # +ci≈498)。True → gqa/dense builder 对该集标 pin_under_recompute。默认 False(116-shim 口径
-    # =全释放;116 原生跑不了全重算,其 shim ON 是人造物,185 为唯一真跑 build——见 probe 报告)。
-    std_recompute_ctx_pin: bool = False
 
     # ---- ③ 残差变体（横切）----
     residual_variant: str = "plain"         # plain | mhc
@@ -192,7 +186,6 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
         cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
         ce_pynative_lean=cfg.ce_pynative_lean,         # unfused CE lean K=4（116 std 实测口径）
-        std_recompute_ctx_pin=cfg.std_recompute_ctx_pin,   # std 全重算保留集(185 基准)
         norm_compute_dtype_bytes=cfg.layernorm_compute_dtype_bytes,   # norm 激活 fp32（真机 layernorm_compute_dtype）
         kept_frag_factor=cfg.kept_frag_factor,   # B 标定 margin（select-kept-MoE loss 峰碎片长尾）
         nr_moe_frag_factor=cfg.nr_moe_frag_factor,   # D1 标定 margin（无重算-MoE loss 峰碎片长尾，pp==1）

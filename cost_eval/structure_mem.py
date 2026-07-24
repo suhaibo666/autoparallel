@@ -56,13 +56,10 @@ class StructureMemory:
     checkpoint_input: int = 0
     forward_max_live: int = 0
     grad_shard_bytes: int = 0
-    # ── 重算免疫 saves（2026-07-22，185 pp4+全重算锚点定标）────────────────────────
-    # `recompute_pinned_saves`：saves 中标 `pin_under_recompute=True` 的张量（去重、块对齐）
-    #   字节和——**自定义算子 `ctx.save_for_backward` 持有的状态**（fused SparseFlashMla 11
-    #   张量集，csa.py:224-235），MindSpore use_reentrant=False 全重算不释放（activation_
-    #   checkpoint.py:151）→ 全重算下该层仍随微批 pin `checkpoint_input + 此值` 进 act_live
-    #   （mem_timeline full 分支）。是 `activation_saves` 的子集口径（同 dedup/对齐；norm-fp32
-    #   bump 不适用——ctx 张量按 kernel 实际 dtype 计）。无标记 spec 恒 0（惰性）。
+    # ── 重算免疫 saves（**2026-07-24 口径切换后恒 0**）──────────────────────────────
+    # `recompute_pinned_saves`：saves 中标 `pin_under_recompute=True` 的张量字节和。经验 pin 补偿
+    #   已删除（见 model_spec.TensorRef.pin_under_recompute 注释）→ 当前无任一 spec 设此标志 →
+    #   **恒 0**，全重算 saved 恒 = checkpoint_input（纯理论重算边界）。字段/聚合保留作通用机制占位。
     recompute_pinned_saves: int = 0
     # persistent 组成分解用：本结构内、按 fsdp/efsdp 切后的**驻留参数量**（去重、未乘倍数、未块对齐）。
     #   matrix = Muon 分类的 2D 矩阵权重（is_muon_matrix_weight）；other = 其余。persistent 分量拆解
@@ -310,11 +307,19 @@ def estimate_structure_memory(
     bwd_scratch = _backward_max_live(resolved_ops, conservative=bwd_scratch_conservative)
     workspace = max((op.workspace_bytes for op in resolved_ops), default=0)
 
+    # 重算边界 checkpoint_input = 层「construct 入参」hidden_states（MS `_InputSaver`,
+    # recompute.py:158，以 compute/bf16 dtype 持有），**不是**首个 op 恰好 save 的那张激活。
+    # mHC 下首 op 是 RMSNorm：它 **save 的是 fp32 [S,B,n·H] 输出（256MiB）**，而吃进的 construct
+    # 入参是 **bf16 打包流 [S,B,n·H]（128MiB）** —— 旧口径取 save 被 norm-fp32 污染成 256。取首个有
+    # saves 的 op 的**首个非权重输入**（层入口张量、真实 dtype），无激活输入(embedding 类)时回退首个
+    # save。非 mHC(std/MLA/DSv3) 首 op ln1 save 的即其输入 x → 逐字节不变；mHC 修正回 bf16 128。
     checkpoint_input = 0
     for op in resolved_ops:
         if op.saves:
-            s = op.saves[0]
-            checkpoint_input = _align_up(s.local_numel * s.dtype_bytes, blk)
+            boundary = next((t for t in op.inputs if not getattr(t, "is_weight", False)), None)
+            if boundary is None:
+                boundary = op.saves[0]
+            checkpoint_input = _align_up(boundary.local_numel * boundary.dtype_bytes, blk)
             break
 
     # forward_max_live（重算瞬态）**不用 norm fp32**：重算时 fp32 cast 转瞬即释、不与峰值共存,
@@ -461,13 +466,16 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
     sm_non = estimate_structure_memory(nonselected, alloc_block_bytes=blk,
                                        norm_compute_dtype_bytes=norm_compute_dtype_bytes)
 
-    # 层入口 checkpoint_input（重算边界，始终保留）：整层第一个有 saves 的 op 的首个 save。
+    # 层入口 checkpoint_input（重算边界，始终保留）：层「construct 入参」= 第一个有 saves 的 op
+    # 的**首个非权重输入**（真实 bf16 dtype，与主 checkpoint_input 同口径；非 mHC 逐字节不变，
+    # mHC 从 fp32 污染修正回 bf16 128）；无激活输入时回退首个 save。
     ci_name = None
     ci_bytes = 0
     for op in ops:
         if op.saves:
-            ci_name = op.saves[0].name
-            ci_bytes = _align_up(op.saves[0].local_numel * op.saves[0].dtype_bytes, blk)
+            _b = next((t for t in op.inputs if not getattr(t, "is_weight", False)), None) or op.saves[0]
+            ci_name = _b.name
+            ci_bytes = _align_up(_b.local_numel * _b.dtype_bytes, blk)
             break
 
     # act_live_pinned = 非选中 saves（去重）∪ {ci}。ci 若已在非选中 saves 里则不重复加（按名去重）。
