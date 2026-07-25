@@ -273,10 +273,23 @@ def floordiv(a: Factors, n: int) -> Factors | None:
     return Factors(1, {f"{render_term(a)}//{n}": 1})
 
 
+def _sum_term(f: Factors) -> str:
+    """和式的一项在**串形式**里的写法:**乘积项必须加括号**。
+
+    为什么(2026-07-25 实测的一个静默错):`_split_top(s, "·")` 只认括号深度,不认 `+`。
+    若把两个乘积项裸着相加成 `"B·S·v_head_dim+B·S·v_head_dim"`,再 `parse_axis` 时会被按 `·`
+    切成 `["B", "S", "v_head_dim+B", "S", "v_head_dim"]` —— 中间冒出个假和式单元
+    `v_head_dim+B`,值算成 `B·(B+v_head_dim)·S·S·v_head_dim`(实测把一个 8 MiB 的 concat
+    产物算成 8·10⁶ MiB)。旧代码只在**单符号**之间相加(`qk_head_dim+v_head_dim`)故没暴露;
+    concat 的"元素数 = 各输入元素数之和"要相加**乘积**,必须补括号才能往返。
+    """
+    t = render_term(f)
+    return f"({t})" if (_split_top(t, "·")[1:] or _split_top(t, "+")[1:]) else t
+
+
 def add(a: Factors, b: Factors) -> Factors:
     """两个轴相加(concat 末轴 / q_head_dim=qk_head_dim+qk_pos_emb_head_dim):合成一个和式原子单元。"""
-    ta, tb = render_term(a), render_term(b)
-    unit = _canon_sum(f"{ta}+{tb}")
+    unit = _canon_sum(f"{_sum_term(a)}+{_sum_term(b)}")
     return Factors(1, {unit: 1})
 
 

@@ -95,6 +95,11 @@ def _sym_value(sym, dims):
         return _cap_value(dims)
     field = _SYM2FIELD.get(sym)
     if field is None:
+        # **乘积项**（concat 的"元素数之和"里每一项都是一个乘积，见 `sym_shape._sum_term`）：
+        # 不是单符号 → 按轴重新解析求积。纯符号但无映射的仍落 None（不杜撰）。
+        stripped = sym.strip("()").strip()
+        if _split_top(stripped, "·")[1:]:
+            return _axis_value(parse_axis(stripped), dims)
         return None                          # 无映射 → 未解析（不杜撰）
     v = getattr(dims, field, None)
     return int(v) if v else None             # 0/None → 未解析
@@ -233,20 +238,121 @@ def save_bytes(save, dims):
     return elems * _dtype_bytes(save.dtype, dims)
 
 
+# ---------------------------------------------------------------------------
+# `Detach` 别名去重 —— `stop_gradient` 不复制存储
+# ---------------------------------------------------------------------------
+
+def detach_aliases(dag) -> dict:
+    """`{detach 产物名: 其输入名}`。
+
+    `ops.stop_gradient(x)` **不复制存储**：它返回一个共享同一块内存、只是不参与 autograd 的
+    别名（`Detach` 的 `PIN` 也是 `{"inputs": []}`，`bprop_rules.py:53`）。故字节记账里
+    **产物与输入不得各计一份** —— 真源 6 处 detach（`csa.py:665/666/764/765/794/795`）里
+    `x_detach`/`qr_detach` 与 `x`/`qr` 就是同一块内存，`derive_saves` 按名去重看不出这层。
+    传递闭包（detach 的 detach）按链一路指向最原始的那个名字。
+    """
+    direct: dict = {}
+    for n in dag.nodes:
+        if n.op != "Detach" or not n.out or not n.ins:
+            continue
+        src = n.ins[0].split(":", 1)[0]
+        dst = n.out.split(":", 1)[0]
+        if dst != src:
+            direct[dst] = src
+    out: dict = {}
+    for dst in direct:
+        seen, cur = {dst}, direct[dst]
+        while cur in direct and cur not in seen:
+            seen.add(cur)
+            cur = direct[cur]
+        out[dst] = cur
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 权重（params）—— 与激活**结构性**分开（契约 W1..W6 + B4）
+# ---------------------------------------------------------------------------
+
+def dag_param_bytes(dag, dims, init_dims=None, pm=None):
+    """DAG 的**权重**字节。返回 `{total_bytes, per_param, unresolved}`。
+
+    权重从哪来（结构性，不是筛名字）：walker 把 `self.<attr>` 且 `__init__` 里是 `Parameter(...)`
+    的操作数**刻意排除在 `OpNode.ins` 之外**，单列在 `OpDAG.param_operands`
+    （`schema.py:56-59`；正因如此 `derive_saves` 结构上**不可能**把权重当激活 save —— 契约 W2/W4
+    自动成立，实测 `FFNGroupedGEMM` 那 88 MiB 的病在本路径上不存在）。形状/dtype 由
+    `init_dims.param_shapes` / `param_dtypes` 从 `Parameter(mint.empty((...), dtype=...))`
+    逐字读出（`compressor.py:117`、`csa.py:589`、`deepseek_v4_hybrid_attention.py:139/159`）。
+
+    `init_dims` 不给（或某个权重没形状）→ 该权重进 `unresolved`（**不猜**）。
+    """
+    shapes = dict(getattr(init_dims, "param_shapes", None) or {})
+    dtypes = dict(getattr(init_dims, "param_dtypes", None) or {})
+    names, seen = [], set()
+    for p in getattr(dag, "param_operands", None) or ():
+        nm = p.get("param") if isinstance(p, dict) else str(p)
+        if nm and nm not in seen:
+            seen.add(nm)
+            names.append((nm, p.get("src") if isinstance(p, dict) else ""))
+    per, unres, total = [], [], 0
+    for nm, src in names:
+        axes = shapes.get(nm)
+        if not axes:
+            unres.append((nm, "?", f"Parameter 形状未由 __init__ 求出（{src}）"))
+            continue
+        shp = "·".join(axes)
+        elems = (local_shape_elems(shp, dims, pm, is_weight=True) if pm is not None
+                 else resolve_shape_elems(shp, dims))
+        if elems is None:
+            unres.append((nm, shp, f"符号未解析（{src}）"))
+            continue
+        b = elems * _dtype_bytes(dtypes.get(nm), dims)
+        per.append((nm, shp, dtypes.get(nm), b))
+        total += b
+    return {"total_bytes": total, "per_param": per, "unresolved": unres}
+
+
 def dag_saved_bytes(dag, dims):
     """DAG 的 save-set 逐张量算字节。返回 {total_bytes, per_save, unresolved}。
 
     per_save: [(name, sym_shape, dtype, bytes)]；unresolved: [(name, sym_shape, reason)]
     （derive_saves 已按 name 去重，故此处天然去重）。
     """
-    per_save = []
-    unresolved = []
+    return dag_local_saved_bytes(dag, dims, None)
+
+
+def dag_local_saved_bytes(dag, dims, pm, *, shard=None, cp_kv_names=(),
+                          dedup_detach_aliases=True):
+    """`dag_saved_bytes` 的**并行度感知**版本：每个 save 的字节按 TP/EP/CP 切分**除过**（契约 B4）。
+
+    `pm is None` → 全局口径（与 `dag_saved_bytes` 逐字节相同，既有调用方不变）。
+    `shard`：`{张量名: {轴键: 'tp'|'ep'|...}}`（轴键语义见 `local_shape_elems`）。
+    `cp_kv_names`：attention KV 侧激活名（colossal CP 下保持 full-S，`shape_eval.py:105-106`）。
+    `dedup_detach_aliases`：`Detach` 产物与其输入共享存储 → 只计一份（见 `detach_aliases`）。
+    """
+    alias = detach_aliases(dag) if dedup_detach_aliases else {}
+    saves = list(derive_saves(dag))
+    save_names = {s.name for s in saves}
+    per_save, unresolved, aliased = [], [], []
     total = 0
-    for s in derive_saves(dag):
-        b = save_bytes(s, dims)
-        if b is None:
+    for s in saves:
+        root = alias.get(s.name, s.name)
+        elems = (resolve_shape_elems(s.sym_shape, dims) if pm is None else
+                 local_shape_elems(s.sym_shape, dims, pm,
+                                   shard=(shard or {}).get(s.name),
+                                   cp_kv=s.name in set(cp_kv_names)))
+        if elems is None:
             unresolved.append((s.name, s.sym_shape, "unknown-symbol-or-?"))
-        else:
-            per_save.append((s.name, s.sym_shape, s.dtype, b))
-            total += b
-    return {"total_bytes": total, "per_save": per_save, "unresolved": unresolved}
+            continue
+        b = elems * _dtype_bytes(s.dtype, dims)
+        if root != s.name and root in save_names:
+            # `stop_gradient` 的产物与其输入是**同一块存储**，且那块内存已由 root 记过一份
+            # → 不重复计（顺序无关：判据是"root 也在 saves 里"，不是"root 已先算过"）。
+            # 仍逐条列出（可见，不静默丢）。
+            aliased.append((s.name, root, s.sym_shape, s.dtype, b))
+            continue
+        per_save.append((s.name, s.sym_shape, s.dtype, b))
+        total += b
+    out = {"total_bytes": total, "per_save": per_save, "unresolved": unresolved}
+    if dedup_detach_aliases:
+        out["detach_aliased"] = aliased
+    return out
