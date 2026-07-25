@@ -971,3 +971,146 @@ def test_mtp_embedding_param_cell_undeclared_stays_visible_not_silent(mf_pkg):
     with pytest.raises(ExtractionDroppedError):
         from cost_eval.opdag.construct_walker import assert_extraction_clean
         assert_extraction_clean(dag)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# 7. 发射点的**轴/形状元信息**(G4)与多输出 dtype(T3)—— 缺它们时下游是**错**,不是"未知"
+# ══════════════════════════════════════════════════════════════════════════════════
+_AXIS_KEYS = ("reduce_dim", "keepdim", "chunk_dim", "chunks", "concat_axis", "permute_dims",
+              "topk_k", "topk_dim", "const_shape", "const_shape_src", "slice_bounds",
+              "stack_axis", "squeeze_axis", "roll_shifts", "broadcast_shape")
+
+_CSA_REL = "pynative/transformers/experimental_attention_variant"
+
+
+def _dsv4_bare() -> dict:
+    return {n: ResolvedSpec(cell=n, submodules={}) for n in
+            ("UnfusedCSAIndexerLoss", "Hadamard")}
+
+
+def extract_dsv4(mf_pkg, cls: str, fname: str, fused: bool = True, strict: bool = True):
+    top = resolve_layer_spec(mf_pkg, SPEC_FLAGS, spec_files=PYNATIVE_SPEC_FILES)
+    csa = top.submodules["self_attention"].submodules["core_attention"]
+    spec = {"Compressor": csa.submodules["compressor"],
+            "CSAIndexer": csa.submodules["indexer"],
+            "CompressedSparseAttention": csa,
+            "DSv4HybridSelfAttention": top.submodules["self_attention"]}[cls]
+    return extract_cell(
+        mf_pkg, f"{_CSA_REL}/{fname}", cls, spec,
+        cell_flags(apply_dsa_kernel_fusion=fused), present_params={"rotary_pos_emb"},
+        recurse=True, subcell_specs=_dsv4_bare(), cross_file=True,
+        runtime_predicates=RUNTIME_PREDICATES, host_call_allow=HOST_ALLOW,
+        kernel_call_allow=("npu_lightning_indexer",), input_axes=INPUT_AXES,
+        injected_binds=INJECTED, strict=strict,
+    )
+
+
+def test_reduce_chunk_concat_axes_are_recorded_at_emit_time(mf_pkg):
+    """三个**曾经静默算错**的算子现在带轴(G4;并行 agent 实测的偏差量写在断言旁)。
+
+    没有轴时下游字节解析对它们退化成"直通",于是**不是"未知"而是"错"**:
+      * `(kv.astype(fp32) * weights).sum(dim=1)`(`compressor.py:216`)→ 直通 = **8× 过读**;
+      * `self.chunk(x, 2, -1)`(`compressor.py:169`)→ **n× 过读**;
+      * `cat((kv_nope, kv_pe), -1)`(`compressor.py:243`)→ 解成 `2n·b·(d−64)` 而非 `n·b·d`。
+    纪律:抠不出的**一律不写**该键(消费方按缺键落 `unresolved`),绝不填一个默认轴。
+    """
+    dag = extract_dsv4(mf_pkg, "Compressor", "compressor.py")
+    clean(dag)
+    by_src = {}
+    for n in dag.nodes:
+        by_src.setdefault(n.src, []).append(n)
+
+    # ① `.sum(dim=1)` —— 张量方法形态(实参里没有 receiver,位序要补齐才对得上)
+    red = [n for n in by_src["compressor.py:216"] if "reduce_dim" in n.attrs]
+    assert red and red[0].attrs["reduce_dim"] == 1, [n.attrs for n in by_src["compressor.py:216"]]
+    # ② chunk(chunks=2, dim=-1)
+    ch = [n for n in by_src["compressor.py:169"] if "chunks" in n.attrs]
+    assert ch and (ch[0].attrs["chunks"], ch[0].attrs["chunk_dim"]) == (2, -1), \
+        [n.attrs for n in by_src["compressor.py:169"]]
+    # ③ cat 的轴
+    cat = [n for n in by_src["compressor.py:243"] if "concat_axis" in n.attrs]
+    assert cat and cat[0].attrs["concat_axis"] == -1, [n.attrs for n in by_src["compressor.py:243"]]
+    # ④ 切片边界(`freqs[:total:ratio][:n]`,`compressor.py:233`)
+    sl = [n for n in by_src["compressor.py:233"] if "slice_bounds" in n.attrs]
+    assert len(sl) == 2, [n.attrs for n in by_src["compressor.py:233"]]
+    assert sl[0].attrs["slice_bounds"][0][2] == "self.compress_ratio", sl[0].attrs
+
+
+def test_axis_metadata_is_absent_rather_than_guessed_when_unreadable(mf_pkg):
+    """轴抠不出时 **不写该键**(缺键 = 未知),而不是填一个默认轴。
+
+    合成源:`dim` 由一个运行期变量给 —— 填 0 会让下游按错轴算(比"未知"危险)。
+    """
+    from cost_eval.opdag.construct_walker import walk_construct
+    from cost_eval.opdag.init_binder import Binding
+    src = '''
+class C:
+    def construct(self, x, k):
+        a = self.sum(x, dim=k)
+        b = self.sum(x, dim=2)
+        return a, b
+'''
+    dag = walk_construct(
+        src, "C", {"sum": Binding("Elementwise", {"linear": True, "reduce": True})},
+        "c.py", config_flags={})
+    a, b = dag.nodes
+    assert "reduce_dim" not in a.attrs, a.attrs      # 运行期变量 → 不写
+    assert b.attrs["reduce_dim"] == 2, b.attrs       # 字面量 → 写
+
+
+def test_multi_output_dtypes_are_registered_per_output(mf_pkg):
+    """多输出算子的**每个**输出按自己的 dtype 进 SSA(T3)。
+
+    `topk_scores, topk_indices = self.topk(index_scores, k=..., dim=-1)`(`indexer.py:262`)
+    的第 2 个输出是 int32 索引。此前所有目标都按同一个 `out_dtype`(bf16)进 SSA,而
+    `attrs["outs"]` 里写的是 int32 —— 于是下一行 `topk_indices = self.cast(topk_indices, int32)`
+    (`:263`)的 `ins` 带着**错的 dtype**;`derive_saves` 按名去重只留一个,留下哪个取决于
+    谁先被 pin = **静默取错分支**(与 op 类型拼错同一类)。
+    """
+    dag = extract_dsv4(mf_pkg, "CSAIndexer", "indexer.py", fused=False)
+    clean(dag)
+    tk = next(n for n in dag.nodes if n.op == "TopK")
+    assert tk.src == "indexer.py:262", tk.src
+    assert tk.attrs["outs"][1].endswith(":int32"), tk.attrs["outs"]
+    # `k=effective_topk` 是运行期 `min(self.index_topk, int(k.shape[1]))`(`indexer.py:212`)
+    # —— 抠不出整数 ⇒ **不写** `topk_k`(缺键 = 未知,而不是编一个 k)
+    assert "topk_k" not in tk.attrs, tk.attrs
+    # 下一行 cast 的 ins 必须已经是 int32(不是 bf16)
+    cst = next(n for n in dag.nodes if n.src == "indexer.py:263")
+    assert cst.ins == ["topk_indices:?:int32"], cst.ins
+    # saved 的 topk_indices 是 int32(TopK 的第 2 个输出),不是 bf16
+    tsave = next(s for s in derive_saves(dag) if s.name == "topk_indices")
+    assert tsave.dtype == "int32", tsave
+
+
+def test_all_four_dsv4_cells_still_clean_after_axis_capture(mf_pkg):
+    """四个 dsv4 Cell 的 census 锁(A/B 两支):节点数全不变,零诊断全不变。
+
+    census 基线取自 `docs/opdag_walker_core_2026-07-25.md` §6.1 的实测表。
+    **唯一一处变化**(2026-07-25,逐条给理由,不是"顺手放宽"):
+      `CompressedSparseAttention` / `DSv4HybridSelfAttention` 的 fused 支边数 104→103 / 146→145。
+      去掉的那一条是 `[84, 88]`:`FusedSparseFlashMlaWithIndexerLoss.apply(..., attn_sink, ...)`
+      (`csa.py:689-697`)的 `attn_sink` 操作数。源侧 `self.attn_sink` 是一个 `Parameter`
+      (`csa.py` 的 `__init__`),`:683-687` 只是 `to_local()` + `cast(fp32)` —— 全程没有任何
+      激活参与。此前 `:685` 的**自赋值** `attn_sink = attn_sink.to_local()` 会把权重身份
+      `_forget` 掉(见 `_bind_name_rhs` 的自赋值分支注释),于是 `:687` 的 cast 产出一个
+      **看起来是激活**的张量并进了融合算子的 `ins` → 按 W2/W3/W4 它本不该在那里。
+      现在它走 `param_operands`(仍可见),`ins` 与 saves 都不含它 —— 字节影响
+      `[n_heads] fp32` = 64×4 = **256 B**,方向是**修正**。
+    """
+    census = {
+        (True,  "Compressor"): (29, 31),  (True,  "CSAIndexer"): (7, 6),
+        (True,  "CompressedSparseAttention"): (90, 103),
+        (True,  "DSv4HybridSelfAttention"): (123, 145),
+        (False, "Compressor"): (29, 31),  (False, "CSAIndexer"): (14, 13),
+        (False, "CompressedSparseAttention"): (207, 240),
+        (False, "DSv4HybridSelfAttention"): (240, 281),
+    }
+    files = {"Compressor": "compressor.py", "CSAIndexer": "indexer.py",
+             "CompressedSparseAttention": "csa.py",
+             "DSv4HybridSelfAttention": "deepseek_v4_hybrid_attention.py"}
+    for (fused, cls), (nn, ne) in census.items():
+        dag = extract_dsv4(mf_pkg, cls, files[cls], fused=fused)
+        clean(dag)
+        assert (len(dag.nodes), len(dag.edges)) == (nn, ne), (fused, cls, len(dag.nodes),
+                                                              len(dag.edges))

@@ -1443,8 +1443,29 @@ class _Walker:
             self._emit("IndexSelect", {"advanced_index": True}, lineno, operands, targets, None)
             return
         operands = self._tensor_operands([val.value], lineno)
-        self._emit("View", {"view": "slice", "index": self._describe(idx)}, lineno,
-                   operands, targets, None)
+        attrs = {"view": "slice", "index": self._describe(idx)}
+        bounds = self._slice_bounds(idx)
+        if bounds is not None:
+            attrs["slice_bounds"] = bounds
+        self._emit("View", attrs, lineno, operands, targets, None)
+
+    def _slice_bounds(self, idx):
+        """逐轴 `(lower, upper, step)`(未求值符号串或 None);抠不出返回 None(**不猜**)。
+
+        真源:`kv = kv[:cutoff]` / `score = score[:cutoff]`(`compressor.py:198/199`)、
+        `freqs = freqs[:total:ratio][:n]`(`:233`)—— 没有 bounds,切片在下游只能按整轴算。
+        """
+        items = idx.elts if isinstance(idx, ast.Tuple) else [idx]
+        out = []
+        for it in items:
+            if isinstance(it, ast.Slice):
+                out.append(tuple(None if p is None else self._describe(p)
+                                 for p in (it.lower, it.upper, it.step)))
+            elif isinstance(it, ast.Constant) or self._const_int(it) is not None:
+                out.append(("index", self._describe(it), None))
+            else:
+                return None                  # 有一轴抠不出 → 整条不写(缺键 = 未知,不是错)
+        return out
 
     def _tensor_operands(self, exprs, lineno: int) -> list:
         """从混合实参里挑出**可追踪张量操作数**(Name / 嵌套 Call 先物化 / `self.<Parameter>` 记权重),
@@ -1693,6 +1714,14 @@ class _Walker:
                     attrs = {**attrs, "prim": f"<tensor>.{func.attr}"}
                     if op == "View" and attrs.get("view"):
                         attrs = {**attrs, **self._view_capture(call, attrs["view"], target_names)}
+                    # `(kv.astype(fp32) * weights).sum(dim=1)`(`compressor.py:216`)——
+                    # 缺 `reduce_dim` 时下游按直通算,实测 **8× 过读**(G4)。**注意**:张量方法的
+                    # 实参不含 receiver,故轴的位置比 `mint.sum(x, dim)` 少一位 → 用一个
+                    # 合成的"补上 receiver"的 call 去抠,位序才与命名空间形式一致。
+                    shim = ast.Call(func=call.func,
+                                    args=[base] + list(call.args), keywords=list(call.keywords))
+                    ast.copy_location(shim, call)
+                    attrs = {**attrs, **self._axis_capture(op, attrs, shim, target_names)}
                     out_dtype = "bool" if op == "Compare" else None
                     self._emit(op, attrs, call.lineno,
                                self._expand_args(args, attrs), target_names, out_dtype)
@@ -1853,6 +1882,8 @@ class _Walker:
         if binding.op == "View" and binding.attrs.get("view"):
             # View 子类型:捕获变换元信息(reshape 目标 / split 尺寸 / perm / ...)供 shape 推断。
             attrs = {**binding.attrs, **self._view_capture(call, binding.attrs["view"], target_names)}
+        # 轴/形状元信息(归约 dim / topk k / 常量 shape)—— 缺轴时下游按直通算 = 静默错(G4)。
+        attrs = {**attrs, **self._axis_capture(binding.op, attrs, call, target_names)}
         arg_exprs = self._expand_args(call.args, binding.attrs)
         self._emit(binding.op, attrs, call.lineno, arg_exprs, target_names, out_dtype)
 
@@ -1881,6 +1912,7 @@ class _Walker:
         if op == "View" and attrs.get("view"):
             attrs = {**attrs, **self._view_capture(call, attrs["view"], target_names)}
         attrs = {**attrs, "prim": path}
+        attrs = {**attrs, **self._axis_capture(op, attrs, call, target_names)}
         # out_dtype 仍为 None → 交给 `_emit` 按**已解析的 ins** 推(实参可能还没物化)。
         self._emit(op, attrs, call.lineno, arg_exprs, target_names, out_dtype)
 
@@ -2033,6 +2065,63 @@ class _Walker:
             return self._const_int(call.args[argidx])
         return None
 
+    def _axis_capture(self, op: str, attrs: dict, call: ast.Call, target_names) -> dict:
+        """把一次调用的**轴/形状元信息**抠成 int / int 列表 / 未求值符号串。
+
+        为什么必须在发射点记(G4,2026-07-25 并行 agent 实测):没有轴,下游字节解析对这些算子
+        只能退化成"直通",于是**不是"未知"而是"错"**:
+          * `.sum(dim=1)`(`compressor.py:216`)按直通算 → **8× 过读**;
+          * `chunk`(`experts.py:229` / `compressor.py:169`)→ **n× 过读**;
+          * `cat([kv_nope, kv_pe], -1)`(`compressor.py:243`)→ 解成 `2n·b·(d−64)` 而非 `n·b·d`。
+        纪律不变:抠不出的**一律不写**该键(消费方按缺键落 `unresolved`),**绝不填一个默认轴**
+        —— 填错轴比"不知道"危险得多,这正是上面三条的成因。
+        """
+        out: dict = {}
+        prim = (attrs.get("prim") or "").rsplit(".", 1)[-1]
+        # ── 归约算子的轴 + keepdim(`mint.sum/mean/max/min/cumsum` 与同名张量方法)────────
+        if op == "Elementwise" and attrs.get("reduce"):
+            d = self._kw_or_arg_int(call, "dim", 1)
+            if d is None:
+                d = self._kw_or_arg_int(call, "axis", 1)
+            if d is not None:
+                out["reduce_dim"] = d
+            else:
+                elts = None
+                for kw in call.keywords:
+                    if kw.arg in ("dim", "axis"):
+                        elts = self._tuple_elts(kw.value)
+                if elts is None and len(call.args) > 1:
+                    elts = self._tuple_elts(call.args[1])
+                if elts is not None:
+                    dims = [self._const_int(e) for e in elts]
+                    if all(x is not None for x in dims):
+                        out["reduce_dim"] = dims
+            for kw in call.keywords:
+                if kw.arg == "keepdim" and isinstance(kw.value, ast.Constant):
+                    out["keepdim"] = bool(kw.value.value)
+        # ── topk 的 k(反向要 scatter 回 k 个位置;shape 也靠它)`indexer.py:262`──────────
+        if op == "TopK":
+            k = self._kw_or_arg_int(call, "k", 1)
+            if k is None and len(call.args) > 1:
+                v = self._scalar_of(call.args[1])
+                k = v if isinstance(v, int) and not isinstance(v, bool) else None
+            if k is not None:
+                out["topk_k"] = k
+            d = self._kw_or_arg_int(call, "dim", 2)
+            if d is not None:
+                out["topk_dim"] = d
+        # ── 常量产出的 shape(`mint.zeros(shape, dtype)` / `full` / `arange`)────────────
+        if op == "Constant" and call.args:
+            if prim in ("arange",):
+                out["const_shape"] = [self._describe(call.args[0])]
+            else:
+                elts = self._tuple_elts(call.args[0])
+                if elts is not None:
+                    out["const_shape"] = [self._describe(e) for e in elts]
+                elif not isinstance(call.args[0], (ast.Constant,)):
+                    out["const_shape_src"] = self._describe(call.args[0])
+        return out
+
     def _view_capture(self, call: ast.Call, kind: str, target_names) -> dict:
         """把一次 View 调用的变换参数抠成"未求值符号表达式串"(reshape/split 目标)或整数(perm/axis)。"""
         U = self._describe
@@ -2060,6 +2149,51 @@ class _Walker:
             return {"tile_mult": [U(e) for e in elts]} if elts is not None else {}
         if kind == "shape":
             return {"shape_src": (U(args[0]) if args else None), "shape_unpack": list(target_names)}
+        # ── G4(2026-07-25):此前**没有**捕获轴的几种 View —— 缺轴时下游按直通算 = 静默错。
+        if kind == "concat":
+            # `mint.cat(tensors, dim=-1)`(`compressor.py:243` 的 `cat([kv_nope, kv_pe], -1)`)
+            ax = self._kw_or_arg_int(call, "dim", 1)
+            if ax is None:
+                ax = self._kw_or_arg_int(call, "axis", 1)
+            return {"concat_axis": ax} if ax is not None else {}
+        if kind == "stack":
+            ax = self._kw_or_arg_int(call, "dim", 1)
+            return {"stack_axis": ax} if ax is not None else {}
+        if kind == "chunk":
+            # `mint.chunk(input, chunks, dim)`(`experts.py:229` 的 `self.chunk(fc1_output, 2, -1)`)
+            out = {"chunk_targets": list(target_names)}
+            n = self._kw_or_arg_int(call, "chunks", 1)
+            if n is not None:
+                out["chunks"] = n
+            d = self._kw_or_arg_int(call, "dim", 2)
+            if d is not None:
+                out["chunk_dim"] = d
+            return out
+        if kind == "permute":
+            # `mint.permute(input, dims)`:dims 既可是元组实参也可是散开的位置实参
+            elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
+            if elts is None and len(args) > 2:
+                elts = list(args[1:])
+            if elts is not None:
+                dims = [self._const_int(e) for e in elts]
+                if all(x is not None for x in dims):
+                    return {"permute_dims": dims}
+            return {}
+        if kind == "squeeze":
+            ax = self._kw_or_arg_int(call, "dim", 1)
+            return {"squeeze_axis": ax} if ax is not None else {}
+        if kind == "roll":
+            out = {}
+            sh = self._kw_or_arg_int(call, "shifts", 1)
+            if sh is not None:
+                out["roll_shifts"] = sh
+            d = self._kw_or_arg_int(call, "dims", 2)
+            if d is not None:
+                out["roll_dims"] = d
+            return out
+        if kind == "broadcast":
+            elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
+            return {"broadcast_shape": [U(e) for e in elts]} if elts is not None else {}
         return {}
 
     @staticmethod
@@ -2891,8 +3025,19 @@ class _Walker:
         #      (实测:那正是 88/236 MiB 的来源)。
         derived = ((not ins) and bool(line_params)) or (
             bool(ins) and all(r.split(":")[0] in self._weight_derived for r in ins))
-        for t in target_names:
-            self.ssa[t] = f"{t}:?:{out_dtype}"  # dtype 随 SSA 传播(Cast 会改写)
+        # 多输出算子:**每个输出用它自己的 dtype**(T3,2026-07-25)。
+        # 此前所有目标都按同一个 `out_dtype` 进 SSA,于是
+        #   `topk_scores, topk_indices = self.topk(...)`(`indexer.py:262`)的 `topk_indices`
+        # 在 SSA 里是 bf16(而 `attrs["outs"]` 里正确写着 int32),下一行
+        #   `topk_indices = self.cast(topk_indices, int32)`(`:263`)的 `ins` 就带着**错的 dtype**;
+        # `derive_saves` 按名去重只留一个 → 到底留下 int32 还是 bf16 取决于谁先被 pin,
+        # 也就是**静默取错分支**(与 op 类型拼错同一类)。现按 `outs` 逐个登记。
+        outs_refs = attrs.get("outs")
+        for i, t in enumerate(target_names):
+            dt = out_dtype
+            if outs_refs and i < len(outs_refs) and outs_refs[i].count(":") == 2:
+                dt = outs_refs[i].split(":")[2]
+            self.ssa[t] = f"{t}:?:{dt}"       # dtype 随 SSA 传播(Cast 会改写)
             self.producer[t] = node_id
             if derived:
                 self._weight_derived.add(t)
