@@ -438,9 +438,16 @@ def _split_decoder(ops):
 
     手写 decoder 的 op 序列为 [attn 段…(以 add1→h1 结尾)] + [ffn 段…]。无 `h1` 产出者（embedding/
     lm_head/mtp 等非 decoder body）→ 返回 (None, None)。
+
+    **mHC 后缀（2026-07-25，Task 2）**：开 `enable_hyper_connections` 时残差承载张量被
+    `residual.py:62` 重命名为 `{name}_xn`（实测 `add1 → h1_xn`、`moe_add → h2_xn`），此前
+    只精确比 `"h1"` 的探针**全部失配** → `(None, None)` → MLA/MoE/layer_norms 三族 census 全跳过
+    → `covered=0` 却 `ok=True`（评估文档 §1 的空判决）。故按前缀 `h1` / `h1_*` 匹配。
+    只认 `h1`（attn 段末残差），`h2*`（ffn 段末）不是 attn/ffn 边界。
     """
     for i, op in enumerate(ops):
-        if getattr(op.output, "name", None) == "h1":
+        name = getattr(op.output, "name", None)
+        if name == "h1" or (isinstance(name, str) and name.startswith("h1_")):
             return list(ops[:i + 1]), list(ops[i + 1:])
     return None, None
 
@@ -680,17 +687,56 @@ class CrossCheckReport:
     # 被 layer_norms 族校验过的 decoder-body 层名（可读覆盖记录；与 delta-census 的 `covered` 分列，
     # 保持 `covered` 仅指 MLA/MoE 两族的语义——GQA/dense 层也参与 layer_norms 但不进 `covered`）。
     layer_norm_checked: list = field(default_factory=list)
+    # ── 空判决门（Task 2，2026-07-25）───────────────────────────────────────────────────────
+    # 病症（评估文档 §1）：DSv4-Flash 上 `covered=0`、`layer_norm_checked` 只有 `lm_head`（来自
+    # A5 final_norm 支）、**5 个层段全落 uncovered**，而 `ok` 照样 True —— 一条也没真比，却报绿。
+    # 根因是 `_split_decoder` 的 `h1` 探针在 mHC 下失配（已修，见该函数）；但**探针失配这件事
+    # 本身不能再变成绿**，故加本门。
+    #
+    # 分母必须**探针无关**（否则循环论证：同一个失配的探针既定义分母又定义分子）：
+    #   `attn_layers` —— 结构性地含**注意力 op**（`OpType.FLASH_ATTN`）的层段 = 定义上的 decoder body。
+    # 分子 = 这些层里被**任何一族**（MLA/MoE delta-census 的 `covered`，或 layer_norms 族的
+    #   `layer_norm_checked`）真校验过的。分子为 0 → 空判决。
+    #
+    # 为何不能简单用「`covered` 为空」：全 GQA/dense 的模型**合法**地没有 MLA/MoE 对应
+    # （模块 docstring 的 F6 契约、`test_legitimate_no_correspondence_does_not_trip_strict`），
+    # 但它的 decoder body 仍被 layer_norms 族校验 → 不是空判决。
+    attn_layers: list = field(default_factory=list)
+    # `_split_decoder` 成功切出 attn+ffn 两段的层名（探针相关，供诊断阅读，不作分母）。
+    decoder_bodies: list = field(default_factory=list)
+
+    @property
+    def validated_attn_layers(self) -> list:
+        """`attn_layers` 里被任何一族真校验过的层名。"""
+        done = {c.layer_type for c in self.covered} | set(self.layer_norm_checked)
+        return [lt for lt in self.attn_layers if lt in done]
+
+    @property
+    def coverage_findings(self) -> list:
+        """空判决 → 单条可读 finding；否则空。判据见 `attn_layers` 注释。"""
+        if self.available and self.attn_layers and not self.validated_attn_layers:
+            return [(f"[opdag 空判决] spec 有 {len(self.attn_layers)} 个含注意力的层段"
+                     f"（{', '.join(map(str, self.attn_layers))}），但**没有一个**被任何一族校验到"
+                     f"（MLA/MoE delta-census 覆盖={len(self.covered)}、"
+                     f"layer_norms 校验={len(self.layer_norm_checked)}，"
+                     f"_split_decoder 切段成功={len(self.decoder_bodies)}）"
+                     f" —— 一条也没真比，不得报绿。常见根因：残差输出名/层段结构与内建探针"
+                     f"（`_split_decoder` 找 `h1*`、MLA 找 `linear_kvb`、MoE 找 grouped-GEMM 窗口）"
+                     f"不匹配。")]
+        return []
 
     @property
     def ok(self) -> bool:
-        """无漂移**且**无提取失败**且**无层级 pre-norm 缺失即通过（不可用也视作「无从校验、无可报」→ True）。
+        """无漂移**且**无提取失败**且**无层级 pre-norm 缺失**且**非空判决即通过。
 
         注意：提取失败也让 ok=False——一个已声明覆盖的族抽取失败意味着交叉校验无从验证它，
         若仍返回 True 就是假绿（见模块 docstring「提取失败 ≠ 合法无对应」）。layer_norms 族的缺失
-        （删 ln1/ln2）同样让 ok=False（Z1 修复）。
+        （删 ln1/ln2）同样让 ok=False（Z1 修复）。**空判决**（含注意力的层段一个都没被校验到）
+        同样让 ok=False（Task 2）。缺源（`available=False`）仍 True——无从校验、无可报，
+        且这是既有契约（`test_missing_source_skips_gracefully`）。
         """
         return (not self.findings and not self.extraction_failures
-                and not self.layer_norm_findings)
+                and not self.layer_norm_findings and not self.coverage_findings)
 
     def summary(self) -> str:
         if not self.available:
@@ -703,6 +749,8 @@ class CrossCheckReport:
                 f"层级pre-norm校验={len(self.layer_norm_checked)}、"
                 f"pre-norm缺失={len(self.layer_norm_findings)}")
         lines = [head]
+        for cf in self.coverage_findings:
+            lines.append("  - " + cf)
         for f in self.findings:
             lines.append("  - " + f.message)
         for lf in self.layer_norm_findings:
@@ -798,6 +846,10 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
 
     for ltype, ls in spec.layer_specs.items():
         ops = ls.ops
+        # Task 2 空判决门的**探针无关分母**：结构性含注意力 op 的层段 = 定义上的 decoder body。
+        # 用既有 `hand_category`（flash_attn → ATTENTION），不引入新的结构猜测。
+        if any(hand_category(op) == ATTENTION for op in ops):
+            report.attn_layers.append(ltype)
         # A5：MTP 层先拦截——其 embedding/enorm/hnorm/eh_proj 前缀 + 内层 decoder + 共享 head 的包装结构
         # 不被 MLA/MoE 窗口建模（逐 op delta 会满屏假阳），故**路由出前两族 delta 家族**，只校验
         # enorm/hnorm 两个 MTP 专属 norm 的在场，记 uncovered（诚实边界）。
@@ -808,6 +860,8 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
                 (ltype, "MTP 层：enorm/hnorm 名册已校验；MLA/MoE delta 家族不建模 MTP 包装结构"))
             continue
         attn_ops, ffn_ops = _split_decoder(ops)
+        if attn_ops is not None and ffn_ops is not None:
+            report.decoder_bodies.append(ltype)   # Task 2:空判决门的分母
         matched = False
         # MLA 注意力段：signature = 段内含 `linear_kvb`（MLA 独有；GQA 走融合 `qkv` 无此名）。
         if attn_ops is not None and any(op.name == "linear_kvb" for op in attn_ops):
@@ -829,8 +883,10 @@ def validate_against_opdag(spec, *, mf_root: str | None = None,
             report.uncovered.append(
                 (ltype, "无 opdag 提取源（embedding/lm_head/mtp/gqa/dense 未抽取）"))
 
-    # 漂移 **或** 提取失败 **或** 层级 pre-norm 缺失都是「非绿」——strict 下都要 raise（静默放行=假绿）。
-    if report.findings or report.extraction_failures or report.layer_norm_findings:
+    # 漂移 **或** 提取失败 **或** 层级 pre-norm 缺失 **或** 空判决都是「非绿」——strict 下都要 raise
+    # （静默放行=假绿）。
+    if (report.findings or report.extraction_failures or report.layer_norm_findings
+            or report.coverage_findings):
         if strict:
             if (report.extraction_failures and not report.findings
                     and not report.layer_norm_findings):

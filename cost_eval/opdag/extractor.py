@@ -27,8 +27,10 @@ import os
 import re
 
 from .schema import OpDAG
-from .init_binder import bind_init, Binding, _base_call_name
-from .construct_walker import walk_construct_meta, SubExtract
+from .init_binder import bind_init, Binding, _base_call_name, unbound_aliases
+from .construct_walker import (
+    walk_construct_meta, SubExtract, assert_extraction_clean,
+)
 from .module_resolver import ResolvedSpec, LEAF_OPTYPE
 from .init_dims import eval_init_dims
 
@@ -359,7 +361,7 @@ def _make_subcell_resolver(
             recurse=True, subcell_specs=subcell_specs, _stack=stack_with_self,
         )
         return SubExtract(nodes=dag.nodes, edges=dag.edges, param_names=params, returns=returns,
-                           opaque_calls=dag.opaque_calls)
+                           opaque_calls=dag.opaque_calls, diagnostics=dag.diagnostics)
     return resolver
 
 
@@ -373,6 +375,7 @@ def extract_cell(
     present_params: set | None = None,
     recurse: bool = False,
     subcell_specs: dict | None = None,
+    strict: bool = False,
 ) -> OpDAG:
     """读真 mindformers Cell 源,按 config 剪枝,产出其 op-DAG。
 
@@ -389,12 +392,17 @@ def extract_cell(
                           ResolvedSpec,或裸 Cell 类名+subcell_specs 提供其 spec)→ 递归抽取该子
                           Cell DAG 并在调用点内联(id 续编、形参重映射、跨界连边)。
       subcell_specs     — 可选。{类名: ResolvedSpec}:为裸 Cell 类名(不在 LEAF_OPTYPE)提供其解析树。
+      strict            — 可选(Task 2 / 评估文档 P0#1)。True:走查诊断(`dag.diagnostics`)非空即
+                          `ExtractionDroppedError`。默认 False → 只记录,既有路径逐字节不变。
     行为
       找不到源 / 无法解析具名模块 / 剪枝时遇不可判定 if / 子 Cell 递归环 → fail-loud(ValueError)。
+      **0 节点硬门恒开**(与 strict 无关):construct 有非平凡 body 却抽出 0 节点 →
+      `ExtractionDroppedError`(实测反例 `CSAIndexer` fused 支,见 construct_walker._run_walker)。
     """
     dag, _params, _returns = _extract_meta(
         mf_root, cell_file_relpath, cls_name, spec, config_flags,
         present_params=present_params, recurse=recurse, subcell_specs=subcell_specs,
+        strict=strict,
     )
     return dag
 
@@ -408,6 +416,7 @@ def _extract_meta(
     present_params: set | None = None,
     recurse: bool = False,
     subcell_specs: dict | None = None,
+    strict: bool = False,
     _stack: set | None = None,
 ):
     """extract_cell 的内核,额外返回 (OpDAG, construct 形参名, 返回值分类)——供 resolver 递归内联。
@@ -515,6 +524,18 @@ def _extract_meta(
         present_vars=present,
         subcell_resolver=resolver,
         method_aliases=method_aliases,
+        strict=False,     # 先不抛:下面还要并入 __init__ 侧的裸别名诊断,再统一判 strict
     )
     dag.dims_ctx = init_dims.dims_ctx           # self.<attr> → 符号 token(供 shape 推断解析)
+    # ── Task 2(P0#1):把 `__init__` 侧的**裸函数别名**(pynative 惯用法,_CLS2OP 绑不上)并入诊断。
+    # 调用点若真用到它们,`_handle_self_call` 会 fail-loud;但**没被调用**的那些今天完全不可见
+    # (评估文档 §2.4:dsv4 链上 39 原语 / 196 调用点)。此处让它们出现在计数里,不静默跳过。
+    # 与 `base_binds` 同口径:按 `_init_classes`(derived→base)逐类扫,覆盖跨 MRO 的 __init__。
+    aliases = [a for cname in init_classes
+               for a in unbound_aliases(src, cname, file=src_file)
+               if a["attr"] not in combined]
+    if aliases:
+        dag.diagnostics.setdefault("unbound_aliases", []).extend(aliases)
+    if strict:
+        assert_extraction_clean(dag)
     return dag, params, returns

@@ -196,4 +196,129 @@ ori_win_left/ori_win_right/loss_coeff/layer_number/num_layers`，只作 kwarg �
 
 ---
 
-（Task 2 里程碑将追加到本文件）
+## 3. Task 2 交付：静默丢弃全部 fail-loud / 可断言化 [RAN]
+
+`pytest tests -q` → **1583 passed**（基线 1526 + Task 1 的 33 + Task 2 的 24，
+**既有测试一个未改**）。新测试文件 `tests/test_opdag_drop_diagnostics.py`（24 测试）。
+
+### 3.1 新增的不变量（四条）
+
+| # | 机制 | 位置 | 默认行为 |
+|---|---|---|---|
+| ① | **0 节点硬门（恒开，不受 `strict` 影响）** | `construct_walker._run_walker` | construct 有非平凡 body 却抽出 0 节点 → `ExtractionDroppedError`。`return x`/`pass`（恒等/空 Cell）的合法 0 节点由 `_body_is_trivial` 豁免 |
+| ② | **结构化计数 `dag.diagnostics`** | `schema.OpDAG.diagnostics` + `construct_walker.DIAG_KINDS` | 逐条带 `src=file:line` + 原文。默认只记录 → 既有路径逐字节不变 |
+| ③ | **`strict=True`** | `walk_construct` / `walk_construct_meta` / `extract_cell` | 任一诊断非空即 `ExtractionDroppedError`（默认 False） |
+| ④ | **`assert_extraction_clean(dag, allow=(), check_opaque=False)`** | `construct_walker` | 消费方一行门（路线 B `to_resolved.py` 适配器要用的就是这道） |
+
+`ExtractionDroppedError` 继承 `ValueError`：①既有 `pytest.raises(ValueError)` 惯用法照旧；
+②`crosscheck._check_segment` 的 `except Exception` 会把它漏斗进 `extraction_failures` →
+`ok=False`、strict 下 raise —— 即「已声明覆盖族抽取失败 ≠ 合法无对应」那条既有纪律**自动生效**。
+
+### 3.2 转换的静默丢弃站点清单
+
+| 站点 | 此前 | 现在 |
+|---|---|---|
+| `walk_stmt` 无 `else` 分支（`construct_walker.py:251-276`） | `With`/`For`/`While`/`Try`/`AugAssign`/`AnnAssign`/`Assert`/`Delete`/`Match` **静默 return**（实测 0 nodes / 0 opaque） | 逐条进 `dropped_stmts`；`with _no_grad():` 另带「整块 detach」note（刻意**不**内联走查——会造出一批无 detach 语义的假节点）；`Pass/Break/Continue/Import/嵌套 def` 明确列为「真·无 op 语义」不记账 |
+| `walk_stmt` 的 `ast.Expr` 非 Call 分支 | 静默丢 | 记账（docstring `Expr(Constant)` 豁免） |
+| `_handle_assign` 无 `else`（`:329-344`） | `BinOp`/`Compare`/`Subscript`/`Name`/`Attribute`/`ListComp` RHS **静默丢**（评估文档 §6.2 实测 34 处，含 `q_hnorm_fp32`/`attention_scores`/`score_f32`/两个 mask/三处切片） | 进 `dropped_assigns`（带 targets + RHS 形态 + 原文），**并**把目标名记进 `unregistered_targets` |
+| `_handle_call` 终端 fallthrough（`:411-413`） | 只记调用文本，**赋值目标从未进 SSA/producer** → 下游拿占位 ref 且**无边**，与合法形参操作数长得一模一样 | 额外记 `unregistered_targets`（`cause="opaque_call"`） |
+| `_emit` 占位 ref 分支（`:889-890`） | 未知操作数静默变 `name:?:bf16` —— 这是让**所有上游静默丢弃变得不可见**的汇聚点 | 非 construct 形参、非帧内合成名（`__i<n>`）的落 `unresolved_operands` |
+| `init_binder` 只认类实例化（`:95-96`） | pynative 的裸别名（`self.reshape = mint.reshape`）**完全不可见**（评估文档 §2.4：39 原语 / 196 调用点） | 新增 `unbound_aliases(src, cls, file)` 枚举（链首限 `mint/ops/F/mindspore/P/nn`，已被 `_CLS2OP` 绑住的排除）；`extractor` 按 `_init_classes`（derived→base）逐类扫并入 `unbound_aliases` 诊断 |
+| 子 Cell 边界 | 子 walker 的诊断不上浮 → 子里丢一大块会被洗白 | `SubExtract.diagnostics` 逐类并入父（镜像既有 `opaque_calls` 传播） |
+| `crosscheck._split_decoder` 的 `h1` 探针（`:436-445`） | mHC 下残差名为 `h1_xn`（`residual.py:62` `{name}_xn`）→ 探针失配 → `(None,None)` → 三族 census 全跳过 | 按 `h1` / `h1_*` 前缀匹配（`h2*` 明确不认，非 attn/ffn 边界） |
+| `crosscheck` 的空判决 | `covered=0` 照样 `ok=True` | 新增 `attn_layers`（**探针无关**分母：结构性含 `ATTENTION` op 的层段）+ `validated_attn_layers` + `coverage_findings`；含注意力的层段一个都没被任何一族校验到 → `ok=False`、strict 下 raise |
+| `init_binder.bind_init` 的 `ast.walk(None)` | 类自身无 `__init__` 时 **AttributeError**（潜伏 bug，被本轮调用暴露） | `init is None` → 返回 `{}`（调用方本就按 MRO 逐类调） |
+
+### 3.3 空判决门为何用「探针无关分母」
+
+第一版规则「有 decoder body 却 `covered=0` → 非绿」**打破了既有契约**
+（`test_legitimate_no_correspondence_does_not_trip_strict`：全 GQA/dense 模型**合法**无 MLA/MoE
+对应，模块 docstring 的 F6 契约）。且 `decoder_bodies` 来自 `_split_decoder`，是**循环论证**
+（同一个失配的探针既定义分母又定义分子——原病症下 `decoder_bodies` 恰恰是 0，规则根本不会触发）。
+
+最终规则：
+- **分母** `attn_layers` = 结构性含注意力 op 的层段（用既有 `hand_category(op) == ATTENTION`，
+  不引入新结构猜测）—— 探针无关，不可能算错。
+- **分子** = 这些层里被**任何一族**（MLA/MoE delta-census 的 `covered`，或 layer_norms 族的
+  `layer_norm_checked`）真校验过的。
+- 分子为 0 → `coverage_findings` → `ok=False`。缺源（`available=False`）仍 True（既有契约）。
+
+四种情形核对（均有测试）：原病症形状（`covered=0`、`layer_norm_checked=['lm_head']`、
+`decoder_bodies=0`）→ **触发**；修复后 DSv4 → 不触发；全 GQA/dense → 不触发；缺源/无注意力层 → 不触发。
+
+### 3.4 验收：`CSAIndexer` 不再 `OK -> 0 nodes` [RAN]
+
+同一段附录 A 复现脚本，`531bcdc` 时的输出 vs 现在：
+
+```
+【此前】CSAIndexer   OK  -> 0 nodes   <== 假成功：空图
+【现在】CSAIndexer   ExtractionDroppedError
+```
+
+完整报错（实跑，权威快照）：
+
+```
+construct 走查产出 **0 个节点**,但 CSAIndexer.construct 的 body 非平凡（indexer.py）
+—— 整段被丢弃,这**不是**成功。
+  诊断计数: dropped_stmts=2, dropped_assigns=0, unregistered_targets=0,
+            unresolved_operands=0, unbound_aliases=0, opaque_calls=0
+  [dropped_stmts] 2 条:
+    - indexer.py:211 Delete: del actual_seq_qlen, actual_seq_klen
+        (del 无 op 语义,但是 liveness 的显式释放点(未建模))
+    - indexer.py:214 With: with _no_grad():  …
+        (`_no_grad()` = 整块 detach:块内产物应标 detached,而非当普通节点发射
+         ——故此处刻意**不**内联走查(会造出一批无 detach 语义的假节点))
+  —— 请为上列语句/RHS 形态补处理器(评估文档 §10 P0#1/#4/#5)。
+```
+
+四个 dsv4 Cell 现在全部**大声**失败（无一个假成功）：
+
+| Cell | 现在 |
+|---|---|
+| `CSAIndexer` | `ExtractionDroppedError`：0 节点 + `indexer.py:214` `with _no_grad():` |
+| `CompressedSparseAttention` | `ExtractionDroppedError`（递归进 `CSAIndexer` 时先命中；此前报 `compressor.py:190`——两者都是 fail-loud，只是现在更早） |
+| `Compressor` | `ValueError`：`compressor.py:190` `sq < ratio` 不可判定（不变） |
+| `DSv4HybridSelfAttention` | `ValueError`：`deepseek_v4_hybrid_attention.py:233` `self.shape(...)` 未绑定（不变） |
+
+### 3.5 副产物：`h1_*` 探针修复让 DSv4 crosscheck 从空判决变成**真**覆盖 [RAN]
+
+`build_llm_spec(deepseek_v4(6))` + `validate_against_opdag`：
+
+| | 评估文档 §1 实测（修复前） | 现在 |
+|---|---|---|
+| `covered` | **空** | 3 × `moe_experts`（r4/r128/r0_moe 三层的专家 grouped-GEMM 核逐类别 delta） |
+| `layer_norm_checked` | `['lm_head']` | 6 项：4 个 dsv4 decoder body + `mtp` + `lm_head` |
+| `decoder_bodies` | （h1 探针失配 → 0） | 4（全部命中 `h1_xn`） |
+| `ok` | `True`（**空判决**） | `True`（**真**绿：`coverage_findings == []`、`findings == []`） |
+
+即：连 `ln1`/`ln2` 名册校验都没跑到的那 4 个 decoder body，现在被 layer_norms 族逐层校验了。
+
+### 3.6 副产物：诊断在**抽得通**的 DSv3 MLA 路径上也记到东西 [RAN]
+
+```
+MLPInterleaved      8 nodes | 全 0
+MLASelfAttention   26 nodes | dropped_assigns=2 unregistered_targets=2 unresolved_operands=1
+   [dropped_assigns] multi_latent_attention.py:232 Attribute:  ori_dtype = x.dtype
+   [dropped_assigns] multi_latent_attention.py:258 Subscript:  head_dim = query.shape[-1]
+   [unresolved_operands] multi_latent_attention.py:307 Cast:   Cast(… ori_dtype …)
+```
+
+两条都是**标量/dtype、不是张量** → 对字节无影响；但它们此前完全不可见，且第三条说明
+`:307` 那个 `Cast` 的 dtype 操作数是未解析的。这证明计数器不只对失败路径生效。
+
+---
+
+## 4. 留作原样的东西（诚实清单）
+
+| # | 留作原样 | 为什么 |
+|---|---|---|
+| 1 | **`saves` 名册的三处差异（D1/D2/D3）一个数字都没改** | 任务明确要求：改 `saves` 会移动已标定锚点（unfused `50187.9/43940.0/43407.1/47888.1`、fused `24153.3/14641.7/14097.7/23508.0` MiB），需单独决策。已登记进 `KNOWN_GAPS` 双向棘轮台账 + 字节影响 |
+| 2 | **`ast.With` 仍不内联走查**（只记账 + 0 节点门） | `with _no_grad():` 语义是**整块 detach**。走进去发射普通节点会造出一批「看起来梯度可达」的假节点 —— 那是比静默丢更危险的错法（评估文档 §11 纪律）。真正的 `With` 处理器 + 块内 `detached` 标注是路线 B **P0#4**，需与 `TensorRef.detached` / `FREE_CALL_MAP` 一并做 |
+| 3 | **`ops.stop_gradient` 仍不建 `Detach` 节点 / 不保边** | 同上，属路线 B **P1#11**（会改 walker 图形状，非字节中性）。本轮只做「detach 站点逐字抽出 + 与手写 `detached` flag 对账」 |
+| 4 | **`strict` 默认 False** | 实测既有 DSv3 MLA 路径就有 2 条 `dropped_assigns`（标量/dtype，无害）。默认 True 会让既有 26 节点抽取直接失败 = 破坏 1526 基线。故：**0 节点门恒开**（那一条不可能是无害的），细粒度诊断默认只记录、由消费方用 `assert_extraction_clean(..., allow=...)` 显式决定 |
+| 5 | **`_emit` 里 `self.weight` 这类 `Attribute` 操作数仍被丢出 `ins`**（`:881-882`） | 这是 `is_weight` / `op.params` 缺失那件事的同一个根（评估文档 §9，M 级）；补它要同时引入权重操作数概念，属路线 B **P1#14** |
+| 6 | **`_handle_chained_call` 的未知链式方法仍当纯视图**（`:461-469`） | 未在本轮 dsv4 链上实测触发；改它要先建 `_VIEW_METHODS` 白名单外的语义表（PIN 侧配套），属路线 B P1#12 |
+| 7 | **`tests/conftest.py` 的 `MF_ROOT` 默认仍指非权威树** | 既有 fixture（`mlp_dag`/`mla_dag`）与全部既有 opdag 测试都依赖它，改默认会牵动一大片。本轮新测试**自带 md5 门控**（`authoritative_variant_dir()`），非权威树一律 skip，绝不对着另一个 commit 断言 |
+| 8 | **`_DSAIndexerFunction` / `_DSAIndexerGradFunction` 的裸 ctx 张量只登记、未进任何字节口径** | DSA（非 CSA）分支，本 yaml（`is_dsv4_hybrid`→CSA）不在关键路径；进字节口径需要 DSA 配置的形状/锚点，本轮无据可依，不杜撰 |
+| 9 | **`del x` 记进 `dropped_stmts` 而非单列 liveness 类** | `del` 无 op 语义但是 liveness 的显式释放点。单列一类需要 liveness 侧配套消费，本轮只保证它可见 |
+

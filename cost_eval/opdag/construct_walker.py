@@ -29,6 +29,78 @@ from dataclasses import dataclass, field
 
 from .schema import OpNode, OpDAG
 
+# ── 抽取诊断(Task 2 / 评估文档 P0#1,2026-07-25)──────────────────────────────────────────
+# 语义与逐键含义见 `schema.OpDAG.diagnostics` 的 docstring。此处只声明键序(报告/summary 用)。
+DIAG_KINDS = (
+    "dropped_stmts",         # walk_stmt 不处理的语句类
+    "dropped_assigns",       # _handle_assign 不支持的 RHS 形态
+    "unregistered_targets",  # 赋值目标从未进 SSA(下游会拿占位 ref、丢边)
+    "unresolved_operands",   # _emit 里落占位 ref 的操作数
+    "unbound_aliases",       # __init__ 里 _CLS2OP 绑不上的裸函数别名(由 extractor 并入)
+)
+
+
+class ExtractionDroppedError(ValueError):
+    """抽取过程**丢了东西**却本会静默通过 —— 显式拒绝。
+
+    继承 `ValueError`:①既有 `pytest.raises(ValueError)` 惯用法照旧;②`crosscheck._check_segment`
+    的 `except Exception` 会把它漏斗进 `extraction_failures` → `ok=False`、strict 下 raise
+    （即「已声明覆盖族抽取失败 ≠ 合法无对应」那条既有纪律自动生效）。
+    """
+
+
+def _empty_diagnostics() -> dict:
+    return {k: [] for k in DIAG_KINDS}
+
+
+def diagnostics_summary(dag) -> dict:
+    """`{kind: 条数}` + `total`(仅 DIAG_KINDS 之和) + `opaque_calls`。缺字段按 0。"""
+    diag = getattr(dag, "diagnostics", None) or {}
+    out = {k: len(diag.get(k) or ()) for k in DIAG_KINDS}
+    out["total"] = sum(out[k] for k in DIAG_KINDS)
+    out["opaque_calls"] = len(getattr(dag, "opaque_calls", None) or ())
+    return out
+
+
+def _format_diagnostics(dag, kinds) -> str:
+    diag = getattr(dag, "diagnostics", None) or {}
+    lines = []
+    for kind in kinds:
+        items = diag.get(kind) or ()
+        if not items:
+            continue
+        lines.append(f"  [{kind}] {len(items)} 条:")
+        for it in items:
+            src = it.get("src", "?")
+            what = it.get("code") or it.get("alias") or it.get("target") or it.get("operand") or ""
+            tag = (it.get("node") or it.get("rhs") or it.get("cause")
+                   or it.get("node_op") or it.get("attr") or "")
+            note = f"  ({it['note']})" if it.get("note") else ""
+            lines.append(f"    - {src} {tag}: {what}{note}")
+    return "\n".join(lines)
+
+
+def assert_extraction_clean(dag, *, allow=(), check_opaque: bool = False) -> None:
+    """消费方的一行门:抽取诊断非空即 `ExtractionDroppedError`(可用 `allow` 显式豁免某些类)。
+
+    评估文档 §11 的纪律「这三个列表非空时消费方默认拒绝出数」的落地。`check_opaque=True`
+    时把 `opaque_calls` 也算进来(默认不算——它按设计是「消费方自带白名单」的语义)。
+    """
+    kinds = tuple(k for k in DIAG_KINDS if k not in allow)
+    summary = diagnostics_summary(dag)
+    bad = [k for k in kinds if summary[k]]
+    opaque_bad = check_opaque and summary["opaque_calls"] and "opaque_calls" not in allow
+    if not bad and not opaque_bad:
+        return
+    parts = [f"抽取诊断非空,拒绝当成「抽好了」(cell={getattr(dag, 'cell', '?')}):"]
+    parts.append(_format_diagnostics(dag, bad))
+    if opaque_bad:
+        parts.append(f"  [opaque_calls] {summary['opaque_calls']} 条:")
+        for it in dag.opaque_calls:
+            parts.append(f"    - {it.get('src', '?')}: {it.get('expr', '')}")
+    parts.append("  —— 静默丢算子 = DAG 少算子 = 字节少算。请补处理器,或用 allow=(...) 显式豁免。")
+    raise ExtractionDroppedError("\n".join(p for p in parts if p))
+
 
 @dataclass
 class SubExtract:
@@ -39,12 +111,15 @@ class SubExtract:
                        用于把"子输出 → 下游消费者"的边接回父 SSA。
       * opaque_calls —— 子 walker 记录的 fallthrough 调用点(T0-6.5 Fix2),原样并入父 opaque_calls
                        (src 已指向子文件,不需重映射;镜像 nodes/edges 的子→父传播,防止子 Cell
-                       边界二次静默丢)。"""
+                       边界二次静默丢)。
+      * diagnostics —— 子 walker 的抽取诊断(Task 2),同理逐类并入父 diagnostics(src 已指子文件),
+                       否则子 Cell 边界会把「子里丢了一大块」洗白。"""
     nodes: list = field(default_factory=list)
     edges: list = field(default_factory=list)
     param_names: list = field(default_factory=list)
     returns: list = field(default_factory=list)
     opaque_calls: list = field(default_factory=list)
+    diagnostics: dict = field(default_factory=dict)
 
 # 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
@@ -199,6 +274,7 @@ class _Walker:
         cls_name: str | None = None,
         subcell_resolver=None,
         method_aliases: dict | None = None,
+        strict: bool = False,
     ):
         self.binds = binds                 # self.<name> -> Binding(op, attrs)(Pass B 产)
         self.src_file = src_file
@@ -219,6 +295,10 @@ class _Walker:
         # T0-6.5 Fix2:_handle_call 终端 fallthrough 命中的调用点(既非四种已知形态、也非内部方法/
         # Morph 别名)——显式记录,不静默丢(schema.OpDAG.opaque_calls docstring 详述语义)。
         self.opaque_calls: list = []
+        # Task 2(P0#1):一切「看不懂而没建节点」的东西逐条记账(语义见 schema.OpDAG.diagnostics)。
+        # 默认只记录(既有路径逐字节不变);strict=True 时走查结束统一抛。
+        self.diagnostics: dict = _empty_diagnostics()
+        self.strict = bool(strict)
         # ---- 内联支持:类层级 AST(找内部方法定义)+ 递归/帧状态 ----
         self._tree = tree
         self._cls_name = cls_name
@@ -243,6 +323,52 @@ class _Walker:
             x is not None for x in (config_flags, none_vars, param_defaults, present_vars)
         )
 
+    # ---- 诊断记账(Task 2 / P0#1):看不懂就记,绝不静默 ----
+    def _diag(self, kind: str, **rec) -> None:
+        self.diagnostics[kind].append(rec)
+
+    @staticmethod
+    def _short_code(text: str, cap: int = 120) -> str:
+        """复合语句(with/for/try)的 unparse 含整个块体 —— 报告里只留首行 + 尾部标记。"""
+        first = text.split("\n", 1)[0]
+        more = "  …" if "\n" in text else ""
+        if len(first) > cap:
+            first = first[:cap] + "…"
+        return first + more
+
+    def _diag_drop_stmt(self, stmt) -> None:
+        """未处理的语句类。`with _no_grad():` 额外带「整块 detach」note(路线 B P0#4 的挂钩)。"""
+        node = type(stmt).__name__
+        note = ""
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            items = " / ".join(self._describe(it.context_expr) for it in stmt.items)
+            if "_no_grad" in items or "no_grad" in items:
+                note = ("`_no_grad()` = 整块 detach:块内产物应标 detached,而非当普通节点发射"
+                        "——故此处刻意**不**内联走查(会造出一批无 detach 语义的假节点)")
+            else:
+                note = "with 块体未走查(walk_stmt 无处理器)"
+        elif isinstance(stmt, ast.Delete):
+            # `del x`(如 indexer.py:211 `del actual_seq_qlen, actual_seq_klen`)不产 op,但对
+            # **liveness** 有语义(显式释放点)。记账、不当 op 丢弃处理。
+            note = "del 无 op 语义,但是 liveness 的显式释放点(未建模)"
+        self._diag("dropped_stmts", src=f"{self.src_file}:{stmt.lineno}", node=node,
+                   code=self._short_code(self._describe(stmt)), note=note)
+
+    def _diag_unregistered(self, targets, lineno: int, cause: str) -> None:
+        for t in targets:
+            self._diag("unregistered_targets", src=f"{self.src_file}:{lineno}",
+                       target=t, cause=cause)
+
+    def _raise_diagnostics(self, cell_name: str, head: str = "") -> None:
+        kinds = [k for k in DIAG_KINDS if self.diagnostics.get(k)]
+        if not kinds:
+            return
+        raise ExtractionDroppedError(
+            (head or f"construct 走查有静默丢弃(strict=True 拒绝放行,cell={cell_name}):")
+            + "\n" + _format_diagnostics(
+                type("_D", (), {"cell": cell_name, "diagnostics": self.diagnostics,
+                                "opaque_calls": self.opaque_calls})(), kinds))
+
     # ---- 语句层:按源序遍历,分派到具体处理器 ----
     def walk_body(self, body) -> None:
         for stmt in body:
@@ -255,6 +381,9 @@ class _Walker:
             # 裸表达式语句(无赋值目标),只关心其中的调用
             if isinstance(stmt.value, ast.Call):
                 self._handle_call(stmt.value, target_names=[])
+            elif not isinstance(stmt.value, ast.Constant):
+                # docstring(Expr(Constant))合法无 op;其余裸表达式(`x.foo`/await/…)是真丢弃。
+                self._diag_drop_stmt(stmt)
         elif isinstance(stmt, ast.If):
             if self._pruning:
                 # 配置门控分支:按 config 求值,只走命中支;不可判定 → fail-loud(拒绝双走)。
@@ -273,7 +402,16 @@ class _Walker:
                     f"construct 剪枝命中被选中的 raise 分支（{self.src_file}:{stmt.lineno}）:"
                     f"`{self._describe(stmt)}` —— config 实际选到了不支持的路径,fail-loud"
                 )
-        # pass / For / While / 增强赋值等:当前不产 op(后续任务按需扩展)
+        elif isinstance(stmt, (ast.Pass, ast.Break, ast.Continue, ast.Global,
+                               ast.Nonlocal, ast.Import, ast.ImportFrom,
+                               ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            pass    # 真·无算子语义(控制流/声明/嵌套定义):不是丢弃,不记账
+        else:
+            # Task 2(P0#1):**其余一切语句类**(With/For/While/Try/AugAssign/AnnAssign/Assert/
+            # Delete/Match/…)此前是**静默 return**(实测 0 nodes / 0 opaque)——现逐条记账。
+            # 实测最危险的一条:`indexer.py:214` 的 `with _no_grad():` 包住整个 fused indexer 支
+            # → 整块丢 → `extract_cell` 返回 `ok, 0 nodes` 假成功(评估文档 §3.1)。
+            self._diag_drop_stmt(stmt)
 
     # ---- if 剪枝:求值条件,只走命中支 ----
     def _handle_if_pruned(self, stmt: ast.If) -> None:
@@ -341,7 +479,16 @@ class _Walker:
               and isinstance(val.value, ast.Name) and len(targets) >= 2):
             # `seq, bs, h = x.shape`:不产 op,但记标量→轴解包(shape 推断阶段按 x 已知 shape 填)。
             self.scalar_binds.append({"names": list(targets), "src": val.value.id})
-        # 其它(算术/常量/切片/属性)当前不产 op
+        else:
+            # Task 2(P0#1):此前静默丢。评估文档 §6.2 实测 **34 处**,且**恰好包含这次要修的张量**:
+            #   `q_hnorm_fp32`(deepseek_v4_hybrid_attention.py:245 BinOp)、O(S·S/r) fp32
+            #   `attention_scores`(indexer.py:350 BinOp)、`score_f32`(compressor.py:209 BinOp)、
+            #   两个 bool mask(csa.py:779/810 Compare)、切片(compressor.py:198/199/233 Subscript)。
+            # 记两笔:①RHS 形态本身;②目标名从未进 SSA(下游消费它会拿占位 ref、**丢边**)。
+            self._diag("dropped_assigns", src=f"{self.src_file}:{stmt.lineno}",
+                       targets=list(targets), rhs=type(val).__name__,
+                       code=self._describe(stmt))
+            self._diag_unregistered(targets, stmt.lineno, f"dropped_assign_rhs_{type(val).__name__}")
 
     def _handle_ifexp(self, ifexp: ast.IfExp, targets: list[str]) -> None:
         r = self._eval_test(ifexp.test)
@@ -411,6 +558,11 @@ class _Walker:
         self.opaque_calls.append(
             {"src": f"{self.src_file}:{call.lineno}", "expr": self._describe(call)}
         )
+        # Task 2(P0#1):终端 fallthrough 只记了「调用文本」,**赋值目标从未进 SSA/producer** →
+        # 下游消费它会拿占位 ref `t:?:bf16` 且**无边**,与合法的 construct 形参操作数长得一模一样
+        # （评估文档 §5 第 3 条:`ops.stop_gradient` 就是这样把数据流静默切断的）。单列记账。
+        if target_names:
+            self._diag_unregistered(target_names, call.lineno, "opaque_call")
 
     def _handle_self_call(self, call: ast.Call, name: str, target_names: list[str]) -> None:
         binding = self.binds.get(name)
@@ -680,6 +832,9 @@ class _Walker:
         # T0-6.5 Fix2:子 walker 的 opaque_calls 原样并入(src 已指子文件,无需重映射)——不这样做
         # 的话子 Cell 边界内的 fallthrough 调用会在父 DAG 视角下二次静默丢(违反 Fix2 初衷)。
         self.opaque_calls.extend(sub.opaque_calls)
+        # Task 2:抽取诊断同理逐类并入(否则子 Cell 边界会把「子里丢了一大块」洗白)。
+        for kind, items in (sub.diagnostics or {}).items():
+            self.diagnostics.setdefault(kind, []).extend(items)
 
         # 4) 子返回值绑回调用点目标
         for tgt, r in zip(target_names, sub.returns):
@@ -888,6 +1043,14 @@ class _Walker:
                     seen_prod.add(prod)
             else:  # 方法形参 / 未知名 → 占位 ref(shape 未知,dtype 缺省 bf16)
                 ins.append(f"{a.id}:?:bf16")
+                # Task 2(P0#1):形参占位是**合法**的(种子由 infer_shapes 喂);但「既非形参、也无
+                # producer」的名意味着上游有东西被丢了(被丢的赋值 / opaque 调用的目标 / 内联未接上)。
+                # 这是让所有上游静默丢弃**变得不可见**的那个汇聚点(评估文档 §「其它静默丢弃站点」),
+                # 故单列记账。形参/帧内合成名(`__i<n>` 后缀)不记。
+                if a.id not in self._param_set and "__i" not in a.id:
+                    self._diag("unresolved_operands",
+                               src=f"{self.src_file}:{lineno}", operand=a.id, node_op=op,
+                               code=f"{op}(… {a.id} …)")
 
         # id 在实参(含嵌套 Call 已递归发射的子节点)处理完毕后才分配,保证 id 单调 = 数据流序。
         node_id = self._next_id
@@ -920,6 +1083,7 @@ def walk_construct(
     present_vars: set | None = None,
     subcell_resolver=None,
     method_aliases: dict | None = None,
+    strict: bool = False,
 ) -> OpDAG:
     """走查 `cls_name` 的 construct(),把每个 self.<name>(...) 调用落成 OpNode,返回 op-DAG。
 
@@ -943,12 +1107,20 @@ def walk_construct(
     未绑定的 self.<name>:若是本类(含基类)内部方法则内联展开,否则 fail-loud。
     子 Cell(binding.op=="SubCell")且传入 subcell_resolver 时递归内联;否则退化为发射 SubCell 节点。
     找不到类或其 construct 方法时 fail-loud(ValueError)。
+
+    **静默丢弃门(Task 2 / 评估文档 P0#1)**:
+      * `strict=False`(默认)—— 一切看不懂的东西逐条记进 `dag.diagnostics`(见 schema),
+        既有路径行为/字节逐字不变;
+      * `strict=True` —— 任一诊断非空即 `ExtractionDroppedError`;
+      * **0 节点硬门恒开(与 strict 无关)**:construct 有非平凡 body 却抽出 0 节点 →
+        `ExtractionDroppedError`。`return x`/`pass` 这类恒等/空 Cell 的合法 0 节点不误伤。
     """
     return _run_walker(
         src, cls_name, binds, src_file,
         config_flags=config_flags, none_vars=none_vars,
         param_defaults=param_defaults, present_vars=present_vars,
         subcell_resolver=subcell_resolver, method_aliases=method_aliases,
+        strict=strict,
     )[0]
 
 
@@ -963,6 +1135,7 @@ def walk_construct_meta(
     present_vars: set | None = None,
     subcell_resolver=None,
     method_aliases: dict | None = None,
+    strict: bool = False,
 ):
     """同 walk_construct,但额外返回 (OpDAG, construct 形参名列表, 返回值分类)——供上层递归内联子 Cell。"""
     return _run_walker(
@@ -970,13 +1143,29 @@ def walk_construct_meta(
         config_flags=config_flags, none_vars=none_vars,
         param_defaults=param_defaults, present_vars=present_vars,
         subcell_resolver=subcell_resolver, method_aliases=method_aliases,
+        strict=strict,
     )
+
+
+def _body_is_trivial(body) -> bool:
+    """construct body 是否**本就没有算子语义**(只 docstring / pass / 裸 return)。
+
+    恒等 Cell(`Identity.construct: return x`)与空壳 Cell 的 0 节点是**合法**的,不得被 0 节点
+    硬门误伤。除此之外的 body 若抽出 0 节点,一律视为「全丢了」。
+    """
+    for s in body:
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
+            continue                                  # docstring
+        if isinstance(s, (ast.Pass, ast.Return)):
+            continue                                  # `pass` / `return x`
+        return False
+    return True
 
 
 def _run_walker(
     src, cls_name, binds, src_file, *,
     config_flags=None, none_vars=None, param_defaults=None,
-    present_vars=None, subcell_resolver=None, method_aliases=None,
+    present_vars=None, subcell_resolver=None, method_aliases=None, strict=False,
 ):
     tree = ast.parse(src)
     if next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls_name), None) is None:
@@ -985,7 +1174,7 @@ def _run_walker(
     walker = _Walker(
         binds, src_file, config_flags, none_vars, param_defaults, present_vars,
         tree=tree, cls_name=cls_name, subcell_resolver=subcell_resolver,
-        method_aliases=method_aliases,
+        method_aliases=method_aliases, strict=strict,
     )
     construct = walker._lookup_method("construct")  # 支持 construct 定义在基类
     if construct is None:
@@ -996,5 +1185,27 @@ def _run_walker(
     walker.walk_body(construct.body)
     walker.returns = walker._resolve_returns(construct.body)
     dag = OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges,
-                scalar_binds=walker.scalar_binds, opaque_calls=walker.opaque_calls)
+                scalar_binds=walker.scalar_binds, opaque_calls=walker.opaque_calls,
+                diagnostics=walker.diagnostics)
+
+    # ── 0 节点硬门(Task 2 / P0#1;**恒开**,与 strict 无关)────────────────────────────────
+    # 实测反例:`CSAIndexer` fused 支整块在 `with _no_grad():`(indexer.py:214)里 → 整块丢 →
+    # 此前返回 `ok, 0 nodes / 0 opaque`,若接进数字链路会**贡献 0 字节而不报错**(评估文档 §3.1
+    # 「最危险的一条」)。有非平凡 body 却 0 节点 = 全丢了,绝不许看起来像成功。
+    if not walker.nodes and not _body_is_trivial(construct.body):
+        summary = diagnostics_summary(dag)
+        detail = _format_diagnostics(dag, [k for k in DIAG_KINDS if summary[k]])
+        opaque = "\n".join(f"    - {c.get('src','?')}: {c.get('expr','')}"
+                           for c in walker.opaque_calls)
+        raise ExtractionDroppedError(
+            f"construct 走查产出 **0 个节点**,但 {cls_name}.construct 的 body 非平凡"
+            f"（{src_file}）—— 整段被丢弃,这**不是**成功。\n"
+            f"  诊断计数: " + ", ".join(f"{k}={summary[k]}" for k in DIAG_KINDS)
+            + f", opaque_calls={summary['opaque_calls']}\n"
+            + (detail + "\n" if detail else "")
+            + (f"  [opaque_calls] {summary['opaque_calls']} 条:\n{opaque}\n" if opaque else "")
+            + "  —— 请为上列语句/RHS 形态补处理器(评估文档 §10 P0#1/#4/#5)。"
+        )
+    if strict:
+        walker._raise_diagnostics(cls_name)
     return dag, walker.construct_params, walker.returns

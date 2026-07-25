@@ -86,6 +86,10 @@ def bind_init(src: str, cls_name: str) -> dict[str, Binding]:
         raise ValueError(f"源码里找不到 class {cls_name}(fail-loud)")
     init = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
     out: dict[str, Binding] = {}
+    if init is None:
+        # 该类自身不定义 __init__(继承自基类)。此前直接 `ast.walk(None)` → AttributeError;
+        # 调用方(extractor 用 _init_classes 逐类调本函数)本就按「该类无绑定」处理,故返回空。
+        return out
     for stmt in ast.walk(init):
         if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
             continue
@@ -101,4 +105,62 @@ def bind_init(src: str, cls_name: str) -> dict[str, Binding]:
             if clsname == "Concat":
                 attrs["concat_axis"] = _concat_axis(stmt.value)
             out[tgt.attr] = Binding(op=op, attrs=attrs)
+    return out
+
+
+# ── 裸函数别名(pynative 惯用法)—— Task 2 / 评估文档 §2.4 + P0#2 ────────────────────────────
+# `bind_init` 只认「类实例化」(`isinstance(stmt.value, ast.Call)` + 类名查 `_CLS2OP`),这是
+# `parallel_core/training_graph/` 的惯用法(`self.reshape = Reshape()`)。pynative 侧是**成文约定**
+# 的另一套:`self.reshape = mint.reshape` / `self.cast = ops.cast`(裸别名,不是 Call)
+# —— 见 `csa.py:629-630` 注释「Alias the non-trivial mint ops used in construct/forward per the
+# fine-grained-recompute convention (RFC §3.1 #9)」。实测 dsv4 链上 **39 个不同原语 / 196 个调用点**
+# 一个都绑不上(评估文档 §2.4 表)。
+#
+# 真正的绑定通路(裸别名 → op 类型的新表)属**路线 B P0#2**(M 级)。本函数只做 Task 2 要求的那半:
+# **把它们枚举出来、计数、surface**,绝不静默跳过 —— 否则「196 个调用点不可见」这件事在报告里
+# 一个字都不会出现。
+_ALIAS_NAMESPACES = ("mint", "ops", "F", "mindspore", "P", "nn")
+
+
+def unbound_aliases(src: str, cls_name: str, file: str = "") -> list[dict]:
+    """列出 `__init__` 里 `self.<attr> = <ns>.<fn>` 形态的**裸函数别名**(`_CLS2OP` 绑不上的)。
+
+    只收「点号路径且链首在已知张量算子命名空间」的形态,避免把 `self.n = config.num_heads`
+    这类配置读取误当算子别名。返回逐条 dict:`{attr, alias, lineno, src, note}`。
+    """
+    tree = ast.parse(src)
+    cls = next((n for n in ast.walk(tree)
+                if isinstance(n, ast.ClassDef) and n.name == cls_name), None)
+    if cls is None:
+        raise ValueError(f"源码里找不到 class {cls_name}(fail-loud)")
+    init = next((n for n in cls.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
+    out: list[dict] = []
+    if init is None:
+        return out                      # 该类自身不定义 __init__(调用方按 MRO 逐类调本函数)
+    bound = set(bind_init(src, cls_name))
+    for stmt in ast.walk(init):
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+            continue
+        tgt = stmt.targets[0]
+        if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                and tgt.value.id == "self"):
+            continue
+        val = stmt.value
+        if not isinstance(val, ast.Attribute):      # 裸别名恒是 Attribute(不是 Call)
+            continue
+        # 链首必须是已知张量算子命名空间(`mint.reshape` / `ops.cast` / `mint.nn.functional.x`)
+        head = val
+        while isinstance(head, ast.Attribute):
+            head = head.value
+        if not (isinstance(head, ast.Name) and head.id in _ALIAS_NAMESPACES):
+            continue
+        if tgt.attr in bound:                       # 已被 _CLS2OP 绑住 → 不算未绑
+            continue
+        out.append({
+            "attr": tgt.attr, "alias": ast.unparse(val), "lineno": stmt.lineno,
+            "src": f"{file}:{stmt.lineno}" if file else str(stmt.lineno),
+            "note": "pynative 裸函数别名:init_binder._CLS2OP 只认类实例化 → 未绑定"
+                    "(路线 B P0#2 的绑定表尚未建)",
+        })
     return out

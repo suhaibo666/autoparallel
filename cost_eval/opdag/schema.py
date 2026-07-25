@@ -32,6 +32,18 @@ class OpDAG:
     # (如 embedding 段的 inline AllReduce 由 comm_probe 另侧覆盖,walker 若也发射会双重计数)——
     # 消费方需对未在已知白名单内的条目自行判断是否 fail-loud,不猜其语义。
     opaque_calls: list = field(default_factory=list)
+    # ── 抽取诊断(Task 2 / 评估文档 P0#1,2026-07-25)────────────────────────────────────────
+    # 走查过程中**看不懂而没建节点**的一切,逐条带 `src=file:line` + 原文。纪律(评估文档 §11):
+    # 「任何抽取器看不懂的东西都必须显式出现在 unresolved / opaque_calls / extraction_failures 里」
+    # ——本字段就是前者在 walker 侧的落地。键见 `construct_walker.DIAG_KINDS`:
+    #   dropped_stmts        walk_stmt 不处理的语句类(With/For/While/Try/AugAssign/…);
+    #                        `with _no_grad():` 另带 note(整块 detach 信号,路线 B P0#4)
+    #   dropped_assigns      _handle_assign 不支持的 RHS 形态(BinOp/Compare/Subscript/Name/…)
+    #   unregistered_targets 赋值目标从未进 SSA(被丢的赋值 / opaque 调用的目标)——下游会拿占位 ref、丢边
+    #   unresolved_operands  _emit 里落占位 ref `name:?:bf16` 的操作数(非 construct 形参)
+    #   unbound_aliases      __init__ 里的裸函数别名(`self.reshape = mint.reshape`),_CLS2OP 绑不上
+    # 每条是 dict(纯数据,JSON 往返安全)。空字典 = 尚未走查 / 无诊断。
+    diagnostics: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
