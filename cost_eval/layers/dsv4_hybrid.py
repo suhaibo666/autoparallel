@@ -205,8 +205,26 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
             uout_pm  = TensorRef("uout_pm",  ("B", "n_heads", "S", "v_head_dim"), dtype_bytes=4)
             _ucopies = [uq_f32, uq_bm, ukv_bm, uscore1, uscore2, uexp, uaw_bm, uout_f32, uout_pm]
             if enable_indexer:
-                ukl1 = TensorRef("ukl1", ("B", "S", "dsa_indexer_n_heads", S_DIV_R), dtype_bytes=4)
-                ukl2 = TensorRef("ukl2", ("B", "S", "dsa_indexer_n_heads", S_DIV_R), dtype_bytes=4)
+                # ── indexer-KL **目标分布**分支：`detached=True`（2026-07-25，167 源码核验）───────
+                # 真机 `csa.py:794-795` 调用是
+                #     self.unfused_indexer_loss(index_scores, topk_indices_compressed,
+                #                               ops.stop_gradient(query),
+                #                               ops.stop_gradient(compressed_kv), mask=causal_mask)
+                # 两个张量输入都被 `ops.stop_gradient` 截断；其内部（`indexer.py:350`
+                # `attention_scores = matmul(permute(query), permute(key)) * softmax_scale`,
+                # `:380` `softmax(cast(attention_scores, float32), dim=-1)`）整条链**没有一个输入
+                # requires_grad** → MS 不为其建 autograd 节点 → **反向没有任何节点会读它** →
+                # 它不是 saved 张量、是**纯瞬态**（单卡微基准实测 ~2 MiB/blk 驻留；若真被 save 会显
+                # ~128 MiB/blk）。与之对照 `CSAIndexer` 自己的 `index_scores`（`indexer.py:245`
+                # `bmm(q,k)` → relu → ×weights → sum）经 indexer 自身 params 携带梯度 → **不**
+                # detached、照常 save（上方 `index_scores` TensorRef）。
+                # ⚠ 该 flag **只被 `cost_eval/liveness/` 读**：`structure_mem.activation_saves`
+                # 等桶路径不读它 → 本次改动对既有桶模型/全部锚点**逐字节无影响**（这两张仍留在
+                # `saves` 里，桶模型行为不动）；liveness 交叉校验按 grad 可达性把它们排除。
+                ukl1 = TensorRef("ukl1", ("B", "S", "dsa_indexer_n_heads", S_DIV_R),
+                                 dtype_bytes=4, detached=True)
+                ukl2 = TensorRef("ukl2", ("B", "S", "dsa_indexer_n_heads", S_DIV_R),
+                                 dtype_bytes=4, detached=True)
                 _ucopies += [ukl1, ukl2]
             sparse_saves = [q_hnorm, kv_gathered, kv_g_fp32, attn_weights, core_out] + _ucopies
         # inputs 含 topk_indices（仅 CSA）= 稀疏选 KV 的**数据流依赖**（indexer→sparse_attn 边;

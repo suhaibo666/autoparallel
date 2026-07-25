@@ -119,6 +119,18 @@ class TensorRef:
     # 恒 0、`mem_timeline` 全重算 saved 恒 = checkpoint_input。字段保留作通用机制占位。真机残留
     # （1.9G/微批层 = 重算边界×在途深度）归**框架释放缺口**，显式暴露（FrameworkGapWarning/报告§八）。
     pin_under_recompute: bool = False
+    # ── grad 可达性标注（2026-07-25，`cost_eval/liveness/` 用；对既有桶路径**逐字节无影响**）──
+    # detached=True：该张量由 **`stop_gradient`/detach 后的输入**喂出的子计算产生 → 该子计算
+    #   **不建 autograd 节点** → 反向没有任何节点会读它 → 它**不是 saved 张量**，是纯瞬态。
+    #   真机实例：`csa.py:794-795` unfused indexer KL loss
+    #   `self.unfused_indexer_loss(index_scores, topk_idx, ops.stop_gradient(query),
+    #   ops.stop_gradient(compressed_kv))`；其内部 `indexer.py:350` `matmul(query,key)*scale`
+    #   与 `:380` 的 fp32 `softmax` 全在 detached 侧（单卡微基准实测 ~2 MiB/blk 纯瞬态，而 saved
+    #   张量会显 ~128 MiB/blk）。与之对照，`CSAIndexer` 自己的 `index_scores`（`indexer.py:245`）
+    #   经 indexer 自身 params 携带梯度 → **不** detached、照常保留。
+    # **只被 `cost_eval/liveness/graph.py` 读**（structure_mem / mem_timeline / static_mem 均不
+    #   读它）→ `activation_saves` / `forward_max_live` / 全部锚点逐字节不变。
+    detached: bool = False
 
     def has_ep(self) -> bool:
         return "ep" in self.shard.values()

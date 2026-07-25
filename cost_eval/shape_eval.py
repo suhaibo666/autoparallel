@@ -73,6 +73,9 @@ class ResolvedTensor:
     # 整参不做 FSDP（replicate_params，全量驻留）。structure_mem 以此替代 total-numel ceil。
     # 0 = 未知（旧构造/测试 stub → structure_mem 退回 numel 整除判定,兼容）。
     dim0: int = 0
+    # grad 可达性直通（TensorRef.detached，2026-07-25）：stop_gradient 后的子计算产物 →
+    # 无 autograd 节点 → 反向无节点读它。**只被 cost_eval/liveness 读**，桶路径逐字节不变。
+    detached: bool = False
 
 
 def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
@@ -113,7 +116,8 @@ def resolve_tensor(t: TensorRef, dims: DimTable, pm) -> ResolvedTensor:
     dtype_bytes = t.dtype_bytes if t.dtype_bytes is not None else dims.dtype_bytes
     return ResolvedTensor(t.name, numel, dtype_bytes, t.is_weight, t.has_ep(),
                           getattr(t, "pin_under_recompute", False),
-                          int(sizes[0]) if sizes else 1)
+                          int(sizes[0]) if sizes else 1,
+                          getattr(t, "detached", False))
 
 
 # ---------------------------------------------------------------------------
