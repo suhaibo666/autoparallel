@@ -394,6 +394,13 @@ diff before.txt after.txt   ->  *** 0 diff ***
 ```
 即抽取侧仍**完全不在数字路径上**,本轮 4 个文件对既有桶路径**逐字节无影响**。
 
+**主树(与并行 agent 的改动合在一起)同样 0 diff**:
+```bash
+cd <main tree @ b5502d2> && PYTHONPATH=. python scratchpad/dump_numbers.py > after_main.txt
+diff before.txt after_main.txt   ->  *** 0 diff ***   (650 行 / 79088 字节)
+python -m pytest tests -q        ->  1780 passed, 268 warnings in 52.52s   (0 failed)
+```
+
 ### 6.3 主树状态说明
 
 主树(`feat/unified-llm-modelspec` HEAD)同时有并行 agent 对 `construct_walker.py` /
