@@ -283,17 +283,26 @@ class Evaluator:
         pm = ParallelModel(self.pc, self.spec.dims.n_layers, world)
         g = ShapeEval().resolve(self.spec, pm)
         _validate_recompute_against_graph(self.recompute, g)     # C1：full 空集/select 零命中 fail-loud
-        # ── 框架缺口显式暴露（2026-07-24 口径切换）：任一层 full-recompute 时，评估器按 MindSpore
-        #    checkpoint 理论语义只留每微批层重算边界（~128MiB 层入口 bf16），而 MS2.10 真机每微批层
-        #    实际驻留约 1.9GB、全重算实际只释放约 30% 激活——差距为**框架释放缺口**，不吸收进数字。
+        # ── 重算工作集口径提示（2026-07-25 **重写**：旧「框架不释放」理论已被实测证伪）─────────
+        #    167/MS2.10 单卡微基准（VERDICT_2026-07-25）：rc=ON `fwd_end` ≡ 0（NBLK=2/4/8，
+        #    bare_ctx/saved/pyref 三锚同值）→ 重算**确实**释放激活；`fwd_peak` 与 NBLK **无关** →
+        #    残余是单区域瞬态 ×1。缺的不是"释放"，是**重算工作集/再物化记账**——已由 `remat_saves`
+        #    桶补建（mem_timeline，A−ci，逐区域落在其自己的 bwd 事件上）。
         _any_full = any(self.recompute.is_full(l.layer_id)
                         for layers in g.stages.values() for l in layers)
         if _any_full:
             warn_framework_gap(
-                "按 MindSpore checkpoint 理论语义估计全重算(每微批层仅保留区域边界 ~128MiB 层入口)。"
-                "MS2.10 真机实测每微批层驻留约 1.9GB、全重算实际仅释放约 30% 激活——差距为**框架释放"
-                "缺口**(证据:pp4 ON−OFF 仅省 6.2/21.6GB;判决实验 E5/E1b 证机制上应释放)。**理论峰值"
-                "显著低于真机实测,OOM 判断勿直接采用此值。**")
+                "全重算按 MindSpore checkpoint **理论语义**估计:前向只留每微批层的区域边界"
+                "(checkpoint_input,~128MiB bf16 层入口);反向在**该区域自己的 bwd 事件**上再计"
+                "**重算工作集**——重跑 forward 的瞬态(recomp_scratch)+**再物化的整个 saved 集**"
+                "(remat_saves = activation_saves − checkpoint_input,2026-07-25 新增,每区域 ×1)。"
+                "⚠ 旧措辞「框架不释放 / 全重算实际仅释放约 30% 激活」**已被实测证伪**:167/MS2.10"
+                "微基准(2026-07-25)测得 rc=ON 前向末残留 ≡ 0(NBLK=2/4/8,三锚法同值)、前向峰与微批"
+                "深度无关 → 重算**确实**释放;此前理论偏低的根因是**重算工作集未建模**,不是框架不释放。"
+                "**残余偏差仍在,且方向依配置而异**:站点 pp8 全重算理论约为真机 74%(**欠读**,OOM 判断"
+                "务必留余量);而 1 层/stage 的极端 PP 配置上,因 recomp_scratch/bwd_working_set 与"
+                "remat 三者都由 `forward_max_live`/saves 派生而**部分重叠**,会**过读**约 1.1~1.3×。"
+                "两向皆非精确,勿把理论值直接当 OOM 判据。")
         # ── round3 A：OOM-安全咨询（不改数值,只提示欠预测风险；欠预测=误报"放得下"却 OOM）──
         n_layers = self.spec.dims.n_layers
         # F3：缩层锚点外推全尺寸风险——n_layers 远超已验证尺度时,累计每层残差（欠方向）无全尺寸验证点。

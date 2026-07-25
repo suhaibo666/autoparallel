@@ -23,13 +23,21 @@ class OOMSafetyWarning(UserWarning):
 
 
 class FrameworkGapWarning(UserWarning):
-    """**框架缺口**咨询（2026-07-24 口径切换）：评估器按 MindSpore/mindformers 真实代码语义做
-    **纯理论**估计，不做任何经验补偿；理论 vs 真机的差距作为框架缺口**显式暴露**、不吸收进数字。
+    """**理论口径 vs 真机残余偏差**咨询（2026-07-25 重写；类名保留兼容 import/filter）：评估器按
+    MindSpore/mindformers 真实代码语义做**纯理论**估计，不做任何经验补偿；理论 vs 真机的残余差
+    **显式暴露**、不吸收进数字。
 
-    典型场景：full-recompute 下评估器按 MS checkpoint 理论语义只留每微批层的重算边界（~128MiB
-    层入口），但 MS2.10 真机每微批层实际驻留约 1.9GB、全重算只释放约 30% 激活——差距是**框架释放
-    缺口**，非模型/建模误差。**这类警示务必让用户看见：理论峰值显著低于真机实测，OOM 判断勿直接
-    采用此理论值。**"""
+    典型场景：full-recompute。**旧措辞「框架不释放 / 全重算仅释放约 30% 激活」已被实测证伪**——
+    167/MS2.10 单卡微基准（2026-07-25，`log_release_probe/VERDICT_2026-07-25.txt`）测得 rc=ON
+    前向末残留 **≡ 0**（NBLK=2/4/8，bare_ctx/saved/pyref 三锚同值）、rc=ON 前向峰**与微批深度
+    无关**（复刻 552 / 真模块 403 恒定）→ 重算**确实**释放激活，残余量是**单区域瞬态 ×1**。
+    真正的缺口是**重算工作集未建模**：重算再执行必须把 backward 需要的整个 saved 集同时物化并
+    活到 backward 消费完（`remat_saves = activation_saves − checkpoint_input`，2026-07-25 补建）。
+
+    **补建后残余偏差仍在，方向依配置而异**：站点 pp8 全重算理论约为真机 74%（**欠读**）；1 层/
+    stage 的极端 PP 配置上因 `recomp_scratch`/`bwd_working_set`/`remat_saves` 都从
+    `forward_max_live`/saves 派生而**部分重叠**，会**过读** 1.1~1.3×。**这类警示务必让用户看见：
+    OOM 判断勿直接采用理论值（欠读侧会误报"放得下"）。**"""
 
 
 def warn_oom_safety(msg: str, *, stacklevel: int = 2) -> None:
@@ -38,7 +46,8 @@ def warn_oom_safety(msg: str, *, stacklevel: int = 2) -> None:
 
 
 def warn_framework_gap(msg: str, *, stacklevel: int = 2) -> None:
-    """发一条框架缺口咨询（纯理论 vs 真机差距，显式暴露、不进数字）。"""
+    """发一条理论口径 vs 真机残余偏差咨询（显式暴露、不进数字；见 `FrameworkGapWarning`——
+    「框架不释放」旧理论已被 167/MS2.10 微基准证伪，现指重算工作集口径的残余偏差）。"""
     warnings.warn(msg, FrameworkGapWarning, stacklevel=stacklevel + 1)
 
 
