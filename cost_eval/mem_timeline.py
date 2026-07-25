@@ -37,13 +37,15 @@ class Buckets:
     kept_frag: int = 0        # **标定 margin**（非 op 图导出）：保留(非重算)模块 loss 峰的 fp32-cast 横切 + 小张量长尾（313 个 <100MiB 碎片，源码级 op-DAG 提取证实其在 op 图粒度之下，见 opdag_validation.md）。仅 loss-BWD 事件、按 kept 激活比例计；full 重算 kept=0→此项 0（锚点不破）。**两作用域共用此桶**：① select-kept-MoE（kept_frag_factor×kept_act）；② 无重算-MoE（D1，nr_moe_frag_factor×_nr_moe_act，仅 pp==1 单 stage 无重算 loss-BWD）——同族碎片、不同 gate，互斥不双算
     grad_accum: int = 0       # **已规约梯度累计驻留**（P0-01，2026-07-14）：真机证实 step-scoped cumulative——每层首次反向后其 reduced 本地分片常驻，至 optimizer 后 zero_grad 释放（两卡探针 1889.5 MiB 吻合）。与 grad_buf（当前层 reduce-scatter 前 full 瞬态）正交
     p2p_buf: int = 0          # **PP stage 间 P2P send 激活缓冲**（P1-15，Task A）：非末 stage 前向把本 stage 输出激活 [S,B,H] send 给下 stage，send 通信期间驻留（1 份；overlap_p2p 时 2 份双缓冲）。recv 侧（非首 stage 首层输入）已隐含在 act_live 首层 pin → 不双算。pp=1 恒 0。仅 FWD 事件驻留、BWD/optstep 清零（pp2 峰在 BWD，不移锚点）
+    remat_saves: int = 0      # **重算再物化的 saved 集**（2026-07-25，167/MS2.10 单卡微基准实测驱动）：被重算区域反向重跑 forward 时，**backward 需要的那批 saved 张量必须同时在世**（活到该区域 backward 消费完），而 `forward_max_live`（→ recomp_scratch）的语义是「中间量最后一次被用完即死」的单时刻峰 → 整个 `activation_saves` 集的再物化此前记 **0**。结构量 = `max(0, A(R) − ci(R))`：A=区域 activation_saves、ci=checkpoint_input（已在 act_live，减掉防重复）。**逐层赋在该层自己的 `bwd@lid` 事件**上 → 同一时刻只有一个 bwd 事件在世 → **×1 自动成立**（实测：rc=ON fwd_peak 与 NBLK 无关、复刻 552/真模块 403 恒定），且逐层精确。**不沿用 `_pp_full_recomp`(pp>1) 门**——重算再物化与 pp 无关。与 recomp_scratch 存在**部分重叠**（fml 里含一部分 saved 张量）→ 轻度保守，如实记录、暂不精细扣减（spec §3）
     mtp_resident: int = 0     # **MTP loss 链 per-微批步内驻留**（2026-07-23，185 pp4+MTP 锚点）：mtp 层的 loss 段激活（h_last/h_final/logits/logsm）每微批前向后**不随该微批反向释放**、驻留至 step 末（真机 mtp_1_loss 逐步聚合;185 实测 mtp=1 仅尾 stage 净增 +16.4GB ≈ m×3.1GB,前 stage 逐 MiB 不变）。仅 **full-recompute 的 mtp 层** 计入（该层 saved 已塌缩到 ci+ctx,无双算;无重算 mtp 的同款驻留未有锚点,见 gate 注释）。optstep 前清零
 
     def total(self) -> int:
         return (self.persistent + self.act_live + self.gather_buf + self.grad_buf
                 + self.recomp_scratch + self.bwd_scratch + self.bwd_working_set
                 + self.swap_buf + self.workspace + self.optstep + self.kept_frag
-                + self.grad_accum + self.p2p_buf + self.mtp_resident)
+                + self.grad_accum + self.p2p_buf + self.remat_saves
+                + self.mtp_resident)
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class MemBreakdown:
     grad_accum: int = 0       # P0-01 尾部追加（default=0，序不破，照 kept_frag 先例）
     p2p_buf: int = 0          # P1-15 尾部追加（default=0，序不破，照 grad_accum 先例）
     mtp_resident: int = 0     # 2026-07-23 尾部追加（default=0,序不破）:MTP loss 链步内驻留
+    remat_saves: int = 0      # 2026-07-25 尾部追加（default=0,序不破）:重算再物化的 saved 集
 
 
 @dataclass(frozen=True)
@@ -290,9 +293,10 @@ class MemTimeline:
                     ep_degree=pm.degree("ep"))            # P0-3:与 persistent 同口径
                 for l in layers
             }
-            # 选择性重算：每层按选择器（op 名/类型子串）把 op 划分为选中/非选中，预算三桶
-            # （act_live_pinned / recomp_scratch / bwd_working_set，复用 forward_max_live 机理，
-            # 单点去重）。仅对 is_select 的层预算；full/None 层走既有路径（字节级不变）。
+            # 选择性重算：每层按选择器（op 名/类型子串）把 op 划分为选中/非选中，预算四桶
+            # （act_live_pinned / recomp_scratch / bwd_working_set / remat_saves，复用
+            # forward_max_live 与 activation_saves 机理，单点去重）。仅对 is_select 的层预算；
+            # full/None 层走既有路径（字节级不变）。
             select_mem_by_id = {
                 l.layer_id: estimate_select_memory(
                     l.ops,
@@ -466,7 +470,7 @@ class MemTimeline:
                         B.recomp_scratch, B.bwd_scratch, B.bwd_working_set,
                         B.swap_buf, B.workspace, B.optstep,
                         framework_reserve, B.kept_frag, B.grad_accum, B.p2p_buf,
-                        B.mtp_resident,
+                        B.mtp_resident, B.remat_saves,
                     )
                 if record_timeline:
                     series.append(TimelineSample(len(series), lbl, t, bd, mb, chunk))
@@ -586,10 +590,13 @@ class MemTimeline:
                             # 2026-07-24 口径切换：去除经验驻留集（recompute_pinned_saves 恒 0，见
                             # model_spec.pin_under_recompute）——受控 A/B 证 save_for_backward /
                             # DTensor / aclnn 自定义算子 ctx 全重算均正常释放（报告§7.9），全重算只
-                            # 留边界。真机每微批层 ~1.9G 驻留（= 重算边界 checkpoint_input × 在途深度
-                            # + mHC hc_mult 多流放大）是**框架释放缺口**，显式暴露（FrameworkGapWarning
-                            # /报告§八），不吸收进数字。checkpoint_input 已修正为 bf16 层入口（128MiB/
-                            # 微批层，非 fp32 256；见 structure_mem）。
+                            # 留边界。**2026-07-25 更正**：167/MS2.10 微基准（rc=ON `fwd_end` ≡ 0，
+                            # NBLK=2/4/8 三锚同值）证实前向末**确实**释放 → 此处 `saved =
+                            # checkpoint_input` 是对的,不需要驻留补偿;此前理论偏低的根因在**反向**
+                            # ——重算再执行时那批 saved 张量要同时物化并活到 backward 消费完,已由
+                            # 下方 `B.remat_saves`（A−ci，落在该层自己的 bwd 事件、×1）补建。
+                            # checkpoint_input 已修正为 bf16 层入口（128MiB/微批层，非 fp32 256；
+                            # 见 structure_mem）。
                             saved = sm.checkpoint_input
                         elif recompute.is_select(lid):
                             # 选择性重算：非选中 op 的 saves（去重）+ 层入口边界常驻；
@@ -630,6 +637,7 @@ class MemTimeline:
                         #     单元预取末 transformer 层）
                         #   + reduce-scatter 前 full 梯度(grad dtype)
                         #   + (full 重算)重物化激活 recomp_scratch / (无重算)反向工作集 bwd_working_set
+                        #   + (full/select 重算)再物化的 saved 集 remat_saves（2026-07-25）
                         #   + (op)反向临时物化 bwd_scratch(如 loss probs)
                         #   共存，叠在 persistent + 其余 act_live 之上。
                         #   resident（no-reshard）层反向不 re-gather（hsdp_scheduler.py:241-250：
@@ -682,6 +690,24 @@ class MemTimeline:
                             # 仅 PP(pp>1) 全重算(_pp_full_recomp)——pp1 旧口径已验证匹配真机,不加。
                             if _pp_full_recomp:
                                 B.bwd_working_set = max(0, sm.forward_max_live - sm.bwd_scratch)
+                            # ── 2026-07-25：重算**再物化的 saved 集**（spec §2.2，167/MS2.10 实测）──
+                            # `recomp_scratch` 用 `forward_max_live`,其语义是「前向中间量在最后一次
+                            # 被用完就死」的单时刻峰（structure_mem.py:142-175）。但**重算再执行**的
+                            # 目的恰是重建 backward 需要的那批 saved 张量——它们**不能**在前向末尾死,
+                            # 必须一直活到该区域 backward 消费完 → 重算再执行期真正同驻的是**整个
+                            # `activation_saves` 集**,而 fml（单时刻最大活跃）与 saves 无大小序
+                            # （structure_mem.py:43-48;现场 layer1 full_act 3646.2 vs recomp_scratch
+                            # 672.1）→ 该再物化量此前**记 0**,是口径缺口。
+                            # 结构量 = `max(0, activation_saves − checkpoint_input)`（ci 已 pin 进
+                            # act_live,减掉防重复;不引入任何拟合常数——A/ci 都来自结构化张量清单）。
+                            # **逐层赋在该层自己的 bwd@lid 事件上** → 同一时刻只有一个 bwd 事件在世 →
+                            # **×1 自动成立**（对应实测 rc=ON fwd_peak 与 NBLK 无关:复刻 552/真模块
+                            # 403 恒定）,且逐层精确（不同层 A 不同,不做 stage 级 max）。
+                            # **不沿用 `_pp_full_recomp`(pp>1) 门**（spec §3）——重算再物化与 pp 无关,
+                            # pp=1 同样发生。与 recomp_scratch **部分重叠**（fml 含一部分 saved 张量）
+                            # → 轻度保守,如实记录、暂不精细扣减,由真机验证决定是否细化。
+                            B.remat_saves = max(
+                                0, sm.activation_saves - sm.checkpoint_input)
                         elif recompute.is_select(lid):
                             # 选择性重算：选中 op 反向重物化（recomp_scratch，= 选中段 forward_max_live
                             # 扣段边界）与非选中 op 反向工作集（bwd_working_set，= 非选中段
@@ -690,6 +716,11 @@ class MemTimeline:
                             smem = select_mem_by_id[lid]
                             B.recomp_scratch = smem.recomp_scratch
                             B.bwd_working_set = smem.bwd_working_set
+                            # 2026-07-25：选中 island 的再物化 saved 集（= max over islands，反向逐
+                            # island 重算、算完释放,不同时存活）。全选 → 退化为 `A(层)−ci` == full 路径
+                            # 上式（→ select-all == full 逐字节保持）;全不选 → islands 空 → 0 == None。
+                            # 区域比整层小 → 该项显著小于 full（spec §4）。
+                            B.remat_saves = smem.remat_saves
                         else:
                             # 无重算层：反向仍需再遍历 forward 求梯度，激活梯度 dL/dact 与激活同形、
                             # 同样共存 → 反向工作集 ≈ 该层 forward_max_live（§8.5②）。其中已被显式建模
@@ -726,6 +757,7 @@ class MemTimeline:
                         rec(f"bwd@{lid}", ev_mb, ev_chunk)
                         B.grad_buf = B.recomp_scratch = B.optstep = 0
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
+                        B.remat_saves = 0      # 2026-07-25：跑完即清（瞬时项，×1 的机理）
                         # post_backward：resident 层此刻 reshard（reshard_after_backward 默认 True，
                         # state.py:505-537）→ 从 resident 集移除；gather_buf 回落到其余 resident。
                         resident_gather.pop(lid, None)
@@ -798,6 +830,7 @@ class MemTimeline:
             if optstep_bytes > 0:
                 B.act_live = B.gather_buf = B.grad_buf = B.recomp_scratch = 0
                 B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.workspace = 0
+                B.remat_saves = 0                      # 2026-07-25：重算再物化随反向结束即释
                 B.p2p_buf = 0                          # P1-15：step 在所有反向后、P2P 已收尾
                 B.mtp_resident = 0                     # MTP loss 图随全部反向完成释放（step 末）
                 B.optstep = optstep_bytes              # fp32 瞬态（grad_accum 保持驻留，与之共存）

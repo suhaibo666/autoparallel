@@ -55,14 +55,21 @@ def test_full_recompute_lowers_peak_and_moves_event():
     none = mt.simulate(g, RecomputeSpec("None"), SwapSpec(), pm, persistent,
                        framework_reserve=0, max_device_memory=10**12)
     full = mt.simulate(g, RecomputeSpec("full", {0, 1, 2, 3}), SwapSpec(), pm, persistent,
-                       framework_reserve=0, max_device_memory=10**12)
+                       framework_reserve=0, max_device_memory=10**12,
+                       record_timeline=True)
     # full 重算降低峰值（act_live 大降 > 反向重物化一层）；none 峰仍在反向（FSDP gather+grad 共存）。
-    # P0-01（2026-07-14）：grad_accum 常驻至 optstep → full（激活峰被压低）的全局峰移到 optstep
+    # P0-01（2026-07-14）：grad_accum 常驻至 optstep → full（激活峰被压低）的全局峰曾移到 optstep
     # （persistent + K_OPT 瞬态 + 累计梯度共存）——真机语义（optimizer 前全部 reduced grad 驻留）。
+    # **2026-07-25（remat_saves 入账）**：重算层 bwd 事件叠上「再物化的 saved 集」(A−ci) 后重新
+    # **超过** optstep → full 峰回到 `bwd@*`（真实迁移，非调参：toy dense 层 A−ci=622592 B >
+    # optstep 断面 3220480 与 bwd 断面之差）。optstep 语义（grad_accum 与瞬态共存）改从 timeline 守。
     assert full[0].peak_bytes < none[0].peak_bytes
     assert none[0].peak_event.startswith("bwd")
-    assert full[0].peak_event == "optstep"
-    assert full[0].breakdown.grad_accum > 0            # 累计梯度与 optstep 瞬态共存
+    assert full[0].peak_event.startswith("bwd@")
+    assert full[0].breakdown.remat_saves > 0           # 峰上带再物化 saved 集
+    opt = next(s for s in full[0].timeline if s.event == "optstep")
+    assert opt.breakdown.grad_accum > 0                # 累计梯度与 optstep 瞬态共存（语义不变）
+    assert opt.breakdown.remat_saves == 0              # step 时重算再物化已释
 
 
 def test_oom_flag():
@@ -93,7 +100,8 @@ def test_no_recompute_adds_bwd_working_set():
     # 逐桶之和 == 峰值（新桶已并入 total，无遗漏/重复；P0-01 后含 grad_accum/kept_frag）
     assert (b.persistent + b.act_live + b.gather_buf + b.grad_buf + b.recomp_scratch
             + b.bwd_scratch + b.bwd_working_set + b.swap_buf + b.workspace
-            + b.framework + b.kept_frag + b.grad_accum) == r[0].peak_bytes
+            + b.framework + b.kept_frag + b.grad_accum
+            + b.remat_saves) == r[0].peak_bytes      # 2026-07-25 新桶并入 total
 
 
 def test_full_recompute_scratch_is_forward_max_live():
@@ -142,8 +150,11 @@ def test_none_full_byte_identical_anchor():
     # （split/rope-fp32/TND/mask/ctx/残差保留,116 stdL1/2/4/8 逐层差分 728.0(MHA) 实测背书,
     # attention.py build_gqa_attn_ops ①-⑥）→ 无重算 act_live 每层净增;full 锚不动（saves 被
     # 丢弃重物化,census 追加成员默认无 pin_under_recompute → 全重算行为不变）。
+    # 2026-07-25（remat_saves 入账）：full 锚 3220480 → 3761664——重算层 bwd 事件叠上「再物化的
+    #   saved 集」`max(0, activation_saves − checkpoint_input)` = 622592 B 后超过 optstep 断面,
+    #   峰事件 optstep → bwd@0。none 锚**逐字节不变**（无重算区域 → 该桶恒 0，严格回归保护）。
     assert none.peak_bytes == 5284352
-    assert full.peak_bytes == 3220480
+    assert full.peak_bytes == 3761664
 
 
 def test_select_core_attn_peak_between_none_and_full():
@@ -187,6 +198,7 @@ def test_select_all_ops_equals_full():
     assert sel_all.breakdown.act_live == full.breakdown.act_live
     assert sel_all.breakdown.recomp_scratch == full.breakdown.recomp_scratch
     assert sel_all.breakdown.bwd_working_set == full.breakdown.bwd_working_set
+    assert sel_all.breakdown.remat_saves == full.breakdown.remat_saves   # 2026-07-25 新桶同样等价
 
 
 def test_select_none_selectors_equals_no_recompute():

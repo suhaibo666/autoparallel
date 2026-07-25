@@ -24,8 +24,8 @@ from cost_eval.report import Evaluator
 
 MiB = 2 ** 20
 BK = ["persistent", "act_live", "kept_frag", "gather_buf", "grad_buf", "recomp_scratch",
-      "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "optstep",
-      "grad_accum", "p2p_buf", "mtp_resident", "framework"]   # grad_accum/p2p_buf(2026-07-20):此前遗漏→HTML 不展示;mtp_resident(2026-07-23):MTP loss 链步内驻留
+      "remat_saves", "bwd_scratch", "bwd_working_set", "swap_buf", "workspace", "optstep",
+      "grad_accum", "p2p_buf", "mtp_resident", "framework"]   # grad_accum/p2p_buf(2026-07-20):此前遗漏→HTML 不展示;mtp_resident(2026-07-23):MTP loss 链步内驻留;remat_saves(2026-07-25):重算再物化的 saved 集
 _CP_METHODS = ("colossal", "ulysses", "ring", "hybrid")
 # select 选择器:**单一来源** = 转换器 _SELECT_MODULE_OPS（2026-07-14 review P1.5:此前双维护
 # 导致口径漂移——serve 多 "qkv" 而转换器没有,GQA yaml select 静默漏选）。
@@ -556,17 +556,23 @@ def graph_json(layers, norm_dtype, spec, dims, recompute=None):
         #   - select：`act_live_pinned`（非选中 op saves ∪ 层入口锚点）。
         # per-op stored 判定：被重算 op 前向不存 saves；层入口 checkpoint_input 是**层级重算锚点**
         # （层 construct 入参 bf16，非本层某 op 的激活），单列 `entry_mib` 于层头解释 stored 总量与 per-op 之差。
+        # `remat_b`（2026-07-25）：该层重算态下的**再物化 saved 集**（`remat_saves` 桶的层级量，
+        #   审计用——把层卡的 `full_act_mib` 与反向峰上那一项对上）。none → 0。
         if rc.is_full(lid):
             recomp_state = "full"
             layer_act = sm.checkpoint_input
+            remat_b = max(0, sm.activation_saves - sm.checkpoint_input)
         elif rc.is_select(lid):
             recomp_state = "select"
-            layer_act = estimate_select_memory(
+            _selm = estimate_select_memory(
                 l.ops, lambda op: rc.op_matches(lid, op.name, _optype(op)),
-                norm_compute_dtype_bytes=norm_dtype).act_live_pinned
+                norm_compute_dtype_bytes=norm_dtype)
+            layer_act = _selm.act_live_pinned
+            remat_b = _selm.remat_saves
         else:
             recomp_state = "none"
             layer_act = sm.activation_saves
+            remat_b = 0
         entry_mib = round(sm.checkpoint_input / MiB, 2) if recomp_state != "none" else 0
         orig_ops = spec.get_layer(l.layer_type).ops
         ops, edges = [], []
@@ -615,6 +621,12 @@ def graph_json(layers, norm_dtype, spec, dims, recompute=None):
                     "entry_mib": entry_mib,                                 # 重算态层入口锚点（stored）
                     # 2026-07-24 纯理论口径：full 态无 ctx 免疫量 → 恒 0（保留字段兼容前端）。
                     "pinned_mib": 0,
+                    # 2026-07-25 审计字段：`fml_mib` = forward_max_live（recomp_scratch 的来源，
+                    #   语义=中间量最后一次被用完即死的单时刻峰）；`remat_mib` = 重算再物化的 saved 集
+                    #   （= A−ci，落在该层 bwd@lid 事件）。二者与 full_act_mib 并列即可看出
+                    #   「fml 与 saves 无大小序」（structure_mem.py:43-48）。
+                    "fml_mib": round(sm.forward_max_live / MiB, 1),
+                    "remat_mib": round(remat_b / MiB, 1),
                     "param_mib": round(sum(o["param_mib"] for o in ops), 1),
                     "ops": ops, "edges": edges})
     return out
@@ -1358,8 +1370,8 @@ const PRESETS=__PRESETS__;
 const OPC={matmul:"#4e79a7",flash_attn:"#e15759",elementwise:"#b07aa1",norm:"#59a14f",rope:"#8cd17d",
   moe_router:"#f9a825",moe_gemm:"#2f4b7c",dispatch:"#76b7b2",combine:"#76b7b2",embedding:"#7cae60",
   dsa:"#e15759",csa:"#e15759",hca:"#e15759"};
-const BKC={persistent:"#6b6b6b",act_live:"#4e79a7",kept_frag:"#c0392b",gather_buf:"#59a14f",grad_buf:"#f28e2b",recomp_scratch:"#b07aa1",bwd_scratch:"#e15759",bwd_working_set:"#8cd17d",swap_buf:"#76b7b2",workspace:"#bab0ac",optstep:"#ff9da7",grad_accum:"#9c755f",p2p_buf:"#edc948",framework:"#d7d7d7"};
-const BKD={persistent:"参数+优化器状态",act_live:"存活激活",kept_frag:"B margin(保留-MoE碎片)",gather_buf:"FSDP all-gather",grad_buf:"梯度缓冲",recomp_scratch:"full重算重物化",bwd_scratch:"反向临时(loss fp32)",bwd_working_set:"无重算反向工作集",swap_buf:"激活swap",workspace:"算子workspace",optstep:"优化器step",grad_accum:"梯度累积驻留(num_microbatches≥2)",p2p_buf:"PP P2P send缓冲",framework:"框架"};
+const BKC={persistent:"#6b6b6b",act_live:"#4e79a7",kept_frag:"#c0392b",gather_buf:"#59a14f",grad_buf:"#f28e2b",recomp_scratch:"#b07aa1",remat_saves:"#9467bd",bwd_scratch:"#e15759",bwd_working_set:"#8cd17d",swap_buf:"#76b7b2",workspace:"#bab0ac",optstep:"#ff9da7",grad_accum:"#9c755f",p2p_buf:"#edc948",mtp_resident:"#a0522d",framework:"#d7d7d7"};
+const BKD={persistent:"参数+优化器状态",act_live:"存活激活",kept_frag:"B margin(保留-MoE碎片)",gather_buf:"FSDP all-gather",grad_buf:"梯度缓冲",recomp_scratch:"full重算重物化",remat_saves:"重算再物化saved集(A−ci)",bwd_scratch:"反向临时(loss fp32)",bwd_working_set:"无重算反向工作集",swap_buf:"激活swap",workspace:"算子workspace",optstep:"优化器step",grad_accum:"梯度累积驻留(num_microbatches≥2)",p2p_buf:"PP P2P send缓冲",mtp_resident:"MTP loss链步内驻留",framework:"框架"};
 let cur=null,curStage=0,openLayers=new Set();
 function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function fmib(m){return m>=1024?(m/1024).toFixed(1)+" GiB":m.toFixed(0)+" MiB";}

@@ -56,12 +56,19 @@ def _site_unfused_stage7():
     gmax = max(s["buckets"].get("gather_buf", 0) for s in st7["timeline"])
     omax = max(s["buckets"].get("optstep", 0) for s in st7["timeline"]
                if s["event"].startswith("bwd@"))
-    return pk["buckets"], gmax, omax
+    # 梯度路径同样取**跨事件最大断面**（与 gather/muon 同法）——CSV 6845 是 stage 瞬态池的逐块
+    # 汇总，不是某单个事件的横切。2026-07-25 起必须如此取：`remat_saves` 入账后本 stage 峰事件
+    # 从 loss 层 bwd@45 迁到某重算层 bwd@41（真实迁移），而 grad_buf 是**逐层**量、在 loss 层最大
+    # → 只看峰事件横切会把 grad 路径读成 6327.2/0.924；跨事件最大 6827.0/0.997 才是与 CSV 可比的
+    # 同一物理量（结构未变，只是采样点修正；CSV_GRAD 未动）。
+    gpath = max(s["buckets"].get("grad_buf", 0) + s["buckets"].get("grad_accum", 0)
+                for s in st7["timeline"])
+    return pk["buckets"], gmax, omax, gpath
 
 
 def test_stage7_gather_regather_matches_csv():
     """① gather re-gather：修后 gather 峰 ≈ CSV 10491（结构量 Σ param_full 补齐 re-gather 窗）。"""
-    _, gmax, _ = _site_unfused_stage7()
+    _, gmax, _, _ = _site_unfused_stage7()
     ratio = gmax / CSV_GATHER
     assert 0.92 <= ratio <= 1.05, (
         f"gather 峰 {gmax:.1f} vs CSV 10491, ratio={ratio:.3f}（结构量=Σ本stage全重算层 param_full;"
@@ -70,7 +77,7 @@ def test_stage7_gather_regather_matches_csv():
 
 def test_stage7_muon_overlap_present_and_bounded():
     """② Muon NS 反向重叠：一份 NS workspace(结构量),present 且 ≤ CSV 2264（余为多专家并发,未拟合）。"""
-    _, _, omax = _site_unfused_stage7()
+    _, _, omax, _ = _site_unfused_stage7()
     assert omax > 0, "Muon NS 反向重叠桶应 > 0（反向事件叠一份 NS workspace）"
     assert 0.55 <= omax / CSV_MUON <= 1.02, (
         f"Muon 反向重叠 {omax:.1f} vs CSV 2264（一份 NS=68%,余多专家 NS 并发 CSV-文档化,不拟合顶数）")
@@ -78,17 +85,35 @@ def test_stage7_muon_overlap_present_and_bounded():
 
 def test_stage7_grad_path_near_perfect():
     """梯度路径(grad_buf+grad_accum)结构精确——CSV +18 近乎完美,修改不得破坏。"""
-    b, _, _ = _site_unfused_stage7()
-    g = b.get("grad_buf", 0) + b.get("grad_accum", 0)
+    _, _, _, g = _site_unfused_stage7()
     assert abs(g / CSV_GRAD - 1) <= 0.05, f"grad 路径 {g:.1f} vs CSV 6845（应 ±5%）"
 
 
 def test_stage7_residual_is_framework_gap():
     """三结构桶补齐后,剩余 = csa/indexer fp32 物化框架缺口(激活+重算+bwd_scratch 桶欠 CSV)。
     纯理论口径下此桶不追（框架缺口显式暴露,非模型误差）——守卫其仍 < 真机(欠估方向,OOM 提示)。"""
-    b, _, _ = _site_unfused_stage7()
+    b, _, _, _ = _site_unfused_stage7()
     act_recomp_bwd = (b.get("act_live", 0) + b.get("recomp_scratch", 0)
                       + b.get("bwd_scratch", 0) + b.get("bwd_working_set", 0))
     # CSV 激活+重算+bwd = 18373（含未释放 fp32 物化）;理论应显著低（框架缺口）。
     assert act_recomp_bwd < 18373.0, (
         f"激活+重算+bwd 桶 {act_recomp_bwd:.1f} 应 < CSV 18373（差=csa/indexer fp32 框架缺口,纯理论不追）")
+
+
+def test_stage7_remat_overreads_csv_activation_family_documented():
+    """④ **2026-07-25 如实记录的方向翻转**：`remat_saves`（重算再物化的 saved 集）入账后，
+    「激活+重算+bwd」族**加上该桶**从欠读 CSV 翻成**过读约 2×**（37146 vs CSV 18373）。
+
+    成因（都不是拟合，全部可溯源）：unfused 分支的 saved 集 census（`dsv4_hybrid.py:187-211`
+    的 fp32 复本群 + KL 链）此前是按 **no-recompute/seq2048** 对 185 U1 标定的；在**全重算**下它
+    此前对峰值**完全无贡献**（saves 被丢弃、只剩 fml/ci），现在经 `remat` 第一次进入反向峰，而
+    其 S² 项在 seq4096 站点配置下达到单层 A−ci≈35.3GB。叠上与 `recomp_scratch`(fml−ci) 的部分
+    重叠 → 过读。**按纪律不反向调参**：钉住比值防继续恶化，同时明示这是"过读"（OOM 安全侧但不
+    准），待真机逐桶 micro-anchor 决定是否细化 unfused census 的重算态口径 / 扣减 fml 重叠。"""
+    b, _, _, _ = _site_unfused_stage7()
+    fam = (b.get("act_live", 0) + b.get("recomp_scratch", 0) + b.get("bwd_scratch", 0)
+           + b.get("bwd_working_set", 0) + b.get("remat_saves", 0))
+    assert fam > 18373.0, "remat 入账后该族应过读 CSV——若回到欠读，说明 remat 被误门控/清零"
+    assert 1.8 <= fam / 18373.0 <= 2.3, (
+        f"该族 {fam:.1f} / CSV 18373 = {fam/18373.0:.2f}× 越出已记录的过读带 (1.8,2.3)——"
+        f"unfused census × remat 的过读幅度漂移,如实重钉并说明理由,勿调参掩盖。")

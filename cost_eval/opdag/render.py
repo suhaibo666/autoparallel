@@ -152,6 +152,7 @@ def dag_to_svg(dag, dims=None, title=None) -> str:
 _BUCKETS = [
     ("persistent", "#6b6b6b"), ("act_live", "#4e79a7"), ("kept_frag", "#c0392b"),
     ("gather_buf", "#59a14f"), ("grad_buf", "#f28e2b"), ("recomp_scratch", "#b07aa1"),
+    ("remat_saves", "#9467bd"),                      # 2026-07-25 重算再物化的 saved 集
     ("bwd_scratch", "#e15759"), ("bwd_working_set", "#8cd17d"), ("swap_buf", "#76b7b2"),
     ("workspace", "#bab0ac"), ("optstep", "#ff9da7"), ("framework", "#d7d7d7"),
 ]

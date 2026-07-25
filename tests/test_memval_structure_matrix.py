@@ -95,7 +95,8 @@ def _bd_fields(bd) -> list:
     return [bd.persistent, bd.act_live, bd.gather_buf, bd.grad_buf,
             bd.recomp_scratch, bd.bwd_scratch, bd.bwd_working_set, bd.swap_buf,
             bd.workspace, bd.optstep, bd.framework, bd.kept_frag,
-            bd.grad_accum, bd.p2p_buf]
+            bd.grad_accum, bd.p2p_buf,
+            bd.remat_saves]                 # 2026-07-25 重算再物化 saved 集
 
 
 def _max_act(rep) -> int:

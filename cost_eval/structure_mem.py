@@ -365,6 +365,13 @@ class SelectMemory:
       **低估**（OOM 不安全）。D-3 改为**按实际 pin 的进入边界扣**，修正低估、两端仍退化不变。
     - ``bwd_working_set``：非选中段反向工作集 = `forward_max_live(非选中 op) −
       bwd_scratch(非选中)`——与无重算路径同构，只是**范围收窄到非选中 op**。
+    - ``remat_saves``：**重算再物化的 saved 集**（2026-07-25，167/MS2.10 微基准实测驱动）=
+      `max over islands( max(0, activation_saves(island) − pinned_input_boundary(island)) )`。
+      与 ``recomp_scratch`` 的区别是**语义**而非范围：``recomp_scratch`` 用 `forward_max_live`
+      ——「前向中间量在最后一次被用完就死」的峰值工作集；但重算再执行的**目的**恰是重建 backward
+      需要的那批 saved 张量，它们**不能**在段末死、必须活到该 island backward 消费完 → 同驻的是
+      **整个 saved 集**。取 max over islands 的理由同 ``island_recomp``（反向逐 island 重算、算完
+      释放，不同时存活）。两端退化：全选 → `A(层) − ci` == full 式；全不选 → 0 == None。
 
     两端退化**逐字节复现**既有公式（这是 None/full 不变、且 select-all==full /
     select-none==None 的机理根因）：
@@ -390,6 +397,11 @@ class SelectMemory:
     #                   recomp_scratch = max(island_recomp)（反向逐 island 重物化、算完释放、不同时存活）。
     n_islands: int = 0
     island_recomp: tuple = ()
+    # 2026-07-25 尾部追加（default=0/()，序不破，照 island_recomp 先例）：重算再物化的 saved 集。
+    #   island_remat — 每 island 的 `max(0, activation_saves(island) − pinned_input_boundary(island))`；
+    #   remat_saves  — `max(island_remat)`（同 island_recomp 的 ×1 机理）。
+    remat_saves: int = 0
+    island_remat: tuple = ()
 
 
 def _checkpoint_islands(ops, is_selected) -> list:
@@ -497,6 +509,21 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
         max(0, _forward_max_live(isl, blk) - _pinned_input_boundary(isl, pinned_names, blk))
         for isl in islands)
     recomp_scratch = max(island_recomp) if island_recomp else 0
+    # ── 2026-07-25：重算再物化的 saved 集（`remat_saves`，spec §2.2）────────────────────────
+    # `island_recomp` 用 `forward_max_live`——「中间量最后一次被用完即死」的峰值工作集；但重算再执行
+    # 的**目的**是重建 backward 需要的那批 saved 张量,它们必须活到该 island backward 消费完 → 真正
+    # 同驻的是**整个 saved 集**。故每 island 另计 `activation_saves(island) − 已 pin 的进入边界`
+    # （边界扣法与 island_recomp 完全同源 `_pinned_input_boundary`,故全选时恰退化为 `A(层) − ci`
+    # == full 路径公式 → select-all == full 逐字节保持）。saves 走 `estimate_structure_memory`
+    # （全库唯一按名去重点,不另写一份求和）,含 norm-fp32 口径,与 act_live 同尺。
+    island_remat = tuple(
+        max(0,
+            estimate_structure_memory(
+                isl, alloc_block_bytes=blk,
+                norm_compute_dtype_bytes=norm_compute_dtype_bytes).activation_saves
+            - _pinned_input_boundary(isl, pinned_names, blk))
+        for isl in islands)
+    remat_saves = max(island_remat) if island_remat else 0
     # bwd_working_set = 非选中段 forward_max_live − 非选中 bwd_scratch（与无重算同构，范围收窄）。
     bwd_working_set = max(0, sm_non.forward_max_live - sm_non.bwd_scratch)
 
@@ -506,4 +533,6 @@ def estimate_select_memory(resolved_ops, is_selected, *, alloc_block_bytes: int 
         bwd_working_set=bwd_working_set,
         n_islands=len(islands),
         island_recomp=island_recomp,
+        remat_saves=remat_saves,
+        island_remat=island_remat,
     )

@@ -15,6 +15,11 @@
   (a) 理论值 pin 住（防建模漂移，数值由 eval_config 现算写死）；
   (b) 框架缺口文档化（`assert 理论 < 真机`，缺口=真机−理论，属框架缺口非模型误差）。
 无重算 OFF 锚点**不受口径切换影响**（全量 saves、无 pin/ci-dtype 影响峰值），band 原样保留。
+
+**2026-07-25 `remat_saves`（重算再物化的 saved 集）入账**：pp4 四 stage 与 pp8 s0/s7 的理论值
+上移、缺口**收窄**且方向不变（仍欠读真机）；**pp8 中部 s1-s6 方向翻转为过读 1.14~1.31×**——
+1 层/stage 极端配置下单层 `A−ci`≈3.5GB 占断面 26%，叠上 `recomp_scratch`/`bwd_working_set` 的
+`forward_max_live` 重叠。**如实记录、未反向调参**，见 THEO_PP8 与 `test_pp8_framework_gap`。
 """
 import os
 import sys
@@ -34,7 +39,15 @@ REAL_OFF = {0: 30395.0, 1: 21019.4, 2: 17799.9, 3: 27822.0}
 # 差距=框架释放缺口（见 test_full_recompute_framework_gap）。改动建模而此值漂移即回归。
 # 2026-07-24 §8.5 三结构桶(FSDP re-gather / Muon NS 反向重叠 / 全重算反向工作集)入账后上移
 # (仅 pp>1 全重算反向;pp1 安全网不动)。理论仍 << 真机,差距=csa/indexer fp32 物化框架缺口。
-THEO_ON = {0: 14551.0, 1: 9555.7, 2: 9478.5, 3: 21037.9}
+# ── 2026-07-25 `remat_saves`(重算再物化的 saved 集)入账后再上移 ──────────────────────────
+#   s0 14551.0→18172.2 / s1 9555.7→13049.0 / s2 9478.5→12975.9 / s3 21037.9→**不变**。
+#   机理:重算区域反向重跑 forward 时 backward 需要的整个 `activation_saves` 集必须同时在世
+#   (`max(0,A−ci)`,fused dsv4 层 A−ci≈3.5GB),此前记 0。逐层赋在该层 bwd@lid 事件 → ×1。
+#   s3(尾 stage)峰在 **loss/head 层**(非重算层)的 bwd 事件 → 该事件此桶 0 → 逐 MiB 不变(真实,
+#   不是被门挡掉:重算层 bwd 事件确实涨了,只是仍不及 loss 层断面)。
+#   方向:与真机比 s0 0.602→0.752 / s1 0.653→0.891 / s2 0.672→0.920 / s3 0.895 不变——**收窄**,
+#   四个 stage 仍全部 sim < real（框架缺口方向不变）。
+THEO_ON = {0: 18172.2, 1: 13049.0, 2: 12975.9, 3: 21037.9}
 
 # ── no-recompute OFF band（口径切换不影响 OFF:全量 saves,无 pin/ci-dtype 影响峰值）──────
 # OFF 过估根因仍为 mHC ×n 记账（残差②,未修,与 scorecard mHC+MTP 锚 band 联动，不单独动）。
@@ -137,7 +150,11 @@ REAL_MTP = {0: 24153.0, 1: 14641.0, 2: 14100.0, 3: 39898.0}
 # 纯理论值：mtp_resident=0（代码核查 116 multi_token_prediction.py：`_MTPLossAutoScaler` 逐微批
 #   attach、`save_to_mtp_losses_tracker` 只累加 `.detach()` 标量 → 无步内跨微批驻留，见 mem_timeline
 #   注释）。s0-s2 与无 MTP 理论一致；s3(尾)仅多 MTP decoder 层自身（非 loss 链步内驻留）。
-THEO_MTP = {0: 14551.0, 1: 9555.7, 2: 9478.5, 3: 24360.3}  # 2026-07-24 §8.5 三桶入账
+# 2026-07-24 §8.5 三桶入账;**2026-07-25 `remat_saves` 入账**再上移:s0-s2 同 THEO_ON
+#   (14551.0/9555.7/9478.5 → 18172.2/13049.0/12975.9)、s3 24360.3 → 29276.5(尾 stage 的 MTP
+#   decoder 层是重算层,其 bwd 事件此刻成为该 stage 峰 → 带上 A−ci)。四 stage 仍全部 sim < real
+#   (s3 29276.5 vs 39898 → 0.734,缺口收窄自 0.611)。
+THEO_MTP = {0: 18172.2, 1: 13049.0, 2: 12975.9, 3: 29276.5}
 
 
 @pytest.fixture(scope="module")
@@ -179,10 +196,21 @@ def test_mtp_front_stages_unchanged(peaks_mtp, peaks_on):
 REAL_PP8 = {0: 24759.0, 1: 12324.0, 2: 11678.0, 3: 11919.0,
             4: 10867.0, 5: 11113.0, 6: 10074.0, 7: 26449.0}
 # 纯理论值（每微批层入口 ci 线性 pin 到 warmup 深度；无经验饱和 cap——cap 是死 ctx 的经验回收模型,
-#   纯理论口径无免疫 ctx 可回收）。理论 << 真机，差距=框架释放缺口。
+#   纯理论口径无免疫 ctx 可回收）。
 # 2026-07-24 §8.5 三结构桶入账后上移(s0 无 BWD-SEND 不叠 re-gather 窗故仅 muon+bwd_ws;中部叠满)。
-THEO_PP8 = {0: 19697.7, 1: 10625.4, 2: 10237.8, 3: 10028.3,
-            4: 10241.4, 5: 9853.8, 6: 9644.3, 7: 25304.9}
+# ── 2026-07-25 `remat_saves` 入账后再上移(每 stage +2817~3656 = 该 stage 单个 dsv4 层的 A−ci)──
+#   s0 19697.7→22514.6 / s1 10625.4→14281.2 / s2 10237.8→13815.1 / s3 10028.3→13601.6 /
+#   s4 10241.4→13897.2 / s5 9853.8→13431.1 / s6 9644.3→13217.6 / s7 25304.9→**不变**(峰在
+#   loss/head 层 bwd 事件,非重算层)。
+#   ⚠ **方向翻转(如实记录,未做任何反向调参)**:pp8 是 **1 层/stage** 的极端配置——中部 stage
+#   的 persistent/act_live 都很小(s3 persistent 仅 2551),该层 A−ci≈3.5GB 一入账就占了断面的
+#   26%,于是 s1-s6 从「欠读真机」翻成「**过读**真机」1.14~1.31×(见 test_pp8_framework_gap 的
+#   逐 stage 记录)。s0/s7 仍欠读。成因两条:①本项与 `recomp_scratch`(fml−ci)/`bwd_working_set`
+#   (fml−bwd_scratch)存在**部分重叠**(fml 里含一部分 saved 张量;s3 两项合计仅 1216MiB,不足以
+#   解释全部 1683MiB 过读);②pp8 中部 stage 的 Σ re-gather + Muon NS 三桶在 1 层/stage 下也偏
+#   保守。**按纪律不调参掩盖**,如实钉住并在 framework_gap 门里逐 stage 记录方向。
+THEO_PP8 = {0: 22514.6, 1: 14281.2, 2: 13815.1, 3: 13601.6,
+            4: 13897.2, 5: 13431.1, 6: 13217.6, 7: 25304.9}
 
 
 @pytest.fixture(scope="module")
@@ -202,9 +230,30 @@ def test_pp8_theoretical_value(peaks_pp8, stage):
         f"pp8 ON stage{stage} 理论漂移: sim={sim:.1f} vs {THEO_PP8[stage]:.1f}")
 
 
+# pp8 逐 stage 方向（2026-07-25 `remat_saves` 入账后重测；**如实记录，未反向调参**）：
+#   s0/s7 仍 **欠读**真机（框架释放缺口方向不变，0.909 / 0.957）；
+#   s1-s6 **翻成过读** 1.14~1.31×——1 层/stage 极端配置下该层 A−ci≈3.5GB 一入账即占断面 26%，
+#   叠上 recomp_scratch/bwd_working_set 的 fml 重叠（s3 合计 1216MiB）与 Σre-gather/MuonNS 的
+#   保守性。OOM 方向上过读是安全侧，但**不准**——留待真机逐桶 micro-anchor 细化重叠扣减。
+_PP8_UNDER = {0, 7}          # 仍 sim < real 的 stage
+_PP8_OVER_BAND = (1.10, 1.35)  # 翻成过读的 stage 的 ratio 带（钉住幅度，防再漂）
+
+
 @pytest.mark.parametrize("stage", list(range(8)))
 def test_pp8_framework_gap(peaks_pp8, stage):
-    """(b) 框架缺口：理论 << 真机（真机中部 steady 段死 ctx 未及时回收 + warmup 驻留=框架缺口）。"""
+    """(b) 理论 vs 真机方向门（2026-07-25 起**分两档**，如实记录 remat 入账后的方向翻转）。
+
+    s0/s7：仍 `sim < real`——框架释放缺口（真机中部 steady 段死 ctx 未及时回收 + warmup 驻留）。
+    s1-s6：`sim > real` 1.14~1.31×——**方向已翻转**（成因见 THEO_PP8 注释；OOM 安全侧但不准，
+      不做反向调参掩盖）。此门把翻转**钉死**：既守它没继续恶化，也守它没被偷偷"调回去"。"""
     sim, real = peaks_pp8[stage], REAL_PP8[stage]
-    assert sim < real, (
-        f"pp8 ON stage{stage}: 理论 {sim:.1f} 应 < 真机 {real:.1f}（框架释放缺口，缺口={real-sim:.0f}MiB）。")
+    if stage in _PP8_UNDER:
+        assert sim < real, (
+            f"pp8 ON stage{stage}: 理论 {sim:.1f} 应 < 真机 {real:.1f}"
+            f"（框架释放缺口，缺口={real-sim:.0f}MiB）。")
+    else:
+        lo, hi = _PP8_OVER_BAND
+        assert lo <= sim / real <= hi, (
+            f"pp8 ON stage{stage}: 理论 {sim:.1f} vs 真机 {real:.1f}, ratio={sim/real:.3f} 越出"
+            f" 已记录的过读带 ({lo},{hi})——2026-07-25 remat 入账使 1 层/stage 中部 stage 由欠读"
+            f"翻为过读（fml 重叠 + Σre-gather/MuonNS 保守）。此为如实记录,勿调参掩盖。")
