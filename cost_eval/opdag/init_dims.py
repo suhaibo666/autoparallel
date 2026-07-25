@@ -171,8 +171,17 @@ class _Eval:
                 return add(a, b) if (a and b) else None
             if isinstance(node.op, ast.FloorDiv):
                 a = self._eval_dim(node.left, local)
-                if a and isinstance(node.right, ast.Constant) and isinstance(node.right.value, int):
+                if not a:
+                    return None
+                if isinstance(node.right, ast.Constant) and isinstance(node.right.value, int):
                     return floordiv(a, node.right.value)
+                # 除数是**已知整数值**的名字/属性(不是字面量):真源
+                # `o_chunk = self.query_projection_size // o_groups`
+                # (deepseek_v4_hybrid_attention.py:276,`o_groups = config.o_groups` 是局部名)。
+                # 值来自 config_flags,**不是猜**;解不出仍 None。
+                rk, rv = self.eval_val(node.right, local)
+                if rk and isinstance(rv, int) and not isinstance(rv, bool) and rv:
+                    return floordiv(a, rv)
                 return None
             return None
         if isinstance(node, ast.IfExp):

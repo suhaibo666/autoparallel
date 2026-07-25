@@ -160,9 +160,19 @@ def _scalar(ctx: _Ctx, name: str):
 
 def _fill_scalar_bind(ctx: _Ctx, sb: dict) -> None:
     """`names = src.shape`:按 src 当前 env shape 逐轴填 names(仅在 src 已解出时填,setdefault
-    避免覆盖 shape 节点的权威登记;src 未解出则暂不缓存,留待后续重试)。"""
-    shp = _lookup(ctx.env, sb.get("src", ""))
-    if not shp:
+    避免覆盖 shape 节点的权威登记;src 未解出则暂不缓存,留待后续重试)。
+
+    ⚠ src 是 `numel_only`(`~`)时**逐轴绑定不成立** —— 那种 shape 只有一条"总积"轴,按位取轴
+    会把 `b, s, n, d = x.shape` 绑成完全错的值(实测泄漏样例:`q_bm` 被解成
+    `(B·~S)·n_heads·v_head_dim` —— `~` 都跑进轴里了)。故一律绑 None(保 `?`)。
+    """
+    raw = _lookup(ctx.env, sb.get("src", ""))
+    if not raw:
+        return
+    shp, numel_only = strip_numel_only(raw)
+    if numel_only:
+        for nm in sb.get("names", []):
+            ctx.scalar_map.setdefault(nm, None)
         return
     axes = parse_shape(shp)
     for i, nm in enumerate(sb.get("names", [])):
@@ -203,6 +213,12 @@ def _eval_expr(node, ctx: _Ctx):
         if isinstance(node.op, ast.FloorDiv):
             if isinstance(node.right, ast.Constant) and isinstance(node.right.value, int):
                 return floordiv(a, node.right.value)
+            # 除数是个**解出来只有系数、没有符号**的表达式(如 `self.compress_ratio` → `4`):
+            # 按该整数整除。真源 `deepseek_v4_hybrid_attention.py:276`
+            # `d = self.query_projection_size // o_groups`、`csa.py:779` `positions // ratio`。
+            b = _eval_expr(node.right, ctx)
+            if b is not None and b is not NEG1 and not b.syms and b.coeff:
+                return floordiv(a, b.coeff)
             return None
     return None
 
@@ -564,7 +580,9 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
 
         # 4) View "shape" 原语:即时登记标量轴名(权威,覆盖),不产张量输出
         if n.op == "View" and n.attrs.get("view") == "shape":
-            src_axes = in_axes_list[0] if in_axes_list else None
+            # numel_only 的输入没有可信轴结构 → 逐轴登记一律 None(同 `_fill_scalar_bind`)。
+            src_axes = (None if (in_numel_only and in_numel_only[0])
+                        else (in_axes_list[0] if in_axes_list else None))
             for i, nm in enumerate(n.attrs.get("shape_unpack", [])):
                 ctx.scalar_map[nm] = (src_axes[i] if (src_axes and i < len(src_axes)) else None)
             node_out_name[n.id] = _base(n.out) if n.out else ""
