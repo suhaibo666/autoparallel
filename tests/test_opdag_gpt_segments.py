@@ -99,9 +99,15 @@ def test_extract_embedding_walks_morph_func():
     # 精确 census 钉死(仓库惯例;是 ReLU/Minimum/Equal _CLS2OP 与 FREE_CALL_MAP ops.mul 映射的唯一
     # tripwire):reshape 铺平 → relu→minimum→equal(TP mask 三连,layers.py:153-155)→ mint embedding
     # 查表(Gather,:160)→ ops.mul mask(:165)→ reshape 回 (bs,-1,hidden)(:167)。行号为 2026-07-16 基线。
+    # 2026-07-25(P0#5):census 7 → 9 —— 两条**真算子**此前被 `_handle_assign` 静默丢:
+    #   layers.py:152 `input_ = input_ - self.vocab_start_index`(BinOp,张量−标量 → 线性)
+    #   layers.py:164 `input_mask = input_mask.expand_dims(-1)`(张量方法形态的视图)
+    # 二者 PIN 都不存激活 → `derive_saves` **逐字节不变**(实测同为 4 项 saves,同 dtype/shape)。
     assert [n.op for n in dag.nodes] == [
-        "View", "Activation", "Elementwise", "Elementwise", "Gather", "Elementwise", "View"]
-    assert [int(n.src.split(":")[1]) for n in dag.nodes] == [149, 153, 154, 155, 160, 165, 167]
+        "View", "Elementwise", "Activation", "Elementwise", "Elementwise",
+        "Gather", "View", "Elementwise", "View"]
+    assert [int(n.src.split(":")[1]) for n in dag.nodes] == [
+        149, 152, 153, 154, 155, 160, 164, 165, 167]
     assert all(n.src.split(":")[0] == "layers.py" for n in dag.nodes)
 
 
@@ -118,9 +124,10 @@ def test_extract_embedding_records_opaque_allreduce():
     assert any("AllReduce" in c["expr"] for c in dag.opaque_calls), dag.opaque_calls
     hit = next(c for c in dag.opaque_calls if "AllReduce" in c["expr"])
     assert hit["src"] == "layers.py:182"
-    # census 未变:walker 未为这条 opaque 调用产节点。
+    # census 未变:walker 未为这条 opaque 调用产节点(9-op census 见上一测试的 2026-07-25 说明)。
     assert [n.op for n in dag.nodes] == [
-        "View", "Activation", "Elementwise", "Elementwise", "Gather", "Elementwise", "View"]
+        "View", "Elementwise", "Activation", "Elementwise", "Elementwise",
+        "Gather", "View", "Elementwise", "View"]
 
 
 def test_lm_head_segment_source_pinned():

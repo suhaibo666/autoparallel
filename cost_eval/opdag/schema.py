@@ -44,6 +44,21 @@ class OpDAG:
     #   unbound_aliases      __init__ 里的裸函数别名(`self.reshape = mint.reshape`),_CLS2OP 绑不上
     # 每条是 dict(纯数据,JSON 往返安全)。空字典 = 尚未走查 / 无诊断。
     diagnostics: dict = field(default_factory=dict)
+    # ── 梯度可达性 / 权重 / 释放点(路线 B P0#4 + P1#11,2026-07-25)────────────────────────
+    # detached —— 被 detach 的张量名(源序):`with _no_grad():` 块内产物(`indexer.py:214-232`)
+    #   与 `ops.stop_gradient(...)` 的产物(`csa.py:665/666/764/765/794/795`)。**边仍在**
+    #   (Detach 是一个真节点,连着它的输入),这里只是"哪些名字的梯度到此为止"的名册,
+    #   概念上对齐 `cost_eval/model_spec.py` 的 `TensorRef.detached`(已被 liveness/graph.py 消费)。
+    #   注意:**不做传递闭包** —— 「detach 的下游是否仍梯度可达」取决于链上有没有参数
+    #   (有参数 → 仍需 save,如 `index_scores` 经 `linear_wq_b` 携梯度;无参数 → 不需要,如
+    #   `ukl1/ukl2`)。参数操作数建模是 P1#14,故闭包留给消费方,walker 只给 detach 边界事实。
+    detached: list = field(default_factory=list)
+    # param_operands —— `self.<attr>` 且 __init__ 里是 `Parameter(...)` 的操作数出现点。
+    #   **刻意不进 `OpNode.ins`**:塞进 ins 会让 `derive_saves` 把权重当激活 save 计
+    #   (实测 FFNGroupedGEMM 的「236 MiB」里 88 MiB 就是这个病)。此处只保证它**可见**。
+    param_operands: list = field(default_factory=list)
+    # deletes —— `del x`(`indexer.py:211`):无 op 语义,但是 liveness 的显式释放点。
+    deletes: list = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)

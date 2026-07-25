@@ -30,6 +30,10 @@ from cost_eval.opdag.init_binder import Binding, unbound_aliases
 
 BINDS = {"act": Binding("Activation", {}), "mm": Binding("MatMul", {})}
 
+# 单抽子 Cell 时,父本会通过构造点传入的注入项(csa.py:614 / indexer.py:131 的
+# `rotary_pos_emb=...`)。RoPE 频率表 = 常量产出(无参数、无梯度)。
+_INJECTED = {"rotary_pos_emb": Binding("Constant", {"rope_freqs": True})}
+
 
 def _walk(src, **kw):
     return walk_construct(src, "C", BINDS, "c.py", **kw)
@@ -72,39 +76,62 @@ class C:
 '''
 
 
-def test_with_only_body_raises_instead_of_zero_nodes():
-    """整个 construct 都在 `with` 里（= `CSAIndexer` fused 支的形状）→ 抛，不再 `ok, 0 nodes`。"""
-    with pytest.raises(ExtractionDroppedError) as ei:
-        _walk(WITH_ONLY, config_flags={})
-    msg = str(ei.value)
-    assert "0 " in msg and "c.py:4" in msg          # 指到 `with` 那一行
-    assert "With" in msg
+UNKNOWN_WITH = '''
+class C:
+    def construct(self, x):
+        h = self.mm(x, x)
+        with some_unknown_ctx():
+            y = self.act(h)
+        return y
+'''
 
 
-def test_with_is_recorded_as_dropped_stmt_when_other_nodes_exist():
-    """有别的节点 → 0 节点门不触发，但 `With` 必须逐条记账（非静默）。"""
+def test_with_no_grad_body_is_walked_and_marked_detached():
+    """P0#4:`with _no_grad():` 的块体**要走查**，块内产物标 `detached`（不是丢、也不是当普通节点发）。
+
+    这条替代了原先的「整块记 dropped_stmts」断言：同一条不变量（`_no_grad` 是整块 detach 的信号）
+    现在由**节点上的 detached 标记**承载，比只记一行诊断强。
+    """
+    dag = _walk(WITH_ONLY, config_flags={})
+    assert [n.op for n in dag.nodes] == ["MatMul"]                 # 块体真的走进去了
+    assert dag.diagnostics["dropped_stmts"] == []                  # 不再是"被丢弃"
+    assert dag.nodes[0].attrs.get("detached") is True              # 块内产物 = detached
+    assert dag.nodes[0].attrs.get("no_grad_region") is True
+    assert dag.detached == ["y"]                                   # 名册上浮到 DAG
+
+
+def test_with_no_grad_marks_only_the_block_body():
+    """块外的节点**不得**被误标 detached（边界要准）。"""
     dag = _walk(WITH_PLUS, config_flags={})
-    assert [n.op for n in dag.nodes] == ["MatMul"]          # act 在 with 里，被丢
-    drops = dag.diagnostics["dropped_stmts"]
-    assert len(drops) == 1
-    assert drops[0]["node"] == "With"
-    assert drops[0]["src"] == "c.py:5"
-    assert "_no_grad" in drops[0]["code"]
-    # `_no_grad` 是**整块 detach** 的信号 —— 记进 note，供路线 B P0#4 接 detach 语义
-    assert "detach" in drops[0]["note"]
+    assert [n.op for n in dag.nodes] == ["MatMul", "Activation"]
+    assert dag.nodes[0].attrs.get("detached") is None              # 块外
+    assert dag.nodes[1].attrs.get("detached") is True              # 块内
+    assert dag.detached == ["y"]
 
 
-def test_with_dropped_is_loud_under_strict():
-    with pytest.raises(ExtractionDroppedError) as ei:
-        _walk(WITH_PLUS, config_flags={}, strict=True)
-    assert "c.py:5" in str(ei.value)
+def test_unknown_with_context_is_fail_loud():
+    """语义判不出来的 `with` → **fail-loud**，绝不猜它改不改梯度可达性（任务纪律）。"""
+    with pytest.raises(ValueError) as ei:
+        _walk(UNKNOWN_WITH, config_flags={})
+    msg = str(ei.value)
+    assert "c.py:5" in msg and "some_unknown_ctx" in msg
 
 
-def test_for_while_try_augassign_all_recorded():
+def test_for_while_try_all_recorded():
+    """`For`/`While`/`Try` 仍未支持 → 仍逐条记账（`AugAssign` 已被 P0#5 支持，见下条）。"""
     dag = _walk(LOOPS, config_flags={})
     kinds = [d["node"] for d in dag.diagnostics["dropped_stmts"]]
-    assert kinds == ["For", "While", "Try", "AugAssign"]
+    assert kinds == ["For", "While", "Try"]
     assert all(d["src"].startswith("c.py:") for d in dag.diagnostics["dropped_stmts"])
+
+
+def test_augassign_on_a_tensor_becomes_a_node():
+    """`h += self.act(h)`(LOOPS 末行)等价于 `h = h + self.act(h)` → 建节点，不再记丢弃。"""
+    dag = _walk(LOOPS, config_flags={})
+    adds = [n for n in dag.nodes if n.op == "Elementwise" and n.attrs.get("arith") == "add"]
+    assert adds and adds[-1].src == "c.py:13"     # LOOPS 里 `h += self.act(h)` 那一行
+    assert adds[-1].attrs["linear"] is True       # `+` 反向直通 → 不存激活
+    assert "AugAssign" not in [d["node"] for d in dag.diagnostics["dropped_stmts"]]
 
 
 def test_docstring_is_not_counted_as_a_drop():
@@ -134,33 +161,91 @@ class C:
 '''
 
 
-def test_unhandled_assign_rhs_recorded_with_targets_and_kind():
-    dag = _walk(RHS, config_flags={})
-    got = [(d["src"], tuple(d["targets"]), d["rhs"]) for d in dag.diagnostics["dropped_assigns"]]
-    assert got == [
-        ("c.py:5", ("q",), "BinOp"),
-        ("c.py:6", ("m",), "Compare"),
-        ("c.py:7", ("s",), "Subscript"),
-        ("c.py:8", ("a",), "Name"),
-        ("c.py:9", ("w",), "Attribute"),
-    ]
-    assert all("code" in d for d in dag.diagnostics["dropped_assigns"])
+UNSUPPORTED_RHS = '''
+class C:
+    def construct(self, x, y):
+        h = self.mm(x, y)
+        d = {"k": h}
+        f = lambda t: t
+        g = f"{h}"
+        return self.act(h)
+'''
 
 
-def test_dropped_assign_target_is_flagged_unregistered():
-    """被丢的赋值目标从未进 SSA → 下游消费它会拿占位 ref、丢边。必须显式记账。"""
+def test_tensor_rhs_forms_now_become_nodes():
+    """P0#5:`BinOp`/`Compare`/`Subscript` 的**张量** RHS 建节点（此前全进 dropped_assigns）。
+
+    原断言「这五条 RHS 全被丢」是在钉病症；同一份合成源现在必须产出对应节点。
+    """
     dag = _walk(RHS, config_flags={})
+    by_src = {n.src: n for n in dag.nodes}
+    assert by_src["c.py:5"].op == "Elementwise"          # q = h * 0.5   (tensor × 标量 → 线性)
+    assert by_src["c.py:5"].attrs["linear"] is True
+    assert by_src["c.py:6"].op == "Compare"              # m = h > 0     (bool、不可微)
+    assert by_src["c.py:6"].out.endswith(":bool")
+    assert by_src["c.py:7"].op == "View"                 # s = h[:2]     (切片 = 视图)
+    assert by_src["c.py:7"].attrs["view"] == "slice"
+    # 只剩 `w = self.weight` 一条:合成源**没有 `__init__`**,故 walker 无从知道 `self.weight`
+    # 是 Parameter 还是别的东西 → 保持 fail-loud 记账(这是对的:不猜)。给了 `self_kinds`
+    # 的真路径上它会变成 param 操作数,见 `test_weight_attr_becomes_a_param_operand`。
+    assert [d["src"] for d in dag.diagnostics["dropped_assigns"]] == ["c.py:9"]
+
+
+def test_alias_and_weight_rhs_do_not_fabricate_nodes():
+    """`a = h`（别名）与 `w = self.weight`（权重）**不建节点**，但也不再"丢边"。"""
+    dag = _walk(RHS, config_flags={})
+    assert not [n for n in dag.nodes if n.src in ("c.py:8", "c.py:9")]
+    # `a = h` → 别名到 h 的 producer(边接得回去),不再进 unregistered_targets
     unreg = {d["target"] for d in dag.diagnostics["unregistered_targets"]}
-    assert {"q", "m", "s", "a", "w"} <= unreg
-    # 下游 `self.act(q)` 确实拿到了占位 ref（这是「丢边」的可见证据）
+    assert "a" not in unreg
+    assert unreg == {"w"}          # 只剩没有 __init__ 信息的 self.weight(见上条注释)
+
+
+def test_weight_attr_becomes_a_param_operand():
+    """给了 `self_kinds`(由 `init_dims` 静态求值 `__init__` 得)后,`self.weight` 是**权重**:
+
+    契约(W2/W3):权重**不进 `ins`**、**不是任何节点的 out** —— 否则 `derive_saves` 会把它
+    当激活 save 计(实测 FFNGroupedGEMM「236 MiB」里 88 MiB 就是这个病)。它单列 param_operands。
+    """
+    src = '''
+class C:
+    def construct(self, x):
+        w = self.weight
+        return self.mm(x, w)
+'''
+    dag = walk_construct(src, "C", BINDS, "c.py", config_flags={},
+                         self_kinds={"weight": "param"})
+    mm = [n for n in dag.nodes if n.op == "MatMul"][0]
+    assert mm.ins == ["x:?:bf16"]                       # 权重不在 ins 里
+    assert mm.attrs["param_operands"] == ["weight"]     # 但**可见**
+    # 两处出现点都被记(:4 的别名赋值 + :5 的消费点)——出现点越全,消费方越好对账。
+    assert [r["param"] for r in dag.param_operands] == ["weight", "weight"]
+    assert {r["src"] for r in dag.param_operands} == {"c.py:4", "c.py:5"}
+    assert all(n.out.split(":")[0] != "weight" for n in dag.nodes)   # 权重不是任何 out
+    assert diagnostics_summary(dag)["total"] == 0
+
+
+def test_downstream_consumer_now_gets_a_real_ref_not_a_placeholder():
+    """原「丢边」的可见证据反过来用:下游 `self.act(q)` 现在拿到真 ref + 真边。"""
+    dag = _walk(RHS, config_flags={})
     act = [n for n in dag.nodes if n.op == "Activation"][0]
+    q_node = [n for n in dag.nodes if n.src == "c.py:5"][0]
     assert act.ins == ["q:?:bf16"]
-    assert any(d["operand"] == "q" for d in dag.diagnostics["unresolved_operands"])
+    assert [q_node.id, act.id] in dag.edges           # **边在**（此前没有）
+    assert dag.diagnostics["unresolved_operands"] == []
 
 
-def test_strict_reports_every_kind_with_src():
+def test_still_unsupported_rhs_forms_are_recorded_and_loud():
+    """机制不变:真的还不支持的 RHS 形态(Dict/Lambda/JoinedStr)仍逐条记账 + strict 下抛。"""
+    dag = _walk(UNSUPPORTED_RHS, config_flags={})
+    got = [(d["src"], tuple(d["targets"]), d["rhs"]) for d in dag.diagnostics["dropped_assigns"]]
+    assert got == [("c.py:5", ("d",), "Dict"), ("c.py:6", ("f",), "Lambda"),
+                   ("c.py:7", ("g",), "JoinedStr")]
+    assert all("code" in d for d in dag.diagnostics["dropped_assigns"])
+    unreg = {d["target"] for d in dag.diagnostics["unregistered_targets"]}
+    assert {"d", "f", "g"} <= unreg
     with pytest.raises(ExtractionDroppedError) as ei:
-        _walk(RHS, config_flags={}, strict=True)
+        _walk(UNSUPPORTED_RHS, config_flags={}, strict=True)
     msg = str(ei.value)
     for line in ("c.py:5", "c.py:6", "c.py:7"):
         assert line in msg
@@ -223,15 +308,15 @@ def test_zero_nodes_is_allowed_for_a_trivial_body():
 # 5. diagnostics_summary / assert_extraction_clean
 # ---------------------------------------------------------------------------
 def test_diagnostics_summary_counts_every_kind():
-    dag = _walk(RHS, config_flags={})
+    dag = _walk(UNSUPPORTED_RHS, config_flags={})
     s = diagnostics_summary(dag)
     assert set(s) == set(DIAG_KINDS) | {"total", "opaque_calls"}
-    assert s["dropped_assigns"] == 5
+    assert s["dropped_assigns"] == 3
     assert s["total"] == sum(s[k] for k in DIAG_KINDS)
 
 
 def test_assert_extraction_clean_raises_with_readable_listing():
-    dag = _walk(RHS, config_flags={})
+    dag = _walk(UNSUPPORTED_RHS, config_flags={})
     with pytest.raises(ExtractionDroppedError) as ei:
         assert_extraction_clean(dag)
     msg = str(ei.value)
@@ -239,7 +324,7 @@ def test_assert_extraction_clean_raises_with_readable_listing():
 
 
 def test_assert_extraction_clean_allows_explicit_waivers():
-    dag = _walk(RHS, config_flags={})
+    dag = _walk(UNSUPPORTED_RHS, config_flags={})
     assert_extraction_clean(dag, allow=("dropped_assigns", "unregistered_targets",
                                         "unresolved_operands"))
 
@@ -266,23 +351,48 @@ class C:
         self.cast = ops.cast
         self.permute = mint.permute
         self.topk = mint.topk
+        self.weird = mint.some_unreviewed_primitive
         self.mul = Mul()
         self.n_heads = config.num_attention_heads
         self.flag = True
 '''
 
 
-def test_bare_function_aliases_are_enumerated():
-    """`self.reshape = mint.reshape` 这类裸别名 —— `_CLS2OP` 绑不上，但必须被列出、不得静默跳过。"""
+def test_bare_function_aliases_are_bound_and_unknown_ones_enumerated():
+    """P0#2:能查 `primitives.PRIMITIVES` 的裸别名**绑上**;查不到的仍逐条列出(该加表项的清单)。
+
+    原断言「这四条裸别名全未绑」是在钉病症;现在它们必须绑成正确的 op 类型,
+    而 `unbound_aliases` 的语义收窄为「真·未知原语」——不变量(不得静默跳过)保持。
+    """
+    from cost_eval.opdag.init_binder import bind_init
+    binds = bind_init(ALIAS_INIT, "C")
+    assert binds["reshape"].op == "View" and binds["reshape"].attrs["view"] == "reshape"
+    assert binds["cast"].op == "Cast"
+    assert binds["permute"].op == "View"
+    assert binds["topk"].op == "TopK"
+    assert binds["mul"].op == "Elementwise"                       # `Mul()` 走既有 _CLS2OP
+    assert "n_heads" not in binds and "flag" not in binds         # 配置读取不是算子别名
+
     got = unbound_aliases(ALIAS_INIT, "C")
     assert [(a["attr"], a["alias"]) for a in got] == [
-        ("reshape", "mint.reshape"), ("cast", "ops.cast"),
-        ("permute", "mint.permute"), ("topk", "mint.topk"),
-    ]
+        ("weird", "mint.some_unreviewed_primitive")]
     assert all(a["src"].startswith("c") is False for a in got)   # src 由调用方给文件名
     assert all("lineno" in a for a in got)
-    # `Mul()` 已被 _CLS2OP 绑住、`config.num_attention_heads`/`True` 不是算子别名 → 都不入列
-    assert {a["attr"] for a in got} == {"reshape", "cast", "permute", "topk"}
+
+
+def test_calling_an_unknown_bare_alias_is_fail_loud():
+    """未知原语被**调用** → `UnknownPrimitiveError`,报错指名道姓说"加哪条表项"(绝不猜类别)。"""
+    from cost_eval.opdag.primitives import UnknownPrimitiveError
+    from cost_eval.opdag.init_binder import bind_init
+    src = ALIAS_INIT + '''
+    def construct(self, x):
+        return self.weird(x)
+'''
+    with pytest.raises(UnknownPrimitiveError) as ei:
+        walk_construct(src, "C", bind_init(src, "C"), "c.py", config_flags={},
+                       alias_unknown={a["attr"]: a for a in unbound_aliases(src, "C", "c.py")})
+    msg = str(ei.value)
+    assert "mint.some_unreviewed_primitive" in msg and "primitives" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -409,30 +519,53 @@ def mf_pkg():
     return os.path.abspath(os.path.join(d, "..", "..", ".."))
 
 
-def test_csaindexer_no_longer_reports_ok_zero_nodes(mf_pkg):
-    """评估文档 §3.1「最危险的一条」的验收：fused `CSAIndexer` 现在**抛**，不再假成功。"""
+def test_csaindexer_fused_branch_is_walked_and_fully_detached(mf_pkg):
+    """评估文档 §3.1「最危险的一条」的**最终**验收(P0#4):
+
+    `CSAIndexer` fused 支整块在 `with _no_grad():`(`indexer.py:214`,区域 `:214-232`)里。
+    `7b9aa86` 把它从「假成功 0 节点」改成了「抛」;本轮把它改成**真抽出来**,且块内产物
+    **全部标 detached**(这才是 `_no_grad` 的语义)。三段演进的不变量始终是同一条:
+    **不可能把「全丢了」误认成「抽好了」**。
+    """
     from cost_eval.opdag.extractor import extract_cell
     from cost_eval.opdag.module_resolver import PYNATIVE_SPEC_FILES, resolve_layer_spec
 
     top = resolve_layer_spec(mf_pkg, _SPEC_FLAGS, spec_files=PYNATIVE_SPEC_FILES)
-    csa = top.submodules["self_attention"].submodules["core_attention"]
+    sa = top.submodules["self_attention"]
+    assert sa.cell == "DSv4HybridSelfAttention"        # 断言解的是**目标模型**(不是 DSv3 MLA)
+    csa = sa.submodules["core_attention"]
     rel = "pynative/transformers/experimental_attention_variant/indexer.py"
-    with pytest.raises(ExtractionDroppedError) as ei:
-        extract_cell(mf_pkg, rel, "CSAIndexer", csa.submodules["indexer"], _CELL_FLAGS,
-                     present_params={"rotary_pos_emb"}, recurse=True, subcell_specs={})
-    msg = str(ei.value)
-    assert "CSAIndexer" in msg
-    assert "indexer.py:214" in msg            # 就是那个 `with _no_grad():`
-    assert "With" in msg
-    assert "0" in msg and "detach" in msg     # 计数 + `_no_grad` 整块 detach 提示
+    dag = extract_cell(mf_pkg, rel, "CSAIndexer", csa.submodules["indexer"], _CELL_FLAGS,
+                       present_params={"rotary_pos_emb"}, recurse=True, subcell_specs={},
+                       cross_file=True, injected_binds=_INJECTED,
+                       kernel_call_allow=("npu_lightning_indexer",))
+    assert dag.nodes, "fused 支必须抽出非空图"
+    assert all(n.src.startswith("indexer.py:") for n in dag.nodes)
+    # 块内(`:214-232`)产出的每个节点都必须带 detached + no_grad_region
+    for n in dag.nodes:
+        line = int(n.src.split(":")[1])
+        assert 214 <= line <= 232, n.src
+        assert n.attrs.get("detached") is True, n.src
+        assert n.attrs.get("no_grad_region") is True, n.src
+    # 源真值(fn_saves 已核):块内绑定 q/k/weights/key_length/cmp_residual_k/topk_indices/index_scores
+    assert {"q", "k", "weights", "topk_indices", "index_scores"} <= set(dag.detached)
+    assert diagnostics_summary(dag)["total"] == 0      # 零诊断
+    # 融合内核在 no-grad 区里 → **可证明**无反向 → saved 集为空(而不是"猜它没有")
+    kern = [n for n in dag.nodes if n.op == "Kernel"]
+    assert len(kern) == 1 and kern[0].attrs["kernel"] == "npu_lightning_indexer"
+    assert kern[0].attrs["saved_ins_idx"] == []
+    assert "no_grad" in kern[0].attrs["no_backward_reason"]
 
 
-def test_working_dsv3_mla_path_also_surfaces_its_drops():
-    """反向验收：诊断在**抽得通**的 DSv3 MLA 路径上也真的记到了东西（不是只对失败路径生效）。
+def test_working_dsv3_mla_path_scalar_forms_are_handled_not_dropped():
+    """反向验收(P0#5):DSv3 MLA 路径上那两条**标量/dtype** RHS 现在被**正确处理**,而不是记丢弃。
 
-    实测两条 `dropped_assigns`（`ori_dtype = x.dtype` 的 Attribute、`head_dim = query.shape[-1]`
-    的 Subscript）+ 由此派生的 `unresolved_operands`（下游 `Cast` 的 dtype 操作数）。二者都是
-    **标量/dtype、不是张量** → 对字节无影响，但它们此前完全不可见。此处只断言机制在场，不钉行号。
+    `7b9aa86` 实测的两条 `dropped_assigns` 是 `ori_dtype = x.dtype`(Attribute)与
+    `head_dim = query.shape[-1]`(Subscript)。它们**是标量/dtype 记号,不是张量** ——
+    正确行为是「进标量/dtype 环境、**不建节点**」,而不是「记一笔丢弃」。判据:
+      * 该路径 `assert_extraction_clean` 通过(零诊断);
+      * 这两行**没有**产生节点(没有造假张量);
+      * `derive_saves` 的名册与 `7b9aa86` 逐字节相同(字节中性)。
     """
     from cost_eval.opdag.crosscheck import default_mf_root
     from cost_eval.opdag.extractor import extract_cell
@@ -457,12 +590,19 @@ def test_working_dsv3_mla_path_also_surfaces_its_drops():
         mf, "parallel_core/training_graph/transformer/multi_latent_attention.py",
         "MLASelfAttention", top.submodules["self_attention"], mla_flags,
         present_params={"rotary_pos_emb"})
-    assert len(dag.nodes) > 0                       # 这条路径本来就通（不受新门影响）
+    assert len(dag.nodes) > 0                       # 这条路径本来就通(不受新门影响)
     s = diagnostics_summary(dag)
-    assert s["dropped_assigns"] >= 2 and s["unresolved_operands"] >= 1
-    for it in dag.diagnostics["dropped_assigns"]:
-        assert it["src"].endswith(tuple(f":{n}" for n in range(1, 1000))) or ":" in it["src"]
-        assert it["rhs"] and it["code"] and it["targets"]
-    # 消费方门在真路径上确实会拦（这是路线 B 的适配器要用的那道门）
-    with pytest.raises(ExtractionDroppedError):
-        assert_extraction_clean(dag)
+    assert s["total"] == 0, dag.diagnostics         # 零诊断 —— 消费方门现在**放行**
+    assert_extraction_clean(dag)
+    # `ori_dtype = x.dtype`(:232)与 `head_dim = query.shape[-1]`(:258)不得产生任何节点
+    lines = {int(n.src.split(":")[1]) for n in dag.nodes}
+    assert 232 not in lines and 258 not in lines
+    # 下游 `self.cast(..., ori_dtype)`(:307)的 dtype 现在解成**真 dtype**,
+    # 而不是字面串 "ori_dtype"(那是个假 dtype)
+    cast307 = [n for n in dag.nodes if n.src.endswith(":307")]
+    assert cast307 and cast307[0].out.split(":")[2] in ("bf16", "fp32", "fp16")
+    # 字节中性:saves 名册与 `7b9aa86` 逐字相同(该 commit 实跑值)
+    from cost_eval.opdag.bprop_rules import derive_saves
+    names = sorted(sv.name for sv in derive_saves(dag))
+    assert names == ["attn_out", "key", "kv_compressed__i0", "q_compressed__i0",
+                     "query", "value", "x"], names

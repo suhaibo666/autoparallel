@@ -28,6 +28,8 @@ import copy
 from dataclasses import dataclass, field
 
 from .schema import OpNode, OpDAG
+from . import primitives as prims
+from .primitives import SHAPE_OF, UnknownPrimitiveError
 
 # ── 抽取诊断(Task 2 / 评估文档 P0#1,2026-07-25)──────────────────────────────────────────
 # 语义与逐键含义见 `schema.OpDAG.diagnostics` 的 docstring。此处只声明键序(报告/summary 用)。
@@ -120,6 +122,11 @@ class SubExtract:
     returns: list = field(default_factory=list)
     opaque_calls: list = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
+    # detached —— 子里被 detach 的产物名(no-grad 块 / stop_gradient),逐名上浮到父
+    #             (grad 可达性不能在子 Cell 边界丢)。
+    # param_operands —— 子里出现的权重(Parameter)操作数,同理上浮。
+    detached: list = field(default_factory=list)
+    param_operands: list = field(default_factory=list)
 
 # 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
@@ -152,13 +159,66 @@ def _dotted_path(node) -> str | None:
     return ".".join(reversed(parts))
 
 # 张量方法(链式 `<expr>.method(...)`)里视作纯视图/元数据(反向不新增激活)的方法名。
-_VIEW_METHODS = {"reshape", "view", "transpose", "swapaxes", "flatten", "expand_dims",
-                 "tile", "permute", "squeeze", "unsqueeze"}
+# 表已合并到 `primitives.VIEW_METHODS`(单点维护),此处保留旧名做别名以免动既有引用。
+_VIEW_METHODS = prims.VIEW_METHODS
+
+# ── `with` 上下文管理器的语义分类(路线 B P0#4,2026-07-25)────────────────────────────────
+# `walk_stmt` 此前对 `ast.With` 只记账不走查(`7b9aa86` 的理由是对的:走进去发普通节点会造出
+# 一批**看起来梯度可达**的假节点,比丢更危险)。正确做法是**走进去 + 带上块级语义**:
+#   * NO_GRAD    —— `with _no_grad():` 整块不建 autograd 图 → 块内产物**全部标 detached**
+#                    (`indexer.py:214`,区域 `:214-232`,块内绑定
+#                     q/k/weights/key_length/cmp_residual_k/topk_indices/index_scores);
+#   * TRANSPARENT —— 只切换**派发/布局模式**,数学恒等、不改梯度可达性 → 照常走查
+#                    (`SkipDTensorDispatch`:hyper_parallel 的 DTensor 派发旁路,
+#                      `multi_latent_attention.py:244/288`、`flash_attention.py:311`);
+# 其余一切 `with` —— **语义未知即 fail-loud**(任务纪律:不许猜)。
+_WITH_NO_GRAD = frozenset({"_no_grad", "no_grad", "NoGrad", "_NoGrad", "stop_gradient_region"})
+_WITH_TRANSPARENT = frozenset({"SkipDTensorDispatch"})
+
+# host 侧内建:产出是 python 数,不是张量。
+_HOST_BUILTINS = frozenset({"int", "float", "bool", "str", "len", "min", "max", "sum",
+                            "abs", "round", "range"})
+
+# host 侧字面量构造的小常量张量:`Tensor([...], dtype=...)`(indexer.py:219 / csa.py:118)。
+_CONST_CTORS = frozenset({"Tensor"})
 
 # 三态哨兵:一个 `if`/三元条件在剪枝上下文下无法由已知 config 判定。
 _UNDECIDED = object()
 # "已知存在(非 None)"的取值哨兵(用于 present_vars 走 `if v is not None:` 真支)。
 _PRESENT = object()
+# 标量环境里的"是标量但值未知"哨兵(如 `sk = kv_full.shape[0]`,轴长符号未种子化)。
+# **不可**参与数值比较(`_eval_test` 遇它返回 _UNDECIDED),只用来判"这不是张量"。
+_UNKNOWN_SCALAR = object()
+
+
+class _PositiveDim:
+    """**公理**哨兵:一个「张量某轴的长度」——值未知,但**必然 >= 1**。
+
+    这不是"猜一个尺寸",而是张量语义本身给的事实:一个参与计算的张量的任一轴长至少是 1。
+    用途只有一处:让 `if n_compressed > 0:`(csa.py:762,`n_compressed = int(compressed_kv.shape[0])`)
+    这类**只问轴长是否非空**的条件可判定,而 `if sq < ratio:`(compressor.py:190,要真值)
+    仍然 `_UNDECIDED` → fail-loud。判据实现见 `_Walker._cmp_positive_dim`。
+    """
+
+    def __repr__(self):
+        return "<dim>=1>"
+
+
+_POSITIVE_DIM = _PositiveDim()
+
+
+class _Kind:
+    """一个表达式在 walker 眼里的种类。**张量与标量必须分开** —— 这是"不造假节点"的关键:
+    `ori_dtype = x.dtype`(dtype 记号)、`head_dim = query.shape[-1]`(轴长标量)、
+    `d = self.query_projection_size // o_groups`(config 算术)都**字节中性**,建节点就是造假;
+    而 `q_hnorm_fp32 = q * rsqrt(...)`、`score_f32 = score.astype(fp32) + ape`
+    是**真张量**,不建节点就是漏字节。"""
+    TENSOR = "tensor"
+    SCALAR = "scalar"      # python 数 / 轴长 / config 值(含 _UNKNOWN_SCALAR)
+    DTYPE = "dtype"        # `x.dtype` 这类 dtype 记号
+    NONE = "none"          # 已知 None
+    PARAM = "param"        # `self.<attr>`,且 __init__ 里是 `Parameter(...)` —— 权重,不是激活
+    UNKNOWN = "unknown"    # 判不出来 —— 调用方按"记账 + 不建节点"处理
 
 # mindspore dtype 名 → 本库短标签(best-effort;未知名原样透传)。
 _DTYPE_ALIAS = {
@@ -275,6 +335,18 @@ class _Walker:
         subcell_resolver=None,
         method_aliases: dict | None = None,
         strict: bool = False,
+        class_index=None,
+        cls_rel: str | None = None,
+        module_funcs: dict | None = None,
+        runtime_predicates: dict | None = None,
+        fn_classes: dict | None = None,
+        self_kinds: dict | None = None,
+        param_literals: dict | None = None,
+        alias_unknown: dict | None = None,
+        host_call_allow: tuple = (),
+        kernel_call_allow: tuple = (),
+        input_axes: dict | None = None,
+        module_consts: dict | None = None,
     ):
         self.binds = binds                 # self.<name> -> Binding(op, attrs)(Pass B 产)
         self.src_file = src_file
@@ -322,6 +394,66 @@ class _Walker:
         self._pruning = any(
             x is not None for x in (config_flags, none_vars, param_defaults, present_vars)
         )
+        # ── 跨文件 MRO(P0#3):class_index 能顺 import 解析基类;cls_rel = 定义 cls_name 的文件 ──
+        self._class_index = class_index
+        self._cls_rel = cls_rel
+        # 模块级自由函数(**同文件**)→ 可内联:`unfused_compressed_sparse_attn`(csa.py:464)、
+        # `parse_cu_seqlens`(:322)、`get_window_topk_idxs`(:449)、`get_compress_topk_idxs`(:430)…
+        self._module_funcs: dict = dict(module_funcs or {})
+        # `hasattr(x,"to_local")` / `isinstance(x, DTensor)` 这类**部署形态**谓词:必须由调用方
+        # 显式给值(键形如 `hasattr:to_local` / `isinstance:DTensor`),缺键 → fail-loud,不猜。
+        self.runtime_predicates: dict = dict(runtime_predicates or {})
+        # `_Function` 子类信息:{类名: {"saves": [名单], "forward_params": [...], "bare_ctx": [...]}}
+        # 供 `<Cls>.apply(...)` 发射 FusedFunction 节点时把**源真值 saved 集**逐字挂上(复用 fn_saves)。
+        self._fn_classes: dict = dict(fn_classes or {})
+        # `self.<attr>` 的种类(由 init_dims 静态求值 __init__ 得):"param"/"scalar"/"module"。
+        # 这是"`self.attn_sink` 是权重 / `self.softmax_scale` 是标量"的**源侧判据**,不是猜。
+        self._self_kinds: dict = dict(self_kinds or {})
+        # construct 形参的**字面量缺省**(如 `rope_pos_offset: int = 0`)→ 标量环境种子。
+        self._param_literals: dict = dict(param_literals or {})
+        # __init__ 里裸别名**查表失败**的条目(attr -> {alias, src}):调用到它才 fail-loud,
+        # 且报错要指名道姓说"加哪条表项"(未被调用的未知别名只记诊断)。
+        self._alias_unknown: dict = dict(alias_unknown or {})
+        # 显式白名单:纯宿主副作用调用(如 `save_to_indexer_losses_tracker(...)` 记 loss 到
+        # 模块级 dict,utils.py:41)—— 记 opaque、不记 unregistered(它没有被消费的返回值)。
+        self._host_call_allow: tuple = tuple(host_call_allow)
+        # 融合 NPU 内核的自由函数名(如 `npu_lightning_indexer`,indexer.py:220):发射 `Kernel`
+        # 节点(**保边、登记目标**),但它的 saved 集**不由 PIN 猜** —— 只有能证明"该调用在
+        # no-grad 区里因而没有反向"时才写 saves=[];否则留空让 `derive_saves` fail-loud。
+        self._kernel_call_allow: tuple = tuple(kernel_call_allow)
+        # 入口方法**形参的轴符号种子**:{形参名: (轴0符号, 轴1符号, ...)},符号可是 int 或
+        # config_flags 里的键名。与 `infer_shapes(dag, input_shapes)` 同一套契约 —— 调用方本来
+        # 就得给这份种子,这里只是让 `sq, b, _ = x.shape` 之后的 `if sq < ratio` 可判定。
+        # **不给就是 `_UNKNOWN_SCALAR` → 条件不可判定 → fail-loud(绝不杜撰尺寸)**。
+        self._input_axes: dict = dict(input_axes or {})
+        # 模块级常量(`_BF16_MIN = -3.3895...e38`,indexer.py:47;`eps` 之类)—— host 侧标量,
+        # 不是张量。不登记的话它们会以"未知名"进 ins 变成假操作数。
+        self._module_consts: dict = dict(module_consts or {})
+
+        # ── 标量 / dtype 环境(P0#5 的另一半:把"标量记账"与"张量建节点"分开)────────────
+        self.scalars: dict[str, object] = {**dict(module_consts or {}),
+                                          **dict(self._param_literals)}
+        self.dtypes: dict[str, str] = {}     # 变量名 -> dtype 短标签(`ori_dtype = x.dtype`)
+        # ── 块级 detach(P0#4)/ 逐点 detach(P1#11)────────────────────────────────────
+        self._nograd_depth = 0
+        self.detached: list[str] = []        # 被 detach 的张量名(源序、去重)
+        # `del x` 的显式释放点(无 op 语义,但对 liveness 有意义)——记录而非当"丢弃"。
+        self.deletes: list = []
+        # `self.<attr>` 权重操作数(Parameter):不进 `ins`(否则权重被当激活 save 计),
+        # 单列 attrs["param_operands"] + dag.param_operands,使其**可见**而非静默丢。
+        self.param_operands: list = []
+        # **权重别名**:`attn_sink = self.attn_sink`(csa.py:683)这类局部名其实指向一个
+        # `Parameter`。它们**不进 SSA**(否则该权重会以张量操作数身份进 `ins`,被
+        # `derive_saves` 当激活 save 计——实测 FFNGroupedGEMM「236 MiB」里 88 MiB 就是这个病),
+        # 而是记在这里,消费点统一路由到 `param_operands`。
+        # 契约(并行 agent 的 W2/W3):**权重永不出现在 saves、永不是任何节点的 out**。
+        self.param_aliases: set[str] = set()
+        self._param_of: dict[str, str] = {}     # 权重别名局部名 -> `self.<attr>` 名
+        # `_eval_predicate_call` 最近一次缺键的谓词(用于把 fail-loud 报错写成"加哪个键")。
+        self._pending_predicate = None
+        # 顶层 `return` 命中标志(剪枝上下文下用于中止后续语句走查)+ 实际命中的返回表达式。
+        self._stop = False
+        self._taken_return = None
 
     # ---- 诊断记账(Task 2 / P0#1):看不懂就记,绝不静默 ----
     def _diag(self, kind: str, **rec) -> None:
@@ -372,6 +504,10 @@ class _Walker:
     # ---- 语句层:按源序遍历,分派到具体处理器 ----
     def walk_body(self, body) -> None:
         for stmt in body:
+            if self._stop:
+                # 顶层 `return` 已命中 → 后续语句在运行期**不可达**,继续走就是把互斥支
+                # 一起算进来(见本类 `_handle_return` 的注释)。仅剪枝上下文下生效。
+                break
             self.walk_stmt(stmt)
 
     def walk_stmt(self, stmt) -> None:
@@ -402,6 +538,12 @@ class _Walker:
                     f"construct 剪枝命中被选中的 raise 分支（{self.src_file}:{stmt.lineno}）:"
                     f"`{self._describe(stmt)}` —— config 实际选到了不支持的路径,fail-loud"
                 )
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            self._handle_with(stmt)
+        elif isinstance(stmt, ast.Delete):
+            self._handle_delete(stmt)
+        elif isinstance(stmt, ast.AugAssign):
+            self._handle_augassign(stmt)
         elif isinstance(stmt, (ast.Pass, ast.Break, ast.Continue, ast.Global,
                                ast.Nonlocal, ast.Import, ast.ImportFrom,
                                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -413,10 +555,80 @@ class _Walker:
             # → 整块丢 → `extract_cell` 返回 `ok, 0 nodes` 假成功(评估文档 §3.1)。
             self._diag_drop_stmt(stmt)
 
+    # ---- with 块:走查块体 + 带上块级语义(P0#4)----
+    @staticmethod
+    def _ctx_head(expr) -> str:
+        """取上下文管理器的"名字":`_no_grad()` → `_no_grad`;`ms._no_grad()` → `_no_grad`;
+        `SkipDTensorDispatch()` → `SkipDTensorDispatch`;裸名同理。"""
+        node = expr.func if isinstance(expr, ast.Call) else expr
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        if isinstance(node, ast.Name):
+            return node.id
+        return ""
+
+    def _handle_with(self, stmt) -> None:
+        """`with <ctx>:` —— 按 `_WITH_NO_GRAD` / `_WITH_TRANSPARENT` 分类走查;未知语义 fail-loud。
+
+        为什么不能"走进去就当普通语句":`_no_grad()` 块内的产物**没有 autograd 节点**,当普通节点
+        发射会造出一批"看起来梯度可达"的张量 → 反向会去 save 它们 → **字节多算**。所以走查的同时
+        必须把块内产物标 `detached`(见 `_emit`)。这正是 `7b9aa86` 刻意不走查的那个顾虑的正解。
+        """
+        heads = [self._ctx_head(it.context_expr) for it in stmt.items]
+        if any(h in _WITH_NO_GRAD for h in heads):
+            self._nograd_depth += 1
+            try:
+                self.walk_body(stmt.body)
+            finally:
+                self._nograd_depth -= 1
+            return
+        if heads and all(h in _WITH_TRANSPARENT for h in heads):
+            # 只切换派发/布局模式,数学恒等、梯度可达性不变 → 照常走查,不打任何标。
+            self.walk_body(stmt.body)
+            return
+        raise ValueError(
+            f"construct 里的 `with` 上下文语义未知（{self.src_file}:{stmt.lineno}）:"
+            f"`{self._short_code(self._describe(stmt))}` —— 上下文管理器 {heads!r} 既不在"
+            f"`_WITH_NO_GRAD`(整块 detach)也不在 `_WITH_TRANSPARENT`(数学恒等)里。"
+            f"**拒绝猜它改不改梯度可达性**:猜错就是一整块张量的 saved 语义错。"
+            f"请在 construct_walker 的两张表里显式登记它。"
+        )
+
+    def _handle_delete(self, stmt: ast.Delete) -> None:
+        """`del a, b`(如 `indexer.py:211`):无 op 语义,但是 **liveness 的显式释放点**。
+        从 SSA/标量环境里摘掉这些名字并记进 `dag.deletes`(不记诊断——它不是"看不懂")。"""
+        for t in stmt.targets:
+            if not isinstance(t, ast.Name):
+                continue
+            self.deletes.append({"src": f"{self.src_file}:{stmt.lineno}", "name": t.id})
+            self.ssa.pop(t.id, None)
+            self.producer.pop(t.id, None)
+            self.scalars.pop(t.id, None)
+
+    def _handle_augassign(self, stmt: ast.AugAssign) -> None:
+        """`x += <expr>` / `x *= 2`:等价于 `x = x <op> <expr>`,复用 BinOp 通路
+        (张量 → 建节点;标量 → 更新标量环境)。非 Name 目标(下标/属性)仍记账。"""
+        if not isinstance(stmt.target, ast.Name):
+            self._diag_drop_stmt(stmt)
+            return
+        binop = ast.BinOp(left=ast.Name(id=stmt.target.id, ctx=ast.Load()),
+                          op=stmt.op, right=stmt.value)
+        ast.copy_location(binop, stmt)
+        ast.fix_missing_locations(binop)
+        self._handle_binop(binop, [stmt.target.id], stmt.lineno)
+
     # ---- if 剪枝:求值条件,只走命中支 ----
     def _handle_if_pruned(self, stmt: ast.If) -> None:
+        self._pending_predicate = None
         r = self._eval_test(stmt.test)
         if r is _UNDECIDED:
+            if self._pending_predicate:
+                raise ValueError(
+                    f"construct 的 if 条件是**部署形态谓词**且未给值"
+                    f"（{self.src_file}:{stmt.lineno}）:`{self._describe(stmt.test)}` —— "
+                    f"请在 `runtime_predicates` 里显式给 `{self._pending_predicate}`(True/False)。"
+                    f"绝不默认取某一支(两支常常字节等价,但「常常」不是「总是」)。"
+                )
             if self._is_pure_raise_guard(stmt):
                 # 纯断言守卫:条件不可判定、整支仅 raise、无 else —— 视作对合法输入恒成立的
                 # 校验断言(如 `if x.ndim != 3: raise`),跳过(不取 raise 支)而非 fail-loud。
@@ -444,11 +656,17 @@ class _Walker:
         val = stmt.value
         if self._inline_stack:
             raise _ReturnSignal(self._materialize_return_call(val))
-        if isinstance(val, ast.Call):
-            self._handle_call(val, target_names=[])
-        elif isinstance(val, ast.Subscript) and isinstance(val.value, ast.Call):
-            self._handle_call(val.value, target_names=[])
+        if isinstance(val, (ast.Call, ast.Subscript)) or isinstance(
+                val, (ast.BinOp, ast.Compare, ast.BoolOp)):
+            mat = self._materialize_expr(val, stmt.lineno)
+            if mat is not None:
+                val = mat
         # 返回 Name/Tuple/其它:顶层无需产 op(下游没有消费者)
+        if self._pruning:
+            # 剪枝上下文:命中的 return 就是**真正的出口** —— 中止后续语句(否则互斥的
+            # 分派支会被同时走查)。同时记下它,`_resolve_returns` 优先用它而不是"最后一条 return"。
+            self._stop = True
+            self._taken_return = val
 
     def _materialize_return_call(self, val):
         """内联方法 `return <Call>`:把该调用发射到合成临时名并返回该 Name(供别名到调用点目标)。"""
@@ -467,6 +685,11 @@ class _Walker:
     def _handle_assign(self, stmt: ast.Assign) -> None:
         val = stmt.value
         targets = _target_names(stmt.targets)
+        if targets and all(t == "_" for t in targets):
+            # `_ = <...>` —— 显式丢弃(源里用来消掉 lint 告警,如
+            # `_ = rotary_pos_emb, attention_mask, mscale, rotary_cos_sin`,
+            # deepseek_v4_hybrid_attention.py:226)。`_` 永不被读 → 无 op 语义,**不记诊断**。
+            return
         if isinstance(val, ast.Call):
             self._handle_call(val, targets)
         elif isinstance(val, ast.Subscript) and isinstance(val.value, ast.Call):
@@ -478,25 +701,524 @@ class _Walker:
         elif (isinstance(val, ast.Attribute) and val.attr == "shape"
               and isinstance(val.value, ast.Name) and len(targets) >= 2):
             # `seq, bs, h = x.shape`:不产 op,但记标量→轴解包(shape 推断阶段按 x 已知 shape 填)。
-            self.scalar_binds.append({"names": list(targets), "src": val.value.id})
+            self._bind_shape_unpack(list(targets), val.value.id)
+        elif isinstance(val, (ast.BinOp, ast.UnaryOp)):
+            self._handle_binop(val, targets, stmt.lineno)
+        elif isinstance(val, (ast.Compare, ast.BoolOp)):
+            self._handle_compare(val, targets, stmt.lineno)
+        elif isinstance(val, ast.Subscript):
+            self._handle_subscript_assign(val, targets, stmt.lineno)
+        elif isinstance(val, ast.Name):
+            self._bind_name_rhs(val.id, targets)
+        elif isinstance(val, ast.Attribute):
+            self._handle_attribute_assign(val, targets, stmt)
+        elif isinstance(val, ast.Constant):
+            for t in targets:
+                self._forget(t)
+                if val.value is None:
+                    self.known_none.add(t)
+                else:
+                    self.scalars[t] = val.value
+        elif isinstance(val, (ast.Tuple, ast.List)) and len(targets) == len(val.elts):
+            for t, e in zip(targets, val.elts):
+                self._bind_expr_to_target(e, t, stmt.lineno)
         else:
-            # Task 2(P0#1):此前静默丢。评估文档 §6.2 实测 **34 处**,且**恰好包含这次要修的张量**:
-            #   `q_hnorm_fp32`(deepseek_v4_hybrid_attention.py:245 BinOp)、O(S·S/r) fp32
-            #   `attention_scores`(indexer.py:350 BinOp)、`score_f32`(compressor.py:209 BinOp)、
-            #   两个 bool mask(csa.py:779/810 Compare)、切片(compressor.py:198/199/233 Subscript)。
-            # 记两笔:①RHS 形态本身;②目标名从未进 SSA(下游消费它会拿占位 ref、**丢边**)。
+            # 仍不支持的 RHS 形态(Dict/Set/Lambda/ListComp/Starred/JoinedStr/…):
+            # 记两笔——①RHS 形态本身;②目标名从未进 SSA(下游消费它会拿占位 ref、**丢边**)。
             self._diag("dropped_assigns", src=f"{self.src_file}:{stmt.lineno}",
                        targets=list(targets), rhs=type(val).__name__,
                        code=self._describe(stmt))
             self._diag_unregistered(targets, stmt.lineno, f"dropped_assign_rhs_{type(val).__name__}")
 
+    # ---- 标量 / dtype / 张量 三分(P0#5 的判据层)------------------------------------
+    def _forget(self, name: str) -> None:
+        """重新绑定一个名字前,清掉它在各环境里的旧身份(SSA/标量/dtype/None/权重别名)。"""
+        self.param_aliases.discard(name)
+        self.ssa.pop(name, None)
+        self.producer.pop(name, None)
+        self.scalars.pop(name, None)
+        self.dtypes.pop(name, None)
+        self.known_none.discard(name)
+        self.present_vars.discard(name)
+
+    def _bind_shape_unpack(self, names: list[str], src_name: str) -> None:
+        """`sq, b, _ = x.shape` —— **不产 op**(产出的是 python int 元组)。
+        既记进 `scalar_binds`(shape 推断按 x 的已知 shape 逐轴回填),又把每个名字登记成
+        **标量**(值未知),使下游 `if sq < ratio` 这类判定至少知道"它不是张量"。"""
+        self.scalar_binds.append({"names": list(names), "src": src_name})
+        for i, n in enumerate(names):
+            if n == "_":
+                continue
+            self._forget(n)
+            self.scalars[n] = self._axis_scalar(src_name, i)
+
+    def _axis_scalar(self, src_name: str, axis: int):
+        """一个张量轴长的标量值:**只在调用方给了该形参的轴种子时**才求出,否则 `_UNKNOWN_SCALAR`。
+
+        种子形态 `input_axes={"x": ("seq_length", "b", "hidden_size")}`(与 `infer_shapes` 同契约)。
+        符号名再经 `config_flags` 解成数(`seq_length` → 4096)。**绝不杜撰尺寸**:没种子就是
+        未知 → 依赖它的 `if` 不可判定 → fail-loud。
+        """
+        axes = self._input_axes.get(src_name)
+        tok = axes[axis] if (axes and axis < len(axes)) else None
+        if isinstance(tok, int):
+            return tok
+        if isinstance(tok, str):
+            v = self.config_flags.get(tok)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return v
+        return _POSITIVE_DIM        # 无种子:值未知,但**必然 >= 1**(见 _PositiveDim)
+
+    def _classify(self, node) -> str:
+        """判一个表达式是 张量 / 标量 / dtype 记号 / None / 权重 / 判不出。**只按已知事实**。"""
+        if isinstance(node, ast.Constant):
+            return _Kind.NONE if node.value is None else _Kind.SCALAR
+        if isinstance(node, ast.Name):
+            if node.id in self.param_aliases:
+                return _Kind.PARAM          # 权重别名(见 param_aliases 的契约)
+            if node.id in self.ssa or node.id in self.producer:
+                return _Kind.TENSOR
+            if node.id in self.dtypes:
+                return _Kind.DTYPE
+            if node.id in self.scalars:
+                return _Kind.SCALAR
+            if node.id in self.known_none:
+                return _Kind.NONE
+            if node.id in self._param_set:
+                return _Kind.TENSOR          # construct 形参:默认是张量(种子由 infer_shapes 喂)
+            if "__i" in node.id:
+                return _Kind.UNKNOWN         # 帧内合成占位名(实参非 Name / 未传)
+            return _Kind.UNKNOWN
+        if isinstance(node, ast.Attribute):
+            if node.attr == "dtype":
+                return _Kind.DTYPE
+            if node.attr == "shape":
+                return _Kind.SCALAR          # shape 元组(host 侧)
+            if _config_flag_name(node) is not None and isinstance(node.value, ast.Attribute):
+                return _Kind.SCALAR          # `self.config.<x>` —— config 对象里没有张量
+            sattr = _self_attr(node)
+            if sattr is not None:
+                kind = self._self_kinds.get(sattr)
+                if kind == "param":
+                    return _Kind.PARAM
+                if kind == "scalar":
+                    return _Kind.SCALAR
+                if sattr in self.config_flags:
+                    return _Kind.SCALAR
+                return _Kind.UNKNOWN
+            # `ms.float32` / `mstype.int32` 这类 dtype 字面量
+            return _Kind.DTYPE if _dtype_name(node) in _DTYPE_ALIAS.values() else _Kind.UNKNOWN
+        if isinstance(node, ast.Subscript):
+            base = self._classify(node.value)
+            if base == _Kind.SCALAR:
+                return _Kind.SCALAR          # `x.shape[0]` / 标量元组下标
+            return base
+        if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp)):
+            kinds = [self._classify(o) for o in self._operands(node)]
+            if _Kind.TENSOR in kinds or _Kind.PARAM in kinds:
+                return _Kind.TENSOR
+            if kinds and all(k == _Kind.SCALAR for k in kinds):
+                return _Kind.SCALAR
+            return _Kind.UNKNOWN
+        if isinstance(node, ast.Compare):
+            kinds = [self._classify(o) for o in self._operands(node)]
+            if _Kind.TENSOR in kinds or _Kind.PARAM in kinds:
+                return _Kind.TENSOR          # 张量比较 → bool **张量**
+            if kinds and all(k in (_Kind.SCALAR, _Kind.NONE) for k in kinds):
+                return _Kind.SCALAR
+            return _Kind.UNKNOWN
+        if isinstance(node, ast.Call):
+            return self._classify_call(node)
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return _Kind.SCALAR
+        return _Kind.UNKNOWN
+
+    def _classify_call(self, call: ast.Call) -> str:
+        f = call.func
+        if isinstance(f, ast.Name):
+            if f.id in ("int", "float", "len", "str", "bool", "sum", "max", "min"):
+                return _Kind.SCALAR          # host 侧内建:`int(k.shape[1])`、`len(...)`
+            if f.id in self._module_funcs or f.id in self._fn_classes:
+                return _Kind.TENSOR
+            return _Kind.UNKNOWN
+        sattr = _self_attr(f)
+        if sattr is not None:
+            b = self.binds.get(sattr)
+            if b is not None:
+                return _Kind.SCALAR if b.op == SHAPE_OF else _Kind.TENSOR
+            return _Kind.TENSOR if self._lookup_method(sattr)[0] is not None else _Kind.UNKNOWN
+        if isinstance(f, ast.Attribute):
+            # **先**按完整点号路径查表(`mint.permute` / `ops.cast` / …)——注意 `permute` 之类
+            # 方法名与命名空间函数名同名,若先走"张量方法"分支会把 `mint` 当成 base 判成 UNKNOWN。
+            path = _dotted_path(f)
+            if path is not None:
+                hit = prims.lookup(path)
+                if hit is not None:
+                    return _Kind.SCALAR if hit[0] == SHAPE_OF else _Kind.TENSOR
+                if path in FREE_CALL_MAP:
+                    return _Kind.TENSOR
+                if prims.is_alias_namespace(path):
+                    return _Kind.UNKNOWN     # 命名空间调用但表里没有 → 未知,别当张量方法
+            if f.attr in ("astype", "to"):
+                return _Kind.TENSOR
+            if (f.attr in prims.PASSTHRU_METHODS or f.attr in _VIEW_METHODS
+                    or prims.lookup_method(f.attr) is not None):
+                return self._classify(f.value)
+        return _Kind.UNKNOWN
+
+    @staticmethod
+    def _operands(node) -> list:
+        if isinstance(node, ast.BinOp):
+            return [node.left, node.right]
+        if isinstance(node, ast.UnaryOp):
+            return [node.operand]
+        if isinstance(node, ast.BoolOp):
+            return list(node.values)
+        if isinstance(node, ast.Compare):
+            return [node.left] + list(node.comparators)
+        return []
+
+    def _scalar_of(self, node):
+        """把一个**标量**表达式求成 python 值;求不出返回 `_UNKNOWN_SCALAR`。
+        支持:字面量、标量名、config 属性、`x.shape[i]`、`int()/len()` 包裹、+ - * // / % ** 与一元负。"""
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in self.scalars:
+                return self.scalars[node.id]
+            if node.id in self.known_none:
+                return None
+            return _UNKNOWN_SCALAR
+        if isinstance(node, ast.Attribute):
+            nm = _config_flag_name(node)
+            if nm is not None and nm in self.config_flags:
+                return self.config_flags[nm]
+            return _UNKNOWN_SCALAR
+        if isinstance(node, ast.Subscript):
+            # `<x>.shape[i]` —— 轴长:值未知但 >= 1(公理);其余下标未知。
+            base = node.value
+            if isinstance(base, ast.Attribute) and base.attr == "shape":
+                return _POSITIVE_DIM
+            return _UNKNOWN_SCALAR
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name) and f.id in ("int", "float") and node.args:
+                v = self._scalar_of(node.args[0])
+                if v is _POSITIVE_DIM:
+                    return _POSITIVE_DIM        # `int(x.shape[0])` 仍是"某轴长" (>=1)
+                if v is _UNKNOWN_SCALAR or v is None:
+                    return _UNKNOWN_SCALAR
+                try:
+                    return int(v) if f.id == "int" else float(v)
+                except (TypeError, ValueError):
+                    return _UNKNOWN_SCALAR
+            return _UNKNOWN_SCALAR
+        if isinstance(node, ast.UnaryOp):
+            v = self._scalar_of(node.operand)
+            if v is _UNKNOWN_SCALAR:
+                return _UNKNOWN_SCALAR
+            try:
+                if isinstance(node.op, ast.USub):
+                    return -v
+                if isinstance(node.op, ast.UAdd):
+                    return +v
+                if isinstance(node.op, ast.Not):
+                    return not v
+            except TypeError:
+                return _UNKNOWN_SCALAR
+            return _UNKNOWN_SCALAR
+        if isinstance(node, ast.BinOp):
+            a, b = self._scalar_of(node.left), self._scalar_of(node.right)
+            if a is _UNKNOWN_SCALAR or b is _UNKNOWN_SCALAR or a is None or b is None:
+                return _UNKNOWN_SCALAR
+            try:
+                if isinstance(node.op, ast.Add):
+                    return a + b
+                if isinstance(node.op, ast.Sub):
+                    return a - b
+                if isinstance(node.op, ast.Mult):
+                    return a * b
+                if isinstance(node.op, ast.FloorDiv):
+                    return a // b
+                if isinstance(node.op, ast.Div):
+                    return a / b
+                if isinstance(node.op, ast.Mod):
+                    return a % b
+                if isinstance(node.op, ast.Pow):
+                    return a ** b
+            except (TypeError, ZeroDivisionError):
+                return _UNKNOWN_SCALAR
+        return _UNKNOWN_SCALAR
+
+    # ---- 具体 RHS 形态 --------------------------------------------------------------
+    def _bind_expr_to_target(self, expr, target: str, lineno: int) -> None:
+        """把任意 RHS 子表达式绑到单个目标(元组赋值的逐项通路)。"""
+        if isinstance(expr, ast.Name):
+            self._bind_name_rhs(expr.id, [target])
+        elif isinstance(expr, ast.Constant):
+            self._forget(target)
+            if expr.value is None:
+                self.known_none.add(target)
+            else:
+                self.scalars[target] = expr.value
+        elif isinstance(expr, (ast.BinOp, ast.UnaryOp)):
+            self._handle_binop(expr, [target], lineno)
+        elif isinstance(expr, (ast.Compare, ast.BoolOp)):
+            self._handle_compare(expr, [target], lineno)
+        elif isinstance(expr, ast.Call):
+            self._handle_call(expr, [target])
+        elif isinstance(expr, ast.Attribute):
+            self._handle_attribute_assign(
+                expr, [target], ast.Assign(targets=[ast.Name(id=target, ctx=ast.Store())],
+                                           value=expr, lineno=lineno))
+        elif isinstance(expr, ast.Subscript):
+            self._handle_subscript_assign(expr, [target], lineno)
+        else:
+            self._forget(target)
+            self.scalars[target] = _UNKNOWN_SCALAR
+
+    def _bind_name_rhs(self, src_name: str, targets: list[str]) -> None:
+        """`a = b` —— 按 b 的身份别名过去(张量保 producer 边;标量/dtype/None 传身份)。"""
+        for t in targets:
+            self._forget(t)
+        if src_name in self.param_aliases:
+            for t in targets:
+                self.param_aliases.add(t)
+                self._param_of[t] = self._param_of.get(src_name, src_name)
+            return
+        if src_name in self.ssa or src_name in self.producer:
+            self._alias(targets, src_name)
+            for t in targets:
+                if src_name in self.detached and t not in self.detached:
+                    self.detached.append(t)
+            return
+        for t in targets:
+            if src_name in self.dtypes:
+                self.dtypes[t] = self.dtypes[src_name]
+            elif src_name in self.scalars:
+                self.scalars[t] = self.scalars[src_name]
+            elif src_name in self.known_none:
+                self.known_none.add(t)
+            elif src_name in self._param_set:
+                self._alias([t], src_name)   # 形参:占位 ref 别名(合法,种子由 infer_shapes 喂)
+            else:
+                self.scalars[t] = _UNKNOWN_SCALAR
+
+    def _handle_attribute_assign(self, val: ast.Attribute, targets: list[str], stmt) -> None:
+        """`t = <expr>.<attr>` 的三类:dtype 记号 / shape 元组 / config 标量 / **权重 Parameter**。"""
+        kind = self._classify(val)
+        if kind == _Kind.DTYPE and val.attr == "dtype":
+            # `ori_dtype = x.dtype`(multi_latent_attention.py:232):dtype **记号**,字节中性。
+            # 记进 dtype 环境 → 下游 `self.cast(y, ori_dtype)` 能解出真 dtype(此前解成字面串
+            # "ori_dtype",即一个**假 dtype**)。
+            base = val.value
+            dt = None
+            if isinstance(base, ast.Name):
+                ref = self.ssa.get(base.id)
+                dt = ref.split(":")[2] if ref and ref.count(":") == 2 else None
+            for t in targets:
+                self._forget(t)
+                self.dtypes[t] = dt or self.config_flags.get("compute_dtype", "bf16")
+            return
+        if kind == _Kind.PARAM:
+            # `attn_sink = self.attn_sink`(csa.py:683):**权重**,不是激活 →
+            # 记成权重别名(不进 SSA),消费点路由到 param_operands(W2/W3)。
+            sattr = _self_attr(val)
+            for t in targets:
+                self._forget(t)
+                self.param_aliases.add(t)
+                self._param_of[t] = sattr
+                self._note_param_operand(sattr, stmt.lineno)
+            return
+        if kind == _Kind.SCALAR:
+            v = self._scalar_of(val)
+            for t in targets:
+                self._forget(t)
+                if v is None:
+                    self.known_none.add(t)
+                else:
+                    self.scalars[t] = v
+            return
+        # 判不出来的 `self.<attr>` / `<x>.<attr>` —— 保持记账(它确实是"看不懂")。
+        self._diag("dropped_assigns", src=f"{self.src_file}:{stmt.lineno}",
+                   targets=list(targets), rhs="Attribute", code=self._describe(stmt))
+        self._diag_unregistered(targets, stmt.lineno, "dropped_assign_rhs_Attribute")
+
+    def _param_dtype(self, sattr: str) -> str:
+        _ = sattr
+        return self.config_flags.get("params_dtype", "bf16")
+
+    def _note_param_operand(self, name: str, lineno: int) -> None:
+        rec = {"src": f"{self.src_file}:{lineno}", "param": name}
+        if rec not in self.param_operands:
+            self.param_operands.append(rec)
+
+    def _binop_kind(self, node) -> tuple[str, dict, str]:
+        """二元/一元算术 → (op 类型, attrs, 记号)。**关键判据(直接决定字节)**:
+        `tensor <op> scalar` 的反向是 `dy·const` —— **与输入值无关 → 线性 → 不存激活**;
+        只有 `tensor <op> tensor` 的 mul/div 才需要存两个操作数。
+        实例:`attention_scores = self.matmul(q,k) * self.softmax_scale`(indexer.py:350)
+        —— 若误判非线性,就会把那个 O(S·S/r) fp32 张量错声明成 saved。"""
+        if isinstance(node, ast.UnaryOp):
+            return "Elementwise", {"linear": True, "arith": "neg"}, "neg"
+        op = node.op
+        both_tensor = sum(
+            1 for o in self._operands(node)
+            if self._classify(o) in (_Kind.TENSOR, _Kind.PARAM)
+        ) >= 2
+        if isinstance(op, (ast.Add, ast.Sub)):
+            return "Elementwise", {"linear": True, "arith": "add"}, "add"
+        if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor)):
+            # bool 掩码的逻辑组合(csa.py:376 `(causal_mask < 0) | (...)`):不可微。
+            return "Compare", {"logical": True}, "logical"
+        if isinstance(op, ast.MatMult):
+            return "MatMul", {}, "matmul"
+        if isinstance(op, (ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)):
+            return "Elementwise", {"linear": not both_tensor, "arith": "mul"}, "mul"
+        return "Elementwise", {"linear": False, "arith": "other"}, "other"
+
+    def _handle_binop(self, val, targets: list[str], lineno: int) -> None:
+        """`BinOp`/`UnaryOp` RHS。张量 → 建节点(**这次要修的张量全在这里**);标量 → 只记标量。"""
+        kind = self._classify(val)
+        if kind == _Kind.SCALAR:
+            v = self._scalar_of(val)
+            for t in targets:
+                self._forget(t)
+                self.scalars[t] = v
+            return
+        if kind != _Kind.TENSOR:
+            self._diag("dropped_assigns", src=f"{self.src_file}:{lineno}",
+                       targets=list(targets), rhs=type(val).__name__,
+                       code=self._describe(val))
+            self._diag_unregistered(targets, lineno, f"dropped_assign_rhs_{type(val).__name__}")
+            return
+        op, attrs, _tag = self._binop_kind(val)
+        operands = self._tensor_operands(self._operands(val), lineno)
+        self._emit(op, attrs, lineno, operands, targets,
+                   "bool" if op == "Compare" else None)
+
+    def _handle_compare(self, val, targets: list[str], lineno: int) -> None:
+        """`Compare`/`BoolOp` RHS。张量比较 → bool **张量**节点(`Compare`,不可微、反向不读)。
+        实例:`future = cm >= positions // ratio`(csa.py:779)、
+        `valid = topk_indices_compressed < self.unsqueeze(n_valid_per_pos, 0)`(csa.py:810)
+        —— 两个 O(S·S/r) bool mask,此前完全不可见。"""
+        kind = self._classify(val)
+        if kind == _Kind.SCALAR:
+            for t in targets:
+                self._forget(t)
+                self.scalars[t] = _UNKNOWN_SCALAR
+            return
+        if kind != _Kind.TENSOR:
+            self._diag("dropped_assigns", src=f"{self.src_file}:{lineno}",
+                       targets=list(targets), rhs=type(val).__name__,
+                       code=self._describe(val))
+            self._diag_unregistered(targets, lineno, f"dropped_assign_rhs_{type(val).__name__}")
+            return
+        attrs = {"logical": True} if isinstance(val, ast.BoolOp) else {"compare": True}
+        operands = self._tensor_operands(self._operands(val), lineno)
+        self._emit("Compare", attrs, lineno, operands, targets, "bool")
+
+    def _handle_subscript_assign(self, val: ast.Subscript, targets: list[str], lineno: int) -> None:
+        """`t = <x>[<idx>]` 的三类:
+          * base 是标量元组(`x.shape[0]`)→ 标量,**不建节点**;
+          * 下标含 `Slice` → `View{view:"slice"}`(反向零填,不存激活)。
+            实例 `freqs = freqs[:total:ratio][:n]`(compressor.py:233)、`kv = kv[:cutoff]`(:198);
+          * 下标是**张量**(advanced indexing)→ `IndexSelect`(反向 scatter_add → 存 index)。
+            实例 `kv_flat[flat_indices]`(csa.py:485)—— 这是 unfused 链里真正的 gather。"""
+        base_kind = self._classify(val.value)
+        if base_kind == _Kind.SCALAR:
+            v = self._scalar_of(val)
+            for t in targets:
+                self._forget(t)
+                self.scalars[t] = v
+            return
+        if base_kind not in (_Kind.TENSOR, _Kind.PARAM):
+            self._diag("dropped_assigns", src=f"{self.src_file}:{lineno}",
+                       targets=list(targets), rhs="Subscript", code=self._describe(val))
+            self._diag_unregistered(targets, lineno, "dropped_assign_rhs_Subscript")
+            return
+        idx = val.slice
+        idx_tensors = [n for n in ast.walk(idx)
+                       if isinstance(n, ast.Name) and self._classify(n) == _Kind.TENSOR]
+        if idx_tensors:
+            operands = self._tensor_operands([val.value] + idx_tensors, lineno)
+            self._emit("IndexSelect", {"advanced_index": True}, lineno, operands, targets, None)
+            return
+        operands = self._tensor_operands([val.value], lineno)
+        self._emit("View", {"view": "slice", "index": self._describe(idx)}, lineno,
+                   operands, targets, None)
+
+    def _tensor_operands(self, exprs, lineno: int) -> list:
+        """从混合实参里挑出**可追踪张量操作数**(Name / 嵌套 Call 先物化 / `self.<Parameter>` 记权重),
+        标量与 dtype 记号一律略过(它们不是激活,进 `ins` 就会被 bprop 当张量算字节)。"""
+        out = []
+        for e in exprs:
+            k = self._classify(e)
+            if k == _Kind.PARAM:
+                sattr = _self_attr(e) or (self._param_of.get(e.id)
+                                          if isinstance(e, ast.Name) else None)
+                if sattr:
+                    self._note_param_operand(sattr, lineno)
+                continue                       # 权重不进 ins(见 param_operands 的理由)
+            if k != _Kind.TENSOR:
+                continue
+            if isinstance(e, (ast.Name,)):
+                out.append(e)
+            elif isinstance(e, (ast.Call, ast.Subscript, ast.BinOp, ast.UnaryOp,
+                               ast.Compare, ast.BoolOp, ast.Attribute)):
+                out.append(self._materialize_expr(e, lineno))
+        return [o for o in out if o is not None]
+
+    def _materialize_expr(self, expr, lineno: int):
+        """把一个**张量子表达式**先发射成节点,返回指向它的 `ast.Name`(保 id 单调 = 数据流序)。
+        镜像既有 `_materialize_call_arg` 的 `__arg__i<n>` 合成名模式。"""
+        if isinstance(expr, ast.Name):
+            return expr
+        tmp = f"__arg__i{self._frame_seq}"
+        self._frame_seq += 1
+        before = len(self.nodes)
+        if isinstance(expr, ast.Call):
+            self._handle_call(expr, [tmp])
+        elif isinstance(expr, (ast.BinOp, ast.UnaryOp)):
+            self._handle_binop(expr, [tmp], lineno)
+        elif isinstance(expr, (ast.Compare, ast.BoolOp)):
+            self._handle_compare(expr, [tmp], lineno)
+        elif isinstance(expr, ast.Subscript):
+            self._handle_subscript_assign(expr, [tmp], lineno)
+        elif isinstance(expr, ast.Attribute):
+            sattr = _self_attr(expr)
+            if sattr:
+                self._note_param_operand(sattr, lineno)
+            return None
+        if len(self.nodes) == before and tmp not in self.ssa:
+            return None
+        return ast.Name(id=tmp, ctx=ast.Load())
+
+    def _promote_dtype(self, exprs) -> str:
+        """产出 dtype = 参与张量操作数里"最宽"的那个(fp32 > bf16/fp16 > 其它);无从判断则 bf16。
+        这条让 `score_f32 = score.astype(fp32) + ape`(compressor.py:209)的产出正确落 fp32。"""
+        rank = {"fp64": 4, "fp32": 3, "bf16": 2, "fp16": 2}
+        best, best_r = None, -1
+        for e in exprs:
+            dt = None
+            if isinstance(e, ast.Name):
+                ref = self.ssa.get(e.id)
+                if ref and ref.count(":") == 2:
+                    dt = ref.split(":")[2]
+            if dt and rank.get(dt, 1) > best_r:
+                best, best_r = dt, rank.get(dt, 1)
+        return best or self.config_flags.get("compute_dtype", "bf16")
+
     def _handle_ifexp(self, ifexp: ast.IfExp, targets: list[str]) -> None:
+        self._pending_predicate = None
         r = self._eval_test(ifexp.test)
         if r is _UNDECIDED:
             if self._pruning:
+                extra = (f" 该条件是**部署形态谓词**:请在 `runtime_predicates` 里给 "
+                         f"`{self._pending_predicate}`。" if self._pending_predicate else "")
                 raise ValueError(
                     f"construct 的三元条件无法由 config 判定（{self.src_file}:{ifexp.lineno}）:"
-                    f"`{self._describe(ifexp.test)}` —— 剪枝上下文下拒绝双走,fail-loud"
+                    f"`{self._describe(ifexp.test)}` —— 剪枝上下文下拒绝双走,fail-loud{extra}"
                 )
             r = True  # 非剪枝:保守取 body(优先保留算子,别静默丢)
         chosen = ifexp.body if r else ifexp.orelse
@@ -504,8 +1226,14 @@ class _Walker:
             self._handle_call(chosen, targets)
         elif isinstance(chosen, ast.Name):
             # `... else x`:目标别名 x —— 复用 x 的 ref 与 producer(下游消费能连回真源)。
-            self._alias(targets, chosen.id)
-        # 其它表达式(字面量等):不产 op,目标不登记 SSA
+            self._bind_name_rhs(chosen.id, targets)
+        else:
+            # 其余表达式(`self.<Parameter>` / config 标量 / 字面量 / BinOp / …):走统一 RHS 通路,
+            # 别再"不登记 SSA"——那正是下游拿占位 ref、丢边的来源。
+            #   `ape = self.ape.to_local() if hasattr(...) else self.ape`(compressor.py:208)
+            #   `effective_topk = self.index_topk if ... else min(...)`(indexer.py:212)
+            for t in targets:
+                self._bind_expr_to_target(chosen, t, ifexp.lineno)
 
     def _alias(self, targets: list[str], src_name: str) -> None:
         ref = self.ssa.get(src_name, f"{src_name}:?:bf16")
@@ -522,6 +1250,12 @@ class _Walker:
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
             self._handle_self_call(call, func.attr, target_names)
             return
+        # 形态一.五:`self.<subcell>.<method>(...)` —— 子 Cell 的**指定方法**(非 construct)。
+        if isinstance(func, ast.Attribute):
+            outer = _self_attr(func.value)
+            if outer is not None and func.attr != "apply":
+                if self._handle_subcell_method(call, outer, func.attr, target_names):
+                    return
         # 形态二:直接实例化即调用的算子 `OpClass(...)(...)`(如 GroupedMatmul(split_item=3)(...)、Reshape()(x,shp))。
         if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id in DIRECT_OP_MAP:
             op, attrs = DIRECT_OP_MAP[func.func.id]
@@ -543,14 +1277,93 @@ class _Walker:
                 self._emit(op, attrs, call.lineno, list(call.args), target_names,
                            attrs.get("compute_dtype") or "bf16")
                 return
+            # 形态二.六(P0#2):裸 `mint.*` / `ops.*` **自由调用**按同一张 primitives 表发射。
+            # `unfused_compressed_sparse_attn`(csa.py:464-533)整条链就是这么写的(24 处),
+            # `CSAIndexer` 的 `mint.squeeze`(indexer.py:231-232)亦然。
+            if path is not None and prims.lookup(path) is not None:
+                self._emit_primitive(path, call, target_names)
+                return
+        # 形态二.七:`<Cls>.apply(...)`(mindspore `_Function` 自定义反向)/ `self.<attr>.apply(...)`。
+        if isinstance(func, ast.Attribute) and func.attr == "apply":
+            if self._handle_function_apply(call, func, target_names):
+                return
+        # 形态二.七二:`Tensor([...], dtype=...)` —— host 侧字面量建的小常量张量
+        # (`cmp_residual_k = Tensor([int(key_length) % self.compress_ratio], ...)`,indexer.py:219)。
+        if isinstance(func, ast.Name) and func.id in _CONST_CTORS:
+            self._emit("Constant", {"ctor": func.id}, call.lineno, [], target_names,
+                       self._const_dtype(call))
+            return
+        # 形态二.七三:融合 NPU 内核的自由函数(调用方白名单)。**建节点 + 登记目标 + 保边**;
+        # saved 集只在"可证明无反向"(no-grad 区内)时写 [],否则不写 → derive_saves fail-loud。
+        if isinstance(func, ast.Name) and func.id in self._kernel_call_allow:
+            attrs = {"kernel": func.id}
+            if self._nograd_depth:
+                attrs["saved_ins_idx"] = []
+                attrs["no_backward_reason"] = "in _no_grad region"
+            operands = self._tensor_operands(list(call.args) +
+                                            [k.value for k in call.keywords], call.lineno)
+            self._emit("Kernel", attrs, call.lineno, operands, target_names,
+                       self._promote_dtype(operands))
+            return
+        # 形态二.七五:host 侧内建 `int()/float()/min()/max()/len()/...`(**全标量实参**)——
+        # 产出是 python 数,不是张量:登记标量身份,**不建节点、不记诊断**。
+        # `effective_topk = ... min(self.index_topk, int(k.shape[1]))`(indexer.py:212)。
+        if isinstance(func, ast.Name) and func.id in _HOST_BUILTINS:
+            if all(self._classify(a) != _Kind.TENSOR for a in call.args):
+                for t in target_names:
+                    self._forget(t)
+                    self.scalars[t] = self._scalar_of(call)
+                return
+        # 形态二.八:模块级自由函数 `foo(...)`(同文件 `def`)→ **内联展开**。
+        # `unfused_compressed_sparse_attn`(csa.py:823)、`parse_cu_seqlens`(:743)、
+        # `get_window_topk_idxs`(:758)…此前只进 opaque_calls → 整条 11-op 注意力链不可见。
+        if isinstance(func, ast.Name) and func.id in self._module_funcs:
+            self._inline_method(self._module_funcs[func.id], call, target_names,
+                               is_module_func=True)
+            return
+        # 形态二.九:`<expr>.<张量方法>(...)` —— base 可以是 Call / BinOp / Name / Subscript。
+        # 实测必需:`pooled = (kv.astype(fp32) * weights).sum(dim=1)`(compressor.py:216)
+        # —— base 是**带括号的 BinOp**,既有的"链式调用"分支只认 Call/Subscript base,
+        # 于是此前整句落 opaque、`pooled` 从未进 SSA、下游 `self.norm(pooled...)` 丢边。
+        if isinstance(func, ast.Attribute) and prims.lookup_method(func.attr) is not None:
+            if self._classify(func.value) in (_Kind.TENSOR, _Kind.PARAM):
+                op, attrs = prims.lookup_method(func.attr)
+                base = self._materialize_expr(func.value, call.lineno)
+                if base is not None:
+                    args = [base] + list(call.args)
+                    attrs = {**attrs, "prim": f"<tensor>.{func.attr}"}
+                    if op == "View" and attrs.get("view"):
+                        attrs = {**attrs, **self._view_capture(call, attrs["view"], target_names)}
+                    out_dtype = "bool" if op == "Compare" else None
+                    self._emit(op, attrs, call.lineno,
+                               self._expand_args(args, attrs), target_names, out_dtype)
+                    return
         # 形态三:链式方法 `<innercall>.method(...)`(如 self.swiglu(x).reshape(...)):先发射内层算子,再处理外层方法。
         if isinstance(func, ast.Attribute) and isinstance(func.value, (ast.Call, ast.Subscript)):
             self._handle_chained_call(call, func, target_names)
             return
-        # 形态四:`<expr>.astype(<dtype>)`(expr 为 Name/Attribute)—— 视作 Cast(dtype 传播关键路径)。
-        if isinstance(func, ast.Attribute) and func.attr == "astype":
-            out_dtype = self._resolve_cast_dtype(call.args, 0, {})  # astype 目标 dtype 在 idx=0
+        # 形态四:`<expr>.astype(<dtype>)` / `<expr>.to(<dtype>)`(expr 为 Name/Attribute)—— Cast。
+        # `.to(mstype.float32)`:indexer.py:359 `mask.to(...)`、:365 `.to(mstype.int64)`。
+        if isinstance(func, ast.Attribute) and func.attr in ("astype", "to"):
+            out_dtype = self._resolve_cast_dtype(call.args, 0, {})  # 目标 dtype 在 idx=0
             self._emit("Cast", {}, call.lineno, [func.value], target_names, out_dtype)
+            return
+        # 形态四.五:`<expr>.to_local()` / `.full_tensor()` / `.contiguous()` —— **直通别名**,
+        # 不新增激活、不建节点(DTensor 局部分片视图 / 布局重排,数学恒等)。
+        if isinstance(func, ast.Attribute) and func.attr in prims.PASSTHRU_METHODS:
+            self._bind_passthru(func.value, target_names, call.lineno)
+            return
+        # 形态四.六:张量方法形态的视图 `<Name>.unsqueeze(1)` / `.broadcast_to(...)`(链首是 Name/Attribute)。
+        if (isinstance(func, ast.Attribute) and func.attr in _VIEW_METHODS
+                and self._classify(func.value) in (_Kind.TENSOR, _Kind.PARAM)):
+            self._emit("View", {"view": func.attr}, call.lineno, [func.value], target_names,
+                       self._promote_dtype([func.value]))
+            return
+        # 形态四.七:显式白名单的**纯宿主副作用调用**(无被消费的返回值),记 opaque、不记 unregistered。
+        if isinstance(func, ast.Name) and func.id in self._host_call_allow and not target_names:
+            self.opaque_calls.append(
+                {"src": f"{self.src_file}:{call.lineno}", "expr": self._describe(call),
+                 "kind": "host_side_effect"})
             return
         # 其它调用(非上述形态):当前不产 op(如 self.token_dispatcher.token_permutation —— AllToAll 派发,
         # opaque;或 layers.py:182 `ops.AllReduce(group=...)(x)` 双层调用形态)—— T0-6.5 Fix2:
@@ -569,18 +1382,39 @@ class _Walker:
         if binding is None:
             # 未绑定:①Morph(self.method) 别名 → 内联被包裹的方法;②本类(含基类)内部方法 → 内联;③否则 fail-loud。
             if name in self._method_aliases:
-                m = self._lookup_method(self._method_aliases[name])
+                m, mrel = self._lookup_method(self._method_aliases[name])
                 if m is not None:
-                    self._inline_method(m, call, target_names)
+                    self._inline_method(m, call, target_names, method_rel=mrel)
                     return
-            method = self._lookup_method(name)
+            method, mrel = self._lookup_method(name)
             if method is not None:
-                self._inline_method(method, call, target_names)
+                self._inline_method(method, call, target_names, method_rel=mrel)
                 return
+            if name in self._alias_unknown:
+                # P0#2 的 fail-loud 面:这个名字**是**裸函数别名,但 primitives 表里没有它。
+                # 报错必须指名道姓——归错类会静默产出错的 saved 集(这件事要杀的正是那类 bug)。
+                info = self._alias_unknown[name]
+                raise UnknownPrimitiveError(
+                    f"construct 调用了裸别名 self.{name}(...)（{self.src_file}:{call.lineno}）,"
+                    f"其别名目标 `{info.get('alias')}`(定义于 {info.get('src')})"
+                    f"**不在 primitives.PRIMITIVES 表里** —— 拒绝猜它的 bprop 类别。"
+                    f"请加表项(并写清「反向要读什么」+ 定位符)。"
+                )
             raise ValueError(
                 f"construct 调用了未绑定的 self.{name}(...)（{self.src_file}:{call.lineno}）:"
                 f"Pass B(init_binder)未覆盖此名、且非本类内部方法/Morph 别名,fail-loud"
             )
+        if binding.op == SHAPE_OF:
+            # `sq, bsz, _ = self.shape(x)`(deepseek_v4_hybrid_attention.py:233):产出是 python
+            # int 元组,**不是张量** → 绝不发射节点(发了就是造假节点),只记轴解包 + 标量身份。
+            src = call.args[0].id if (call.args and isinstance(call.args[0], ast.Name)) else None
+            if src is not None:
+                self._bind_shape_unpack(list(target_names), src)
+            else:
+                for t in target_names:
+                    self._forget(t)
+                    self.scalars[t] = _UNKNOWN_SCALAR
+            return
         if binding.op == "SubCell" and self._subcell_resolver is not None:
             # 子 Cell:递归抽取其 DAG,并在调用点内联(镜像内部方法内联的 SSA/边/id 处理)。
             self._inline_subcell(binding.attrs, call, target_names)
@@ -596,6 +1430,132 @@ class _Walker:
             attrs = {**binding.attrs, **self._view_capture(call, binding.attrs["view"], target_names)}
         arg_exprs = self._expand_args(call.args, binding.attrs)
         self._emit(binding.op, attrs, call.lineno, arg_exprs, target_names, out_dtype)
+
+    # ---- primitives 表驱动的发射(裸别名与自由调用共用)----
+    def _emit_primitive(self, path: str, call: ast.Call, target_names: list[str],
+                        op_attrs=None) -> None:
+        op, attrs = op_attrs if op_attrs is not None else prims.lookup(path)
+        if op == SHAPE_OF:
+            src = call.args[0].id if (call.args and isinstance(call.args[0], ast.Name)) else None
+            if src is not None:
+                self._bind_shape_unpack(list(target_names), src)
+            else:
+                for t in target_names:
+                    self._forget(t)
+                    self.scalars[t] = _UNKNOWN_SCALAR
+            return
+        if op == "Cast":
+            out_dtype = self._resolve_cast_dtype(call.args, 1, attrs)
+        elif op == "Compare":
+            out_dtype = "bool"
+        elif op == "Constant":
+            out_dtype = self._const_dtype(call)
+        else:
+            out_dtype = None
+        arg_exprs = self._expand_args(call.args, attrs)
+        if op == "View" and attrs.get("view"):
+            attrs = {**attrs, **self._view_capture(call, attrs["view"], target_names)}
+        attrs = {**attrs, "prim": path}
+        # out_dtype 仍为 None → 交给 `_emit` 按**已解析的 ins** 推(实参可能还没物化)。
+        self._emit(op, attrs, call.lineno, arg_exprs, target_names, out_dtype)
+
+    def _const_dtype(self, call: ast.Call) -> str:
+        """`mint.full(shape, v, dtype=mstype.float32)` / `mint.arange(n, dtype=...)` 的产出 dtype。
+        没写 dtype 就按 compute_dtype(不杜撰 fp32)。"""
+        for kw in call.keywords:
+            if kw.arg == "dtype":
+                d = _dtype_name(kw.value)
+                if d:
+                    return d
+        return self.config_flags.get("compute_dtype", "bf16")
+
+    def _handle_function_apply(self, call: ast.Call, func: ast.Attribute,
+                               target_names: list[str]) -> bool:
+        """`<Cls>.apply(...)` / `self.<attr>.apply(...)` —— mindspore `_Function` 自定义反向。
+
+        这类节点的 saved 集**不该由 PIN 猜**:源里 `ctx.save_for_backward(...)` 逐字写着。
+        故此处发射 `FusedFunction` 节点并把**源真值名单**(由已落地的 `fn_saves` 抽取器给)
+        挂到 `attrs["save_for_backward"]`,同时把能按位映射到调用点实参的项记成
+        `attrs["saved_operand_idx"]`(其余是 forward 内部张量,记 `saved_internal`)。
+        返回 True 表示已处理。"""
+        cls_name = None
+        if isinstance(func.value, ast.Name):
+            cls_name = func.value.id
+        else:
+            sattr = _self_attr(func.value)
+            if sattr is not None:
+                cls_name = (self.binds.get(sattr).attrs.get("cell")
+                            if self.binds.get(sattr) is not None else None) \
+                           or self._self_kinds.get(f"__cls__{sattr}")
+        info = self._fn_classes.get(cls_name) if cls_name else None
+        if info is None:
+            return False
+        fparams = list(info.get("forward_params") or ())
+        saved = list(info.get("saves") or ())
+        pos_args = list(call.args)
+        saved_idx, saved_internal = [], []
+        # forward(ctx, p0, p1, ...) 的形参按位对应 apply(a0, a1, ...) 的实参。
+        arg_of_param = {p: i for i, p in enumerate(fparams)}
+        for nm in saved:
+            i = arg_of_param.get(nm)
+            if i is None or i >= len(pos_args):
+                saved_internal.append(nm)
+            else:
+                saved_idx.append((nm, i))
+        attrs = {
+            "function": cls_name,
+            "save_for_backward": saved,
+            "saved_internal": saved_internal,
+            "bare_ctx_tensors": list(info.get("bare_ctx") or ()),
+        }
+        # 只有**张量**实参进 ins(标量 kernel 参数如 softmax_scale/cmp_ratio 不是激活)。
+        operands = self._tensor_operands(pos_args, call.lineno)
+        _ = operands
+        # saved 名单里能定位到 ins 位置的,记成 ins 下标(供 bprop_rules 逐字取)。
+        name_to_ins = {}
+        for j, e in enumerate(operands):
+            if isinstance(e, ast.Name):
+                name_to_ins[e.id] = j
+        ins_idx = []
+        for nm, i in saved_idx:
+            a = pos_args[i]
+            key = a.id if isinstance(a, ast.Name) else None
+            if key is not None and key in name_to_ins:
+                ins_idx.append(name_to_ins[key])
+        attrs["saved_ins_idx"] = sorted(set(ins_idx))
+        self._emit("FusedFunction", attrs, call.lineno, operands, target_names,
+                   self._promote_dtype(operands))
+        return True
+
+    def _bind_passthru(self, base, target_names: list[str], lineno: int) -> None:
+        """`.to_local()` / `.contiguous()`:目标承接 base 的身份(保 producer 边),不建节点。"""
+        if isinstance(base, ast.Name):
+            self._bind_name_rhs(base.id, target_names)
+            return
+        sattr = _self_attr(base)
+        if sattr is not None and self._self_kinds.get(sattr) == "param":
+            self._note_param_operand(sattr, lineno)
+            for t in target_names:
+                self._forget(t)
+                self.param_aliases.add(t)       # 权重别名,不进 SSA(W2/W3)
+                self._param_of[t] = sattr
+            return
+        for t in target_names:
+            self._forget(t)
+            self.scalars[t] = _UNKNOWN_SCALAR
+
+    def _handle_subcell_method(self, call: ast.Call, sattr: str, method: str,
+                               target_names: list[str]) -> bool:
+        """`self.<subcell>.<method>(...)` —— 递归抽取子 Cell 的**指定方法**(不是 construct)。
+        实测必需:`self.indexer.forward_before_topk(x_detach, qr_detach)`(csa.py:667/766)
+        是 indexer 的**主要算力**(linear_wq_b / compressor / weights proj / RoPE / Hadamard),
+        此前整块落 opaque_calls。"""
+        binding = self.binds.get(sattr)
+        if (binding is None or binding.op != "SubCell"
+                or self._subcell_resolver is None):
+            return False
+        self._inline_subcell(binding.attrs, call, target_names, method=method)
+        return True
 
     def _handle_chained_call(self, call: ast.Call, func: ast.Attribute, target_names: list[str]) -> None:
         """链式方法 `<innercall>.method(...)`:先把内层调用发射到合成临时名,再按外层方法处理:
@@ -696,9 +1656,21 @@ class _Walker:
         )
 
     def _lookup_method(self, name: str):
-        """按 MRO(cls_name 起沿同文件基类 BFS)找最贴近的 `def name`,找不到返回 None。"""
+        """按 MRO 找最贴近的 `def name`,返回 `(FunctionDef|None, 定义它的文件相对路径|None)`。
+
+        **跨文件(P0#3)**:有 `class_index` 时用它顺 import 解析基类
+        (`DSv4HybridSelfAttention` → `MultiLatentAttention` 在 `multi_latent_attention.py`);
+        没有时退化为旧的"同文件基类 BFS"(既有 DSv3 路径行为逐字不变)。
+        """
         if self._tree is None or self._cls_name is None:
-            return None
+            return None, None
+        if self._class_index is not None and self._cls_rel:
+            for rc in self._class_index.mro(self._cls_name, self._cls_rel):
+                m = next((n for n in rc.node.body
+                          if isinstance(n, ast.FunctionDef) and n.name == name), None)
+                if m is not None:
+                    return m, rc.rel
+            return None, None
         seen: set = set()
         queue = [self._cls_name]
         while queue:
@@ -714,13 +1686,14 @@ class _Walker:
                 None,
             )
             if m is not None:
-                return m
+                return m, None
             for b in cls.bases:
                 if isinstance(b, ast.Name):
                     queue.append(b.id)
-        return None
+        return None, None
 
-    def _inline_method(self, method: ast.FunctionDef, call: ast.Call, target_names: list[str]) -> None:
+    def _inline_method(self, method: ast.FunctionDef, call: ast.Call, target_names: list[str],
+                       method_rel: str | None = None, is_module_func: bool = False) -> None:
         name = method.name
         if name in self._inline_stack:
             raise ValueError(
@@ -744,6 +1717,10 @@ class _Walker:
         body_copy = [renamer.visit(s) for s in body_copy]
 
         self._inline_stack.append(name)
+        # 跨文件内联:节点 src 必须指向**真正定义该方法的文件**(否则 file:line 是错的)。
+        prev_file, prev_rel = self.src_file, self._cls_rel
+        if method_rel:
+            self.src_file = method_rel.rsplit("/", 1)[-1]
         ret = None
         try:
             self.walk_body(body_copy)
@@ -751,12 +1728,14 @@ class _Walker:
             ret = sig.value
         finally:
             self._inline_stack.pop()
+            self.src_file, self._cls_rel = prev_file, prev_rel
         self._bind_return(ret, target_names)
 
     def _bind_params(self, method: ast.FunctionDef, call: ast.Call, frame: int) -> dict:
         params = [a.arg for a in method.args.args if a.arg != "self"]
         pos = list(call.args)
         kw = {k.arg: k.value for k in call.keywords if k.arg is not None}
+        defaults = self._fn_defaults(method)
         rename: dict = {}
         for i, p in enumerate(params):
             if i < len(pos):
@@ -767,9 +1746,42 @@ class _Walker:
                 arg = None   # 未传实参 → 用方法自带默认(此处按帧内合成局部处理)
             if isinstance(arg, ast.Name):
                 rename[p] = arg.id            # 复用调用方变量名(共享 SSA / present / known_none)
-            else:
-                rename[p] = f"{p}__i{frame}"  # 非 Name 实参 / 缺省 → 帧内合成局部名(占位)
+                continue
+            local = f"{p}__i{frame}"          # 非 Name 实参 / 缺省 → 帧内合成局部名
+            rename[p] = local
+            # 帧内占位名也要有**身份**:标量实参(`self.softmax_scale` / 字面量 / config)记标量,
+            # 未传且缺省 None 的记 known_none —— 否则下游 `if x is None` / `y * scale` 判不出来。
+            if arg is None:
+                if p in defaults:
+                    if defaults[p] is None:
+                        self.known_none.add(local)
+                    else:
+                        self.scalars[local] = defaults[p]
+                continue
+            k = self._classify(arg)
+            if k == _Kind.SCALAR:
+                self.scalars[local] = self._scalar_of(arg)
+            elif k == _Kind.NONE:
+                self.known_none.add(local)
+            elif k == _Kind.DTYPE:
+                self.dtypes[local] = _dtype_name(arg) or "fp32"
+            elif k in (_Kind.TENSOR, _Kind.PARAM):
+                mat = self._materialize_expr(arg, getattr(call, "lineno", 0))
+                if isinstance(mat, ast.Name):
+                    rename[p] = mat.id        # 张量表达式实参:先物化,再按 Name 共享 SSA
         return rename
+
+    @staticmethod
+    def _fn_defaults(method: ast.FunctionDef) -> dict:
+        args = [a.arg for a in method.args.args if a.arg != "self"]
+        defaults = method.args.defaults
+        out: dict = {}
+        n, nd = len(args), len(defaults)
+        for i, a in enumerate(args):
+            j = i - (n - nd)
+            if j >= 0 and isinstance(defaults[j], ast.Constant):
+                out[a] = defaults[j].value
+        return out
 
     def _bind_return(self, ret_expr, target_names: list[str]) -> None:
         if ret_expr is None or not target_names:
@@ -777,17 +1789,26 @@ class _Walker:
         elts = ret_expr.elts if isinstance(ret_expr, (ast.Tuple, ast.List)) else [ret_expr]
         for tgt, e in zip(target_names, elts):
             if isinstance(e, ast.Name):
-                self._alias([tgt], e.id)
-            # 返回项非 Name(字面量/调用等):该目标不登记 producer(下游若消费则占位 ref)
+                self._bind_name_rhs(e.id, [tgt])
+            elif isinstance(e, ast.Constant):
+                # 内联函数 `return None`(如 `parse_cu_seqlens` 的 `actual_seq_len is None` 支,
+                # csa.py:325)—— 目标必须进 `known_none`,否则下游 `if cu_seqlens is not None:`
+                # 判不出来 → fail-loud(此前正是这样卡住 naive 支的)。
+                self._forget(tgt)
+                if e.value is None:
+                    self.known_none.add(tgt)
+                else:
+                    self.scalars[tgt] = e.value
 
     # ---- 子 Cell 递归内联 ----
-    def _inline_subcell(self, attrs: dict, call: ast.Call, target_names: list[str]) -> None:
+    def _inline_subcell(self, attrs: dict, call: ast.Call, target_names: list[str],
+                        method: str = "construct") -> None:
         """把 resolver 递归抽出的子 DAG 内联到调用点:
           1) 子 construct 形参按位重映射到调用方实参(Name 实参→复用其 SSA ref 与 producer);
           2) 子节点 id 统一加偏移(接父 _next_id,不从 1 重启),子内部边同偏移平移;
           3) 子叶子消费的"形参操作数"→ 改写成调用方 ref,并补父 producer→子叶子的跨界边;
           4) 子返回值 → 绑回调用点赋值目标(下游消费即连"子输出→消费者"边)。"""
-        sub = self._subcell_resolver(attrs.get("cell"), attrs.get("field"), attrs.get("bare", False))
+        sub = self._call_subcell_resolver(attrs, method)
 
         # 1) 形参 -> (调用方 ref, 调用方 producer 或 None)
         pos = list(call.args)
@@ -800,6 +1821,15 @@ class _Walker:
                 arg = kw[p]
             else:
                 arg = None
+            if not isinstance(arg, ast.Name) and arg is not None:
+                # 非 Name 的**张量**实参先物化成节点(否则边被静默切断)。实测关键点:
+                # `self.unfused_indexer_loss(..., ops.stop_gradient(query),
+                #  ops.stop_gradient(compressed_kv), ...)`(csa.py:794-795)—— 内联实参形的
+                # detach,此前既不建 Detach 节点、也不连边,子里拿到的是凭空的占位 ref。
+                if self._classify(arg) in (_Kind.TENSOR, _Kind.PARAM):
+                    mat = self._materialize_expr(arg, getattr(call, "lineno", 0))
+                    if isinstance(mat, ast.Name):
+                        arg = mat
             if isinstance(arg, ast.Name):
                 ref = self.ssa.get(arg.id, f"{arg.id}:?:bf16")
                 param_map[p] = (ref, self.producer.get(arg.id))
@@ -836,6 +1866,14 @@ class _Walker:
         for kind, items in (sub.diagnostics or {}).items():
             self.diagnostics.setdefault(kind, []).extend(items)
 
+        # 4') 子里被 detach 的产物名(no-grad 块 / stop_gradient)上浮(源已是子文件内的名字)。
+        for nm in getattr(sub, "detached", ()) or ():
+            if nm not in self.detached:
+                self.detached.append(nm)
+        for rec in getattr(sub, "param_operands", ()) or ():
+            if rec not in self.param_operands:
+                self.param_operands.append(rec)
+
         # 4) 子返回值绑回调用点目标
         for tgt, r in zip(target_names, sub.returns):
             kind, val = r
@@ -852,9 +1890,32 @@ class _Walker:
                     self.producer[tgt] = cprod
             # kind == "none":该目标不登记(下游消费则占位 ref)
 
+    def _call_subcell_resolver(self, attrs: dict, method: str):
+        """兼容两种 resolver 签名:新的带 `method=`/`injected_binds=`,旧的三位置参数
+        (既有测试自带的 resolver)。
+
+        `injected_binds`:把**父这一侧已绑好的** `self.<attr>` 顺着构造点的关键字实参
+        (`rotary_pos_emb=self.rotary_pos_emb`)传给子,让子的
+        `self.rotary_pos_emb = rotary_pos_emb` 绑得上(见 init_binder 形态 5)。"""
+        cell, field, bare = attrs.get("cell"), attrs.get("field"), attrs.get("bare", False)
+        injected = {kw: self.binds[a] for kw, a in (attrs.get("kw_self") or {}).items()
+                    if a in self.binds}
+        try:
+            return self._subcell_resolver(cell, field, bare, method=method,
+                                          injected_binds=injected)
+        except TypeError:
+            if method and method != "construct":
+                raise
+            return self._subcell_resolver(cell, field, bare)
+
     def _resolve_returns(self, body) -> list:
-        """定位 construct 顶层(含嵌套)最后一条 `return`,把返回值逐项分类:
-           Name 且已被某节点产出 → ("node", producer id);Name 且是形参 → ("param", 名);其它 → ("none", None)。"""
+        """定位 construct 的返回值并逐项分类:
+           Name 且已被某节点产出 → ("node", producer id);Name 且是形参 → ("param", 名);其它 → ("none", None)。
+
+        剪枝上下文下**优先用实际命中的那条 return**(`_taken_return`);否则退化为"最后一条
+        return"(既有非剪枝行为)。"""
+        if self._taken_return is not None:
+            return self._classify_return_value(self._taken_return)
         rets: list[ast.Return] = []
         for top in body:
             for n in ast.walk(top):
@@ -863,7 +1924,9 @@ class _Walker:
         if not rets:
             return []
         ret = max(rets, key=lambda r: getattr(r, "lineno", 0))
-        val = ret.value
+        return self._classify_return_value(ret.value)
+
+    def _classify_return_value(self, val) -> list:
         elts = val.elts if isinstance(val, (ast.Tuple, ast.List)) else [val]
         out: list = []
         for e in elts:
@@ -900,7 +1963,48 @@ class _Walker:
                 return False
             if test.id in self.param_defaults:
                 return bool(self.param_defaults[test.id])
+            if test.id in self.scalars:
+                v = self.scalars[test.id]
+                if v is _POSITIVE_DIM:
+                    return True                 # 轴长 >= 1 → 真(公理)
+                return _UNDECIDED if v is _UNKNOWN_SCALAR else bool(v)
             return _UNDECIDED
+        if isinstance(test, ast.Call):
+            return self._eval_predicate_call(test)
+        return _UNDECIDED
+
+    def _eval_predicate_call(self, call: ast.Call):
+        """`hasattr(x, "attr")` / `isinstance(x, Cls)` —— **部署形态**谓词(DTensor 分支)。
+
+        真源到处用它们做「参数是不是 DTensor / 张量有没有 to_local」的分支
+        (`csa.py:467/684`、`compressor.py:208`、`deepseek_v4_hybrid_attention.py:281`、
+        `indexer.py:284`)。这些**不是** config,而是运行时部署形态 → 必须由调用方显式给值
+        (键 `hasattr:<attr>` / `isinstance:<Cls>`),缺键 → `_UNDECIDED` → fail-loud。
+        **绝不默认取某一支**:两支虽常常字节等价,但"常常"不是"总是"。
+        """
+        f = call.func
+        if not isinstance(f, ast.Name) or f.id not in ("hasattr", "isinstance"):
+            return _UNDECIDED
+        if len(call.args) < 2:
+            return _UNDECIDED
+        second = call.args[1]
+        if f.id == "hasattr":
+            key = second.value if isinstance(second, ast.Constant) else None
+            if not isinstance(key, str):
+                return _UNDECIDED
+            k = f"hasattr:{key}"
+        else:
+            cls = None
+            if isinstance(second, ast.Name):
+                cls = second.id
+            elif isinstance(second, ast.Attribute):
+                cls = second.attr
+            if cls is None:
+                return _UNDECIDED
+            k = f"isinstance:{cls}"
+        if k in self.runtime_predicates:
+            return bool(self.runtime_predicates[k])
+        self._pending_predicate = k
         return _UNDECIDED
 
     def _eval_boolop(self, node: ast.BoolOp):
@@ -939,6 +2043,9 @@ class _Walker:
             return res if isinstance(op, ast.Eq) else (not res)
         # 数值序比较 `<x> >/>=/</<= <y>`
         if isinstance(op, (ast.Gt, ast.GtE, ast.Lt, ast.LtE)):
+            pd = self._cmp_positive_dim(op, lk, lv, rk, rv)
+            if pd is not None:
+                return pd
             if not (lk and rk):
                 return _UNDECIDED
             try:
@@ -965,6 +2072,33 @@ class _Walker:
             return inside if isinstance(op, ast.In) else (not inside)
         return _UNDECIDED
 
+    @staticmethod
+    def _cmp_positive_dim(op, lk, lv, rk, rv):
+        """`<轴长> >/>= <字面量>` 的判定(仅当结论对**任何** >=1 的取值都成立时才给结论)。
+
+        实测用途:`if ratio > 1 and n_compressed > 0:`(csa.py:762)—— `n_compressed` 是
+        `int(compressed_kv.shape[0])`,值未知但 >=1 → `> 0` 恒真。反过来 `sq < ratio`
+        (compressor.py:190)对 >=1 的 sq 既可能真也可能假 → 仍 `_UNDECIDED`(不猜)。
+        """
+        def num(k, v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and k
+
+        if lv is _POSITIVE_DIM and num(rk, rv):
+            if isinstance(op, ast.Gt):
+                return True if rv < 1 else None
+            if isinstance(op, ast.GtE):
+                return True if rv <= 1 else None
+            if isinstance(op, (ast.Lt, ast.LtE)):
+                return False if rv <= 1 and isinstance(op, ast.Lt) else None
+            return None
+        if rv is _POSITIVE_DIM and num(lk, lv):
+            if isinstance(op, ast.Lt):
+                return True if lv < 1 else None
+            if isinstance(op, ast.LtE):
+                return True if lv <= 1 else None
+            return None
+        return None
+
     def _value(self, node):
         """把一个表达式求成"已知值":返回 (known: bool, value)。
         value 可为 config 字面量 / None / _PRESENT 哨兵。"""
@@ -978,8 +2112,35 @@ class _Walker:
                 return True, _PRESENT
             if node.id in self.known_none:
                 return True, None
+            if self.scalars.get(node.id) is _POSITIVE_DIM:
+                return True, _POSITIVE_DIM
+            # 已由某个节点产出的名字 = 一个**真张量** → 对 `is not None` 判定必为"存在"。
+            # 这不是猜:它有 producer,说明源里刚刚算出了它。
+            #   `compressed_kv = self.compressor(x) if self.enable_compress else None`
+            #   → `if compressed_kv is not None:`(csa.py:676/746)
+            if node.id in self.producer or node.id in self.ssa:
+                return True, _PRESENT
+            if node.id in self.scalars:
+                v = self.scalars[node.id]
+                return (False, None) if v is _UNKNOWN_SCALAR else (True, v)
             if node.id in self.param_defaults:
                 return True, self.param_defaults[node.id]
+        if isinstance(node, (ast.BinOp, ast.UnaryOp)) and self._classify(node) == _Kind.SCALAR:
+            v = self._scalar_of(node)
+            return (False, None) if v is _UNKNOWN_SCALAR else (True, v)
+        if isinstance(node, ast.Call) and self._classify(node) == _Kind.SCALAR:
+            v = self._scalar_of(node)
+            return (False, None) if v is _UNKNOWN_SCALAR else (True, v)
+        if isinstance(node, ast.Attribute):
+            sattr = _self_attr(node)
+            if sattr is not None:
+                if self._self_kinds.get(sattr) == "param":
+                    return True, _PRESENT       # Parameter 恒存在
+                if sattr in self.binds:
+                    # 已绑成算子的子模块/原语(`self.rotary_pos_emb` 绑成 Constant{rope_freqs},
+                    # deepseek_v4_hybrid_attention.py:80)→ 它**存在**。
+                    # `if self.rotary_pos_emb is not None:`(:256 / compressor.py:220)
+                    return True, _PRESENT
         return False, None
 
     @staticmethod
@@ -1000,6 +2161,23 @@ class _Walker:
                 v = self.config_flags[nm]
                 if isinstance(v, str):
                     return _DTYPE_ALIAS.get(v, v)
+            # `self.cast(y, ori_dtype)`(multi_latent_attention.py:307):dtype 环境里查真 dtype。
+            # 此前 `_dtype_name` 对裸 Name 直接返回该**变量名**("ori_dtype")= 一个假 dtype。
+            if isinstance(a, ast.Name) and a.id in self.dtypes:
+                return self.dtypes[a.id]
+            # `<张量>.dtype`(`ops.cast(invalid_mask, scores.dtype)`,csa.py:502)——
+            # 同理:此前 `_dtype_name` 返回字面串 "dtype",也是个假 dtype。
+            if (isinstance(a, ast.Attribute) and a.attr == "dtype"
+                    and isinstance(a.value, ast.Name)):
+                ref = self.ssa.get(a.value.id)
+                if ref and ref.count(":") == 2:
+                    return ref.split(":")[2]
+                if a.value.id in self.dtypes:
+                    return self.dtypes[a.value.id]
+                if a.value.id in self._param_set:
+                    # construct 形参的 dtype:按 compute_dtype(`ops.cast(output, query.dtype)`,
+                    # csa.py:521)。形参的真 dtype 要靠 infer_shapes 的种子(P2),此处不杜撰别的。
+                    return self.config_flags.get("compute_dtype", "bf16")
             d = _dtype_name(a)
             if d:
                 return d
@@ -1033,8 +2211,30 @@ class _Walker:
                 # 嵌套 Call 实参:必须先于本节点分配 id(保证 id/nodes 列表顺序与真实数据流一致——
                 # 下游 infer_shapes 等按 dag.nodes 顺序做正向传播,依赖 producer 先于 consumer 出现)。
                 a = self._materialize_call_arg(a)
+            elif isinstance(a, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp, ast.Subscript)):
+                # 张量子表达式实参:同样先物化(否则整条子算子链被静默丢,见本方法上方注释)。
+                if self._classify(a) in (_Kind.TENSOR, _Kind.PARAM):
+                    a = self._materialize_expr(a, lineno) or a
+            if isinstance(a, ast.Attribute):
+                # `self.<Parameter>` 操作数(`unfused_compressed_sparse_attn(..., self.attn_sink, ...)`
+                # @ csa.py:824):此前**静默丢出 ins**。现单列 param_operands 使其可见 —— 仍不进
+                # `ins`,因为把权重塞进 ins 会让 `derive_saves` 把它当激活 save 计
+                # (实测 FFNGroupedGEMM「236 MiB」里 88 MiB 就是这个病,评估文档 §7.2)。
+                # 完整的 `is_weight`/`op.params` 建模是 P1#14,不在本轮。
+                sattr = _self_attr(a)
+                if sattr is not None and self._self_kinds.get(sattr) == "param":
+                    self._note_param_operand(sattr, lineno)
+                continue
             if not isinstance(a, ast.Name):
                 continue  # 字面量/属性/未产节点的 opaque 嵌套调用:非可追踪张量操作数,略过
+            if a.id in self.param_aliases:
+                # 权重(Parameter)别名:**不进 ins**(W2/W3 契约),单列 param_operands。
+                self._note_param_operand(self._param_of.get(a.id, a.id), lineno)
+                continue
+            if (a.id not in self.ssa
+                    and (a.id in self.scalars or a.id in self.dtypes
+                         or a.id in self.known_none)):
+                continue  # 已知是标量 / dtype 记号 / None —— **不是激活**,绝不当张量操作数
             if a.id in self.ssa:  # 已知 SSA 中间变量 → 用其当前 ref 并向其 producer 连边
                 ins.append(self.ssa[a.id])
                 prod = self.producer.get(a.id)
@@ -1060,10 +2260,46 @@ class _Walker:
 
         # 元组多目标(a, b = self.f(...)):首目标作主 out;所有目标都登记为本节点产出的 SSA,
         # 以便后续语句消费任意一个都能连回本节点。
+        if out_dtype is None:
+            # 由已解析的 ins 推(dtype 保持类算子:View/Elementwise/Where/IndexSelect/BMM/...)。
+            # dtype 提升序(float > int > bool,与 numpy/mindspore 的提升规则同向)。
+            rank = {"bool": 0, "uint8": 1, "int8": 1, "int16": 2, "int32": 3, "int64": 4,
+                    "fp16": 5, "bf16": 5, "fp32": 6, "fp64": 7}
+            best, best_r = None, -1
+            for ref in ins:
+                if ref.count(":") != 2:
+                    continue
+                dt = ref.split(":")[2]
+                if rank.get(dt, 1) > best_r:
+                    best, best_r = dt, rank.get(dt, 1)
+            out_dtype = best or self.config_flags.get("compute_dtype", "bf16")
         out_ref = f"{target_names[0]}:?:{out_dtype}" if target_names else ""
+        attrs = dict(attrs)
+        if len(target_names) > 1:
+            # 多输出算子(`topk_scores, topk_indices = self.topk(...)`):`out` 只放首目标,
+            # 其余目标此前完全不可见 —— 而 topk 的**反向恰恰要存第 2 个输出(indices)**。
+            attrs["outs"] = [f"{t}:?:{'int32' if op == 'TopK' and i else out_dtype}"
+                             for i, t in enumerate(target_names)]
+        # ── 块级 / 逐点 detach(P0#4 + P1#11)────────────────────────────────────────
+        # `with _no_grad():` 块内产物 与 `ops.stop_gradient(...)` 的产物:**保边、打标**。
+        # 打标而不是"不发节点":下游消费方要能看见"这张张量的上游被切断了"(grad 可达性),
+        # 而不是看见一个凭空出现的、看起来梯度可达的张量。
+        detached = bool(self._nograd_depth) or op == "Detach"
+        if detached:
+            attrs["detached"] = True
+            if self._nograd_depth:
+                attrs["no_grad_region"] = True
+            for t in target_names:
+                if t not in self.detached:
+                    self.detached.append(t)
+        if self.param_operands and op != "Detach":
+            pnames = [r["param"] for r in self.param_operands
+                      if r["src"] == f"{self.src_file}:{lineno}"]
+            if pnames:
+                attrs["param_operands"] = pnames
         node = OpNode(
             id=node_id, op=op, src=f"{self.src_file}:{lineno}",
-            module=attrs.get("module", ""), ins=ins, out=out_ref, attrs=dict(attrs),
+            module=attrs.get("module", ""), ins=ins, out=out_ref, attrs=attrs,
         )
         self.nodes.append(node)
         for t in target_names:
@@ -1084,6 +2320,7 @@ def walk_construct(
     subcell_resolver=None,
     method_aliases: dict | None = None,
     strict: bool = False,
+    **kw,
 ) -> OpDAG:
     """走查 `cls_name` 的 construct(),把每个 self.<name>(...) 调用落成 OpNode,返回 op-DAG。
 
@@ -1120,7 +2357,7 @@ def walk_construct(
         config_flags=config_flags, none_vars=none_vars,
         param_defaults=param_defaults, present_vars=present_vars,
         subcell_resolver=subcell_resolver, method_aliases=method_aliases,
-        strict=strict,
+        strict=strict, **kw,
     )[0]
 
 
@@ -1136,6 +2373,7 @@ def walk_construct_meta(
     subcell_resolver=None,
     method_aliases: dict | None = None,
     strict: bool = False,
+    **kw,
 ):
     """同 walk_construct,但额外返回 (OpDAG, construct 形参名列表, 返回值分类)——供上层递归内联子 Cell。"""
     return _run_walker(
@@ -1143,7 +2381,7 @@ def walk_construct_meta(
         config_flags=config_flags, none_vars=none_vars,
         param_defaults=param_defaults, present_vars=present_vars,
         subcell_resolver=subcell_resolver, method_aliases=method_aliases,
-        strict=strict,
+        strict=strict, **kw,
     )
 
 
@@ -1166,6 +2404,10 @@ def _run_walker(
     src, cls_name, binds, src_file, *,
     config_flags=None, none_vars=None, param_defaults=None,
     present_vars=None, subcell_resolver=None, method_aliases=None, strict=False,
+    class_index=None, cls_rel=None, module_funcs=None, runtime_predicates=None,
+    fn_classes=None, self_kinds=None, param_literals=None, alias_unknown=None,
+    host_call_allow=(), kernel_call_allow=(), input_axes=None, module_consts=None,
+    entry_method="construct",
 ):
     tree = ast.parse(src)
     if next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls_name), None) is None:
@@ -1175,10 +2417,17 @@ def _run_walker(
         binds, src_file, config_flags, none_vars, param_defaults, present_vars,
         tree=tree, cls_name=cls_name, subcell_resolver=subcell_resolver,
         method_aliases=method_aliases, strict=strict,
+        class_index=class_index, cls_rel=cls_rel, module_funcs=module_funcs,
+        runtime_predicates=runtime_predicates, fn_classes=fn_classes,
+        self_kinds=self_kinds, param_literals=param_literals,
+        alias_unknown=alias_unknown, host_call_allow=host_call_allow,
+        kernel_call_allow=kernel_call_allow, input_axes=input_axes,
+        module_consts=module_consts,
     )
-    construct = walker._lookup_method("construct")  # 支持 construct 定义在基类
+    construct, _crel = walker._lookup_method(entry_method)  # 支持定义在基类(含跨文件)
     if construct is None:
-        raise ValueError(f"class {cls_name}(及其基类)缺少 construct 方法(fail-loud)")
+        raise ValueError(
+            f"class {cls_name}(及其基类)缺少 {entry_method} 方法(fail-loud)")
 
     walker.construct_params = [a.arg for a in construct.args.args if a.arg != "self"]
     walker._param_set = set(walker.construct_params)
@@ -1186,7 +2435,9 @@ def _run_walker(
     walker.returns = walker._resolve_returns(construct.body)
     dag = OpDAG(cell=cls_name, nodes=walker.nodes, edges=walker.edges,
                 scalar_binds=walker.scalar_binds, opaque_calls=walker.opaque_calls,
-                diagnostics=walker.diagnostics)
+                diagnostics=walker.diagnostics,
+                detached=list(walker.detached), deletes=list(walker.deletes),
+                param_operands=list(walker.param_operands))
 
     # ── 0 节点硬门(Task 2 / P0#1;**恒开**,与 strict 无关)────────────────────────────────
     # 实测反例:`CSAIndexer` fused 支整块在 `with _no_grad():`(indexer.py:214)里 → 整块丢 →

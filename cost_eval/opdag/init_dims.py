@@ -38,6 +38,15 @@ class InitDims:
     linear_dims: dict = field(default_factory=dict)
     # self.<attr> -> 符号 token 串(dim,供 reshape/split 表达式解析)
     dims_ctx: dict = field(default_factory=dict)
+    # self.<attr> -> "param" / "scalar" / "module"(P0#5 判据,2026-07-25)。
+    #   param  —— `self.attn_sink = Parameter(...)`(csa.py:589)、`self.ape = Parameter(...)`
+    #             (compressor.py:117)、`self.linear_o_group_proj`/`self.q_rms_gamma`
+    #             (deepseek_v4_hybrid_attention.py:139/159)→ **权重,不是激活**;
+    #   scalar —— `self.softmax_scale = softmax_scale or config.v_head_dim ** -0.5`(csa.py:568)
+    #             这类由 config/算术求出的 host 值 → 参与 `if`/BinOp 时按标量处理;
+    #   module —— `build_module(...)` / 类实例化 → 是算子,不是值。
+    # 这让 walker 判「`self.X` 是张量还是标量」有**源侧判据**,而不是靠猜。
+    self_kinds: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -45,6 +54,7 @@ class _Cell:
     dim: Factors | None = None          # 维度(可乘除加)
     val_known: bool = False             # 是否求得具体值(用于条件判定)
     val: object = None                  # 具体值(int/bool/None/str)
+    kind: str = "scalar"                # "param" / "scalar" / "module"(见 InitDims.self_kinds)
 
 
 def _find_class(tree, name):
@@ -240,10 +250,24 @@ class _Eval:
         vk, vv = self.eval_val(value, local)
         return _Cell(dim=dim, val_known=vk, val=vv)
 
+    @staticmethod
+    def _ctor_name(value):
+        """`Parameter(...)` / `mint.zeros(...)` 这类调用的"构造名"(取 func 末段)。"""
+        if not isinstance(value, ast.Call):
+            return None
+        f = value.func
+        if isinstance(f, ast.Name):
+            return f.id
+        if isinstance(f, ast.Attribute):
+            return f.attr
+        return None
+
     def _do_assign(self, tgt, value, local):
         # build_module(...) 赋值:捕捉 (in,out) 维度,不把该 self 名当标量
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "build_module":
             name = self._self_attr(tgt)
+            if name is not None:
+                self.self_env[name] = _Cell(kind="module")
             if name is not None and len(value.args) >= 3:
                 in_f = self.eval_dim(value.args[1], local)
                 out_f = self.eval_dim(value.args[2], local)
@@ -253,6 +277,11 @@ class _Eval:
                 )
             return
         cell = self._cell_for(value, local)
+        ctor = self._ctor_name(value)
+        if ctor == "Parameter":
+            cell.kind = "param"          # `self.attn_sink = Parameter(mint.zeros(...))`
+        elif isinstance(value, ast.Call) and ctor and ctor[:1].isupper():
+            cell.kind = "module"         # 类实例化(Cell / 原语类)
         sattr = self._self_attr(tgt)
         if sattr is not None:
             self.self_env[sattr] = cell
@@ -296,13 +325,23 @@ def _param_defaults(init_fn: ast.FunctionDef) -> dict:
     return out
 
 
-def eval_init_dims(tree: ast.AST, cls_name: str, config_flags: dict) -> InitDims:
-    """求值 cls_name 的 __init__(沿 MRO base→derived),返回 linear_dims + dims_ctx。"""
+def eval_init_dims(tree: ast.AST, cls_name: str, config_flags: dict,
+                   mro_units: list | None = None) -> InitDims:
+    """求值 cls_name 的 __init__(沿 MRO base→derived),返回 linear_dims + dims_ctx + self_kinds。
+
+    `mro_units`(可选,P0#3):`[(tree, 类名), ...]`,**derived→base** 顺序,用于**跨文件** MRO
+    (`DSv4HybridSelfAttention` 的基类 `MultiLatentAttention` 在另一个文件里,单 tree 找不到)。
+    不给时退化为在 `tree` 内做同文件 BFS(既有调用逐字不变)。
+    """
     ev = _Eval(config_flags)
-    classes = _init_classes(tree, cls_name)     # derived→base
-    for cname in reversed(classes):             # base 先,derived 覆盖
-        cls = _find_class(tree, cname)
-        init_fn = _init_of(cls)
+    if mro_units is None:
+        classes = _init_classes(tree, cls_name)     # derived→base
+        units = [(tree, c) for c in classes]
+    else:
+        units = list(mro_units)
+    for utree, cname in reversed(units):        # base 先,derived 覆盖
+        cls = _find_class(utree, cname)
+        init_fn = _init_of(cls) if cls is not None else None
         if init_fn is None:
             continue
         local: dict[str, _Cell] = {}
@@ -312,4 +351,5 @@ def eval_init_dims(tree: ast.AST, cls_name: str, config_flags: dict) -> InitDims
         ev.exec_body(init_fn.body, local)
     dims_ctx = {k: render_term(c.dim) for k, c in ev.self_env.items()
                 if c.dim is not None and _all_known_dim(c.dim)}
-    return InitDims(linear_dims=ev.linear_dims, dims_ctx=dims_ctx)
+    self_kinds = {k: c.kind for k, c in ev.self_env.items()}
+    return InitDims(linear_dims=ev.linear_dims, dims_ctx=dims_ctx, self_kinds=self_kinds)
