@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import math
+import re
 
 from .bprop_rules import derive_saves
-from .sym_shape import parse_shape, _split_top
+from .sym_shape import (parse_shape, parse_axis, render_term, strip_numel_only,
+                        _split_top)
 
 
 # 符号 token → DimTable 属性名。token 集来自 sym_shape.CONFIG2SYM（提取器/推断产出的符号）。
@@ -31,6 +33,18 @@ _SYM2FIELD = {
     # MLA：DAG 里 qk_head_dim=nope 段、qk_pos_emb_head_dim=rope 段。
     "qk_head_dim": "qk_nope_head_dim",
     "qk_pos_emb_head_dim": "qk_rope_head_dim",
+    # ── DSv4-Flash（pynative dsa_indexer + compressor + CSA），2026-07-25 ─────────────
+    # 与 `sym_shape.CONFIG2SYM` 的新增项一一对应（那张表决定符号能否留进 `dims_ctx`，
+    # 本表决定符号能否取到值；**缺任一张都会让该张量落 unresolved**，见评估文档 §4.1 第 2 条）。
+    # DimTable 字段名见 `cost_eval/model_spec.py:31-32`。
+    "index_n_heads": "dsa_indexer_n_heads",
+    "index_head_dim": "dsa_indexer_head_dim",
+    "index_topk": "dsa_indexer_topk",
+    "csa_window_size": "csa_window_size",
+    "o_groups": "o_groups",
+    "o_lora_rank": "o_lora_rank",
+    # mHC 残差流倍数：`DimTable.num_residual_streams`（model_spec.py:64）。
+    "hc_mult": "num_residual_streams",
 }
 
 # dtype 串 → 字节。未知回退 dims.dtype_bytes（compute dtype）。
@@ -38,6 +52,10 @@ _DTYPE_BYTES = {
     "fp32": 4, "float32": 4,
     "bf16": 2, "bfloat16": 2, "fp16": 2, "float16": 2,
     "fp8": 1, "int8": 1, "uint8": 1,
+    # bool：比较 / 逻辑 / isfinite 的产出（`csa.py:779` 的 O(S·S/r) mask、`:810` 的 O(S·topk)
+    # mask）。MindSpore bool_ 张量 1 字节/元素。缺此项时会退回 compute dtype（bf16）= **2×**。
+    "bool": 1, "bool_": 1,
+    "int32": 4, "uint32": 4, "int64": 8, "uint64": 8, "fp64": 8, "float64": 8,
 }
 
 
@@ -57,12 +75,22 @@ def _cap_value(dims):
 
 
 def _sym_value(sym, dims):
-    """一个原子 token → 整数值。token 可能是和式 'a+b'（concat 出来的）。未知/0 → None。"""
+    """一个原子 token → 整数值。token 可能是和式 'a+b'（concat 出来的）或整除式 'S//4'
+    （`sym_shape.floordiv` 第 3 档，压缩序列长度）。未知/0 → None。"""
     sym = sym.strip()
     parts = [p.strip() for p in _split_top(sym, "+")]
     if len(parts) > 1:                       # 和式单元：逐项求和
         vals = [_sym_value(p, dims) for p in parts]
         return sum(vals) if all(v is not None for v in vals) else None
+    if "//" in sym:                          # 整除式单元：`<term>//<n>`（右结合地剥最外层）
+        base, _, denom = sym.rpartition("//")
+        if not denom.strip().lstrip("-").isdigit():
+            return None
+        n = int(denom.strip())
+        if n == 0:
+            return None
+        b = _axis_value(parse_axis(base), dims) if base.strip() else None
+        return None if b is None else b // n
     if sym == "cap":
         return _cap_value(dims)
     field = _SYM2FIELD.get(sym)
@@ -89,10 +117,15 @@ axis_value = _axis_value
 
 
 def resolve_shape_elems(sym_shape, dims):
-    """符号 shape 串 → 元素总数（各轴之积）。空/`?`/任一轴未解析 → None（不杜撰）。"""
+    """符号 shape 串 → 元素总数（各轴之积）。空/`?`/任一轴未解析 → None（不杜撰）。
+
+    `~` 前缀（`sym_shape.NUMEL_ONLY`）= 只知元素数、不知轴结构 —— 元素数**仍精确**，故照常求值
+    （轴结构只有 shape 推断的下游算子在意，字节记账不在意）。
+    """
     if sym_shape is None:
         return None
-    s = sym_shape.strip()
+    s, _numel_only = strip_numel_only(sym_shape.strip())
+    s = s.strip()
     if s == "" or s == "?":
         return None
     axes = parse_shape(s)
@@ -103,6 +136,87 @@ def resolve_shape_elems(sym_shape, dims):
         v = _axis_value(f, dims)
         if v is None:
             return None
+        total *= v
+    return total
+
+
+# ---------------------------------------------------------------------------
+# 并行度本地化（TP/EP/CP/cp_kv）—— 语义**逐条对齐** `shape_eval.resolve_tensor`
+# ---------------------------------------------------------------------------
+#: 轴串里"引用序列符号 S"的判据。`shape_eval._refs_symbol` 走 AST Name 判定（`"S//4"` 命中、
+#: `"kv_lora_rank"` 不误伤）；符号侧没有 AST，故按**标识符 token 精确等于 `S`** 判，等价。
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def _axis_refs_S(f) -> bool:
+    """一个轴（Factors）是否引用序列符号 S（含 `S//4`、`csa_window_size+S//4` 这类原子）。"""
+    for unit in f.syms:
+        if "S" in _IDENT.findall(unit):
+            return True
+    return False
+
+
+def _shard_axis_index(axes, key):
+    """`shard` 的键 → 轴下标。键可是轴下标（int），或**轴项串 / 该轴里的一个符号单元**（str）。
+
+    与 `TensorRef.shard`（`{dim_index -> axis}`，model_spec.py:100）同语义，但符号侧的轴常是
+    乘积（`n_heads·v_head_dim`），按符号名指定更贴源（"TP 切 head 维"）。找不到 → None。
+    """
+    if isinstance(key, int) and not isinstance(key, bool):
+        return key if 0 <= key < len(axes) else None
+    for i, f in enumerate(axes):
+        if render_term(f) == key or key in f.syms:
+            return i
+    return None
+
+
+def local_shape_elems(sym_shape, dims, pm, *, shard=None, is_weight=False,
+                      cp_shard=True, cp_kv=False):
+    """符号 shape 串 → **本地**元素数（TP/EP shard 与 CP 序列切分已除过）。
+
+    这是契约 **B4**（"字节是 local 量"）在抽取侧的落地。语义参照现役手写路径
+    `shape_eval.resolve_tensor`（shape_eval.py:81-120），逐条对齐：
+
+      * `shard`：`{轴键: 'tp'|'ep'|'cp'|'sp'}` → 该轴 ÷`pm.degree(axis)`；
+        **不整除即 `ValueError`**（shape_eval.py:86-88 同款 fail-loud，不许悄悄取整）；
+      * CP：非权重、`cp_shard=True`、且不是 colossal 下的 `cp_kv` → **只切首个引用 S 的轴**
+        （shape_eval.py:103-114 的 `break`：切 query/token 维，key/context 维保持全量）；
+      * 任一轴解不出 → None（调用方据此进 `unresolved`，**绝不**拿 1 或 0 顶）。
+    """
+    if sym_shape is None:
+        return None
+    s, _numel_only = strip_numel_only(sym_shape.strip())
+    s = s.strip()
+    if s in ("", "?"):
+        return None
+    axes = parse_shape(s)
+    if not axes:
+        return None
+    sizes = []
+    for f in axes:
+        v = _axis_value(f, dims)
+        if v is None:
+            return None
+        sizes.append(v)
+    for key, axis in (shard or {}).items():
+        i = _shard_axis_index(axes, key)
+        if i is None:
+            raise ValueError(f"local_shape_elems: shard 键 {key!r} 在 shape {s!r} 里找不到对应轴")
+        deg = pm.degree(axis)
+        if sizes[i] % deg != 0:
+            raise ValueError(f"{s} 轴 {key!r}={sizes[i]} 不被 {axis}={deg} 整除")
+        sizes[i] //= deg
+    cp = pm.degree("cp")
+    method = getattr(getattr(pm, "pc", None), "context_parallel_method", "colossal")
+    if cp > 1 and not is_weight and cp_shard and not (method == "colossal" and cp_kv):
+        for i, f in enumerate(axes):
+            if _axis_refs_S(f):
+                if sizes[i] % cp != 0:
+                    raise ValueError(f"{s} 序列轴 dim{i}={sizes[i]} 不被 cp={cp} 整除")
+                sizes[i] //= cp
+                break
+    total = 1
+    for v in sizes:
         total *= v
     return total
 

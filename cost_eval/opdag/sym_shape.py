@@ -4,12 +4,20 @@
 一个 shape = 一列**轴**,以 `·` 连接成串(如 "S·B·H");乘积轴用 `(...)` 包裹以消歧
 (如 "S·B·(n_heads·qk_head_dim)" 是 3 轴,末轴为一个乘积)。每个轴 = 一个 `Factors`:
   * `coeff` —— 整数系数(如 `2·ffn_hidden` 的 2);
-  * `syms`  —— 原子因子多重集(dict: 单元→重数)。单元是**纯符号**(H/n_heads)或**和式**
-    (如 "qk_head_dim+v_head_dim",内部不再分解,规范化=按 `+` 项排序)。
+  * `syms`  —— 原子因子多重集(dict: 单元→重数)。单元是**纯符号**(H/n_heads)、**和式**
+    (如 "qk_head_dim+v_head_dim")或**整除式**(如 "S//4"),内部不再分解;
+    规范化 = 和式按 `+` 项排序、整除式保持源写法。
 
-为什么"和式保持原子":reshape 的 -1 需按乘积因子**消元**(整除),把和式当单个不可分因子,
-消元就退化成多重集差 + 系数整除——干净且忠实。任何**不能干净消元/整除**的 → 返回 None
+为什么"和式/整除式保持原子":reshape 的 -1 需按乘积因子**消元**(整除),把它们当单个不可分
+因子,消元就退化成多重集差 + 系数整除——干净且忠实。任何**不能干净消元/整除**的 → 返回 None
 (交调用方保留 `?`,决不杜撰维度)。
+
+整除原子(`//`)的动机(2026-07-25,dsv4 压缩链):`compressor.py:196` `cutoff = (sq // ratio)
+* ratio`、`:201` `n_compressed = cutoff // ratio`、`csa.py:762` 的压缩 KV 序列长度都是
+`S // compress_ratio`。`floordiv` 此前只在**系数整除**时可解(`2·ffn_hidden // 2`),
+`S // 4` 直接返回 None → 整条压缩链 shape 全 `?`。现在系数不整除时改为形成原子单元
+`"<term>//<n>"`,由 `consumer._sym_value` 按 DimTable 值做**整数除法**求值。
+注意这是"表达式保形",**不是**编造尺寸:`S//4` 的值仍完全由 DimTable 的 S 决定。
 """
 from __future__ import annotations
 
@@ -18,6 +26,31 @@ from dataclasses import dataclass, field
 
 # reshape 目标里的 -1(待消元)哨兵。
 NEG1 = object()
+
+#: **只知元素数、不知轴结构**的 shape 串前缀(2026-07-25)。
+#:
+#: 为什么需要这一档:某些原语的轴信息在 DAG 里**没有被记下来**(walker attrs 缺 `dim`/轴序)——
+#: 如 `mint.cat(..., dim=-1)`(`compressor.py:243`)只记了 `view="concat"`,没记轴。这种情况下:
+#:   * 元素数**仍然精确可知**(concat 的 numel = 各输入 numel 之和,与轴无关);
+#:   * 轴结构**不可知** → 任何"猜一个轴"的做法都可能算错(实测:`cat([kv_nope, kv_pe], -1)`
+#:     的两个输入末轴不同,按轴 0 合并会给出错的 numel)。
+#: 契约(`liveness/contract.py` B1)只要 `local_numel > 0`,故"只知 numel"是**可用**的;
+#: 但下游需要轴结构的算子(MatMul 换末轴 / split / expand_dims / tile)遇到它必须**拒绝**
+#: (记 unresolved),不许拿着一个假轴序往下算。串形如 `"~S·B·H"` —— `~` 让它在任何 dump /
+#: 报表里**一眼可见**,不会被误当成普通 shape。
+NUMEL_ONLY = "~"
+
+
+def mark_numel_only(shape: str) -> str:
+    """把一个 shape 串标记为"只知元素数"(幂等)。"""
+    return shape if shape.startswith(NUMEL_ONLY) else NUMEL_ONLY + shape
+
+
+def strip_numel_only(shape: str):
+    """→ `(裸 shape 串, 是否只知元素数)`。"""
+    if isinstance(shape, str) and shape.startswith(NUMEL_ONLY):
+        return shape[len(NUMEL_ONLY):], True
+    return shape, False
 
 
 # config 属性名 → 规范符号维度 token(供 __init__ 维度捕获 + reshape/split 表达式解析共用)。
@@ -34,6 +67,29 @@ CONFIG2SYM = {
     "qk_head_dim": "qk_head_dim",
     "qk_pos_emb_head_dim": "qk_pos_emb_head_dim",
     "v_head_dim": "v_head_dim",
+    # ── DSv4-Flash(pynative dsa_indexer + compressor + CSA)的维度符号 ────────────────
+    # ⚠ 本表的**键是 config 属性名**(`config.<键>`),值是规范符号 token。dsv4 侧二者不同名
+    # (config 里叫 `dsa_indexer_n_heads`、源码里的 self 名叫 `index_n_heads`),必须按属性名收。
+    # 每条都实测出现在**维度上下文**里(reshape/split 表达式或 build_module 的 output_size):
+    #   dsa_indexer_n_heads / dsa_indexer_head_dim —— `indexer.py:94-95`
+    #     `self.index_n_heads = config.dsa_indexer_n_heads`;`:118-119`
+    #     `output_size=self.index_n_heads * self.index_head_dim`;
+    #   dsa_indexer_topk —— `indexer.py:96` / `:262` `self.topk(index_scores, self.index_topk, ...)`
+    #     的 topk 轴(csa.py:474/501 的 O(S·topk) mask/gather 都按它);
+    #   csa_window_size —— `csa.py:571-573` `self.window_size = config.csa_window_size`
+    #     (滑窗上下文位置维;与 `S//ratio` 相加成 TOPK_DIM);
+    #   o_groups / o_lora_rank —— `deepseek_v4_hybrid_attention.py:136-137/146`
+    #     `input_size=o_groups * o_lora_rank`;`:274-276` `o_chunk = ... // o_groups`;
+    #   hc_mult —— mHC 的残差流倍数(消费侧 `DimTable.num_residual_streams`)。
+    # 不在本表 = 在 dims_ctx 里会被 `init_dims._KNOWN_DIM_SYMS` 滤掉 →
+    # shape 推断解不出 `self.<attr>` → 该张量保 `?`(而非拿个数糊上去)。
+    "dsa_indexer_n_heads": "index_n_heads",
+    "dsa_indexer_head_dim": "index_head_dim",
+    "dsa_indexer_topk": "index_topk",
+    "csa_window_size": "csa_window_size",
+    "o_groups": "o_groups",
+    "o_lora_rank": "o_lora_rank",
+    "hc_mult": "hc_mult",
 }
 
 
@@ -87,6 +143,11 @@ def _strip_outer_parens(s: str) -> str:
     return s
 
 
+def _is_atom_expr(unit: str) -> bool:
+    """该单元是否是**表达式原子**(和式或整除式)—— 出现在乘积里时要加括号以免读歧义。"""
+    return bool(_split_top(unit, "+")[1:]) or "//" in unit
+
+
 def _canon_sum(unit: str) -> str:
     """和式单元规范化:按 `+` 顶层项排序后重连(使相等和式串相等)。"""
     terms = [t.strip() for t in _split_top(unit, "+")]
@@ -124,7 +185,7 @@ def parse_shape(s: str) -> list[Factors]:
 
 # ── 渲染 ──────────────────────────────────────────────────────────────────────
 def _render_unit(unit: str) -> str:
-    return f"({unit})" if _split_top(unit, "+")[1:] else unit
+    return f"({unit})" if _is_atom_expr(unit) else unit
 
 
 def render_term(f: Factors) -> str:
@@ -192,10 +253,24 @@ def divide(total: Factors, denom: Factors) -> Factors | None:
 
 
 def floordiv(a: Factors, n: int) -> Factors | None:
-    """轴整除标量 n:仅当系数整除(如 2·ffn_hidden // 2 = ffn_hidden);否则 None。"""
-    if n == 0 or a.coeff % n != 0:
+    """轴整除标量 n。三档(**都不杜撰**,值仍完全由 DimTable 决定):
+
+      1. 系数整除 → 直接约掉(`2·ffn_hidden // 2 = ffn_hidden`)——既有行为逐字不变;
+      2. 纯整数轴 → 直接整数除(`8 // 4 = 2`);
+      3. 否则 → 形成**整除原子** `"<term>//<n>"`(`S // 4` → `S//4`),由
+         `consumer._sym_value` 按 DimTable 值做整数除法。
+         动机:`compressor.py:196/201`、`csa.py:762` 的压缩序列长度 = `S // compress_ratio`;
+         第 3 档缺失时整条压缩链 shape 全 `?`(见模块 docstring)。
+
+    `n == 0` → None(不定义)。
+    """
+    if n == 0:
         return None
-    return Factors(a.coeff // n, dict(a.syms))
+    if a.coeff % n == 0:
+        return Factors(a.coeff // n, dict(a.syms))
+    if not a.syms:                                   # 纯整数轴:精确整数除
+        return Factors(a.coeff // n)
+    return Factors(1, {f"{render_term(a)}//{n}": 1})
 
 
 def add(a: Factors, b: Factors) -> Factors:
