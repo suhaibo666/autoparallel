@@ -124,7 +124,19 @@ def test_ffn_saveset_includes_previously_missing_grouped_gemm_operands(ffn_dag):
     assert "dispatched_input" in prefixes        # ★ 先前缺失:permute 后的 token 激活(18% 根因)
     assert "intermediate_parallel" in prefixes   # swiglu 输出(喂 fc2)
     assert "fc1_output" in prefixes              # swiglu 输入(Activation pin)
-    assert "w1" in names and "w2" in names       # 专家权重(GroupedMatMul 操作数)
+    # ── 2026-07-25 期望迁移(W2/W3/W4;台账见 `docs/opdag_component_coverage_2026-07-25.md`)──
+    # 原断言 `"w1" in names and "w2" in names` 钉的是一个**病症**:专家权重被当激活 save 计。
+    # 评估文档 §7.2 已实测其字节代价 —— FFNGroupedGEMM「236 MiB」里 `w1`(58.7MB)+`w2`(29.4MB)
+    # = **88 MiB 是权重**。契约 W2/W3/W4 要求权重永不进 `saves`。
+    # 不变量(「GroupedMatMul 的**激活**操作数必须被 pin」)逐字保留在上面三条;
+    # 这里反过来钉住权重**不**在 saves 里,同时确认它们仍**在 `ins` 里可见**
+    # (`shape_infer._grouped_matmul` 要靠权重末轴推输出维,`w1`/`w2` 不能从 ins 消失)。
+    assert "w1" not in names and "w2" not in names
+    fc1, fc2 = [n for n in ffn_dag.nodes if n.op == "GroupedMatMul"]
+    assert "w1" in [i.split(":")[0] for i in fc1.ins]
+    assert "w2" in [i.split(":")[0] for i in fc2.ins]
+    # 权重派生的 ins 下标由 walker 显式标出(不是"恰好没被选中")
+    assert fc1.attrs["weight_ins_idx"] == [1] and fc2.attrs["weight_ins_idx"] == [1]
 
 
 def test_ffn_saveset_permuted_tokens_pinned_by_grouped_matmul(ffn_dag):

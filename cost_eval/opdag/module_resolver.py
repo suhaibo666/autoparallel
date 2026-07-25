@@ -24,13 +24,27 @@ import os
 from dataclasses import dataclass, field
 from typing import Union
 
+from .module_index import ClassIndex
+
 
 # ── 对外数据结构 ──────────────────────────────────────────────────────────────
 @dataclass
 class ResolvedSpec:
-    """一个被实例化的 Cell:cell=类名;submodules[field] = 叶子类名(str)或嵌套 ResolvedSpec。"""
+    """一个被实例化的 Cell:cell=类名;submodules[field] = 叶子类名(str)或嵌套 ResolvedSpec。
+
+    `origin_rel`(2026-07-25 新增,可选):**定义该 Cell 类的文件**相对 mf_root 的路径,
+    由 Pass A 顺 spec 文件自己的 `import` 解出。存在的理由是一条实测的**静默解错**:
+    mindformers 有三棵并行的树,`class MoELayer` 在 `pynative/transformers/moe/moe_layer.py`、
+    `parallel_core/training_graph/transformer/moe/moe_layer.py`、
+    `parallel_core/inference/transformer/moe/moe_layer.py` 各有一份。`extractor._find_cell_file`
+    按 `os.walk` **首个命中**定位,实测把 pynative 的 `MoELayer` 解成了 `inference` 那份
+    (于是报「`self.router` 的 build_module 首参不是 submodules.<字段>」—— 那是另一棵树的写法)。
+    spec 文件的 import 是**唯一权威**的答案:`pynative/base_models/gpt/moe_module_specs.py:20`
+    写着 `from mindformers.pynative.transformers.moe.moe_layer import MoELayer`。
+    """
     cell: str
     submodules: dict = field(default_factory=dict)  # dict[str, Union["ResolvedSpec", str]]
+    origin_rel: str | None = None
 
 
 # 叶子类名 → 规范 op 类型(供后续 Pass 用;复合 Cell 不在此表——它们被递归展开)。
@@ -96,6 +110,7 @@ class _Return:
 class _Interp:
     def __init__(self, mf_root: str, spec_files=None):
         self.mf_root = mf_root
+        self._index: ClassIndex | None = None    # 懒建:只在需要解 submodules dataclass 时用
         # name -> (FunctionDef, src_file_relpath)
         self.funcs: dict[str, tuple[ast.FunctionDef, str]] = {}
         for rel in (spec_files or _SPEC_FILES):
@@ -241,11 +256,37 @@ class _Interp:
                 raise ValueError(
                     f"{rel}:{call.lineno} ModuleSpec.submodules 不是 Submodules(...) 调用(fail-loud)"
                 )
+            # ── **未显式填的字段用它在 dataclass 里声明的缺省值**(2026-07-25)────────────
+            # 这不是"补一个默认"——真机上 `TransformerLayerSubmodules()` 的 6 个字段缺省全是
+            # `IdentityOp`(`pynative/transformers/transformer_layer.py:68-75`),而 dsv4_hybrid
+            # 的 spec 只填 4 个槽(`pynative/base_models/gpt/gpt_layer_specs.py:105-113`),
+            # 另两个槽在真机上**确实被实例化**为 `IdentityOp`
+            # (`build_module(IdentityOp, ...)` → `IdentityOp(...)`,`spec_utils.py:76-77,97`)。
+            # 此前 Pass A 只收显式填的字段 → `extractor._bind_build_module` 在
+            # `self.pre_cross_attn_layernorm` 处 fail-loud → **整个 mHC 层零覆盖**
+            # (评估文档 §3.3)。缺省是 `None` 的字段**不收**(见 `_declared_defaults` 的理由)。
+            sub_cls = sub_node.func.id if isinstance(sub_node.func, ast.Name) else None
+            if sub_cls:
+                submods.update(self._declared_defaults(sub_cls, rel))
             for k in sub_node.keywords:
                 if k.arg is None:
                     raise ValueError(f"{rel}:{sub_node.lineno} submodules 含 **kwargs(fail-loud)")
                 submods[k.arg] = self._resolve_field(k.value, env, rel)
-        return ResolvedSpec(cell=cell, submodules=submods)
+        return ResolvedSpec(cell=cell, submodules=submods,
+                            origin_rel=self._origin_rel(cell, rel))
+
+    def _origin_rel(self, cell: str, rel: str) -> str | None:
+        """`cell` 类的定义文件(顺 `rel` 这个 spec 文件的 import 解);解不到 → None。"""
+        if self._index is None:
+            self._index = ClassIndex(self.mf_root)
+        rc = self._index.resolve(cell, rel)
+        return rc.rel if rc is not None else None
+
+    # --- submodules dataclass 的**声明缺省值** ---
+    def _declared_defaults(self, sub_cls: str, from_rel: str) -> dict:
+        if self._index is None:
+            self._index = ClassIndex(self.mf_root)
+        return _declared_defaults(self._index, sub_cls, from_rel)
 
     def _resolve_field(self, node, env: dict, rel: str) -> Union[ResolvedSpec, str]:
         val = self._eval(node, env, rel)
@@ -334,6 +375,46 @@ class _Interp:
         return "raise"
 
 
+# ── submodules dataclass 的声明缺省值(2026-07-25)──────────────────────────────────
+def _declared_defaults(index: ClassIndex, sub_cls: str, from_rel: str) -> dict:
+    """`<XSubmodules>` dataclass 的字段声明缺省 → `{field: 叶子类名}`。
+
+    **只收能确定成"一个类"的缺省**:
+      * `field: T = IdentityOp` → `{"field": "Identity"}`(经 `_NAME_ALIAS` 归一);
+      * `field: T = None` → **不收**。理由是源侧事实,不是保守:`build_module(None, ...)`
+        在真机上会走到 `import_module(None.module)` 而抛 AttributeError
+        (`parallel_core/utils/spec_utils.py:76-82`)—— 所以「缺省 None」的语义是
+        「这条代码路径不会对它调 build_module」。把它填成 Identity 会造出一个真机
+        **不存在**的节点(`MLASelfAttentionSubmodules` 的 7 个字段缺省全是 None,
+        `parallel_core/training_graph/transformer/multi_latent_attention.py:56-62`);
+      * 其它缺省形态(`field(default_factory=...)` / 调用 / 下标 …)→ **不收**,
+        让 `extractor._bind_build_module` 保持 fail-loud(绝不猜一个类出来)。
+
+    解析不到该 dataclass(如它定义在快照外)→ 返回 `{}`,同样退回 fail-loud。
+    """
+    rc = index.resolve(sub_cls, from_rel)
+    if rc is None:
+        return {}
+    out: dict = {}
+    for stmt in rc.node.body:
+        if not isinstance(stmt, ast.AnnAssign) or stmt.value is None:
+            continue
+        if not isinstance(stmt.target, ast.Name):
+            continue
+        v = stmt.value
+        if isinstance(v, ast.Name):
+            out[stmt.target.id] = _NAME_ALIAS.get(v.id, v.id)
+        elif isinstance(v, ast.Attribute):
+            out[stmt.target.id] = _NAME_ALIAS.get(v.attr, v.attr)
+        # Constant(None) / 其它形态:不收(见 docstring)
+    return out
+
+
+def submodule_declared_defaults(mf_root: str, sub_cls: str, from_rel: str) -> dict:
+    """对外可测入口:见 `_declared_defaults`。"""
+    return _declared_defaults(ClassIndex(mf_root), sub_cls, from_rel)
+
+
 # ── 对外入口 ──────────────────────────────────────────────────────────────────
 def resolve_layer_spec(mf_root: str, flags: dict, spec_files=None) -> ResolvedSpec:
     """读真 `gpt_layer_specs.py`,按 `flags` 静态解释 `get_gpt_layer_local_spec`,返回解出的模块树。
@@ -349,3 +430,37 @@ def resolve_layer_spec(mf_root: str, flags: dict, spec_files=None) -> ResolvedSp
       解不出的 if / 命中 raise / 未知构造 → 抛 ValueError 点名 file:line。
     """
     return _Interp(mf_root, spec_files).resolve(flags)
+
+
+# MTP 层 spec 构造函数所在文件(`get_mtp_layer_spec` @ `multi_token_prediction.py:223`)。
+MTP_SPEC_FILES = PYNATIVE_SPEC_FILES + (
+    "pynative/transformers/multi_token_prediction.py",
+)
+
+
+def resolve_spec_call(mf_root: str, entry: str, flags: dict, spec_files=None,
+                      positional=(), keyword=None) -> ResolvedSpec:
+    """静态解释**任意一个** spec 构造函数(不只入口 `get_gpt_layer_local_spec`)。
+
+    存在的理由:MTP 的层 spec 不由入口函数产出 —— `get_gpt_mtp_block_spec`
+    (`pynative/base_models/gpt/gpt_layer_specs.py:227-256`)拿 decoder block 的**最后一层**
+    spec 与 `hc_head` 去调 `get_mtp_layer_spec(...)`(`multi_token_prediction.py:223`)。
+    调用方把已解好的 decoder 层 `ResolvedSpec` 当位置/关键字实参传进来即可,解释逻辑复用同一套
+    (`ResolvedSpec` 实参在 `_resolve_field` 里原样通过)。
+
+    `keyword` 的值可以是 `ResolvedSpec` / 叶子类名字符串 / config 原始值。
+    """
+    interp = _Interp(mf_root, spec_files or MTP_SPEC_FILES)
+    if entry not in interp.funcs:
+        raise ValueError(f"Pass A 源里找不到函数 {entry}(fail-loud)")
+    fdef, rel = interp.funcs[entry]
+    param_names = {a.arg for a in fdef.args.args}
+    kw = {k: v for k, v in (keyword or {}).items() if k in param_names}
+    for k, v in (flags or {}).items():
+        if k in param_names and k not in kw:
+            kw[k] = v
+    result = interp._call(fdef, rel, positional=list(positional), keyword=kw)
+    if not isinstance(result, ResolvedSpec):
+        raise ValueError(
+            f"{rel}:{fdef.lineno} {entry} 未解出 ModuleSpec(得到 {result!r})(fail-loud)")
+    return result

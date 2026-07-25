@@ -68,20 +68,47 @@ class ClassIndex:
                 src = fh.read()
             tree = ast.parse(src, filename=path)
         self._files[rel] = (tree, src)
-        self._imports[rel] = self._scan_imports(tree)
+        self._imports[rel] = self._scan_imports(tree, rel, self._pkg)
         return self._files[rel]
 
     @staticmethod
-    def _scan_imports(tree: ast.AST) -> dict:
+    def _relative_to_dotted(module: str | None, level: int, rel: str, pkg: str) -> str | None:
+        """`from .moe_utils import X` @ `pynative/transformers/moe/router.py` →
+        `<pkg>.pynative.transformers.moe.moe_utils`。
+
+        实测必需(2026-07-25):`pynative/transformers/moe/` 里的模块**互相用相对 import**
+        (`router.py:19` `from .moe_utils import (...)`、`moe_layer.py:24-26`
+        `from .router import TopKRouter`)。此前 `_scan_imports` 直接跳过相对 import,
+        于是 `compute_routing_scores_for_aux_loss`(`moe_utils.py:343`,aux-loss 那段真张量的
+        入口)解析不到 → 整段落 opaque。`level` 语义同 Python:1 = 当前包,2 = 上一层。
+        """
+        parts = rel.replace(os.sep, "/").split("/")[:-1]     # 该文件所在包目录
+        if level > 1:
+            if level - 1 > len(parts):
+                return None
+            parts = parts[: len(parts) - (level - 1)]
+        tail = module.split(".") if module else []
+        return ".".join([pkg] + parts + tail)
+
+    @classmethod
+    def _scan_imports(cls, tree: ast.AST, rel: str = "", pkg: str = "") -> dict:
         """收 `from M import A as B` / `import M as N` → {本地名: (模块路径, 原名)}。
-        `import a.b.c`(无 as)记两把钥匙:`a.b.c` 与末段 `c`,让 `c.Cls` 也解得开。"""
+        `import a.b.c`(无 as)记两把钥匙:`a.b.c` 与末段 `c`,让 `c.Cls` 也解得开。
+        **相对 import**(`from .x import Y`)按 `_relative_to_dotted` 折算成绝对点号路径。"""
         out: dict[str, tuple[str, str]] = {}
         for n in ast.walk(tree):
             if isinstance(n, ast.ImportFrom):
-                if n.module is None or n.level:
-                    continue                    # 相对 import:本库源里未出现,不臆测
+                mod = n.module
+                if n.level:
+                    if not rel:
+                        continue                # 没有文件上下文,无法折算相对 import
+                    mod = cls._relative_to_dotted(n.module, n.level, rel, pkg)
+                    if mod is None:
+                        continue
+                elif mod is None:
+                    continue
                 for a in n.names:
-                    out[a.asname or a.name] = (n.module, a.name)
+                    out[a.asname or a.name] = (mod, a.name)
             elif isinstance(n, ast.Import):
                 for a in n.names:
                     if a.asname:

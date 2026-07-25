@@ -133,6 +133,9 @@ PRIMITIVES: dict[str, tuple[str, dict]] = {
     "mint.nn.functional.relu":     ("Activation", {"activation_type": "relu"}),   # indexer.py:152
     "mint.relu":                   ("Activation", {"activation_type": "relu"}),
     "mint.sigmoid":                ("Activation", {"activation_type": "sigmoid"}),
+    # `mint.nn.functional.sigmoid`(`moe/router.py:145`、`moe/shared_experts.py:62`)—— 与
+    # `mint.sigmoid` 同一个函数的 functional 路径,同一条判据(dy·σ(x)(1-σ(x)) 需要输入)。
+    "mint.nn.functional.sigmoid":   ("Activation", {"activation_type": "sigmoid"}),
     "mint.nn.functional.silu":     ("Activation", {"activation_type": "silu"}),
     "mint.nn.functional.gelu":     ("Activation", {"activation_type": "gelu"}),
     "mint.nn.functional.softplus": ("Activation", {"activation_type": "softplus"}),
@@ -164,10 +167,23 @@ PRIMITIVES: dict[str, tuple[str, dict]] = {
     # argsort/argmax:只产索引,**不可微** ——
     "mint.argsort":                    _CMP,
     "mint.argmax":                     _CMP,
+    # histc(input, bins, min, max):按值域分桶**计数**。产出是整数计数向量
+    #   (`num_tokens_per_expert [num_experts] int32`),**不可微** —— 反向什么都不读。
+    #   与 argsort/argmax 同一条判据(见上一行的注释),故同归 `Compare` 桶。
+    #   `self.histc(selected_experts_indices, bins=self.num_experts, ...)`
+    #   (`moe/router.py:417/357`、`moe/experts.py:96` 绑定)。
+    "mint.histc":                      _CMP,
+    # floor_divide:整除。这里的实测用法是**索引算术**(`token_indices_experts_sorted // top_k`,
+    #   `moe/experts.py:145`)—— 产出 int 索引张量,不可微。
+    "mint.floor_divide":               _CMP,
 
     # —— 比较 / 逻辑:bool 产出,**不可微**,反向什么都不读 ——
     "mint.eq": _CMP, "mint.ne": _CMP, "mint.gt": _CMP, "mint.ge": _CMP,
     "mint.lt": _CMP, "mint.le": _CMP,
+    # `mint.not_equal`(`pynative/base_models/gpt/gpt_model.py:275` 绑定,`:650` 调用:
+    #   由 input_ids 与 eod token 比出 loss mask)—— 与 `mint.ne` 同一个算子的另一个名字。
+    "mint.not_equal": _CMP,
+    "mint.equal": _CMP,
     "mint.isfinite": _CMP,          # csa.py:807 / indexer.py:401
     "mint.isnan": _CMP,
     "mint.logical_and": _CMP, "mint.logical_or": _CMP, "mint.logical_not": _CMP,
@@ -183,6 +199,19 @@ PRIMITIVES: dict[str, tuple[str, dict]] = {
     "mint.zeros_like": _CONST,
     "mint.ones_like":  _CONST,      # indexer.py:285
     "mint.full_like":  _CONST,
+    # `ops.tuple_to_array((1e-8,))`(`pynative/loss/loss.py:347`、`:415`、`:496`):把一个
+    #   **python 元组字面量**变成一个极小的常量张量(分母的 eps)。无输入张量、无梯度 → 常量产出。
+    "ops.tuple_to_array": _CONST,
+
+    # —— `ops.*` 与 `mint.*` 同名同义的那几个(mindformers 两种写法混用;判据逐条同上)——
+    #    `ops.zeros(shape, dtype)` / `ops.concat((a,b), axis=)`:
+    #    `multi_token_prediction.py:178/181/188/193` 的 `roll_tensor`(MTP 的 input_ids 位移)。
+    "ops.zeros":         _CONST,
+    "ops.ones":          _CONST,
+    "ops.zeros_like":    _CONST,
+    "ops.concat":        ("View", {"variadic": True, "view": "concat"}),
+    "ops.reshape":       ("View", {"view": "reshape"}),
+    "ops.transpose":     ("View", {"view": "transpose"}),
 
     # —— detach:**建节点 + 保边 + 打 detached 标**(路线 B P1#11;csa.py:665/666/764/765/794/795)——
     "ops.stop_gradient": ("Detach", {"detach": True}),

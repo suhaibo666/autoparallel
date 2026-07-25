@@ -63,7 +63,7 @@ LOOPS = '''
 class C:
     def construct(self, x):
         h = self.mm(x, x)
-        for i in range(3):
+        for t in x:
             h = self.act(h)
         while True:
             h = self.act(h)
@@ -118,11 +118,51 @@ def test_unknown_with_context_is_fail_loud():
 
 
 def test_for_while_try_all_recorded():
-    """`For`/`While`/`Try` 仍未支持 → 仍逐条记账（`AugAssign` 已被 P0#5 支持，见下条）。"""
+    """迭代次数**判不出**的 `For` / `While` / `Try` 仍未支持 → 仍逐条记账。
+
+    2026-07-25 的例子迁移（机制不变，只换举例形态；台账见
+    `docs/opdag_component_coverage_2026-07-25.md`）：原例是 `for i in range(3):`，
+    而 `range(<静态可求值>)` **现在会被按真实轮数展开**（真源需要：
+    `SinkhornKnopp.construct` 的 `for _ in range(self.iterations - 1)` @
+    `hyper_connection.py:63`，`hc_sinkhorn_iters: 20` ⇒ 19 轮，每轮 4 个
+    `[s,b,n,n]` fp32 中间量）。故这里换成 `for t in x:` —— **迭代次数由张量决定、
+    静态判不出**，正是"仍不支持"的真形态。不变量（未支持语句类必须逐条记账 + 带 src）
+    逐字保留；新增支持形态由 `test_static_range_for_is_unrolled` 单独钉住。
+    """
     dag = _walk(LOOPS, config_flags={})
     kinds = [d["node"] for d in dag.diagnostics["dropped_stmts"]]
     assert kinds == ["For", "While", "Try"]
     assert all(d["src"].startswith("c.py:") for d in dag.diagnostics["dropped_stmts"])
+
+
+STATIC_FOR = '''
+class C:
+    def construct(self, x):
+        h = self.mm(x, x)
+        for i in range(3):
+            h = self.act(h)
+        return h
+'''
+
+
+def test_static_range_for_is_unrolled():
+    """`for ... in range(<静态可求值>)` → 按**真实轮数**展开，且不记诊断。
+
+    走一遍循环体 = 少算 n-1 轮的中间量；整条丢 = 少算 n 轮。两者都是"字节少算"。
+    """
+    dag = _walk(STATIC_FOR, config_flags={})
+    assert [n.op for n in dag.nodes] == ["MatMul", "Activation", "Activation", "Activation"]
+    assert dag.diagnostics["dropped_stmts"] == []
+    # 轮数**随 range 参数变化**（不是"恰好 3 个"的巧合）
+    dag2 = _walk(STATIC_FOR.replace("range(3)", "range(5)"), config_flags={})
+    assert len([n for n in dag2.nodes if n.op == "Activation"]) == 5
+
+
+def test_range_with_undecidable_bound_is_not_unrolled():
+    """`range(<判不出>)` **不展开**（展开几轮就是编造），照旧记诊断。"""
+    src = STATIC_FOR.replace("range(3)", "range(self.unknown_iters)")
+    dag = _walk(src, config_flags={})
+    assert [d["node"] for d in dag.diagnostics["dropped_stmts"]] == ["For"]
 
 
 def test_augassign_on_a_tensor_becomes_a_node():

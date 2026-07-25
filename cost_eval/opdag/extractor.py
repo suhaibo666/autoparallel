@@ -31,7 +31,8 @@ from .init_binder import bind_init, Binding, _base_call_name, unbound_aliases
 from .construct_walker import (
     walk_construct_meta, SubExtract, assert_extraction_clean,
 )
-from .module_resolver import ResolvedSpec, LEAF_OPTYPE
+from .module_resolver import ResolvedSpec, LEAF_OPTYPE, _NAME_ALIAS
+from .construct_walker import _self_attr
 from .init_dims import eval_init_dims
 from .module_index import ClassIndex
 from . import fn_saves
@@ -69,11 +70,36 @@ def _module_level_consts(tree: ast.AST) -> dict:
     return out
 
 
-def _module_level_funcs(tree: ast.AST) -> dict:
-    """模块级 `def`(**同文件**)→ 供 walker 在调用点内联。
-    `unfused_compressed_sparse_attn`(csa.py:464)是这条路径上最重要的一个:它是那条
-    ~11-op 注意力链的**实体**,此前作为「非 self.<method> 的自由函数」只进 opaque_calls。"""
-    return {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+def _module_level_funcs(tree: ast.AST, index: ClassIndex | None = None,
+                        rel: str | None = None) -> dict:
+    """模块级 `def` → `{名: (FunctionDef, 定义它的文件 rel 或 None)}`,供 walker 在调用点内联。
+
+    * **同文件**:`unfused_compressed_sparse_attn`(csa.py:464)是这条路径上最重要的一个
+      —— 那条 ~11-op 注意力链的**实体**,此前作为「非 self.<method> 的自由函数」只进 opaque_calls。
+    * **跨文件(2026-07-25 新增)**:顺 `from ... import <name>` 解析被导入的模块级 `def`。
+      真源必需:`compute_routing_scores_for_aux_loss` 定义在
+      `pynative/transformers/moe/moe_utils.py:343`,被 `pynative/transformers/moe/router.py:466`
+      调用 —— 它是 aux-loss 那段(topk + 可选归一化,**真张量**)的入口;不解就整段丢。
+      带上 rel 才能让内联出的节点 `file:line` 指向真正定义它的文件。
+    """
+    out = {n.name: (n, rel) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if index is None or rel is None:
+        return out
+    for imports in (index._imports.get(rel.replace(os.sep, "/")) or {},):
+        for local, (module, orig) in imports.items():
+            if local in out:
+                continue
+            for cand in index._module_to_rel(module):
+                got = index.load(cand)
+                if got is None:
+                    continue
+                tgt = orig or local
+                fn = next((n for n in got[0].body
+                           if isinstance(n, ast.FunctionDef) and n.name == tgt), None)
+                if fn is not None:
+                    out[local] = (fn, cand)
+                    break
+    return out
 
 
 def _fn_class_table(src_file: str, src: str, extra: dict | None = None) -> dict:
@@ -95,6 +121,17 @@ def _fn_class_table(src_file: str, src: str, extra: dict | None = None) -> dict:
             "saves": list(rec.saved.names) if rec.saved is not None else [],
             "forward_params": params.get(rec.cls, []),
             "bare_ctx": [c.attr for c in rec.ctx_attrs if c.kind not in ("predicate", "const")],
+            # **裸 `ctx.<attr> = <forward 形参>` 也是"保留到反向"**(2026-07-25):
+            # `_LogSoftmax.forward` 只写 `ctx.logits = logits`(`pynative/loss/loss.py:136`),
+            # `backward` 里 `logits = ctx.logits`(`:151`)—— 没有 `save_for_backward`,但这个张量
+            # 同样被**留到反向**,内存事实完全一样。loss 段的 logits 是全模型最大的张量
+            # (`S·B·vocab`),漏掉它就是漏掉最大的一块。
+            # 只收 `is_forward_param`(rhs 逐字是 forward 的形参名 → 能按位映射到 apply 实参);
+            # rhs 是内部表达式的进 `saved_internal`(与 `save_for_backward` 的内部项同待遇)。
+            "bare_ctx_params": [c.rhs for c in rec.ctx_attrs
+                                if c.tensor_candidate and c.is_forward_param],
+            "bare_ctx_internal": [c.attr for c in rec.ctx_attrs
+                                  if c.tensor_candidate and not c.is_forward_param],
             "src": rec.src,
         }
     return out
@@ -259,6 +296,24 @@ def _named_module_binds(
                 stmt.value, name, spec, compute_dtype, ln_compute_dtype, src_file,
                 recurse, subcell_specs, linear_dims, _param_to_attr(init),
             )
+        elif fname in LEAF_OPTYPE:
+            # **直接实例化的叶子层** `self.mapping_proj = Linear(input_size=..., ...)`
+            # (`hyper_connection.py:212-219`、`:145` 的 `self.hc_fn = Linear(...)`)——
+            # 与 `build_module(submodules.X)` 解出 `"Linear"` 是**同一个源侧事实**
+            # (`spec_utils.build_module` 对 `type` 实参就是直接 `module(...)`,`:76-77,97`),
+            # 只是 mHC 不经 spec 树而在 `__init__` 里直接 new。不认这条 → `self.mapping_proj(...)`
+            # 未绑定 fail-loud,非融合 mHC 整条链抽不出。
+            attrs = {"module": fname, "compute_dtype": compute_dtype}
+            if LEAF_OPTYPE[fname] == "Norm":
+                attrs["ln_compute_dtype"] = ln_compute_dtype
+            dims = (linear_dims or {}).get(name)
+            if dims is not None:
+                in_d, out_d = dims
+                if in_d is not None:
+                    attrs["in_dim"] = in_d
+                if out_d is not None:
+                    attrs["out_dim"] = out_d
+            binds[name] = Binding(op=LEAF_OPTYPE[fname], attrs=attrs)
         elif fname == "get_activation":
             if activation_present:
                 binds[name] = Binding(
@@ -267,6 +322,47 @@ def _named_module_binds(
                 )
             # activation_type 显式为 None → 不绑定(下游按 None 剪枝)
     return binds
+
+
+def _init_class_aliases(init_fn: ast.FunctionDef, config_flags: dict) -> dict:
+    """`__init__` 里的**局部类别名**:`hc_cls = A if <config flag> else B` / `cls = A`。
+
+    源侧必需(2026-07-25):
+      `hc_cls = FusedHyperConnectionModule if config.use_fused_mhc else HyperConnectionModule`
+      (`pynative/transformers/transformer_layer.py:279`)之后
+      `self.attn_hc = hc_cls(config=config, layer_number=layer_number)`(`:280`)。
+      不解这个别名,`_base_call_name` 得到的是局部变量名 `hc_cls` → 既不是 `_CLS2OP` 的类、
+      也不在 `subcell_specs` 里 → `self.attn_hc(...)` 未绑定 fail-loud,**整个 mHC 层抽不出**。
+
+    三元的条件**必须**由 `config_flags` 判定(`use_fused_mhc` 是 yaml 的显式开关);判不出
+    → 不收该别名(退回既有 fail-loud),**绝不默认取某一支**——两支是 fused / unfused 两条
+    不同的算子链,取错就是整段图错。
+    """
+    out: dict = {}
+    if init_fn is None:
+        return out
+    for stmt in ast.walk(init_fn):
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)):
+            continue
+        name, v = stmt.targets[0].id, stmt.value
+        if isinstance(v, ast.Name):
+            out[name] = v.id
+        elif isinstance(v, ast.IfExp) and isinstance(v.body, ast.Name) \
+                and isinstance(v.orelse, ast.Name):
+            flag = _flag_of_test(v.test)
+            if flag is not None and flag in config_flags:
+                out[name] = v.body.id if bool(config_flags[flag]) else v.orelse.id
+    return out
+
+
+def _flag_of_test(test) -> str | None:
+    """三元/if 的条件里那个 config flag 名:`config.use_fused_mhc` / `self.config.x` / 裸名。"""
+    if isinstance(test, ast.Name):
+        return test.id
+    if isinstance(test, ast.Attribute):
+        return test.attr
+    return None
 
 
 def _param_to_attr(init_fn: ast.FunctionDef) -> dict:
@@ -319,9 +415,21 @@ def _bind_build_module(
             f"extractor: {src_file} self.{self_name} = build_module(...) 缺首个 submodules 实参（fail-loud）"
         )
     a0 = call.args[0]
-    if not (isinstance(a0, ast.Attribute) and isinstance(a0.value, ast.Name)):
+    # 首参两种等价形态(源侧同一件事):
+    #   ① `build_module(submodules.<field>, ...)`  —— 直接用 `__init__` 的形参;
+    #   ② `build_module(self.submodules.<field>, ...)` —— 先 `self.submodules = submodules`
+    #      再从 `self` 上读。真源必需:`MultiTokenPredictionLayer.__init__`
+    #      (`pynative/transformers/multi_token_prediction.py:286` 存,`:293/:300/:307/:316/:324`
+    #       读)全部走形态 ②;此前只认 ① → 「首参不是 submodules.<字段>」fail-loud,**MTP 零覆盖**。
+    ok = isinstance(a0, ast.Attribute) and (
+        isinstance(a0.value, ast.Name)
+        or (_self_attr(a0.value) is not None
+            and (param_to_attr or {}).get("submodules") == _self_attr(a0.value)))
+    if not ok:
         raise ValueError(
-            f"extractor: {src_file} self.{self_name} 的 build_module 首参不是 submodules.<字段>（fail-loud）"
+            f"extractor: {src_file} self.{self_name} 的 build_module 首参既不是 "
+            f"`submodules.<字段>` 也不是 `self.<存了 submodules 形参的属性>.<字段>`"
+            f"（得到 `{ast.unparse(a0)}`）—— fail-loud"
         )
     field = a0.attr
     leaf = spec.submodules.get(field)
@@ -420,10 +528,23 @@ def _construct_literal_defaults(tree: ast.AST, cls_name: str, method: str = "con
 
 
 # ── 子 Cell 定位 + 递归 resolver ──────────────────────────────────────────────
-def _find_cell_file(mf_root: str, cell_name: str) -> str:
+def _find_cell_file(mf_root: str, cell_name: str, prefer_rel: str | None = None) -> str:
     """在 mf_root 里搜 `class <cell_name>` 的定义源,返回相对 mf_root 的路径(用 "/" 分隔)。
-    多处定义取首个命中;找不到 → fail-loud。"""
+
+    **多处定义时不再静默取首个命中**(2026-07-25 修的实测静默错):mindformers 有三棵并行的树,
+    `class MoELayer` 在 `pynative/transformers/moe/moe_layer.py`、
+    `parallel_core/training_graph/transformer/moe/moe_layer.py`、
+    `parallel_core/inference/transformer/moe/moe_layer.py` 各一份;`os.walk` 首个命中把
+    pynative 的 `MoELayer` 解成了 `inference` 那份 → 报「`self.router` 的 build_module 首参不是
+    submodules.<字段>」(那是另一棵树的写法)。即:**在给一份真机从未跑过的结构建模**。
+
+    判据(有依据,不是猜):按 `prefer_rel`(调用方所在文件)与候选路径的**最长公共目录前缀**排序
+    —— 一个 `pynative/` 树里的 Cell 组合的是 `pynative/` 树里的 Cell。前缀长度**并列**时
+    fail-loud 并列出全部候选,绝不掷硬币。首选答案应当来自 `ResolvedSpec.origin_rel`
+    (spec 文件的 import,唯一权威),本函数只是它解不出时的兜底。
+    """
     pat = re.compile(rf"^\s*class\s+{re.escape(cell_name)}\b", re.M)
+    hits: list[str] = []
     for dirpath, _dirs, files in os.walk(mf_root):
         for fn in files:
             if not fn.endswith(".py"):
@@ -435,10 +556,140 @@ def _find_cell_file(mf_root: str, cell_name: str) -> str:
             except (OSError, UnicodeDecodeError):
                 continue
             if pat.search(txt):
-                return os.path.relpath(p, mf_root).replace(os.sep, "/")
+                hits.append(os.path.relpath(p, mf_root).replace(os.sep, "/"))
+    if not hits:
+        raise ValueError(
+            f"extractor: 在 {mf_root} 找不到定义 class {cell_name} 的源文件（fail-loud）"
+        )
+    if len(hits) == 1:
+        return hits[0]
+    if prefer_rel:
+        pref = prefer_rel.replace(os.sep, "/").split("/")[:-1]
+
+        def shared(rel: str) -> int:
+            parts = rel.split("/")[:-1]
+            n = 0
+            for a, b in zip(pref, parts):
+                if a != b:
+                    break
+                n += 1
+            return n
+
+        scored = sorted(((shared(h), h) for h in hits), key=lambda t: (-t[0], t[1]))
+        if scored[0][0] > (scored[1][0] if len(scored) > 1 else -1):
+            return scored[0][1]
     raise ValueError(
-        f"extractor: 在 {mf_root} 找不到定义 class {cell_name} 的源文件（fail-loud）"
+        f"extractor: class {cell_name} 在 {len(hits)} 个文件里都有定义,且无法由调用方位置"
+        f"（prefer_rel={prefer_rel!r}）唯一确定 —— **拒绝按 os.walk 顺序猜一个**"
+        f"（那会给一份真机从未跑过的结构建模）。候选: {hits}。"
+        f"请给 `ResolvedSpec.origin_rel`（Pass A 顺 spec 文件的 import 解出的权威答案）。"
     )
+
+
+def _inline_submodules_spec(ctor_call: ast.Call, init_fn: ast.FunctionDef,
+                            cell: str) -> ResolvedSpec | None:
+    """`self.X = <Cls>(config, submodules)` 里那个 **`__init__` 本地构造的 submodules** → ResolvedSpec。
+
+    源侧事实(`pynative/transformers/moe/moe_layer.py:58-62`):
+        `submodules = MLPSubmodules(linear_fc1=Linear, linear_fc2=Linear)`
+        `self.shared_experts = SharedExpertMLP(config, submodules)`
+    子 `MLP.__init__` 随后 `build_module(submodules.linear_fc1, ...)`。spec 树里
+    `get_moe_module_spec` 只返回 `ModuleSpec(module=MoELayer)`(submodules **全空**,
+    `pynative/base_models/gpt/moe_module_specs.py:34-37`),所以这些叶子**只能**从这里读。
+
+    只认「实参/关键字实参是一个局部名,且该局部名在同一 `__init__` 里被
+    `<XSubmodules>(field=<类名>, ...)` 赋值」这一种形态;认不出返回 None(退回既有 fail-loud)。
+    """
+    names = [a.id for a in ctor_call.args if isinstance(a, ast.Name)]
+    names += [k.value.id for k in ctor_call.keywords
+              if k.arg == "submodules" and isinstance(k.value, ast.Name)]
+    if not names:
+        return None
+    for local, value, _stmt in _self_assign_local_triples(init_fn):
+        if local not in names or not isinstance(value, ast.Call):
+            continue
+        if not isinstance(value.func, ast.Name) or not value.func.id.endswith("Submodules"):
+            continue
+        fields: dict = {}
+        for kw in value.keywords:
+            if kw.arg is None:
+                return None                      # `**kwargs` → 不猜
+            if isinstance(kw.value, ast.Name):
+                fields[kw.arg] = _NAME_ALIAS.get(kw.value.id, kw.value.id)
+            elif isinstance(kw.value, ast.Attribute):
+                fields[kw.arg] = _NAME_ALIAS.get(kw.value.attr, kw.value.attr)
+            else:
+                return None
+        if fields:
+            return ResolvedSpec(cell=cell, submodules=fields)
+    return None
+
+
+def _self_assign_local_triples(init_fn: ast.FunctionDef):
+    """`__init__` 里所有 `<局部名> = <value>` 的 (name, value, stmt)。"""
+    for stmt in ast.walk(init_fn):
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)):
+            yield stmt.targets[0].id, stmt.value, stmt
+
+
+def _nested_cell_of(mf_root: str, rel: str, cls_name: str, attr: str,
+                    config_flags: dict, class_index):
+    """`<cls_name>.__init__` 里 `self.<attr> = <Cls>(...)` 的 `<Cls>` 及其定义文件 rel。
+
+    **只**在 `<cls_name>` (含其跨文件 MRO) 都**没有**名为 `<attr>` 的方法时才有意义(调用方
+    已判);找不到该属性赋值、或右侧不是可定位的类实例化 → 返回 None(调用方退回原本的
+    「缺少该方法」fail-loud,不猜)。派生类先于基类(`FusedHyperConnectionModule.__init__:388`
+    覆盖 `HyperConnectionModule.__init__:233`)。
+    """
+    units = []
+    if class_index is not None:
+        for rc in class_index.mro(cls_name, rel):
+            units.append((rc.name, rc.node, rc.rel))
+    else:
+        path = os.path.join(mf_root, *rel.split("/"))
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        for cname in _init_classes(tree, cls_name):
+            node = _find_class(tree, cname)
+            if node is not None:
+                units.append((cname, node, rel))
+    for _cname, node, urel in units:                     # derived→base:首个命中即生效
+        if _method_of(node, attr) is not None:
+            return None                                  # 它其实**是**方法 → 不走本通路
+        init = _method_of(node, "__init__")
+        if init is None:
+            continue
+        aliases = _init_class_aliases(init, config_flags)
+        for a, value, _stmt in [(t, v, s) for t, v, s in _self_assign_triples(init)]:
+            if a != attr or not isinstance(value, ast.Call):
+                continue
+            ctor = _base_call_name(value)
+            if ctor is None:
+                continue
+            ctor = aliases.get(ctor, ctor)
+            if class_index is not None:
+                rc = class_index.resolve(ctor, urel)
+                if rc is not None:
+                    return ctor, rc.rel
+            try:
+                return ctor, _find_cell_file(mf_root, ctor, prefer_rel=urel)
+            except ValueError:
+                return None
+    return None
+
+
+def _self_assign_triples(init: ast.FunctionDef):
+    """`__init__` 里所有 `self.<attr> = <value>` 的 (attr, value, stmt)。"""
+    for stmt in ast.walk(init):
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+            continue
+        tgt = stmt.targets[0]
+        if (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                and tgt.value.id == "self"):
+            yield tgt.attr, stmt.value, stmt
 
 
 def _make_subcell_resolver(
@@ -447,7 +698,8 @@ def _make_subcell_resolver(
     parent_tree: ast.AST | None = None, parent_rel: str | None = None,
     cross_file: bool = False, runtime_predicates: dict | None = None,
     host_call_allow: tuple = (), class_index=None,
-    kernel_call_allow: tuple = (), input_axes: dict | None = None,
+    kernel_call_allow: tuple = (), kernel_saves: dict | None = None,
+    param_cells: dict | None = None, input_axes: dict | None = None,
 ):
     """构造给 walker 的 resolver:遇 SubCell 调用点 → 取子 spec、定位子文件、递归抽取,返回 SubExtract。
 
@@ -457,8 +709,12 @@ def _make_subcell_resolver(
     `core/loss/loss.py` / `pynative/loss/loss.py` 各自的同名旧实现）误定位到无关源文件。
     """
     def resolver(cell_name: str, field: str, bare: bool,
-                 method: str = "construct", injected_binds: dict | None = None) -> SubExtract:
-        if bare:
+                 method: str = "construct", injected_binds: dict | None = None,
+                 spec: ResolvedSpec | None = None) -> SubExtract:
+        if isinstance(spec, ResolvedSpec):
+            # 调用点(`__init__` 手搭 submodules,见 `_inline_submodules_spec`)直接给的 spec。
+            sub_spec = spec
+        elif bare:
             sub_spec = (subcell_specs or {}).get(cell_name)
             if not isinstance(sub_spec, ResolvedSpec):
                 raise ValueError(
@@ -470,21 +726,41 @@ def _make_subcell_resolver(
                 raise ValueError(
                     f"extractor: SubCell 字段 {field!r} 在父 spec 里非 ResolvedSpec（得到 {sub_spec!r}）—— fail-loud"
                 )
-        if (parent_tree is not None and parent_rel is not None
+        if getattr(sub_spec, "origin_rel", None):
+            # Pass A 顺 spec 文件的 import 解出的**权威**定义位置(见 ResolvedSpec.origin_rel
+            # 的 docstring:三棵并行树里同名 Cell 的静默错解正是这么来的)。
+            rel = sub_spec.origin_rel
+        elif (parent_tree is not None and parent_rel is not None
                 and _find_class(parent_tree, sub_spec.cell) is not None):
             rel = parent_rel
         elif class_index is not None:
             rc = (class_index.resolve(sub_spec.cell, parent_rel)
                   if parent_rel else None)
-            rel = rc.rel if rc is not None else _find_cell_file(mf_root, sub_spec.cell)
+            rel = (rc.rel if rc is not None
+                   else _find_cell_file(mf_root, sub_spec.cell, prefer_rel=parent_rel))
         else:
-            rel = _find_cell_file(mf_root, sub_spec.cell)
+            rel = _find_cell_file(mf_root, sub_spec.cell, prefer_rel=parent_rel)
+        # ── `self.<A>.<B>(...)` 里 B 不是 A 的方法而是 A 的**子 Cell 属性**(2026-07-25)──
+        # 源侧必需:`self.attn_hc.output_cell(h_res, h_post, streams, dropout_out)`
+        # (`pynative/transformers/transformer_layer.py:323/333`)—— `output_cell` 是
+        # `HyperConnectionModule.__init__:233` / `FusedHyperConnectionModule.__init__:388`
+        # 里 `self.output_cell = <Fused>HyperConnectionOutputCell(...)` 建的**另一个 Cell**,
+        # 不是 `HyperConnectionModule` 的方法。此前会以「缺少 output_cell 方法」fail-loud,
+        # 而这一段正是 mHC 的残差流更新(`h_res^T @ x + h_post * sublayer_out`)。
+        target_cls, target_rel, entry = sub_spec.cell, rel, method
+        if method != "construct" and _nested_cell_of(
+                mf_root, rel, sub_spec.cell, method, config_flags, class_index) is not None:
+            target_cls, target_rel = _nested_cell_of(
+                mf_root, rel, sub_spec.cell, method, config_flags, class_index)
+            entry = "construct"
+            sub_spec = ResolvedSpec(cell=target_cls, submodules={})
         dag, params, returns = _extract_meta(
-            mf_root, rel, sub_spec.cell, sub_spec, config_flags,
+            mf_root, target_rel, target_cls, sub_spec, config_flags,
             recurse=True, subcell_specs=subcell_specs, _stack=stack_with_self,
             cross_file=cross_file, runtime_predicates=runtime_predicates,
-            host_call_allow=host_call_allow, entry_method=method,
-            kernel_call_allow=kernel_call_allow, input_axes=input_axes,
+            host_call_allow=host_call_allow, entry_method=entry,
+            kernel_call_allow=kernel_call_allow, kernel_saves=kernel_saves,
+            param_cells=param_cells, input_axes=input_axes,
             injected_binds=injected_binds, _class_index=class_index,
         )
         return SubExtract(nodes=dag.nodes, edges=dag.edges, param_names=params, returns=returns,
@@ -509,6 +785,8 @@ def extract_cell(
     runtime_predicates: dict | None = None,
     host_call_allow: tuple = (),
     kernel_call_allow: tuple = (),
+    kernel_saves: dict | None = None,
+    param_cells: dict | None = None,
     input_axes: dict | None = None,
     entry_method: str = "construct",
     injected_binds: dict | None = None,
@@ -540,6 +818,7 @@ def extract_cell(
         present_params=present_params, recurse=recurse, subcell_specs=subcell_specs,
         strict=strict, cross_file=cross_file, runtime_predicates=runtime_predicates,
         host_call_allow=host_call_allow, kernel_call_allow=kernel_call_allow,
+        kernel_saves=kernel_saves, param_cells=param_cells,
         input_axes=input_axes, entry_method=entry_method,
         injected_binds=injected_binds,
     )
@@ -560,6 +839,8 @@ def _extract_meta(
     runtime_predicates: dict | None = None,
     host_call_allow: tuple = (),
     kernel_call_allow: tuple = (),
+    kernel_saves: dict | None = None,
+    param_cells: dict | None = None,
     input_axes: dict | None = None,
     entry_method: str = "construct",
     injected_binds: dict | None = None,
@@ -600,7 +881,8 @@ def _extract_meta(
             parent_tree=tree, parent_rel=cell_file_relpath,
             cross_file=cross_file, runtime_predicates=runtime_predicates,
             host_call_allow=host_call_allow, class_index=class_index,
-            kernel_call_allow=kernel_call_allow, input_axes=input_axes,
+            kernel_call_allow=kernel_call_allow, kernel_saves=kernel_saves,
+            param_cells=param_cells, input_axes=input_axes,
         )
 
     # 1) 沿 __init__ 的 MRO 链(base→derived)做基础 + 具名绑定并合并(derived 覆盖 base)。
@@ -608,7 +890,18 @@ def _extract_meta(
     units = _mro_units(mf_root, tree, src, cell_file_relpath, cls_name, class_index)
     init_classes = [u[0] for u in units]           # derived→base
     if not units:
-        raise ValueError(f"extractor: {cls_name} 及其基类均无 __init__（fail-loud）")
+        # **无 `__init__` 的纯静态包装 Cell 是合法的**(2026-07-25):
+        #   `MoEAuxLossAutoScaler`(`moe/moe_utils.py:330-340`)、
+        #   `_LogSoftmaxModule` / `_NLLLossModule`(`pynative/loss/loss.py:187-210`)
+        # 都只有一个 `@staticmethod construct`,里面转发 `<_Function>.apply(...)`。
+        # 它们**没有**要绑的 `self.<op>`,所以「均无 __init__」不是错误,binds 为空即可。
+        # 只有连入口方法都没有才是真错误 —— 那由 `_run_walker` 的
+        # 「缺少 <entry_method> 方法」fail-loud 负责报。
+        cls_node = _find_class(tree, cls_name)
+        if _method_of(cls_node, entry_method) is None and not _defining_class(
+                tree, cls_name, entry_method):
+            raise ValueError(
+                f"extractor: {cls_name} 既无 __init__ 也无 {entry_method}（fail-loud）")
     # PART A:一次求值 __init__(全 MRO,跨文件)得 linear (in,out) 维度 + dims_ctx + self_kinds。
     init_dims = eval_init_dims(tree, cls_name, config_flags,
                                mro_units=[(u[1], u[0]) for u in units])
@@ -653,14 +946,23 @@ def _extract_meta(
             ctor = _base_call_name(stmt.value)
             if ctor is None:
                 continue
+            # 局部类别名(`hc_cls = A if config.use_fused_mhc else B`,transformer_layer.py:279)
+            ctor = _init_class_aliases(init_fn, config_flags).get(ctor, ctor)
             attr_ctor.setdefault(tgt.attr, ctor)
             # T0-6.5 Fix3:units 序已是 derived→base;此处 first-wins(`tgt.attr not in combined`)
             # 与步骤 1 的 `reversed(...)+update 覆盖`(等效 derived wins)MRO 方向一致。
             if recurse and subcell_specs and ctor in subcell_specs and tgt.attr not in combined:
-                combined[tgt.attr] = Binding(
-                    op="SubCell", attrs={"cell": ctor, "field": tgt.attr, "bare": True,
-                                         "kw_self": _kw_self_args(
-                                             stmt.value, _param_to_attr(init_fn))})
+                attrs = {"cell": ctor, "field": tgt.attr, "bare": True,
+                         "kw_self": _kw_self_args(stmt.value, _param_to_attr(init_fn))}
+                # `__init__` 里**手搭**的 submodules 直接传给子 Cell(spec 树给不出):
+                #   `submodules = MLPSubmodules(linear_fc1=Linear, linear_fc2=Linear)`
+                #   `self.shared_experts = SharedExpertMLP(config, submodules)`
+                #   (`moe/moe_layer.py:58-62`)—— 子 `MLP.__init__` 里
+                #   `build_module(submodules.linear_fc1, ...)` 只能从这里拿到 `Linear`。
+                inline_spec = _inline_submodules_spec(stmt.value, init_fn, ctor)
+                if inline_spec is not None:
+                    attrs["spec"] = inline_spec
+                combined[tgt.attr] = Binding(op="SubCell", attrs=attrs)
             # `_Function` 子类(自定义反向)在别的文件里定义时,顺 import 解析并抽它的源真值。
             if class_index is not None and ctor not in fn_classes:
                 rc = class_index.resolve(ctor, urel)
@@ -694,6 +996,22 @@ def _extract_meta(
     self_kinds = dict(init_dims.self_kinds)
     for attr, ctor in attr_ctor.items():
         self_kinds[f"__cls__{attr}"] = ctor
+    # `Parameter(..., requires_grad=False)` = **非梯度 buffer**(源侧逐字事实)。
+    # 用途:证明 `self.<buf>.add_(...)` 这类原地更新是字节中性的(无 autograd 图、无新分配)。
+    # 实测点:`tokens_per_expert`(`moe/moe_layer.py:84-88`)、`expert_bias`(`:73-77`)、
+    #         `rms_weight`(`hyper_connection.py:226-230`)、`tid2eid`(`moe/router.py:105-109`)。
+    for cname, utree, _usrc, _urel in units:
+        cls_node = _find_class(utree, cname)
+        init_fn = _method_of(cls_node, "__init__") if cls_node else None
+        if init_fn is None:
+            continue
+        for attr, value, _stmt in _self_assign_triples(init_fn):
+            if not (isinstance(value, ast.Call) and _base_call_name(value) == "Parameter"):
+                continue
+            for kw in value.keywords:
+                if kw.arg == "requires_grad" and isinstance(kw.value, ast.Constant) \
+                        and kw.value.value is False:
+                    self_kinds.setdefault(f"__buffer__{attr}", True)
 
     # 4) 走查 + 剪枝(recurse 时携 resolver:SubCell 调用点递归内联)。
     dag, params, returns = walk_construct_meta(
@@ -710,7 +1028,7 @@ def _extract_meta(
         strict=False,     # 先不抛:下面还要并入 __init__ 侧的裸别名诊断,再统一判 strict
         class_index=class_index,
         cls_rel=cell_file_relpath,
-        module_funcs=_module_level_funcs(tree),
+        module_funcs=_module_level_funcs(tree, class_index, cell_file_relpath),
         module_consts=_module_level_consts(tree),
         runtime_predicates=runtime_predicates,
         fn_classes=fn_classes,
@@ -719,6 +1037,7 @@ def _extract_meta(
         alias_unknown={k: v for k, v in alias_unknown.items() if k not in combined},
         host_call_allow=tuple(host_call_allow or ()),
         kernel_call_allow=tuple(kernel_call_allow or ()),
+        kernel_saves=kernel_saves, param_cells=param_cells,
         input_axes=input_axes,
         entry_method=entry_method,
     )

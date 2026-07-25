@@ -97,7 +97,17 @@ def derive_saves(dag) -> list[Save]:
         elif spec.get("inputs") == "all":
             idxs = list(range(len(n.ins)))
         elif isinstance(spec.get("inputs"), list):
-            idxs = spec["inputs"]
+            # PIN 的下标按「**张量操作数**位序」写(`mint.gather(input, dim, index)` 的 `dim`
+            # 是 int、不计位,故 index = `[1]`)。当某个前置张量操作数是**权重**时它被路由去
+            # `param_operands`(W2/W3)、不进 `ins`,`ins` 位序随之左移 —— `attrs["ins_slots"]`
+            # 记着每个存活 `ins` 项的张量操作数位序,有它就按它取,没有(位序恒等)就直接用,
+            # 既有路径逐字不变。
+            slots = n.attrs.get("ins_slots")
+            if slots:
+                pos = {slot: i for i, slot in enumerate(slots)}
+                idxs = [pos[k] for k in spec["inputs"] if k in pos]
+            else:
+                idxs = spec["inputs"]
         if isinstance(spec.get("outputs"), list):
             # 存**自己的第 k 个输出**(TopK 的 indices):多输出 ref 在 attrs["outs"] 里。
             outs = n.attrs.get("outs") or ([n.out] if n.out else [])
@@ -105,8 +115,13 @@ def derive_saves(dag) -> list[Save]:
                 if k < len(outs) and outs[k].count(":") == 2:
                     name, shape, dtype = _parse(outs[k])
                     saves.setdefault(name, Save(name, dtype, n.id, shape))
+        # **权重派生的操作数不是激活**(W2/W3/W4):`w1 = cast(self.weight1, ...)`(ffn.py:146)
+        # 之后 `w1` 进 GroupedMatmul 的 ins,若照 `inputs:"all"` 计入 saves 就是把权重当激活
+        # —— 实测 FFNGroupedGEMM「236 MiB」里的 88 MiB(评估文档 §7.2)。walker 在
+        # `attrs["weight_ins_idx"]` 里标了这些下标(判据:该项的产出节点操作数全是权重)。
+        wix = set(n.attrs.get("weight_ins_idx") or ())
         for i in idxs:
-            if i >= len(n.ins):
+            if i >= len(n.ins) or i in wix:
                 continue
             name, shape, dtype = _parse(n.ins[i])
             if n.op == "Norm":
