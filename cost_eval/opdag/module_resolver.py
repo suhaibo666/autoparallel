@@ -38,6 +38,12 @@ LEAF_OPTYPE = {
     "ColumnParallelLinear": "MatMul",
     "RowParallelLinear": "MatMul",
     "SequenceParallelLinear": "MatMul",
+    # pynative 侧的统一线性叶子(`mindformers.pynative.layers.linear.Linear`):
+    # training_graph 用 Column/Row/SequenceParallelLinear 三分,pynative 只有一个 `Linear`
+    # (见 pynative/base_models/gpt/gpt_layer_specs.py 与
+    #  pynative/base_models/gpt/experimental_attention_variant_module_specs.py 的 submodules 填充)。
+    # 缺此表项时 pynative 任何 spec 树都在 extractor._bind_build_module 处 fail-loud。
+    "Linear": "MatMul",
     "FlashAttention": "FlashAttention",
     "Norm": "Norm",
     "Identity": "Identity",
@@ -52,6 +58,18 @@ _NAME_ALIAS = {
 _SPEC_FILES = (
     "parallel_core/training_graph/base_models/gpt/gpt_layer_specs.py",
     "parallel_core/training_graph/base_models/gpt/moe_module_specs.py",
+)
+
+# pynative(真机 PyNative 训练路径)的 spec 文件集。DSv4-Flash 走的是这一支:
+# `pynative/.../gpt_layer_specs.py:get_gpt_layer_local_spec` 带 `is_dsv4_hybrid` /
+# `enable_hyper_connections` 两个参数(training_graph 版**没有**这两个参数,传进去会被
+# `_Interp.resolve` 的 param_names 过滤**静默丢弃** → 解出 DSv3 的 MLASelfAttentionConcatenated
+# 而非 DSv4HybridSelfAttention)。第三个文件是必需的:`:110` 调
+# `get_dsv4_hybrid_module_spec(...)`,该 helper 定义在那里,不登记则 `_eval_call` fail-loud。
+PYNATIVE_SPEC_FILES = (
+    "pynative/base_models/gpt/gpt_layer_specs.py",
+    "pynative/base_models/gpt/moe_module_specs.py",
+    "pynative/base_models/gpt/experimental_attention_variant_module_specs.py",
 )
 
 # 入口函数名。
@@ -76,11 +94,11 @@ class _Return:
 
 # ── 解释器 ───────────────────────────────────────────────────────────────────
 class _Interp:
-    def __init__(self, mf_root: str):
+    def __init__(self, mf_root: str, spec_files=None):
         self.mf_root = mf_root
         # name -> (FunctionDef, src_file_relpath)
         self.funcs: dict[str, tuple[ast.FunctionDef, str]] = {}
-        for rel in _SPEC_FILES:
+        for rel in (spec_files or _SPEC_FILES):
             path = os.path.join(mf_root, *rel.split("/"))
             if not os.path.isfile(path):
                 # gpt_layer_specs.py 缺失是硬错;moe 缺失只在真正调用 get_moe_module_spec 时才 fail。
@@ -317,13 +335,17 @@ class _Interp:
 
 
 # ── 对外入口 ──────────────────────────────────────────────────────────────────
-def resolve_layer_spec(mf_root: str, flags: dict) -> ResolvedSpec:
+def resolve_layer_spec(mf_root: str, flags: dict, spec_files=None) -> ResolvedSpec:
     """读真 `gpt_layer_specs.py`,按 `flags` 静态解释 `get_gpt_layer_local_spec`,返回解出的模块树。
 
     参数
-      mf_root — mindformers 源根(含 `parallel_core/...`);仅被 `ast` 读取,绝不 import。
-      flags   — config 派生的 kwargs(见 DSv3 示例);缺的参数用函数自带默认。
+      mf_root    — mindformers 源根(含 `parallel_core/...`);仅被 `ast` 读取,绝不 import。
+      flags      — config 派生的 kwargs(见 DSv3 示例);缺的参数用函数自带默认。
+      spec_files — 可选。spec 构造函数所在文件集(相对 mf_root)。缺省 `_SPEC_FILES`
+                   (`parallel_core/training_graph/...`,与既有 DSv3 调用逐字节一致);
+                   传 `PYNATIVE_SPEC_FILES` 解 pynative(真机 PyNative)那一支——
+                   dsv4_hybrid / hyper-connection 只在那里可解。
     行为
       解不出的 if / 命中 raise / 未知构造 → 抛 ValueError 点名 file:line。
     """
-    return _Interp(mf_root).resolve(flags)
+    return _Interp(mf_root, spec_files).resolve(flags)

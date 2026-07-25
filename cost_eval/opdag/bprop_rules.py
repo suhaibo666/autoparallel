@@ -34,6 +34,11 @@ PIN = {
     "Cast":          {"inputs": []},                 # 自身不存;输出由下游 pin
     "Elementwise":   {},                             # 见下:linear→无;非线性 mul→两操作数
     "View":          {"inputs": []},                 # reshape/transpose 元信息
+    # IdentityOp:恒等映射,反向 dx=dy 直通,不需存任何激活。
+    # 它**会**真出现在 DAG 里:`qk_layernorm=False` 时 spec 把 q_layernorm/k_layernorm 解成
+    # `Identity`(module_resolver._NAME_ALIAS / LEAF_OPTYPE),walker 照常发射 Identity 节点。
+    # 缺此表项时 derive_saves 在 :44 fail-loud(实测 DSv3 MLA + qk_layernorm=False 即触发)。
+    "Identity":      {"inputs": []},
 }
 
 def derive_saves(dag) -> list[Save]:
