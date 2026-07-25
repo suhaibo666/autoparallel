@@ -12,6 +12,13 @@
      修=full-recompute 非 loss 层 max(0,fml−bwd_scratch)。s7 峰在 loss 层→此桶该事件 0(不双算),
      该桶在中部 transformer/MoE 层 stage 生效(见 pp8/s0)。
 纪律：真机 CSV 值绝不改动;结构量修后应更接近真机,剩余=框架缺口显式暴露。
+
+**2026-07-25 结构保真修复的影响（band 重钉，CSV 值一字未动）**：此前 UI round-trip 会把现场
+yaml 的多个结构字段静默换成 dsv4 预设值（`o_groups` 8→16、`moe_shared_ffn` 2048→3072、
+`dsa_indexer_topk` 512→1024、逐层 `compress_ratios` → (0,4,128) 循环、缺 `kv_lora_rank` 补 512），
+故本文件此前对账的**并不是这份 yaml 的结构**。保真后：① gather 9084.2（0.866，此前 ~10075/0.960
+是替换出来的"准"）；② remat 族过读 2.02×→**1.334×**（真实改善，topk 512 而非 1024）。两处 band
+按实测重钉并在各测试 docstring 写明归因。
 """
 import os
 import sys
@@ -42,6 +49,12 @@ def _site_unfused_stage7():
         warnings.simplefilter("ignore")
         mf = yaml.safe_load(open(_SITE, encoding="utf-8"))
         mf["model"]["apply_dsa_kernel_fusion"] = False
+        # kv_lora_rank：现场 yaml **没有**这个键（2026-07-25 round-trip 审计发现）。旧 UI 路径从
+        #   dsv4 预设静默补 512 后照常评估，本文件的 CSV 对账就是在该口径下建立的；保真修复后缺它
+        #   一律 fail-loud（正确）。为让锚点仍可比，此处**显式补上旧路径替换的同一值**并明示这是
+        #   测试补的、不在 yaml 里（dsv4_hybrid 的 op 图不引用该符号——实测 kv_lora∈{1,512,4096}
+        #   峰值逐字节相同 → 补值不影响任何桶）。
+        mf["model"].setdefault("kv_lora_rank", 512)
         mf2, _ = S._mf_adapt(mf)
         w = []
         S._materialize_nested_offset(mf2, w)
@@ -67,12 +80,22 @@ def _site_unfused_stage7():
 
 
 def test_stage7_gather_regather_matches_csv():
-    """① gather re-gather：修后 gather 峰 ≈ CSV 10491（结构量 Σ param_full 补齐 re-gather 窗）。"""
+    """① gather re-gather：gather 峰 ≈ CSV 10491（结构量 Σ param_full 补齐 re-gather 窗）。
+
+    **2026-07-25 如实重钉 band (0.92,1.05) → (0.85,1.05)**：round-trip 保真修复后本 stage 的权重
+    结构才是 yaml 真值，此前是**被预设替换过**的（更大）结构 —— 逐项实测其对本桶的贡献：
+      · `o_groups` 预设 16 而 yaml 真值 **8**  → 旧值多算 **+768 MiB**（分组输出投影 o_group_out）；
+      · `moe_shared_expert_intermediate_size` 预设 3072 而真值 **2048** → 多算 **+288 MiB**；
+      · `compress_ratios` 预设 (0,4,128) 循环 vs 真表 → **−65 MiB**。
+    合计旧口径 Σ param_full ≈ 10075（ratio 0.960，"很准"），真实结构 **9084.2（0.866）**。
+    即：此前的吻合有一部分来自结构被替换。CSV 10491 **不动**；欠读 ~13% = 块对齐/小权重 +
+    本桶尚未覆盖的 re-gather 成分，需真机逐块 micro-anchor 归因，**不调参掩盖**。
+    """
     _, gmax, _, _ = _site_unfused_stage7()
     ratio = gmax / CSV_GATHER
-    assert 0.92 <= ratio <= 1.05, (
+    assert 0.85 <= ratio <= 1.05, (
         f"gather 峰 {gmax:.1f} vs CSV 10491, ratio={ratio:.3f}（结构量=Σ本stage全重算层 param_full;"
-        f"残差=块对齐/小权重,报告 §8.5）")
+        f"残差=块对齐/小权重,报告 §8.5;band 于 2026-07-25 因结构保真修复重钉,见 docstring）")
 
 
 def test_stage7_muon_overlap_present_and_bounded():
@@ -109,11 +132,17 @@ def test_stage7_remat_overreads_csv_activation_family_documented():
     此前对峰值**完全无贡献**（saves 被丢弃、只剩 fml/ci），现在经 `remat` 第一次进入反向峰，而
     其 S² 项在 seq4096 站点配置下达到单层 A−ci≈35.3GB。叠上与 `recomp_scratch`(fml−ci) 的部分
     重叠 → 过读。**按纪律不反向调参**：钉住比值防继续恶化，同时明示这是"过读"（OOM 安全侧但不
-    准），待真机逐桶 micro-anchor 决定是否细化 unfused census 的重算态口径 / 扣减 fml 重叠。"""
+    准），待真机逐桶 micro-anchor 决定是否细化 unfused census 的重算态口径 / 扣减 fml 重叠。
+
+    **2026-07-25 重钉过读带 (1.8,2.3) → (1.15,1.6)**：round-trip 保真修复后 `dsa_indexer_topk`
+    取 yaml 真值 **512**（此前被 dsv4 预设替换成 **1024**，正好 2×），而 unfused census 的
+    `kv_gathered`/`kv_g_fp32`/`attn_weights` 都 ∝ topk → 该族过读从 **2.02× 降到 1.334×**
+    （单项实测：topk 512→1024 使本 stage 峰值 +12808 MiB）。**这是过读幅度的真实改善，不是调参**：
+    结构对了，比值自然靠近真机；残余 1.33× 仍是上文那条 census 口径问题，继续如实钉住。"""
     b, _, _, _ = _site_unfused_stage7()
     fam = (b.get("act_live", 0) + b.get("recomp_scratch", 0) + b.get("bwd_scratch", 0)
            + b.get("bwd_working_set", 0) + b.get("remat_saves", 0))
     assert fam > 18373.0, "remat 入账后该族应过读 CSV——若回到欠读，说明 remat 被误门控/清零"
-    assert 1.8 <= fam / 18373.0 <= 2.3, (
-        f"该族 {fam:.1f} / CSV 18373 = {fam/18373.0:.2f}× 越出已记录的过读带 (1.8,2.3)——"
+    assert 1.15 <= fam / 18373.0 <= 1.6, (
+        f"该族 {fam:.1f} / CSV 18373 = {fam/18373.0:.2f}× 越出已记录的过读带 (1.15,1.6)——"
         f"unfused census × remat 的过读幅度漂移,如实重钉并说明理由,勿调参掩盖。")

@@ -91,10 +91,19 @@ def _validate_structure(cfg: LLMConfig) -> None:
     # csa_compress_ratios（P1-10）：此前 2/3 等非法比被当稀疏 HCA 类路径接受（dsv4_hybrid.py
     # sparse = ratio not in (0,1)）——只有 {0,1(滑窗), 4(CSA), 128(HCA)} 是真实实现取值。
     if cfg.csa_compress_ratios is not None:
-        if len(cfg.csa_compress_ratios) != cfg.num_layers:
+        # 长度合法值 = `num_layers` 或 `num_layers + mtp_num_layers`（2026-07-25）：mindformers
+        #   现场 yaml（DSv4-Flash `test.yaml`：43 层 + 1 MTP → 44 项；A/B launcher：8 层 → 8 项）
+        #   把 **MTP 层的压缩比接在表尾**，而 `head.build_mtp_ops` 正是取 `ratios[-1]` 作 MTP 层
+        #   压缩比 → 两种长度都被逐项忠实消费（transformer 层用 0..N-1，MTP 用末项）。此前只许
+        #   == num_layers，令带 MTP 的现场 config 无法直连 build（UI 路径反而因**丢掉整张表**、
+        #   退回预设循环而"不报错"——静默错图，本次修复的根因之一）。
+        _ok_len = {cfg.num_layers, cfg.num_layers + max(0, cfg.mtp_num_layers)}
+        if len(cfg.csa_compress_ratios) not in _ok_len:
             raise ValueError(
                 f"csa_compress_ratios 长度({len(cfg.csa_compress_ratios)}) 必须 == "
-                f"num_layers({cfg.num_layers})（每层一个压缩比）。")
+                f"num_layers({cfg.num_layers}) 或 num_layers+mtp_num_layers"
+                f"({cfg.num_layers + max(0, cfg.mtp_num_layers)}，mindformers 现场写法：MTP 层的"
+                "压缩比接在表尾，由 build_mtp_ops 取 ratios[-1] 消费)。")
         for r in cfg.csa_compress_ratios:
             # §F5c（2026-07-15）：**先拒非整数值**（bool / 非整数浮点）——旧校验 `int(r)` 会把
             # 4.9 静默截断成 4、错走 dsv4hyb_r4_* 图。整数值（含 4.0 这类整数浮点）才继续档位判定。

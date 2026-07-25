@@ -44,7 +44,14 @@ def _dsv4_flash(**par_over):
             "model_type": "deepseek_v4", "vocab_size": 129280, "seq_length": 4096,
             "hidden_size": 4096, "num_hidden_layers": 43, "num_attention_heads": 64,
             "multi_latent_attention": True, "experimental_attention_variant": "dsv4_hybrid",
-            "q_lora_rank": 1024, "qk_rope_head_dim": 64, "qk_nope_head_dim": 448, "v_head_dim": 512,
+            # kv_lora_rank：**现场 test.yaml 里其实没有这个键**（2026-07-25 审计发现）。此前
+            #   UI round-trip 会从 dsv4 预设静默补 512 再照常评估，故本 fixture 也没写；
+            #   round-trip 保真修复后缺它一律 fail-loud（正确——评估器不猜结构）。本 fixture 的
+            #   两条 UI-round-trip 测试要的是"能评估 + Muon/mHC 不降级 + 结构↔timeline 自洽"，
+            #   故**显式写出旧路径静默替换的那个值**（512），保持测试意图与口径不变；
+            #   "缺 kv_lora_rank 必须 fail-loud" 由 test_yaml_roundtrip_fidelity.py 专门守。
+            "q_lora_rank": 1024, "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64, "qk_nope_head_dim": 448, "v_head_dim": 512,
             "o_groups": 8, "o_lora_rank": 1024, "qk_layernorm": True,
             "params_dtype": "bfloat16", "compute_dtype": "bfloat16",
             "num_nextn_predict_layers": 1,

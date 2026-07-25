@@ -286,6 +286,37 @@ def _head_dim(model: dict, attn_type: str) -> int | None:
     return None
 
 
+def _derive_qk_nope(model: dict, attn_type: str) -> None:
+    """MLA 族缺 `qk_nope_head_dim` 时**仅按恒等式** `head_dim = qk_nope + qk_rope` 导出（就地写入）。
+
+    依据：mindformers MLA 族把每头 QK 维拆成 nope+rope 两段拼接（`head_dim` 即拼接后总维，
+    DSv3 192=128+64；现场 DSv4-Flash `test.yaml` 显式写全三元组 448/64/512 —— 该恒等式在源
+    config 里自证）。167 A/B launcher（`dsv4h_*_pp4_recomp.yaml`）省略 `qk_nope_head_dim`、
+    只给 `head_dim: 512` + `qk_rope_head_dim: 64`，真机由 mindformers 导出 448。
+
+    纪律（与本模块其余 fail-loud 同源）：
+      - **只按这一条恒等式导出**，缺 `head_dim` 或缺 `qk_rope_head_dim` → 不导出（留 0，由
+        `build_llm._validate_structure` fail-loud），绝不杜撰；
+      - 三元组都写了但**不满足**恒等式 → fail-loud（不猜哪个字段对）；
+      - 非 MLA 族（gqa/mha）不导出（这些维对其 op 图惰性，恒 0）。
+    """
+    if attn_type not in ("mla", "dsv4_hybrid", "dsa"):
+        return
+    hd = model.get("head_dim", model.get("qk_head_dim"))
+    rope = model.get("qk_rope_head_dim")
+    nope = model.get("qk_nope_head_dim")
+    if hd is None or rope is None:
+        return                                  # 恒等式不成立于此 config → 不导出
+    if nope is None:
+        model["qk_nope_head_dim"] = int(hd) - int(rope)
+        return
+    if int(nope) + int(rope) != int(hd):
+        raise ValueError(
+            f"MLA 族头维不自洽：qk_nope_head_dim({nope}) + qk_rope_head_dim({rope}) "
+            f"!= head_dim({hd})。mindformers 的每头 QK 维 = nope 段 + rope 段拼接，三者必须满足"
+            "该恒等式——评估器拒绝猜测哪个字段为准（会静默产错 attn op 图）。")
+
+
 def _dsa_fused(model: dict) -> bool:
     """dsa_fused = apply_dsa_kernel_fusion；与 force_unfused_dsa 须互反（否则 fail-loud）。
 
@@ -378,6 +409,10 @@ def _build_llm_config(model: dict) -> LLMConfig:
             "或为该组合补建模。")
 
     attn_type = _infer_attn_type(model)
+    # qk_nope_head_dim 缺省导出（2026-07-25）：仅按 head_dim = qk_nope + qk_rope 恒等式，违背即
+    #   fail-loud（见 `_derive_qk_nope`）。放在 attn_type 推断之后、kwargs 构建之前 —— 下方
+    #   `qk_nope_head_dim=int(model.get("qk_nope_head_dim", 0))` 即读到导出值。
+    _derive_qk_nope(model, attn_type)
     # qk_layernorm 分类（closure-audit F2 2026-07-15 + **F7 订正 2026-07-16**）：mindformers **真构造**
     # q_layernorm/k_layernorm,作用于带 head 维的 Q/K（attention.py:311-357），Qwen3 PyNative 强制
     # qk_layernorm=True（modeling_qwen3_train_pynative.py:47-50）；Qwen3-32B 每层 BF16 72 MiB、64 层
@@ -423,7 +458,12 @@ def _build_llm_config(model: dict) -> LLMConfig:
         moe_shared_expert_gating=bool(model.get("use_shared_expert_gating", False)),
         moe_capacity_factor=float(model.get("moe_capacity_factor", 1.0)),
         first_k_dense_replace=model.get("first_k_dense_replace"),
-        moe_layer_freq=model.get("moe_layer_freq"),
+        # moe_layer_freq 归一成**声明类型** tuple（yaml 给的是 list）：`LLMConfig.moe_layer_freq`
+        #   声明 `tuple | int | None`，list 会让 JSON round-trip 后的 tuple 与之字段不相等
+        #   （保真判据误报）。int/None 原样（Megatron 的「每 freq 层一个 MoE」语义）。
+        moe_layer_freq=(tuple(model["moe_layer_freq"])
+                        if isinstance(model.get("moe_layer_freq"), (list, tuple))
+                        else model.get("moe_layer_freq")),
         # 归一化 / 位置编码（结构相关）
         normalization=model.get("normalization", "RMSNorm"),
         norm_placement=model.get("norm_placement", "pre"),

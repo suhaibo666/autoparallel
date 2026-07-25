@@ -18,6 +18,7 @@ from urllib.parse import urlparse, parse_qs
 sys.stdout.reconfigure(encoding="utf-8")
 from cost_eval.presets import deepseek_v3, deepseek_v4
 from cost_eval.build_llm import build_llm_spec
+from cost_eval.llm_config import from_jsonable, to_jsonable
 from cost_eval.structure_mem import estimate_structure_memory, estimate_select_memory
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
 from cost_eval.report import Evaluator
@@ -299,8 +300,60 @@ def parse_recompute_cfg(s, pp, N, mtp, pp_split):
     return parse_select_cfg(s, N)                                # 全层号写法（mf 口径）
 
 
+# ── yaml 导入的**权威 LLMConfig 通道**（2026-07-25，静默配置丢失 bug 修复）──────────────────
+# 背景:`_bundle_to_fields` 摊平出的扁平 UI dict **表达不了**多个结构字段（逐层
+#   `csa_compress_ratios`/`o_groups`/`dsa_indexer_*`/`chunk_loss_num`/`loss_type`/
+#   `moe_shared_ffn_hidden_size`/`kept_frag_factor`…），而 `parse_and_validate` 又从**预设基座**
+#   重建 LLMConfig → fields 没带的字段静默沿用预设值。现场 A/B config 实测 UI 路径 50926.7 MiB
+#   vs bundle 直连 37518.1 MiB（35% 分歧，纯由 compress_ratios 被换成预设 (0,4,128) 循环造成）。
+# 修法（不再无限加宽扁平 dict）:导入侧把**权威 LLMConfig 整体**编码进隐藏字段 `llm_json`，
+#   parse 侧以它为基座（预设不再参与）；UI 结构字段退化为**只覆盖用户真改过的那个**
+#   （`_LLM_FIELD_GATE` + `_gate_edited`），故"页面导入后微调"仍可用而其余字段逐字忠实。
+#   保真由 `_assert_bundle_roundtrip` 在 `_bundle_to_fields` 内**运行时**核验（护住 web /import）。
+# LLMConfig 字段 → 门控它的 UI 键：llm_json 基座下，仅当该 UI 键相对基座**被改过**才覆盖。
+_LLM_FIELD_GATE = {
+    "num_layers": "layers", "batch_size": "batch", "seq_length": "seq", "attn_type": "attn",
+    "num_attention_heads": "heads", "num_query_groups": "kv_groups",
+    "first_k_dense_replace": "dense_k", "num_moe_experts": "experts",
+    "moe_router_topk": "topk", "mtp_num_layers": "mtp", "dsa_fused": "dsa_fused",
+    "hidden_size": "hidden", "ffn_hidden_size": "ffn", "moe_ffn_hidden_size": "moe_ffn",
+    "q_lora_rank": "q_lora", "kv_lora_rank": "kv_lora", "qk_nope_head_dim": "qk_nope",
+    "qk_rope_head_dim": "qk_rope", "v_head_dim": "v_head", "vocab_size": "vocab",
+    "head_dim": "head_dim", "residual_variant": "hc", "num_residual_streams": "hc",
+    "cross_entropy_fused": "ce_fused", "ce_pynative_lean": "ce_lean",
+    "embedding_params_dtype_bytes": "emb_bytes",
+}
+
+
+class ConfigRoundTripError(RuntimeError):
+    """yaml → UI 字段 → LLMConfig 的 round-trip **不保真**（有字段被静默替换）。"""
+
+
+def _gate_edited(p, canon, field):
+    """`field` 的门控 UI 键相对 llm_json 基座是否**被用户改过**（缺键/同值 → 未改 → 不覆盖）。
+
+    未改就不覆盖，是为了保住基座里 UI 表达不了的语义差（如 `ffn_hidden_size=None`「取 4·H」
+    与显式 `4·H`、`first_k_dense_replace=None` 与 `0`）—— 覆盖会把 None 写成数值，字段级保真判据
+    就会红（而它红得有理:那不是同一份 config 了）。
+    """
+    key = _LLM_FIELD_GATE.get(field)
+    if key is None:                          # 编程错误:新增覆盖项必须登记门控键，否则无从判"改没改"
+        raise ConfigRoundTripError(
+            f"LLMConfig 字段 {field!r} 没有登记 UI 门控键（_LLM_FIELD_GATE）——llm_json 基座下"
+            "无法判断该字段是否被用户改动，拒绝静默覆盖权威 config。")
+    if canon.get(key) is None or p.get(key) is None:
+        return False
+    return str(p.get(key)).strip() != str(canon[key]).strip()
+
+
 def parse_and_validate(p):
-    """query dict → (errors:list[str], cfg:LLMConfig|None, pc_args:dict|None)。全部校验先行、报中文。"""
+    """query dict → (errors:list[str], cfg:LLMConfig|None, pc_args:dict|None)。全部校验先行、报中文。
+
+    结构基座两条路（2026-07-25）：
+      - `p["llm_json"]` 非空（yaml 导入 round-trip）→ 基座 = 该**权威 LLMConfig**，UI 字段只覆盖
+        用户改过的项（见 `_LLM_FIELD_GATE`）；预设**不参与**（故导入结果与页面预设选择无关）。
+      - 缺 `llm_json`（手配路径）→ 基座 = 预设，行为与历史逐字节一致。
+    """
     errs = []
     N = _i(p, "layers", 8); B = _i(p, "batch", 1); S = _i(p, "seq", 4096)
     heads = _i(p, "heads", 8); kvg = _i(p, "kv_groups", heads)
@@ -328,20 +381,45 @@ def parse_and_validate(p):
     # 结构维度（custom/微调:UI 传入即覆盖;未传(-1)则用预设 dims/基座默认）
     _DIMF = {"hidden": "hidden_size", "ffn": "ffn_hidden_size", "moe_ffn": "moe_ffn_hidden_size",
              "q_lora": "q_lora_rank", "kv_lora": "kv_lora_rank", "qk_nope": "qk_nope_head_dim",
-             "qk_rope": "qk_rope_head_dim", "v_head": "v_head_dim", "vocab": "vocab_size"}
+             "qk_rope": "qk_rope_head_dim", "v_head": "v_head_dim", "vocab": "vocab_size",
+             # head_dim（2026-07-25 新增，隐藏字段）：yaml 导入侧回填**每头维真值**，让下方
+             #   「MLA 族 nope+rope 相加」推导不再是唯一来源（A/B launcher 的 dsv4_hybrid
+             #   head_dim=512 而 to_dimtable 默认 H//heads=64，二者都对不上 nope+rope）。
+             #   手配路径不传该键 → 推导逻辑原样生效（逐字节不变）。
+             "head_dim": "head_dim"}
+    # 允许显式 **0** 的维度键：MLA 族低秩/头维对 gqa/mha 的 op 图**惰性**，其忠实值就是 0
+    #   （实证:仅改这 5 个维、gqa op 图与逐 op 字节完全不变）。此前为绕开「≥1」校验，
+    #   `_bundle_to_fields` 回填占位 1 —— 占位值让 round-trip 保真判据无从成立，且曾把 head_dim
+    #   推导腐蚀成 2（116 std 锚点欠估 57% 的主根因）。0 进 dim_over 后仍由
+    #   `build_llm._validate_structure` 按 attn_type 判定该维是否必须 >0（mla/dsa/dsv4 仍 fail-loud）。
+    _DIMF_ZERO_OK = {"q_lora", "kv_lora", "qk_nope", "qk_rope", "v_head"}
+    # 空串 = 未设（**仅隐藏字段**）：`head_dim` 是隐藏输入，未导入时恒为空 —— 空串必须等同"缺键"
+    #   （走下方推导），不能像可见输入框那样报「必须 ≥1」。可见维度框留空仍按旧规则报错（严格更好:
+    #   空框显示不出任何值，静默改用预设值会评估另一份结构）。
+    _DIMF_BLANK_OK = {"head_dim"}
     dim_over = {}
     for uik, field in _DIMF.items():
+        raw = p.get(uik)
+        if uik in _DIMF_BLANK_OK and isinstance(raw, str) and not raw.strip():
+            continue
         v = _i(p, uik, -1)
-        if p.get(uik) is not None and v < 1:
-            errs.append(f"{uik} 必须是 ≥1 的整数")
-        elif v >= 1:
+        lo = 0 if uik in _DIMF_ZERO_OK else 1
+        if raw is not None and v < lo:
+            errs.append(f"{uik} 必须是 ≥{lo} 的整数")
+        elif v >= lo:
             dim_over[field] = v
     # head_dim = qk_nope+qk_rope 是 **MLA 族语义**（每头 nope+rope 拼接）。标准 mha/gqa 的
     # head_dim = hidden/heads,与 qk_nope/qk_rope 无关——而 yaml 导入回填(_bundle_to_fields)对
     # 非 MLA 模型发 qk_nope=1/qk_rope=1(缺省占位),此前无脑相加把 head_dim 覆盖成 2(应 64)
     # → 标准注意力段激活/权重全线缩水 32×(116 std 锚点 s0 欠估 57% 的主根因,2026-07-23 修)。
-    if (attn in ("mla", "dsa", "dsv4_hybrid")
-            and "qk_nope_head_dim" in dim_over and "qk_rope_head_dim" in dim_over):
+    # **显式 head_dim 优先**（2026-07-25）：查询里带了 head_dim（yaml 导入回填的每头维真值）就
+    #   不再推导——推导只是「缺该字段时」的兜底。否则 dsv4_hybrid 的 head_dim=512（真值）会被
+    #   nope+rope 或 H//heads 覆盖成另一个数。
+    if "head_dim" in dim_over:
+        pass
+    elif (attn in ("mla", "dsa", "dsv4_hybrid")
+            and "qk_nope_head_dim" in dim_over and "qk_rope_head_dim" in dim_over
+            and dim_over["qk_nope_head_dim"] > 0 and dim_over["qk_rope_head_dim"] > 0):
         dim_over["head_dim"] = dim_over["qk_nope_head_dim"] + dim_over["qk_rope_head_dim"]
     elif attn in ("mha", "gqa"):
         # 标准注意力 head_dim = hidden/heads(attention.py:112-115 hidden_size%num_heads 校验即此
@@ -418,29 +496,38 @@ def parse_and_validate(p):
     if errs:
         return errs, None, None
 
-    # 预设基座（dims 覆盖 = HF config.json 的全尺寸维度）+ UI 字段最终覆盖。
-    pr = PRESETS[preset]
-    base = (deepseek_v4(N) if (pr["base"] == "v4" or attn == "dsv4_hybrid") else deepseek_v3(N))
-    if pr["dims"]:
-        base = dataclasses.replace(base, **pr["dims"])
-    if dim_over:                               # UI 维度最终覆盖（custom / 预设微调）
-        base = dataclasses.replace(base, **dim_over)
+    # ── 结构基座：① yaml 导入的**权威 LLMConfig**（llm_json）② 否则预设 ─────────────────
+    llm_json = (p.get("llm_json") or "").strip()
+    canon = None            # 非 None → llm_json 基座：UI 覆盖项按"改没改"门控（见 _gate_edited）
+    if llm_json:
+        try:
+            base = from_jsonable(json.loads(llm_json))
+        except Exception as e:                 # 编码漂移/字段集不匹配 → fail-loud,不回落预设
+            return [f"llm_json（yaml 导入的权威结构）解析失败:{type(e).__name__}: {e}"], None, None
+        canon = _llm_to_fields(base)
+    else:
+        # 预设基座（dims 覆盖 = HF config.json 的全尺寸维度）+ UI 字段最终覆盖。
+        pr = PRESETS[preset]
+        base = (deepseek_v4(N) if (pr["base"] == "v4" or attn == "dsv4_hybrid") else deepseek_v3(N))
+        if pr["dims"]:
+            base = dataclasses.replace(base, **pr["dims"])
     # dsa（DSv3.2/GLM-5 的 MLA+lightning indexer 稀疏注意力）:真实 attn_type=dsa（layers/dsa.py，
     # **预估计**——基于 training_graph 静态图 DSA 代码,无真机锚点,待 pynative DSA 落地重校准）。
     # indexer 三维未由预设/UI 提供时按 DSv3.2-Exp 默认(64/128/2048)补齐,避免 fail-loud 拦住 custom。
+    # **llm_json 基座下不补**（2026-07-25）:那是权威 config,缺 indexer 维应由 build_llm fail-loud,
+    #   补默认值 = 又一次静默替换（本次修复要消灭的正是这类）。
     _attn_map = {"mha": "gqa"}
     dsa_fill = {}
-    if attn == "dsa":
+    if attn == "dsa" and canon is None:
         if base.dsa_indexer_n_heads <= 0:
             dsa_fill["dsa_indexer_n_heads"] = 64
         if base.dsa_indexer_head_dim <= 0:
             dsa_fill["dsa_indexer_head_dim"] = 128
         if base.dsa_indexer_topk <= 0:
             dsa_fill["dsa_indexer_topk"] = 2048
-    cfg = dataclasses.replace(
-        base, num_layers=N, batch_size=B, seq_length=S,
+    over = dict(
+        num_layers=N, batch_size=B, seq_length=S,
         attn_type=_attn_map.get(attn, attn),
-        **dsa_fill,
         num_attention_heads=heads,
         # dsv4_hybrid 的 num_query_groups 用基座值（MLA 系惰性=1）;mla/mha/dsa=heads;gqa=kv_groups。
         num_query_groups=(base.num_query_groups if attn == "dsv4_hybrid"
@@ -453,28 +540,34 @@ def parse_and_validate(p):
         #   此前 eval_config 不透传 → 无论 yaml apply_dsa_kernel_fusion 与否恒按 fused 估(dsv4_hybrid 欠估)。
         dsa_fused=_x_flag(p, "dsa_fused", True),
         mtp_num_layers=max(0, mtp))
+    over.update(dim_over)                      # UI 维度覆盖（custom / 预设微调 / 导入后手改）
     # 融合 CE（cross_entropy_fused，隐藏字段 ce_fused）：yaml 导入侧 from_mindformers 对
     #   dsv4_hybrid 推断 True（lean CE，真机锚 15415.5 背书），但此前 _bundle_to_fields 不回填、
     #   此处不解析 → UI round-trip 静默降级回 False（unfused fat K_CE）→ dsv4 无重算 loss stage
     #   过估 ~10GiB（2026-07-22 185 pp4 锚点定标时修）。缺省不传 → 保留基座/默认（历史行为不变）。
     if (p.get("ce_fused") or "").strip() != "":
-        cfg = dataclasses.replace(cfg, cross_entropy_fused=_x_flag(p, "ce_fused", cfg.cross_entropy_fused))
+        over["cross_entropy_fused"] = _x_flag(p, "ce_fused", base.cross_entropy_fused)
     # unfused CE lean 口径（隐藏字段 ce_lean,2026-07-23 std 锚点）：K_CE=4 与 pp 无关（116 std
     # pp1/pp2-s1 实测一致）。缺省 → 制度常数 8/4（DSv3-era 冻结口径）。
     if (p.get("ce_lean") or "").strip() != "":
-        cfg = dataclasses.replace(cfg, ce_pynative_lean=_x_flag(p, "ce_lean", cfg.ce_pynative_lean))
+        over["ce_pynative_lean"] = _x_flag(p, "ce_lean", base.ce_pynative_lean)
     # 2026-07-24 口径切换：去除 std_pin 隐藏字段（std_recompute_ctx_pin 经验保留集已删，纯理论口径）。
     # embedding/head 权重 dtype 字节（隐藏字段 emb_bytes）：116 std fork 的 TransformerConfig 默认
     # embedding_params_dtype=float32（shim 配置转储实证）→ 4;缺省 2 = 全部既有锚点口径。
     if (p.get("emb_bytes") or "").strip() != "":
         _eb = _i(p, "emb_bytes", 2)
         if _eb in (2, 4):
-            cfg = dataclasses.replace(cfg, embedding_params_dtype_bytes=_eb)
+            over["embedding_params_dtype_bytes"] = _eb
     # mHC（HyperConnection 残差变体）：hc 显式设时覆盖基座——1=plain、≥2=mhc(hidden×n 残差流)。
     #   空(hc=0)则保留基座（v4 预设 base=deepseek_v4→num_residual_streams=4、v3→plain）→ 不误关预设 mHC。
     if hc >= 1:
-        cfg = dataclasses.replace(cfg, residual_variant=("mhc" if hc > 1 else "plain"),
-                                  num_residual_streams=hc)
+        over["residual_variant"] = ("mhc" if hc > 1 else "plain")
+        over["num_residual_streams"] = hc
+    if canon is not None:
+        # llm_json 基座：只保留**用户真改过**的 UI 覆盖项，其余一律用权威值（含 UI 表达不了的
+        #   None 语义）。未登记门控键的覆盖项 → `_gate_edited` fail-loud（防日后加字段时静默替换）。
+        over = {k: v for k, v in over.items() if _gate_edited(p, canon, k)}
+    cfg = dataclasses.replace(base, **over, **dsa_fill)
     # （细粒度重算已在上方统一入口 parse_recompute_cfg 解析,含 per-stage 写法——用户报告 #2 合并,
     #   此处不再单独处理 per-stage；stage→层映射用的是**归置前**的用户配额 pp_split，口径不变。）
     # pp 层分配 → 含伪层的 layers_per_stage:embedding→stage0、head+MTP→末 stage（不占用户配额;
@@ -724,6 +817,23 @@ def _build_eval_specs(p, pa):
     return pc, opt, hw, SwapSpec()
 
 
+def _rc_from_pa(pa):
+    """parsed `pa` → `RecomputeSpec`（eval_config 与 round-trip 保真核验共用，单一来源）。"""
+    lset = pa["sel_layers"]   # 重算层范围层号集（多段并集；空→全部 1..T=N+mtp,含 MTP 层,见 parse_and_validate）
+    if pa["rmode"] == "full":
+        return RecomputeSpec("full", full_layers=set(lset))
+    if pa["rmode"] == "select":
+        selset = _SEL_ATTN if pa["sel"] == "attn" else (_SEL_MLP if pa["sel"] == "mlp" else _SEL_ATTN | _SEL_MLP)
+        return RecomputeSpec("select", select_ops={lid: set(selset) for lid in lset})
+    if pa["sel_cfg"]:
+        # 细粒度文本（mindformers select_module 口径,每 pattern 可不同层集）——非空即优先。
+        return RecomputeSpec("select", select_ops=pa["sel_cfg"])
+    if pa["rmode"] == "custom":
+        # 图上勾选:任意 op 名 × 层号集（多段）—— 与 mindformers select_recompute（op 位置级）同口径。
+        return RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in lset})
+    return RecomputeSpec("None")
+
+
 def eval_config(p):
     errs, cfg, pa = parse_and_validate(p)
     if errs:
@@ -731,20 +841,7 @@ def eval_config(p):
     spec = build_llm_spec(cfg)
     d = spec.dims
     N = pa["N"]
-    lset = pa["sel_layers"]   # 重算层范围层号集（多段并集；空→全部 1..T=N+mtp,含 MTP 层,见 parse_and_validate）
-    if pa["rmode"] == "full":
-        rc = RecomputeSpec("full", full_layers=set(lset))
-    elif pa["rmode"] == "select":
-        selset = _SEL_ATTN if pa["sel"] == "attn" else (_SEL_MLP if pa["sel"] == "mlp" else _SEL_ATTN | _SEL_MLP)
-        rc = RecomputeSpec("select", select_ops={lid: set(selset) for lid in lset})
-    elif pa["sel_cfg"]:
-        # 细粒度文本（mindformers select_module 口径,每 pattern 可不同层集）——非空即优先。
-        rc = RecomputeSpec("select", select_ops=pa["sel_cfg"])
-    elif pa["rmode"] == "custom":
-        # 图上勾选:任意 op 名 × 层号集（多段）—— 与 mindformers select_recompute（op 位置级）同口径。
-        rc = RecomputeSpec("select", select_ops={lid: set(pa["sel_ops"]) for lid in lset})
-    else:
-        rc = RecomputeSpec("None")
+    rc = _rc_from_pa(pa)
     # P1-02④（2026-07-14 review）：select 选择器**命中数校验**——错拼 op 子串此前静默空转
     # （层仍被标 select → kept_frag margin 生效 →「越错越贵」，真机应≈none）。判据按**每层
     # 选择器并集**（预设 cell 集刻意覆盖 MLA+GQA 两套 op 词汇,逐 selector 判会误杀）：某层
@@ -935,26 +1032,138 @@ def _materialize_nested_offset(mf, warnings=None):
     par["num_layer_list"] = [sum(base + int(off[c][s]) for c in range(v)) for s in range(pp)]
 
 
-def _bundle_to_fields(b):
-    """EvaluatorConfigBundle → UI 字段 dict（yaml 导入回填;只读转换,不落盘）。"""
-    llm, pc, rc = b.llm, b.parallel, b.recompute
-    f = {
+def _layers_to_ranges(lids):
+    """层号集 → 「重算层范围」文本（`1-4;7`，`_parse_layer_ranges` 的逆）。空集 → ""。"""
+    ids = sorted(set(int(x) for x in lids))
+    if not ids:
+        return ""
+    out, start = [], ids[0]
+    for prev, cur in zip(ids, ids[1:] + [None]):
+        if cur != prev + 1:
+            out.append(f"{start}-{prev}" if prev > start else f"{start}")
+            start = cur
+    return ";".join(out)
+
+
+def _llm_to_fields(llm):
+    """`LLMConfig` → UI 结构字段 dict（**单一来源**：既用于回填，也用于 parse 侧判"改没改"）。
+
+    两条铁律（2026-07-25 静默配置丢失修复）：
+      ① **不发占位值**——`q_lora/kv_lora/qk_nope/qk_rope/v_head` 发**真值**（可为 0，非 MLA 族的
+         忠实值就是 0；parse 侧 `_DIMF_ZERO_OK` 放行 0）。旧代码发 `or 1` 占位，既让保真无从判定，
+         又曾把 head_dim 推导腐蚀成 2（116 std 锚点欠估 57% 主根因）。
+      ② **`llm_json` 带全字段**——UI 扁平表示天然装不下逐层 `csa_compress_ratios`、`o_groups`、
+         `chunk_loss_num`、`loss_type`、`kept_frag_factor` 等，故权威 `LLMConfig` 整体随隐藏字段
+         过桥（`parse_and_validate` 以它为基座）。此后**新增 LLMConfig 字段自动被带上**，
+         不必再逐个加 UI 字段（旧做法每漏一个就静默沿用预设值）。
+
+    `head_dim`/`ffn`/`moe_ffn` 发**生效值**（None → `to_dimtable` 的默认 `H//heads` / `4·H` / 取 ffn）：
+    页面上要显示一个数，且 canon 与回填同源 → 门控判定得出"未改" → 基座里的 None 语义原样保留。
+    """
+    hd = llm.head_dim if llm.head_dim is not None else llm.hidden_size // llm.num_attention_heads
+    ffn = llm.ffn_hidden_size if llm.ffn_hidden_size is not None else 4 * llm.hidden_size
+    return {
         "attn": llm.attn_type, "layers": llm.num_layers,
         "dense_k": (llm.first_k_dense_replace or 0),
         "experts": (llm.num_moe_experts or 0), "topk": (llm.moe_router_topk or 1),
-        "heads": llm.num_attention_heads, "kv_groups": llm.num_query_groups,
+        "heads": llm.num_attention_heads,
+        "kv_groups": (llm.num_query_groups if llm.num_query_groups is not None
+                      else llm.num_attention_heads),
         "seq": llm.seq_length, "batch": llm.batch_size,
-        "hidden": llm.hidden_size, "ffn": llm.ffn_hidden_size,
-        "moe_ffn": (llm.moe_ffn_hidden_size or llm.ffn_hidden_size),
-        "q_lora": (llm.q_lora_rank or 1), "kv_lora": (llm.kv_lora_rank or 1),
-        "qk_nope": (llm.qk_nope_head_dim or 1), "qk_rope": (llm.qk_rope_head_dim or 1),
-        "v_head": (llm.v_head_dim or llm.head_dim), "vocab": llm.vocab_size,
+        "hidden": llm.hidden_size, "ffn": ffn,
+        "moe_ffn": (llm.moe_ffn_hidden_size if llm.moe_ffn_hidden_size is not None else ffn),
+        "head_dim": hd,
+        "q_lora": llm.q_lora_rank, "kv_lora": llm.kv_lora_rank,
+        "qk_nope": llm.qk_nope_head_dim, "qk_rope": llm.qk_rope_head_dim,
+        "v_head": llm.v_head_dim, "vocab": llm.vocab_size,
+        "mtp": int(llm.mtp_num_layers or 0),
+        # mHC 残差流(num_residual_streams)：residual_variant≠mhc → 1(无 mHC)。
+        "hc": (int(llm.num_residual_streams or 1) if llm.residual_variant == "mhc" else 1),
+        # DSA/CSA 融合开关(apply_dsa_kernel_fusion)：unfused 激活大得多，丢了会大幅欠估。
+        "dsa_fused": int(bool(llm.dsa_fused)),
+        # 融合 CE / unfused-CE lean / embedding 权重 dtype 字节（隐藏字段，各自有真机口径背书）。
+        "ce_fused": int(bool(llm.cross_entropy_fused)),
+        "ce_lean": int(bool(llm.ce_pynative_lean)),
+        "emb_bytes": int(llm.embedding_params_dtype_bytes),
+        # **权威结构**（全字段）：parse 侧据此重建 LLMConfig，UI 字段只覆盖用户改过的项。
+        "llm_json": json.dumps(to_jsonable(llm), ensure_ascii=False, separators=(",", ":")),
+    }
+
+
+def _llm_field_diffs(llm, cfg):
+    """两份 `LLMConfig` 的逐字段差异 `[(field, 权威值, 实际值)]`（空 = 完全一致）。"""
+    a, c = dataclasses.asdict(llm), dataclasses.asdict(cfg)
+    return [(k, a[k], c[k]) for k in a if a[k] != c[k]]
+
+
+def _llm_roundtrip_diffs(llm, q):
+    """`LLMConfig` × UI query → 逐字段差异（空 = 保真）。
+
+    这是**运行时保真判据**：query 经 `parse_and_validate` 重建的 LLMConfig 必须与权威 `llm`
+    逐字段相等 —— 任何不等都意味着页面在评估**另一份模型**（历史上就是从预设基座补的值）。
+    """
+    errs, cfg, pa = parse_and_validate(q)
+    if errs:
+        return [("<parse_and_validate>", "无错误", "; ".join(errs))]
+    return _llm_field_diffs(llm, cfg)
+
+
+# round-trip 自检用的**敌意页面默认**：刻意用与 bundle 不同的预设/模块选择，证明结构结论
+#   只由 fields 决定（预设/DEF 泄漏不进结构）。两套预设都跑，防"某个预设恰好等于 bundle"的假阴性。
+_RT_PROBE_DEFAULTS = ({"preset": "dsv4_pro", "select": "both"},
+                      {"preset": "dsv3_mini", "select": "attn"})
+
+
+def _assert_bundle_roundtrip(b, fields):
+    """**运行时不变量**：fields 经 `parse_and_validate` 必须复现 bundle 的 `LLMConfig` 与
+    `RecomputeSpec`，否则 `ConfigRoundTripError`（护住 web `/import` 与所有脚本调用方）。
+
+    与本库既有 fail-loud 纪律同源（`from_mindformers._MAPPED_MODEL_KEYS` 未知键 /
+    `_PAR_UNSUPPORTED_TRUTHY` / `report._validate_recompute_against_graph`）：宁可导入报错，
+    也不静默评估一份"结构被预设补过"的 config。
+    """
+    for probe in _RT_PROBE_DEFAULTS:
+        q = dict(probe)
+        q.update({k: str(v) for k, v in fields.items() if v is not None})
+        errs, cfg, pa = parse_and_validate(q)
+        if errs:
+            raise ConfigRoundTripError(
+                f"yaml 导入的字段回传后无法通过校验（页面会评估不出结果）：{'; '.join(errs)}")
+        diffs = _llm_field_diffs(b.llm, cfg)
+        if diffs:
+            det = "; ".join(f"{k}: yaml={va!r} 但 round-trip={vc!r}" for k, va, vc in diffs[:12])
+            raise ConfigRoundTripError(
+                f"yaml 导入的结构无法经 UI 字段无损回传（{len(diffs)} 个字段被替换）：{det}。"
+                "这些字段在扁平 UI dict 里没有承载,页面评估会从预设基座补值 → 评估的是另一份模型。"
+                "请在 `_llm_to_fields` 里让它们随 `llm_json` 过桥,或为其加 UI 字段+门控键。")
+        rc2 = _rc_from_pa(pa)
+        if (rc2.mode, rc2.full_layers, rc2.select_ops) != (
+                b.recompute.mode, b.recompute.full_layers, b.recompute.select_ops):
+            raise ConfigRoundTripError(
+                f"yaml 导入的重算配置无法经 UI 字段无损回传：yaml="
+                f"({b.recompute.mode}, full={sorted(b.recompute.full_layers)}, "
+                f"select={ {k: sorted(v) for k, v in b.recompute.select_ops.items()} }) "
+                f"但 round-trip=({rc2.mode}, full={sorted(rc2.full_layers)}, "
+                f"select={ {k: sorted(v) for k, v in rc2.select_ops.items()} })。")
+
+
+def _bundle_to_fields(b):
+    """EvaluatorConfigBundle → UI 字段 dict（yaml 导入回填;只读转换,不落盘）。
+
+    返回前跑 `_assert_bundle_roundtrip` —— **保真不成立就 fail-loud**（2026-07-25）。
+    """
+    llm, pc, rc = b.llm, b.parallel, b.recompute
+    f = _llm_to_fields(llm)
+    f.update({
         "dp": pc.dp_shard, "tp": pc.tp, "ep": pc.ep, "pp": pc.pp, "cp": pc.cp,
         "method": pc.context_parallel_method,
-        "mtp": int(getattr(llm, "mtp_num_layers", 0) or 0),
         "recompute": ("full" if rc.mode == "full" else ("custom" if rc.mode == "select" else "None")),
         "sel_cfg": (_sel_ops_to_text(rc.select_ops) if rc.mode == "select" else ""),
-    }
+        # 重算层范围（2026-07-25 补）：full 模式下 `full_layers` **不是恒等于"全部层"**
+        #   （yaml 可只写 `full_recompute_layer: ["0-3"]`），此前不回填 → 页面把它放大成全部层重算、
+        #   静默低估激活。空集/全集都照实发（全集时与"留空=全部"等价，逐字节不变）。
+        "sel_layers": (_layers_to_ranges(rc.full_layers) if rc.mode == "full" else ""),
+    })
     if getattr(pc, "layers_per_stage", None):
         lp = list(pc.layers_per_stage)
         lp[0] -= 1; lp[-1] -= 1        # 去 embedding/head 伪层(mtp 计入可切分层数,保留在配额里)
@@ -979,16 +1188,10 @@ def _bundle_to_fields(b):
     f["optimizer"] = "muon" if str(getattr(b.optimizer, "type", "")).lower() == "muon" else "adamw"
     f["muon_per_head"] = int(bool(getattr(b.optimizer, "per_head", False)))
     f["muon_ns_mult"] = getattr(b.optimizer, "ns_workspace_mult", 3.0)   # Muon NS workspace 倍数(可配)
-    # mHC 残差流(num_residual_streams):此前遗漏 → yaml enable_hyper_connections+num_residual_streams=4
-    #   在 round-trip 被静默降级为 plain(hc=1)→ 持久/激活欠算 ×n。residual_variant≠mhc → 1(无 mHC)。
-    f["hc"] = (int(getattr(llm, "num_residual_streams", 1) or 1)
-               if getattr(llm, "residual_variant", "plain") == "mhc" else 1)
-    # DSA/CSA 融合开关(apply_dsa_kernel_fusion)：此前遗漏 → yaml unfused 在 UI round-trip 被静默按 fused
-    #   估(dsv4_hybrid 激活大幅欠估,现场 DSv4-Flash 实证 unfused 真机 45557 vs fused 估 ~27k)。
-    f["dsa_fused"] = int(bool(getattr(llm, "dsa_fused", True)))
-    # 融合 CE(cross_entropy_fused)：此前遗漏 → yaml 导入推断的 dsv4 lean-CE(True)在 round-trip
-    #   被静默降级为 unfused fat(K_CE)→ 无重算 loss stage 过估(2026-07-22 修,与 parse 侧成对)。
-    f["ce_fused"] = int(bool(getattr(llm, "cross_entropy_fused", False)))
+    # （llm 侧字段 hc / dsa_fused / ce_fused / ce_lean / emb_bytes / head_dim / llm_json 由
+    #   `_llm_to_fields` 统一发出——单一来源，parse 侧的"改没改"判定用的是同一函数。）
+    # **运行时保真门**：fields 必须能无损回传出同一份 LLMConfig + RecomputeSpec，否则 fail-loud。
+    _assert_bundle_roundtrip(b, f)
     return f
 
 
@@ -1335,6 +1538,17 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
       <input type="hidden" name="sp" value="">
       <input type="hidden" name="grad_bytes" value="4">
       <input type="hidden" name="dsa_fused" value="1">
+      <!-- yaml 导入回填的隐藏字段（2026-07-25）：此前 `_bundle_to_fields` 已回填 ce_fused 等，
+           但页面**没有同名输入框** → 浏览器 qs() 收不到、web UI 上那些修复一直没生效
+           （只有脚本调用者受益）。空值 = 手配路径不生效（历史行为逐字节不变）。
+           `llm_json` = yaml 解析出的**权威 LLMConfig 全字段**，parse_and_validate 以它为结构基座；
+           UI 字段只覆盖用户真改过的项，故导入后仍可微调而其余字段逐字忠实。
+           选模型预设 → resetRuntimeExtras() 把这些清空（= 放弃导入的权威结构，回手配语义）。 -->
+      <input type="hidden" name="head_dim" value="">
+      <input type="hidden" name="ce_fused" value="">
+      <input type="hidden" name="ce_lean" value="">
+      <input type="hidden" name="emb_bytes" value="">
+      <input type="hidden" name="llm_json" value="">
     </div>
   </section>
 </aside>
@@ -1638,7 +1852,10 @@ function showBuckets(e){
 }
 /* 运行时/硬件 extra → 手配默认(64GiB/AdamW-fp32/dp_replicate=1/reshard=default/offload 关/prefetch=1)。
    选模型预设=手配路径 → 复位这些 extra,不残留上次 yaml 导入的解析值(非导入路径保持现状)。*/
-const RT_DEFAULTS={dp_replicate:"1",reshard:"default",cpu_offload:"0",prefetch:"1",maxdev_gib:"64",opt_dtype:"fp32",sp:"",grad_bytes:"4"};
+/* llm_json/head_dim/ce_*/emb_bytes 一并复位:选预设 = 放弃 yaml 导入的**权威结构**,回预设+UI 表达
+   (不清 llm_json 会让预设选择看似无效——基座仍是上次导入的那份 config)。 */
+const RT_DEFAULTS={dp_replicate:"1",reshard:"default",cpu_offload:"0",prefetch:"1",maxdev_gib:"64",opt_dtype:"fp32",sp:"",grad_bytes:"4",
+  llm_json:"",head_dim:"",ce_fused:"",ce_lean:"",emb_bytes:""};
 function resetRuntimeExtras(){
   Object.entries(RT_DEFAULTS).forEach(([k,v])=>{const el=document.querySelector(`#side [name=${k}]`);if(el)el.value=v;});
 }

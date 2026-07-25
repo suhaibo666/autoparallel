@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from .model_spec import DimTable
@@ -119,6 +120,46 @@ class LLMConfig:
     add_qkv_bias: bool = False
 
     compute_dtype_bytes: int = 2            # bf16
+
+
+# 声明类型为 `tuple` 的序列字段：JSON 没有 tuple，解码时必须还原，否则 round-trip 得到 `list`
+# 与原 `tuple` **字段不相等**（`(0,4,128) != [0,4,128]`）→ 保真判据会误报/漏报。
+_TUPLE_FIELDS = ("window_pattern", "csa_compress_ratios", "moe_layer_freq")
+
+
+def to_jsonable(cfg: LLMConfig) -> dict:
+    """`LLMConfig` → 纯 JSON 可序列化 dict（**全字段**，无省略）。
+
+    用途（`serve_explorer` 的 yaml 导入闭环，2026-07-25）：把 yaml 解析出的**权威**
+    `LLMConfig` 原样带过「UI query dict」这道扁平表示，使页面评估不再从预设基座重建结构
+    （重建会静默沿用预设值 —— 逐层 `csa_compress_ratios` / `o_groups` / `chunk_loss_num` 等
+    在 UI 里无字段可承载，现场实测造成 35% 峰值分歧）。
+
+    **全字段无省略**是刻意的：任何"只带一部分"的编码都会在新增字段时静默退化成预设值。
+    """
+    return {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
+
+
+def from_jsonable(d: dict) -> LLMConfig:
+    """`to_jsonable` 的逆：JSON dict → `LLMConfig`。**字段集必须逐字对齐**，否则 fail-loud。
+
+    - 多键（未知字段）→ 报错：编码方与本类定义漂移，静默丢弃会评估另一份模型；
+    - 缺键 → 报错：缺的字段会**静默取 dataclass 默认值**，正是本次修复要消灭的静默替换；
+    - `_TUPLE_FIELDS` 的 list → tuple 还原（JSON 无 tuple，见上方注释）。
+    """
+    names = [f.name for f in dataclasses.fields(LLMConfig)]
+    got = set(d)
+    unknown, missing = sorted(got - set(names)), sorted(set(names) - got)
+    if unknown or missing:
+        raise ValueError(
+            f"LLMConfig JSON 字段集不匹配（未知 {unknown} / 缺失 {missing}）——缺字段会静默取"
+            "dataclass 默认值（= 静默替换结构），未知字段说明编码方与 LLMConfig 定义漂移；"
+            "两者都拒绝，请用同版本的 `to_jsonable` 重新编码。")
+    kw = dict(d)
+    for k in _TUPLE_FIELDS:
+        if isinstance(kw.get(k), list):
+            kw[k] = tuple(kw[k])
+    return LLMConfig(**kw)
 
 
 def to_dimtable(cfg: LLMConfig) -> DimTable:
