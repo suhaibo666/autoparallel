@@ -68,10 +68,23 @@ def _validate_structure(cfg: LLMConfig) -> None:
     # {attention.py build_mla_attn_ops, dsv4_hybrid.py, dsa.py} 符号表达式；≤0 会静默产负/零
     # numel）。**gqa/mha 的 MLA 维默认 0 惰性、从不进 op 图 → 不查**（否则误伤合法 GQA 预设）。
     if cfg.attn_type in ("mla", "dsv4_hybrid", "dsa"):
-        for _f, _v in (("q_lora_rank", cfg.q_lora_rank), ("kv_lora_rank", cfg.kv_lora_rank),
-                       ("qk_rope_head_dim", cfg.qk_rope_head_dim),
-                       ("qk_nope_head_dim", cfg.qk_nope_head_dim),
-                       ("v_head_dim", cfg.v_head_dim)):
+        _guarded = [("q_lora_rank", cfg.q_lora_rank), ("kv_lora_rank", cfg.kv_lora_rank),
+                    ("qk_rope_head_dim", cfg.qk_rope_head_dim),
+                    ("qk_nope_head_dim", cfg.qk_nope_head_dim),
+                    ("v_head_dim", cfg.v_head_dim)]
+        # 2026-07-25：`dsv4_hybrid` 的 op 图**不含** kv_lora_rank / qk_nope_head_dim（逐符号核实:
+        # layers/dsv4_hybrid.py 中两者出现 0 次,而 q_lora_rank/qk_rope_head_dim/v_head_dim 分别
+        # 6/2/31 次）。机制原因见 dsv4_hybrid.py:49-51 —— 该变体 `q_head_dim = config.v_head_dim`
+        # （deepseek_v4_hybrid_attention.py:66）,Q/K 头维整体取 v_head_dim,不按 nope+rope 拆；
+        # 且 MLA 的 KV-LoRA 通路被 CSA compressor 取代（CMP_PROJ_OUT = coff*v_head_dim）。
+        # 现场 DSv4-Flash yaml 因此**根本不写** kv_lora_rank —— 旧的一律必需使用者被迫编一个值,
+        # 正是刚修掉的"静默替代"失效模式。故仅对本变体豁免这两维；mla/dsa 仍严查（它们真在用:
+        # attention.py 7/3 次、dsa.py 13/2 次）。回归 test_dsv4_hybrid_unused_mla_dims 守着:
+        # 一旦这两维真进了 dsv4_hybrid 的图（峰值随其变化）,测试即失败 → 回来恢复守卫。
+        if cfg.attn_type == "dsv4_hybrid":
+            _guarded = [(f, v) for f, v in _guarded
+                        if f not in ("kv_lora_rank", "qk_nope_head_dim")]
+        for _f, _v in _guarded:
             _reject_non_strict_int(_f, _v)   # §F5b：MLA 低秩/头维亦须严格整数（bool 放行会产错图）
             if _v <= 0:
                 raise ValueError(

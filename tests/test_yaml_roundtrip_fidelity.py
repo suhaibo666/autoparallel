@@ -285,16 +285,22 @@ def test_site_yaml_roundtrip_field_exact(path):
 
 
 # ── ④ 缺 kv_lora_rank：两条路径同样 fail-loud（绝不替换预设值）────────────────────────
-def test_site_yaml_missing_kv_lora_fails_loud_both_paths():
-    """现场 test.yaml 真的没有 kv_lora_rank → bundle 直连与 UI 路径**都**必须 fail-loud。"""
+def test_site_yaml_missing_kv_lora_roundtrips_as_zero_not_preset():
+    """现场 test.yaml 真的没有 kv_lora_rank → 两条路径都必须忠实带 **0**，绝不补预设值。
+
+    2026-07-25 订正:本测试原先还断言 `build_llm_spec` 必 fail-loud。该守卫已按证据收窄——
+    `kv_lora_rank` 在 `layers/dsv4_hybrid.py` 出现 **0 次**、峰值对其逐字节不变(见
+    tests/test_dsv4_hybrid_unused_mla_dims.py),故本变体不再要求 >0(现场 yaml 遂可原样评估,
+    不必编值)。mla/dsa 的 fail-loud 覆盖移至该文件。**本测试的原本意图(round-trip 不得静默
+    替代成预设值)完整保留** —— 那才是这里要守的东西。
+    """
     mf = _ab_launcher()
     mf["model"].pop("kv_lora_rank")
     b, fields, cfg = _roundtrip(mf)
     assert b.llm.kv_lora_rank == 0 and cfg.kv_lora_rank == 0   # round-trip 忠实带 0，不补预设
+    # dsv4_hybrid 不用这一维 → 可直接建图评估（且 UI 路径与 bundle 一致）
     for label, c in (("bundle", b.llm), ("ui", cfg)):
-        with pytest.raises(ValueError) as ei:
-            build_llm_spec(c)
-        assert "kv_lora_rank" in str(ei.value), (label, str(ei.value))
+        assert build_llm_spec(c) is not None, label
 
 
 # ── ⑤ qk_nope_head_dim：仅按 head_dim = qk_nope + qk_rope 恒等式导出，违背即 fail-loud ──
@@ -313,13 +319,19 @@ def test_qk_nope_identity_violation_fails_loud():
 
 
 def test_qk_nope_not_derivable_without_head_dim():
-    """既无 qk_nope 也无 head_dim → 不导出（保持 0，由 build_llm fail-loud），不杜撰。"""
+    """既无 qk_nope 也无 head_dim → **不导出**（保持 0），不杜撰一个值。
+
+    2026-07-25 订正:原先还断言 build_llm 因此 fail-loud。`qk_nope_head_dim` 在
+    `layers/dsv4_hybrid.py` 出现 **0 次**(该变体 `q_head_dim = v_head_dim`,不按 nope+rope 拆,
+    见 dsv4_hybrid.py:49-51),峰值对其逐字节不变 → 本变体不再要求 >0。**本测试的原本意图
+    (缺恒等式输入时不许编造导出值)完整保留**;mla/dsa 的 fail-loud 见
+    tests/test_dsv4_hybrid_unused_mla_dims.py。
+    """
     mf = _ab_launcher()
     mf["model"].pop("head_dim")
     b = from_mindformers_dict(mf)
-    assert b.llm.qk_nope_head_dim == 0
-    with pytest.raises(ValueError):
-        build_llm_spec(b.llm)
+    assert b.llm.qk_nope_head_dim == 0          # 不导出、不杜撰
+    assert build_llm_spec(b.llm) is not None    # dsv4_hybrid 不用这一维 → 仍可建图
 
 
 # ── ⑥ compress_ratios 长度：N 或 N+mtp（mindformers 现场写法，末项=MTP 层）────────────
