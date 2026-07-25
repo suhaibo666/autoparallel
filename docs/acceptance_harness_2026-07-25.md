@@ -218,3 +218,30 @@ $ <只拷入本次改动的 11 个文件 + 2 份 A/B yaml> && python -m pytest t
 7. **`workspace_bytes` / `bwd_scratch_bytes` 仍是手写/profiler 标定** —— 有意保留的近似
    （kernel 实现细节，源码里读不出来；契约只要求 ≥0 的 int）。
 8. **验收门加了约 10 s 测试时长**（8 跑 × 2 grad_mode × 3 次 `main()` 端到端）。
+
+## 8. 提交与最终 pytest 行 [RAN]
+
+两个提交，**各自独立可绿**（在 `7b9aa86` 的干净 worktree 上逐个 checkout 实测）：
+
+| commit | 内容 | `python -m pytest tests -q` |
+|---|---|---|
+| `c4e5bf4` | `feat(liveness): graph source 插座 + ResolvedLayer 适配器契约` | `1642 passed, 268 warnings in 25.76s`（1583 + 59） |
+| `2b77f92` | `feat(tools): 167 A/B 八跑验收门 —— source × config 的验收台` | **`1676 passed, 268 warnings in 38.51s`**（1583 + 93） |
+
+同一干净 worktree 上验收门端到端：`派生反查违规: 0` / `不变量失败: 0 / 7` / `结论: PASS`。
+
+### 主工作树的现状（如实说明）
+
+主工作树里另一 agent 正在重写 `cost_eval/opdag/`（`construct_walker.py` 等 5 个文件、
++1441 行，**未提交**）。在那个 in-flight 状态下跑全量：
+
+```
+$ python -m pytest tests -q
+14 failed, 1662 passed, 268 warnings in 37.83s
+$ python -m pytest tests -q | grep ^FAILED | sed 's/::.*//' | sort | uniq -c
+     12 tests/test_opdag_drop_diagnostics.py
+      2 tests/test_opdag_gpt_segments.py
+```
+
+14 个红全部落在 `test_opdag_*`，**与本次改动无交集**（本次不碰 `cost_eval/opdag/**`）。
+本次改动的权威回归结论以上表的干净 worktree 为准：**1676 passed**。
