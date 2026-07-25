@@ -94,6 +94,8 @@ _IGNORED_MODEL_KEYS = {
     # ── 现场 DSv4-Flash yaml 的数值/算法旋钮（不改 op 图、不改驻留字节）──────────────────────
     "activation_func_clamp_value",   # 激活函数数值 clamp（数值稳定，不改张量形）
     "compress_rotary_base",          # 压缩注意力 rotary base（同 csa_compress_rotary_base，数值）
+    "compress_rope_theta",           # 同上别名（167 A/B launcher dsv4h_*_pp4_recomp.yaml 用此拼写）；
+                                     # rotary base 是频率标量,全库无任何 shape/字节路径引用 → 内存中性
     "mhc_init_gating_factor",        # mHC 门控初值（数值 init）
     "mhc_sinkhorn_iterations",       # mHC sinkhorn 迭代次数（同 hc_sinkhorn_iters，计算时非驻留）
     "moe_router_score_function",     # router 打分函数名（logits 形不变，同 scoring_func）
@@ -842,6 +844,11 @@ def _build_parallel(mf: dict, mtp: int, num_layers: int) -> ParallelConfig:
             num_microbatches = derived_m
     # 显式 pipeline_parallel_layers_per_stage（pynative 真键）优先；老式 num_layer_list/offset 兜底。
     pp_lps = par.get("pipeline_parallel_layers_per_stage")
+    # `"auto"` = mindformers 的等分语义（config 文档：`auto (equal split) or list of layer
+    # intervals per stage`，167 launcher dsv4h_*_pp4_recomp.yaml 用之）→ 不设显式配额，
+    # 走下游默认等分；不能当区间串解析（会得到段数 1 而 fail-loud）。
+    if isinstance(pp_lps, str) and pp_lps.strip().lower() == "auto":
+        pp_lps = None
     if pp_lps is not None and pp > 1:
         par = dict(par)
         par["num_layer_list"] = _parse_pp_layers_per_stage(pp_lps, pp)
