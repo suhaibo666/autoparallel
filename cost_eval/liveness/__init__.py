@@ -24,14 +24,28 @@ CLI（per-stage 峰值 + 峰值时刻 live-set dump）：
 """
 from .categories import (BUCKET_OF_CATEGORY, LIVENESS_CATEGORIES,
                          NON_LIVENESS_BUCKETS, bucket_of, to_buckets)
+from .contract import (Violation, assert_resolved_layer, layer_activation_bytes,
+                       layer_entry_names, layer_param_bytes, layer_total_bytes,
+                       validate_param_census, validate_resolved_graph,
+                       validate_resolved_layer)
 from .graph import (BwdNode, FwdNode, LayerGraph, LTensor, build_layer_graph,
                     build_stage_graphs)
 from .simulate import (LiveItem, LiveSample, LivenessResult, StageLiveness,
                        simulate_liveness)
+from .sources import (EXTRACTED, HAND_SPEC, available_graph_sources,
+                      graph_source, has_graph_source, register_graph_source,
+                      resolve_graph, unregister_graph_source)
 
 __all__ = [
     "simulate_liveness", "LivenessResult", "StageLiveness", "LiveItem", "LiveSample",
     "build_layer_graph", "build_stage_graphs", "LayerGraph", "LTensor", "FwdNode", "BwdNode",
     "LIVENESS_CATEGORIES", "NON_LIVENESS_BUCKETS", "BUCKET_OF_CATEGORY",
     "bucket_of", "to_buckets",
+    # graph source 插座（hand_spec / extracted）
+    "HAND_SPEC", "EXTRACTED", "register_graph_source", "unregister_graph_source",
+    "graph_source", "has_graph_source", "available_graph_sources", "resolve_graph",
+    # ResolvedLayer 适配器契约
+    "Violation", "validate_resolved_layer", "assert_resolved_layer",
+    "validate_resolved_graph", "validate_param_census",
+    "layer_total_bytes", "layer_param_bytes", "layer_activation_bytes", "layer_entry_names",
 ]

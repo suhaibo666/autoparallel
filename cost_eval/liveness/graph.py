@@ -309,16 +309,19 @@ def build_layer_graph(resolved_layer, *, alloc_block_bytes: int = 1,
 def build_stage_graphs(spec, *, pp: int = 1, m: int = 1, tp: int = 1, cp: int = 1,
                        ep: int = 1, dp_shard: int = 1, alloc_block_bytes: int = 1,
                        norm_compute_dtype_bytes: int = 0,
-                       grad_mode: str = "dataflow") -> dict:
-    """便捷入口：`ModelSpec` → `{stage: [LayerGraph, ...]}`（供图层面的单测/诊断直用）。"""
+                       grad_mode: str = "dataflow",
+                       graph_source: str = "hand_spec") -> dict:
+    """便捷入口：`ModelSpec` → `{stage: [LayerGraph, ...]}`（供图层面的单测/诊断直用）。
+
+    `graph_source` 见 `liveness/sources.py`；默认 `"hand_spec"` 与改造前逐字节相同。"""
     from ..parallel_model import ParallelModel
-    from ..shape_eval import ShapeEval
     from ..specs import ParallelConfig
+    from .sources import resolve_graph
     pc = ParallelConfig(pp=pp, num_microbatches=m, tp=tp, cp=cp, ep=ep,
                         dp_shard=dp_shard, sequence_parallel=(tp > 1))
     world = dp_shard * cp * tp * pp
     pm = ParallelModel(pc, spec.dims.n_layers, world)
-    g = ShapeEval().resolve(spec, pm)
+    g = resolve_graph(spec, pm, graph_source)
     return {st: [build_layer_graph(l, alloc_block_bytes=alloc_block_bytes,
                                   norm_compute_dtype_bytes=norm_compute_dtype_bytes,
                                   grad_mode=grad_mode)

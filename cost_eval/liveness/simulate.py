@@ -32,13 +32,13 @@ from ..framework import framework_reserve as _framework_reserve
 from ..parallel_model import ParallelModel
 from ..schedule import (_1f1b_from_warmup, build_interleaved_1f1b,
                         interleaved_virtual_order)
-from ..shape_eval import ShapeEval
 from ..specs import _MUON_NS_WORKSPACE_MULT, is_attn_projection, is_muon_matrix_weight
 from ..static_mem import StaticMem
 from ..structure_mem import (_checkpoint_islands, _fsdp_local_count,
                              estimate_structure_memory)
 from .categories import LIVENESS_CATEGORIES, NON_LIVENESS_BUCKETS, to_buckets
 from .graph import build_layer_graph
+from .sources import HAND_SPEC, resolve_graph
 
 __all__ = ["simulate_liveness", "LivenessResult", "StageLiveness", "LiveItem",
            "LiveSample"]
@@ -190,7 +190,8 @@ class _LiveSet:
 
 def simulate_liveness(model_spec, parallel_config, optimizer, hardware,
                       recompute, swap, *, record_timeline: bool = False,
-                      grad_mode: str = "dataflow") -> LivenessResult:
+                      grad_mode: str = "dataflow",
+                      graph_source: str = HAND_SPEC) -> LivenessResult:
     """给定与 `Evaluator` 完全相同的一组配置，跑逐张量 liveness 仿真。
 
     参数
@@ -200,13 +201,17 @@ def simulate_liveness(model_spec, parallel_config, optimizer, hardware,
         反向节点所读内部张量的两个最大者（沿用 `structure_mem._backward_max_live` 的相邻窗
         模型，structure_mem.py:178-219）——用于量化「census 把一条 11-op 小算子链塌成单个 op
         的 `saves` 平表后，反向梯度链**不可导出**」这个缺口的规模。
+    graph_source : op 图来源（`liveness/sources.py` 的注册名，或直接给 ``fn(spec, pm)``）。
+        ``"hand_spec"``（默认）= `ShapeEval` 解析手写 census，**与改造前逐字节相同**；
+        ``"extracted"`` = `cost_eval/opdag/to_resolved.py` 的源抽取图（落地后自动可用）。
+        仿真器本身与来源无关 —— 两条来源可在**同一仿真器**上做 A/B（差异只能来自图）。
     """
     if grad_mode not in ("dataflow", "chain2"):
         raise ValueError(f"grad_mode={grad_mode!r} 非法：只支持 'dataflow' / 'chain2'。")
     pc = parallel_config
     world = pc.dp_replicate * pc.dp_shard * pc.cp * pc.tp * pc.pp
     pm = ParallelModel(pc, model_spec.dims.n_layers, world)
-    g = ShapeEval().resolve(model_spec, pm)
+    g = resolve_graph(model_spec, pm, graph_source)
     blk = getattr(hardware, "alloc_block_bytes", 1)
     persistent = StaticMem().compute(
         g, optimizer, pm, alloc_block_bytes=blk,
