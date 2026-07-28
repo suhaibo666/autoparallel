@@ -288,7 +288,16 @@ def _sum_term(f: Factors) -> str:
 
 
 def add(a: Factors, b: Factors) -> Factors:
-    """两个轴相加(concat 末轴 / q_head_dim=qk_head_dim+qk_pos_emb_head_dim):合成一个和式原子单元。"""
+    """两个轴相加(concat 末轴 / q_head_dim=qk_head_dim+qk_pos_emb_head_dim):合成一个和式原子单元。
+
+    **两侧都是纯常数时直接折叠**(2026-07-28):和式原子单元是给"含符号、约不掉"的情形准备的
+    (整个串被当成一个不可解的符号名);两个字面量相加的结果是**已知整数**,包成 `((1+1)+1)`
+    这种原子单元反而让 `consumer._sym_value` 查不到映射 → 落 unresolved。真源:
+    `hyper_connection.py:408` `concat((alpha_pre, alpha_post, alpha_res), -1)` 三个
+    `Parameter` 形状都是 `(1,)`,末轴相加应当就是 3。
+    """
+    if not a.syms and not b.syms:
+        return Factors(coeff=a.coeff + b.coeff)
     unit = _canon_sum(f"{_sum_term(a)}+{_sum_term(b)}")
     return Factors(1, {unit: 1})
 

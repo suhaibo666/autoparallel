@@ -68,3 +68,54 @@ COST_EVAL_EXTRACTED_ALLOW_PARTIAL=1 python tools/liveness_ab_validate.py \
 
 → **缺的只有三条通路**，不是一百个小问题：
 (A) 权重形状喂回 shape 推断；(B) opaque 产出的**声明式**形状（带出处）；(C) gather 的算子定义。
+
+---
+
+## 2. 第一批修复：三条通路 + 三处走查修复 [RAN]
+
+| # | 改动 | 文件 | 为什么是**源读**不是猜 |
+|---|---|---|---|
+| A1 | **跨行调用的权重归属**：`_emit` 按「param 记录行号 == 节点行号」匹配改成**按发射作用域**认领（本次 `_emit` 处理实参期间新记、且未被内层节点认领的权重就是本节点的） | `construct_walker.py` | `hyper_connection.py:408-411` 的 concat 跨四行，三个 `Parameter` 记在 `:409`；发射作用域是**语法事实**，不是行号巧合 |
+| A2 | **权重派生节点的形状通路**：`ins` 为空且操作数全是 `Parameter` 时，用 `init_dims.param_shapes` 当伪输入轴 | `shape_infer.py` + `to_resolved.py` | 权重形状本来就由 `init_dims` 从 `__init__` 的 `Parameter(mint.empty(...))` 逐字读出（本轮之前只喂给 param census） |
+| B | **opaque 产出的声明表** `_DECLARED_OPAQUE_OUTS`（8 条，逐条带 `file:line` + 理由，逐条进 `Coverage.declared_shapes`） | `to_resolved.py` | 每条都是源侧 docstring / 注释 / 紧邻 reshape 目标 / `forward` 的 `return` 逐字；轴结构没逐字给出的只声明**元素数**（`~` 前缀），宁少说勿多说 |
+| C | **`mint.gather` 产出形 = index 形** | `shape_infer.py` | 算子定义。**只**对 `prim == "mint.gather"` 生效 —— advanced indexing（`csa.py:485`）语义不同，套上去会少算尾轴 |
+| D | **数据流边桥接**（`bridge_by_edge`，缺省关） | `shape_infer.py` | 内联子 Cell 的返回值**丢的是名字、不是数据流边**（`h_in` → `aggregated_attn`，边 4→7 在）。缺省关是有意的：`timesim/producer.py:227` 按「几个输入已解出」判 S 分歧，多解出一个就多注入一条 AG —— 那是另一个子系统的口径 |
+| E | **归约算子按已记的轴推形**（`reduce_dim` / `keepdim` / **新增** `reduce_all`） | `shape_infer.py` + `construct_walker.py` | 轴 walker 早就记了（G4），`shape_infer` 一直没用；「源侧根本没传 `dim`」是一条**可判定**的源事实（⇒ 全轴归约 ⇒ 标量），与「抠不出轴」必须分开记 |
+| F | **RoPE 频率表的形状**（`[max_seq_len, 1, 1, qk_pos_emb_head_dim]`） | `shape_infer.py` | `rotary_pos_embedding.py:109-148` 逐字推导链（见代码注释），`dim = config.qk_pos_emb_head_dim` @ `deepseek_v4_hybrid_attention.py:175-177`；三处调用点共用同一实例（`:88` 层层下传） |
+| G | **`init_dims` 支持局部元组 shape** + `Linear`/`VocabEmbedding` 的位置形参种子 | `init_dims.py` + `to_resolved.py` | `linear.py:84-85` `weight_shape = (output_size, input_size)`；种子值逐字来自唯一构造点 `gpt_model.py:252-253` / `language_model_embedding.py:66-68` |
+| H | `sym_shape.add` 对**两侧纯常数**折叠 | `sym_shape.py` | `((1+1)+1)` 这种和式原子单元查不到符号映射 → 落 unresolved；两个字面量之和是已知整数 |
+
+### 2.1 覆盖度逐步实测（run a，L8 fused）[RAN]
+
+| 阶段 | 节点 | op | 跳过 | param 可解析 | param 进图 |
+|---|---|---|---|---|---|
+| 基线（`74d99f4`） | 2568 | 820 | 874 | 3290.9 MiB | 1434.0 MiB |
+| + A1/A2 + B（权重派生 + opaque 声明） | 2568 | 986 | 791 | 3290.9 | 1434.0 |
+| + D（数据流边桥接） | 2568 | 1094 | 737 | 3290.9 | 1434.0 |
+| + E（归约按轴） | 2568 | 1164 | 702 | 3290.9 | 1434.0 |
+| + C/F/G（gather / rope / Linear·Embedding 权重） | 2568 | **1226** | **671** | **5310.9** | **3454.0** |
+
+`hand_spec` 侧 param 合计 6300 MiB 量级 → 抽取侧从 **23%** 提到 **55%**。
+
+### 2.2 逐字节中立 —— diff，不是断言 [RAN]
+
+`scratchpad/dump_numbers.py` 依赖从未进版本库的 `validate_dsv3.py`（前一轮的临时脚本），
+在任何 clean checkout 上都跑不起来（实测 `ModuleNotFoundError`）。故新增
+`scratchpad/dump_numbers_ab.py`：**站点就是验收门那八跑**，dump 手写 `ModelSpec` 全字段
+（每个 op 的每个张量的每个字段）+ 桶模型 `Evaluator` 的 `peak/peak_event/全 breakdown`
++ `liveness(hand_spec)` 两种 grad_mode 的逐 stage 峰值。
+
+```bash
+git worktree add -f --detach <scratch>/wt-base 74d99f4
+(cd <wt-base> && python scratchpad/dump_numbers_ab.py > before.txt)   # 4265 行
+python scratchpad/dump_numbers_ab.py > after.txt                       # 4265 行
+diff before.txt after.txt        ->  *** 0 diff ***
+```
+
+结构上也如此：`bucket` / `hand_spec` 的路径**根本不 import `cost_eval/opdag`**
+（唯一的运行期引用是 `liveness/sources.py` 对 `extracted` 入口点的惰性探测）。
+
+### 2.3 台账更新（`tests/test_to_resolved_adapter.py::LEDGER_BLOCKERS`）
+
+2026-07-25 记的 4 处级联根**全部修掉**，测试的**不变量原样保留**（"级联根必须逐条在册；
+修好一处就更新台账"），只换了例子 —— 新的两处逐条记在该常量的注释里。

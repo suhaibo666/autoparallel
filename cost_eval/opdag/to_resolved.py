@@ -697,6 +697,26 @@ def _init_book(root: str, site: _Site, dims) -> _InitBook:
         "compress_ratio": int(site.ratio),
         # `layer_number` 只参与 host 判定（csa.py:552）。
         "layer_number": 1,
+        # `Linear.__init__` 的两个**位置**形参（无缺省 ⇒ `_param_defaults` 拿不到它们）。
+        # 值逐字来自 lm_head 的构造点 [SRC] `gpt_model.py:252-253`
+        # `Linear(input_size=self.hidden_size, output_size=self.vocab_size, …)`。
+        # 缺它们 → `linear.py:84-85` `weight_shape = (output_size, input_size)` 解不出 →
+        # `Linear.weight` 从来没有形状 → `linear.py:132` 的权重转置成级联根、lm_head 的
+        # 1010 MiB 词表投影权重进不了图。
+        # ⚠ 只对 `Linear` 这个类生效（`eval_init_dims` 按形参名过滤）；解码层里的叶子
+        # `Linear` 被 `LEAF_OPTYPE` 折成单个 `MatMul`、**没有** `linear.py:*` 的节点，
+        # 故这条种子不会把它们算成词表尺寸（实测解码层图里 `linear.py` 节点数 = 0）。
+        "input_size": {"dim": "H", "val": int(dims.H)},
+        "output_size": {"dim": "vocab", "val": int(dims.vocab)},
+        # 同一构造点 [SRC] `gpt_model.py:255` `bias=False`（形参缺省是 `True`，会让
+        # `if self.has_bias:` 分支多记一个不存在的 `bias` 参数）。
+        "bias": False,
+        # `VocabEmbedding.__init__` 的两个位置形参，值逐字来自唯一存在的构造点 [SRC]
+        # `language_model_embedding.py:66-68` `VocabEmbedding(num_embeddings=vocab_size,
+        # embedding_dim=config.hidden_size, …)`（`add_position_embedding=False` ⇒
+        # `:75` 的第二个构造点不存在，见 `_DECLARED_FACTS`）。
+        "num_embeddings": {"dim": "vocab", "val": int(dims.vocab)},
+        "embedding_dim": {"dim": "H", "val": int(dims.H)},
         # `head_dim` **刻意不给**：`Compressor` 有两个构造点且 head_dim 不同
         # （csa.py:604 `config.v_head_dim`=512 vs indexer.py:128 `self.index_head_dim`=128），
         # extractor 不传播构造实参 → 给一个全局值必然把另一处算错。见 opdag_bytes §5 的 G2。
@@ -762,6 +782,83 @@ _KERNEL_SAVES = {
 
 def _kernel_saves(root: str) -> dict:
     return dict(_KERNEL_SAVES)
+
+
+#: **opaque 产出形状的调用方声明**（2026-07-28）。`Kernel` / `FusedFunction` 的产出形是 kernel /
+#: `_Function.forward` 的内部契约，`shape_infer` 推不出来 —— 但**源侧逐字给了**（docstring /
+#: 注释 / 紧接着的 reshape 目标 / `forward` 的 return）。纪律与 `_KERNEL_SAVES` 完全相同：
+#:   ① 每条带 `file:line` 出处；② 每条逐项进 `Coverage.declared_shapes`（报告里可见）；
+#:   ③ **永不**与"推断出来的"混为一谈；④ 源里读不出的位一律留 `None`（不给数）。
+#: 值的形态见 `shape_infer._declared_out_shape`：`"S·B·H"` 逐轴 / `"~…"` 只知元素数 /
+#: `"=in<k>"` 与第 k 个张量输入同形。
+#: 用 `~`（只知元素数）而不是逐轴，是因为**轴结构没有逐字给出**、只有元素数由源可证
+#: （"紧接着被 reshape 成 X" ⇒ reshape 恒不改元素数 ⇒ numel = numel(X)）。宁少说勿多说。
+_DECLARED_OPAQUE_OUTS = {
+    # ── mHC 融合内核 ────────────────────────────────────────────────────────
+    "npu_mhc_pre_sinkhorn": {
+        # 调用点 `hyper_connection.py:413`：`h_in, h_post, h_res_flat, *_ = …`
+        "outs": ("S·B·H", "~S·B·hc_mult", "~S·B·hc_mult·hc_mult"),
+        "src": "hyper_connection.py:396-399,421-423",
+        "why": "Returns docstring 逐字：`aggregated: [s,b,H]` / `h_res: [s,b,n,n]` / "
+               "`h_post: [s,b,n,1]`；:421 `aggregated = h_in` ⇒ h_in 逐轴 [s,b,H]；"
+               "h_res_flat/h_post 只知元素数（:422/:423 的 reshape 目标 ⇒ reshape 恒不改元素数），"
+               "轴结构未逐字给出 → 标 `~`",
+    },
+    "npu_mhc_post": {
+        "outs": ("~S·B·hc_mult·H",),
+        "src": "hyper_connection.py:354-355,366",
+        "why": "Returns docstring 逐字 `Updated packed streams with shape [s, b, n*H]`；"
+               ":366 `reshape(output, (s, b, n*hidden_size))` ⇒ 内核产出元素数 = s·b·n·H",
+    },
+    # ── DSA lightning indexer（fused 支）──────────────────────────────────────
+    "npu_lightning_indexer": {
+        # 调用点 `indexer.py:220`：`topk_indices, index_scores = …`
+        "outs": ("~B·S·index_topk", "~B·S·index_topk"),
+        "src": "indexer.py:231-232,258-264",
+        "why": "源侧逐字钉住 fused/unfused **同一份契约**（:258-261 注释）：unfused 支 :262 "
+               "`topk_scores, topk_indices = topk(index_scores[b,sq,sk], k=effective_topk, dim=-1)`"
+               " ⇒ 两者均 [b, sq, topk]；fused 支 :231-232 各 squeeze 掉一条长度 1 的轴 ⇒ "
+               "内核产出元素数 = b·sq·topk（fused 时 effective_topk = index_topk，:212）",
+    },
+    # ── DSv4 稀疏注意力（fused 支）────────────────────────────────────────────
+    "FusedSparseFlashMlaWithIndexerLoss": {
+        "outs": ("~B·S·n_heads·v_head_dim",),
+        "src": "csa.py:722-725",
+        "why": "紧随其后的注释逐字：`npu_sparse_flash_mla returns BSND/TND [b, sq, np, vd]`，"
+               "并 :725 `reshape(output, (b, s, n, d))` ⇒ 元素数 = b·sq·np·vd",
+    },
+    "FusedSparseFlashMla": {
+        "outs": ("~B·S·n_heads·v_head_dim",),
+        "src": "csa.py:722-725",
+        "why": "同上（同一处 reshape 承接两支）",
+    },
+    # ── 直通型 `_Function`（forward 原样返回入参）────────────────────────────
+    "_MoEAuxLossAutoScaler": {
+        "outs": ("=in0",),
+        "src": "moe_utils.py:284-295",
+        "why": "`forward(ctx, output, aux_loss)` 逐字 `ctx.aux_loss = aux_loss; return output`"
+               " ⇒ 产出与第 0 个输入**同一张**张量",
+    },
+    "_IndexerLossAutoScaler": {
+        "outs": ("=in0",),
+        "src": "indexer.py:273-277",
+        "why": "`forward(ctx, output, indexer_loss)` 逐字 `return output unchanged`",
+    },
+    # ── 交叉熵两段 ──────────────────────────────────────────────────────────
+    "_LogSoftmax": {
+        "outs": ("=in0",),
+        "src": "loss.py:134-143",
+        "why": "`forward(ctx, logits)` 逐字：`shifted = sub(logits, max_val)`（广播，与 logits 同形）、"
+               "`return sub(log_sum, shifted)` ⇒ 产出与 logits 同形。"
+               "（`ctx.logits = logits` @ :136 ⇒ 那 1010 MiB 是真 saved，本节点活过来才拿得到）",
+    },
+    "_NLLLoss": {
+        "outs": ("=in1",),
+        "src": "loss.py:166-170",
+        "why": "`indices = reshape(labels, (-1,1))`、`loss = reshape(gather(log_softmax, 1, indices), (-1,))`"
+               " ⇒ gather 产出与 index 同形（算子定义）、reshape 恒不改元素数 ⇒ 元素数 = numel(labels)",
+    },
+}
 
 
 def _extract(root: str, rel: str, cls: str, spec, flags: dict, **kw):
@@ -1112,9 +1209,23 @@ class _Folder:
         return out
 
     # ── 主循环 ───────────────────────────────────────────────────────────
+    def _param_shapes(self) -> dict:
+        """`(源文件基名, 属性名) -> 符号 shape 串` —— **权重派生节点**的形状通路（2026-07-28）。
+
+        权重形状由 `init_dims` 从各类 `__init__` 的 `Parameter(mint.empty(...))` 逐字读出
+        （`_init_book.param`），此前只喂给 param census；`shape_infer` 拿不到 → `ins` 恒空的
+        权重派生节点（`hyper_connection.py:408` 的 `alpha` concat、`linear.py:132` 的权重转置）
+        整个解不出形状，掐断下游整条链。这里把同一份事实喂回去 —— **是源读，不是猜**。
+        """
+        return {k: "·".join(axes) for k, (axes, _dt, _cls) in self.book.param.items() if axes}
+
     def fold(self, seed_shapes: dict) -> tuple:
         dag = self.dag
-        infer_shapes(dag, seed_shapes, dims_ctx=self.book.dims_ctx, report=self.report)
+        infer_shapes(dag, seed_shapes, dims_ctx=self.book.dims_ctx, report=self.report,
+                     param_shapes=self._param_shapes(),
+                     declared_outs=_DECLARED_OPAQUE_OUTS,
+                     declared=self.cov.declared_shapes,
+                     bridge_by_edge=True)
         for r in self.report:
             k = r.get("reason", "?")
             self.cov.node_gap_reasons[k] = self.cov.node_gap_reasons.get(k, 0) + 1

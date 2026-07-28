@@ -502,6 +502,9 @@ class _Walker:
         # `self.<attr>` 权重操作数(Parameter):不进 `ins`(否则权重被当激活 save 计),
         # 单列 attrs["param_operands"] + dag.param_operands,使其**可见**而非静默丢。
         self.param_operands: list = []
+        # 已被某个节点**认领**的 `param_operands` 下标(见 `_emit` 的发射作用域归属)。
+        # 认领是"先到先得":嵌套实参在内层 `_emit` 里先认领,外层不会重复算。
+        self._param_claimed: set = set()
         # **权重别名**:`attn_sink = self.attn_sink`(csa.py:683)这类局部名其实指向一个
         # `Parameter`。它们**不进 SSA**(否则该权重会以张量操作数身份进 `ins`,被
         # `derive_saves` 当激活 save 计——实测 FFNGroupedGEMM「236 MiB」里 88 MiB 就是这个病),
@@ -2106,9 +2109,21 @@ class _Walker:
         prim = (attrs.get("prim") or "").rsplit(".", 1)[-1]
         # ── 归约算子的轴 + keepdim(`mint.sum/mean/max/min/cumsum` 与同名张量方法)────────
         if op == "Elementwise" and attrs.get("reduce"):
-            d = self._kw_or_arg_int(call, "dim", 1)
+            # **方法形态**(`x.sum(1)`)的 `call.args` 不含接收者 → dim 在第 0 位;
+            # 函数形态(`mint.sum(x, 1)`)在第 1 位。此前只试第 1 位,方法形态的**位置**实参
+            # 抠不出来(实测的都是 `dim=` 关键字形态,故此前没暴露)。
+            method = str(attrs.get("prim") or "").startswith("<tensor>.")
+            dim_at = 0 if method else 1
+            d = self._kw_or_arg_int(call, "dim", dim_at)
             if d is None:
-                d = self._kw_or_arg_int(call, "axis", 1)
+                d = self._kw_or_arg_int(call, "axis", dim_at)
+            # **根本没传 dim/axis** 是一条源事实(≠"抠不出来"):torch/mindspore 语义下
+            # 那就是**全轴归约 ⇒ 标量**。真源 `loss.py:344/346` `self.sum(x)`、
+            # `router.py` 的 aux-loss 全和。两者必须分开记 —— 合在一起只能落 unresolved,
+            # 而"全轴归约"本身是可判定的。
+            n_pos = len(call.args) - (0 if method else 1)
+            if n_pos < 1 and not any(kw.arg in ("dim", "axis") for kw in call.keywords):
+                out["reduce_all"] = True
             if d is not None:
                 out["reduce_dim"] = d
             else:
@@ -2953,6 +2968,9 @@ class _Walker:
 
     # ---- 发射层:建 OpNode + 连数据流边 + 更新 SSA ----
     def _emit(self, op: str, attrs: dict, lineno: int, arg_exprs, target_names, out_dtype: str) -> OpNode:
+        # 发射作用域起点:本次 `_emit` 处理实参期间新记的权重就是**本节点**的操作数
+        # (跨行调用按行号匹配会漏,见下方 `claimed` 处的论证)。
+        p0 = len(self.param_operands)
         ins: list[str] = []
         ins_slots: list[int] = []    # 每个存活 `ins` 项的**张量操作数位序**(见 attrs["ins_slots"])
         tslot = -1                   # 已见的"张量类操作数"计数(权重也计,非张量字面量不计)
@@ -3065,6 +3083,27 @@ class _Walker:
         if self.param_operands and op != "Detach":
             line_params = [r["param"] for r in self.param_operands
                            if r["src"] == f"{self.src_file}:{lineno}"]
+            # ── 跨行调用的权重归属(2026-07-28)────────────────────────────────────────
+            # 按**行号相等**匹配对**跨行**的调用失效。实测级联根:
+            #   `hyper_connection.py:408-411`
+            #       alpha = self.concat((_to_local(self.alpha_pre),
+            #                            _to_local(self.alpha_post),      # <- :409
+            #                            _to_local(self.alpha_res)), dim=-1)
+            # 三个 `Parameter` 记在 **:409**(`_to_local(...)` 那一行)、节点记在 **:408**
+            # → 该节点 `attrs` 里**没有** `param_operands`,于是既不知道自己用了哪三个权重
+            # (→ 那 3 份 Parameter 字节进不了图),也无从据权重形状推 shape(`ins` 恒空)。
+            # 改判据:**本次 `_emit` 处理实参期间新记的、且尚未被任何节点认领的**权重就是
+            # 本节点的操作数 —— 这是发射作用域,不是行号巧合。嵌套实参先递归 `_emit`,
+            # 其权重在内层就被认领,故不会被外层抢走(先认领者胜)。
+            claimed = []
+            for i in range(p0, len(self.param_operands)):
+                if i in self._param_claimed:
+                    continue
+                self._param_claimed.add(i)
+                claimed.append(self.param_operands[i]["param"])
+            for pn in claimed:
+                if pn not in line_params:
+                    line_params.append(pn)
             if line_params:
                 attrs["param_operands"] = line_params
         # 权重派生的 `ins` 项(见 `_weight_derived`)→ 标出来,`derive_saves` 排除它们。

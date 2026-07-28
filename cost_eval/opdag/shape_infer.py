@@ -78,6 +78,9 @@ class _Ctx:
     # 纪律(任务书第 2 点):**任何解不出的东西都必须显式带 `file:line` 出现在这里**,
     # 绝不用一个"看起来合理"的数替代。
     report: list | None = None
+    # **调用方声明 / 源侧 docstring 派生**的形状台账(调用方传 `declared=[]` 才收):
+    # 每条 `(名, 符号 shape, 出处, 理由)`。纪律:声明永远与"推断出来的"分开记。
+    declared: list | None = None
     # dtype 订正表(张量基名 -> 真 dtype):目前只装 `Compare` 的 bool 产出。
     # walker 的 `_emit` 按 ins 推产出 dtype,故比较类算子的产出被记成 compute dtype(bf16)= 2×;
     # 订正必须**连带下游 ins ref** 一起改,否则 `derive_saves` 读的是下游那份旧串。
@@ -103,7 +106,75 @@ UNRESOLVED_REASONS = {
     "needs_axis_structure": "上游只解出**元素数**、无轴结构(`~` 标记),而本算子要按轴改形 →"
                             " 拒绝按假轴序往下算",
     "tile_mult_unresolved": "tile 的倍数表达式解不出",
+    "weight_shape_unresolved": "**权重派生节点**(`ins` 为空、操作数全是 `Parameter`)的权重形状不在"
+                               " `param_shapes` 里 → 无从推形状(权重形状由 `init_dims` 从"
+                               " `__init__` 读出,缺就是那个 `Parameter` 的声明没被求值到)",
 }
+
+# ── (a) 权重派生节点的形状通路(2026-07-28)───────────────────────────────────────
+# 背景:`Parameter` 操作数按契约 W2/W4 **不进 `ins`**(进了就会被 `derive_saves` 当激活 save 计),
+# 单列 `attrs["param_operands"]`。于是"操作数全是权重"的节点 `ins` 恒空 → 无从推形状。
+# 实测级联根:`hyper_connection.py:408` 的 `alpha = concat(alpha_pre, alpha_post, alpha_res)`
+# 与 `linear.py:132` 的权重转置 —— 前者掐断整条 mHC 主数据路。
+# **权重形状源侧其实是知道的**:`init_dims.param_shapes` 从 `__init__` 的
+# `Parameter(mint.empty(...))` 逐字读出。缺的只是"喂回来"这一步。
+#
+# 纪律:① 只在 `ins` **为空**时启用(有真激活操作数就照旧按 `ins` 推,否则混合节点会被权重形状顶掉);
+#       ② 查不到形状 → 记 `weight_shape_unresolved` + 保 `?`,**绝不**顶一个数;
+#       ③ 权重仍然**不进 `ins`**(契约 W2/W4 逐字不变),这里只借形状做推断。
+
+
+def _param_axes(n: OpNode, param_shapes: dict):
+    """权重派生节点的"伪输入轴列表"。查不到任何一个 → `None`(调用方记账保 `?`)。
+
+    `param_shapes` 键按 `(源文件基名, 属性名)` 消歧(与 `to_resolved._InitBook.param` 同口径:
+    `Linear.weight` 是 `(vocab,H)`、`TopKRouter.weight` 是 `(E,H)` —— 全局按名合并必然撞车);
+    退一档接受裸属性名(合成源单测用)。
+    """
+    names = n.attrs.get("param_operands") or ()
+    if not names or not param_shapes:
+        return None
+    base = (n.src or "").rsplit("/", 1)[-1].split(":", 1)[0]
+    out = []
+    for pn in names:
+        sym = param_shapes.get((base, pn))
+        if sym is None:
+            sym = param_shapes.get(pn)
+        if not sym:
+            return None
+        out.append(str(sym))
+    return out
+
+
+# ── (b) opaque 产出的**声明式**形状(2026-07-28)──────────────────────────────────
+# `Kernel` / `FusedFunction` 的产出形是 kernel 内部契约,`shape_infer` 推不出来 —— 但**源侧
+# docstring 往往逐字给了**(`hyper_connection.py:396-399`)。于是开一条与 `extract_cell(
+# kernel_saves=...)` **同一条纪律**的通路:调用方**声明**,声明必须带 `file:line` 出处,
+# 每条逐项进 `declared` 台账(报告里可见),**永不**与"推断出来的"混为一谈。
+#
+# 声明值的三种形态(`declared_outs[name]["outs"]` 按**源侧元组解包次序**逐位给):
+#   `None`        —— 该位不声明(照旧 unresolved,不给数);
+#   `"S·B·H"`     —— 逐轴形状(docstring 逐字);
+#   `"~S·B·n"`    —— 只知**元素数**(`~` 前缀):轴结构未逐字给出,但元素数由源可证
+#                    (如"紧接着被 reshape 成 (s,b,n,1)"⇒ reshape 恒不改元素数 ⇒ numel = s·b·n);
+#   `"=in<k>"`    —— 与第 k 个**张量输入**同形(算子语义由源侧 forward 逐字可证)。
+#                    镜像源自己没解出 → 照旧 `?`(声明不是凭空造数的许可证)。
+
+def _declared_out_shape(spec, in_axes_list, in_numel_only):
+    """一条声明 → `shape 串`(可带 `~`);解不出 → None。"""
+    if not spec:
+        return None
+    s = str(spec).strip()
+    if s.startswith("=in"):
+        try:
+            k = int(s[3:])
+        except ValueError:
+            return None
+        if k >= len(in_axes_list) or in_axes_list[k] is None:
+            return None                       # 镜像源未解出 → 不给数
+        shp = render_shape(in_axes_list[k])
+        return mark_numel_only(shp) if (k < len(in_numel_only) and in_numel_only[k]) else shp
+    return s
 
 
 def merge_dims_ctx(*ctxs) -> dict:
@@ -129,6 +200,13 @@ def merge_dims_ctx(*ctxs) -> dict:
                     f"({prev!r} vs {v!r}) —— 合并会静默取一个,fail-loud。"
                     f"请按 Cell 分别做 shape 推断,或让 extractor 传播构造实参。")
     return out
+
+
+def _declare(ctx: _Ctx, n: OpNode, sym: str, src: str, why: str) -> None:
+    """记一条**源侧文档派生**的形状(不是逐节点推断出来的)。`declared is None` 时静默。"""
+    if ctx.declared is None:
+        return
+    ctx.declared.append((_base(n.out) if n.out else "", sym, src, why))
 
 
 def _note(ctx: _Ctx, n: OpNode, reason: str, extra: str = "") -> None:
@@ -319,11 +397,63 @@ def _broadcast(in_axes_list, in_numel_only, ctx, n):
     return out, False
 
 
-def _elementwise(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
-    """逐元素算子。**归约**(sum/mean/max 带 `reduce`)另走:轴未记录 → 元素数不可知 → 记账。"""
-    if n.attrs.get("reduce"):
+def _reduce(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
+    """归约算子(`sum`/`mean`/`max`/`min`)。**轴信息 walker 已经记了**(G4 的 `_axis_capture`),
+    此前 `shape_infer` 一律记 `reduce_axis_unknown` 不用它 —— 实测这是抽取图第二大的级联根
+    (`deepseek_v4_hybrid_attention.py:245` 的 Q-head RMS 统计 ×8、`loss.py:344/346`)。
+
+    三档,全部是**算子定义**、不是猜:
+      * `attrs["reduce_all"]`(源侧**没传** dim/axis)→ 全轴归约 ⇒ **标量**(1 个元素);
+      * `attrs["reduce_dim"]`(int 或 int 列表)+ `attrs["keepdim"]` → 被约的轴压成 1(keepdim)
+        或整条去掉;
+      * 两者都没有(walker 抠不出该轴)→ 照旧 `reduce_axis_unknown`,保 `?`(绝不 passthrough
+        顶替 —— 那会**多算**被约掉的轴倍)。
+
+    `mint.cumsum` 虽在 `_REDUCE_LIN` 里,但它**不归约**(前缀和,输出与输入同形)→ 透传。
+    """
+    prim = str(n.attrs.get("prim") or "")
+    if prim.rsplit(".", 1)[-1] == "cumsum":
+        r = _passthrough(in_axes_list, in_numel_only)
+        if r is None:
+            _note(ctx, n, "no_input_shape")
+        return r
+    a = in_axes_list[0] if in_axes_list else None
+    if not a:
+        _note(ctx, n, "no_input_shape")
+        return None
+    if n.attrs.get("reduce_all"):
+        return [Factors(coeff=1)], False
+    dims = n.attrs.get("reduce_dim")
+    if dims is None:
         _note(ctx, n, "reduce_axis_unknown")
         return None
+    if in_numel_only and in_numel_only[0]:
+        _note(ctx, n, "needs_axis_structure", "归约要按轴去掉 / 压成 1")
+        return None
+    rank = len(a)
+    victims: set = set()
+    for d in (dims if isinstance(dims, (list, tuple)) else [dims]):
+        k = int(d)
+        k = k if k >= 0 else rank + k
+        if not (0 <= k < rank):
+            _note(ctx, n, "reduce_axis_unknown", f"轴 {d!r} 越界（rank={rank}）")
+            return None
+        victims.add(k)
+    keep = bool(n.attrs.get("keepdim"))
+    out = []
+    for i, f in enumerate(a):
+        if i in victims:
+            if keep:
+                out.append(Factors(coeff=1))
+            continue
+        out.append(f.copy())
+    return (out or [Factors(coeff=1)]), False
+
+
+def _elementwise(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
+    """逐元素算子。**归约**(sum/mean/max 带 `reduce`)另走 `_reduce`。"""
+    if n.attrs.get("reduce"):
+        return _reduce(n, in_axes_list, in_numel_only, ctx)
     b = _broadcast(in_axes_list, in_numel_only, ctx, n)
     if b is not None:
         return b
@@ -397,6 +527,71 @@ def _bmm(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
     out = [f.copy() for f in a]
     out[-1] = b[-1].copy()
     return out, False
+
+
+#: `Constant` 里**元素数可由源证得**的两类构造(2026-07-28)。其余照旧 `constant_shape_unknown`。
+#:
+#: ① **RoPE 频率表**(`attrs["rope_freqs"]`,由调用方 `injected_binds` 注入):
+#:    `RotaryEmbedding.construct(max_seq_len)` 逐字([SRC] `rotary_pos_embedding.py:109-148`)
+#:      `inv_freq = 1/(base ** (np.arange(0, dim, 2)/dim))`  → `dim//2` 个元素(`:61`)
+#:      `freqs = outer(seq, inv_freq)`                       → `[max_seq_len, dim//2]`(`:132`)
+#:      `emb = cat((freqs, freqs), -1)`                      → `[max_seq_len, dim]`(`:141`)
+#:      `out = reshape(emb, (-1, bs, 1, emb.shape[1]))`,`bs = 1`(`:123`,非 position_ids 支)
+#:                                                           → `[max_seq_len, 1, 1, dim]`(`:144`)
+#:    而 `dim = config.qk_pos_emb_head_dim`([SRC] `deepseek_v4_hybrid_attention.py:175-177`
+#:    `RotaryEmbedding(config.qk_pos_emb_head_dim, rotary_percent=…)`;`rotary_percent` 缺省
+#:    1.0 ⇒ `:54-55` 的 `dim = int(dim*rotary_percent)` 不改值)。三个调用点
+#:    (`deepseek_v4:257` / `indexer.py:174` / `compressor.py:231`)共用**同一个实例**
+#:    (`:88` `rotary_pos_emb=self.rotary_pos_emb` 层层下传),故末轴同为 `qk_pos_emb_head_dim`;
+#:    首轴 = 该调用点的 `max_seq_len` 实参(`attrs["const_shape_src"]`,逐点不同)。
+#:
+#: ② `ops.tuple_to_array((1e-8,))`(`loss.py:347`):实参是**值元组**,产出是 1 维张量,
+#:    元素数 = 元组长度(`attrs["const_shape"]` 记的就是那些值的字面量)。
+_ROPE_LAST_AXIS = "qk_pos_emb_head_dim"
+
+
+def _constant(n: OpNode, ctx: _Ctx):
+    if n.attrs.get("rope_freqs"):
+        src = n.attrs.get("const_shape_src")
+        seq = _resolve_token(str(src), ctx) if src else None
+        if seq is None or seq is NEG1:
+            return None
+        axes = [seq, Factors(coeff=1), Factors(coeff=1), parse_axis(_ROPE_LAST_AXIS)]
+        _declare(ctx, n, render_shape(axes), "rotary_pos_embedding.py:109-148",
+                 "RotaryEmbedding.construct 逐字：freqs=[max_seq_len,dim//2] → "
+                 "cat 成 [max_seq_len,dim] → reshape(-1,1,1,dim)；"
+                 "dim=config.qk_pos_emb_head_dim（deepseek_v4_hybrid_attention.py:175-177）")
+        return axes, False
+    if str(n.attrs.get("prim") or "").rsplit(".", 1)[-1] == "tuple_to_array":
+        elts = n.attrs.get("const_shape")
+        if not elts:
+            return None
+        return [Factors(coeff=len(elts))], False
+    return None
+
+
+def _gather(n: OpNode, in_axes_list, in_numel_only):
+    """`mint.gather(input, dim, index)` → 产出与 **index**(张量操作数位序 1)同形。
+
+    位序来自 `attrs["ins_slots"]`(walker 记的「每个存活 `ins` 项的张量操作数位序」——
+    `dim` 是 int 不占位、`Parameter` 占位但不进 `ins`)。没有 `ins_slots` 时 `ins` 位序即
+    张量位序 → index 是 `ins[1]`。认不出就返回 None(调用方记账保 `?`)。
+    """
+    if n.attrs.get("prim") != "mint.gather":
+        return None
+    slots = n.attrs.get("ins_slots")
+    idx = None
+    if slots:
+        for i, s in enumerate(slots):
+            if s == 1:
+                idx = i
+                break
+    elif len(in_axes_list) >= 2:
+        idx = 1
+    if idx is None or idx >= len(in_axes_list) or in_axes_list[idx] is None:
+        return None
+    return ([f.copy() for f in in_axes_list[idx]],
+            bool(idx < len(in_numel_only) and in_numel_only[idx]))
 
 
 def _activation(node: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
@@ -549,19 +744,38 @@ def _reshape(n: OpNode, in_axes, reshape_dims, ctx: _Ctx):
 
 # ── 主流程 ─────────────────────────────────────────────────────────────────────
 def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
-                 *, report: list | None = None) -> OpDAG:
+                 *, report: list | None = None,
+                 param_shapes: dict | None = None,
+                 declared_outs: dict | None = None,
+                 declared: list | None = None,
+                 bridge_by_edge: bool = False) -> OpDAG:
     """从 input_shapes 种子出发,逐节点符号传播 shape,回填 ins/out 的 shape 段,返回同一 dag。
 
     `report`(可选,2026-07-25):给一个 list → 每个**解不出**的节点追加一条
     `{node, op, src, name, reason, detail, prim}`(带 `file:line`)。不给 → 行为逐字不变
     (含 MatMul 缺 `out_dim` 的 fail-loud)。纪律:**解不出的东西必须显式可见**,
     绝不用一个"看起来合理"的数替代(任务书第 2 点)。
+
+    `param_shapes`(可选,2026-07-28):`{(源文件基名, 属性名) | 属性名: 符号 shape 串}` ——
+    **权重派生节点**(`ins` 为空、操作数全是 `Parameter`)的形状通路,见 `_param_axes`。
+
+    `declared_outs` / `declared`(可选,2026-07-28):opaque 产出(`Kernel` / `FusedFunction`)的
+    **调用方声明**表与其台账,见 `_declared_out_shape`。声明必须带出处;逐条进 `declared`,
+    **永不**与推断结果混为一谈。
+
+    `bridge_by_edge`(可选,2026-07-28,**缺省关**):把"按名解不出的输入 ← 入边 producer"
+    的桥接从合成别名放宽到全部入边(见主循环第 2 步的论证)。**缺省关**是有意的:
+    `timesim/producer.py` 的通信注入按「有几个输入的 shape 已解出」判 S 分歧
+    (`producer.py:227` `real = [info for info in in_infos if info.sym and info.sym != "?"]`),
+    多解出一个输入就会多注入一条 layout-redistribution AG —— 那是另一个子系统的口径,
+    不该被本轮的覆盖度改造顺带改掉。故只有 `to_resolved`(显存记账)打开它。
     """
     ctx = _Ctx(
         env=dict(input_shapes or {}),
         dims_ctx=dict(dims_ctx if dims_ctx is not None else getattr(dag, "dims_ctx", {}) or {}),
         scalar_binds=list(getattr(dag, "scalar_binds", []) or []),
         report=report,
+        declared=declared,
     )
 
     # 入边:consumer id -> [producer id...](按 edge 顺序,供合成别名桥接)
@@ -583,13 +797,28 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
         # 1) 解各输入 shape(先按名/种子,内联后缀容忍)
         shapes = [_lookup(ctx.env, _base(r)) for r in n.ins]
 
-        # 2) 合成别名桥接:未按名解出的输入 ← 该节点的合成产出(__chain__/__ret__)按序补
-        synth_prods = [p for p in incoming.get(n.id, [])
-                       if _is_synth(node_out_name.get(p, "")) and p in node_out_shape]
+        # 2) **数据流边桥接**:未按名解出的输入 ← 本节点的入边 producer,按边序(= 实参序)补。
+        #
+        # 缺省只对合成别名(`__chain__` / `__ret__`)生效(既有调用方逐字不变)。
+        # `bridge_by_edge=True` 时放宽到"**产出名没被本节点按名消费**的任何入边 producer"
+        # (2026-07-28),因为**内联子 Cell 的返回值丢的是名字、不是数据流边**:
+        #   `aggregated_attn, h_res, h_post = self.attn_hc(hidden_states)`
+        #       → 子里叫 `h_in`(`hyper_connection.py:421`),父里叫 `aggregated_attn`
+        #         (`transformer_layer.py:311` 的 `ins`),**边 4→7 在**,只是名字对不上;
+        #   `log_softmax = self.log_softmax(logits)`(`loss.py:335`)同理(边 1→2 在);
+        #   `words_embeddings`(`language_model_embedding.py:134`)同理。
+        # 判据是保守的:只补**按名没解出**的位,且只用**产出名不在本节点 ins 名单里**的 producer
+        # (名字对得上的那些本来就该按名解;它们没解出说明 producer 自己也没解出)。
+        # 位序按边序 = `_emit` 里 `pending_prods` 的追加序 = 实参序,故一一对应是源侧次序,不是猜。
+        in_names = {_base(r) for r in n.ins}
+        bridge_prods = [p for p in incoming.get(n.id, [])
+                        if p in node_out_shape
+                        and (_is_synth(node_out_name.get(p, ""))
+                             or (bridge_by_edge and node_out_name.get(p, "") not in in_names))]
         li = 0
         for i in range(len(shapes)):
-            if shapes[i] is None and li < len(synth_prods):
-                shapes[i] = node_out_shape[synth_prods[li]]
+            if shapes[i] is None and li < len(bridge_prods):
+                shapes[i] = node_out_shape[bridge_prods[li]]
                 li += 1
 
         # 3) 回填输入 ref 的 shape 段(供 derive_saves 读到真 shape)+ dtype 订正
@@ -605,6 +834,57 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
         bare = [strip_numel_only(sh) if sh is not None else (None, False) for sh in shapes]
         in_numel_only = [b[1] for b in bare]
         in_axes_list = [parse_shape(b[0]) if b[0] is not None else None for b in bare]
+
+        # 3b) **权重派生节点**(`ins` 为空、操作数全是 `Parameter`)的伪输入轴(2026-07-28)。
+        #     只在 `ins` 为空时启用 —— 有真激活操作数的节点照旧按 `ins` 推(否则
+        #     `self.embedding(weight, 0, input_)` 这类混合节点会被权重形状顶掉)。
+        #     权重**仍然不进 `ins`**(契约 W2/W4 逐字不变),这里只借形状做推断。
+        weight_derived = False
+        if not n.ins and n.attrs.get("param_operands") and n.op != "Constant":
+            psyms = _param_axes(n, param_shapes or {})
+            if psyms is None:
+                _note(ctx, n, "weight_shape_unresolved",
+                      f"权重 {list(n.attrs.get('param_operands') or ())}")
+            else:
+                weight_derived = True
+                pb = [strip_numel_only(s) for s in psyms]
+                in_numel_only = [b[1] for b in pb]
+                in_axes_list = [parse_shape(b[0]) for b in pb]
+
+        # 3c) **opaque 产出的调用方声明**(2026-07-28):`Kernel` / `FusedFunction` 的产出形
+        #     源侧 docstring 逐字给了 → 按声明回填,逐条进 `declared` 台账(带出处)。
+        if n.op in ("FusedFunction", "Kernel") and declared_outs:
+            key = n.attrs.get("kernel") or n.attrs.get("function")
+            rec = (declared_outs or {}).get(key)
+            if rec:
+                specs = list(rec.get("outs") or ())
+                outs = list(n.attrs.get("outs") or ())
+                got_any = False
+                for k, spec in enumerate(specs):
+                    shp = _declared_out_shape(spec, in_axes_list, in_numel_only)
+                    if shp is None:
+                        continue
+                    nm = ""
+                    if k < len(outs) and outs[k].count(":") == 2:
+                        outs[k] = _with_shape(outs[k], shp)
+                        nm = _base(outs[k])
+                    if k == 0 and n.out:
+                        n.out = _with_shape(n.out, shp)
+                        nm = nm or _base(n.out)
+                        node_out_shape[n.id] = shp
+                    if not nm:
+                        continue
+                    ctx.env[nm] = shp
+                    produced_names.add(nm)
+                    got_any = True
+                    if declared is not None:
+                        declared.append((nm, shp, rec.get("src", ""), rec.get("why", "")))
+                if outs:
+                    n.attrs["outs"] = outs
+                if got_any:
+                    if n.out:
+                        produced_names.add(_base(n.out))
+                    continue
 
         # 4) View "shape" 原语:即时登记标量轴名(权威,覆盖),不产张量输出
         if n.op == "View" and n.attrs.get("view") == "shape":
@@ -749,12 +1029,25 @@ def _dispatch(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
               "topk 的 k 未记进 attrs(`indexer.py:262` `k=effective_topk`)→ 末轴长未知")
         return None
     if op == "IndexSelect":
-        # `x[idx]` / `mint.gather(x, dim, idx)`:产出形状由 **index 的形状**决定,
-        # 而 index 的形状本身常来自未解出的 topk → 无从推。记账。
+        # `mint.gather(input, dim, index)`:产出与 **index 同形** —— 这是**算子定义**
+        # (torch/mindspore 的 `gather` 语义),不是猜。真源 `vocab_embedding.py:85`
+        # `self.embedding(weight, 0, input_)`:`weight` 是 `Parameter` 走 `param_operands`,
+        # 存活的那个 `ins` 的张量位序就是 1 = index(`attrs["ins_slots"]`,walker 记的)。
+        # 整个 embedding 段(以及那 1010 MiB 词表)此前就卡在这一条上。
+        #
+        # ⚠ **advanced indexing** (`kv_flat[flat_indices]` @ `csa.py:485`)不是这个语义:
+        # 它的产出形 = index 形 **+ input 的尾轴** → 套 gather 规则会**少算**尾轴。
+        # 故只对 `prim == "mint.gather"` 生效,其余照旧记账保 `?`(宁 `?` 勿错)。
+        r = _gather(n, in_axes_list, in_numel_only)
+        if r is not None:
+            return r
         _note(ctx, n, "constant_shape_unknown",
               "gather/advanced-index 的产出形由 index 形状决定,attrs 未记轴")
         return None
     if op == "Constant":
+        r = _constant(n, ctx)
+        if r is not None:
+            return r
         _note(ctx, n, "constant_shape_unknown", f"ctor={n.attrs.get('prim') or n.attrs.get('ctor')}")
         return None
     if op in ("FusedFunction", "Kernel"):

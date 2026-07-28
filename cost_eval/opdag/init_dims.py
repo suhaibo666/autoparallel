@@ -162,6 +162,9 @@ class _Eval:
         self.linear_dims: dict = {}
         self.param_shapes: dict = {}
         self.param_dtypes: dict = {}
+        #: `__init__` 里的**局部元组字面量**(`weight_shape = (output_size, input_size)`
+        #: @ `pynative/layers/linear.py:84`)→ 元素 AST。供 `_param_shape_of` 展开。
+        self.local_tuples: dict = {}
 
     # ── 维度求值(→ Factors 或 None)──────────────────────────────────────────
     def eval_dim(self, node, local: dict) -> Factors | None:
@@ -441,7 +444,16 @@ class _Eval:
         shp_node = inner.args[0] if inner.args else None
         if shp_node is None:
             return None, dt
-        elts = shp_node.elts if isinstance(shp_node, (ast.Tuple, ast.List)) else [shp_node]
+        # **shape 是个局部元组变量**(2026-07-28):真源 `pynative/layers/linear.py:84-85`
+        #   `weight_shape = (output_size, input_size)`
+        #   `self.weight = Parameter(mint.empty(weight_shape, dtype=self.params_dtype), …)`
+        # 此前 `shp_node` 是个 `ast.Name` → 被当成**单轴**、`eval_dim` 解不出 → 整条不记 →
+        # `Linear.weight` 从来没有形状 → `linear.py:132` 的权重转置成了级联根、lm_head 的
+        # 1010 MiB 词表投影权重进不了图。局部元组字面量的元素是**源里逐字写着的**,不是猜。
+        if isinstance(shp_node, ast.Name) and shp_node.id in self.local_tuples:
+            elts = list(self.local_tuples[shp_node.id])
+        else:
+            elts = shp_node.elts if isinstance(shp_node, (ast.Tuple, ast.List)) else [shp_node]
         axes = []
         for e in elts:
             f = self.eval_dim(e, local)
@@ -466,6 +478,10 @@ class _Eval:
         return None
 
     def _do_assign(self, tgt, value, local):
+        # 局部元组字面量:`weight_shape = (output_size, input_size)`(`linear.py:84`)。
+        # 只记 AST(求值推迟到 `_param_shape_of`,那时 `local` 才是对的那一份)。
+        if isinstance(tgt, ast.Name) and isinstance(value, (ast.Tuple, ast.List)):
+            self.local_tuples[tgt.id] = list(value.elts)
         # build_module(...) 赋值:捕捉 (in,out) 维度,不把该 self 名当标量
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "build_module":
             name = self._self_attr(tgt)

@@ -336,22 +336,34 @@ def test_norm_fp32_prelift_is_undone(mf_pkg):
 
 #: 当前抽出的图的**级联根**（各 segment 执行序上第一个被跳过的节点）。每条都是一处
 #: `shape_infer` 的结构性盲区，逐条见 `docs/to_resolved_adapter_2026-07-25.md` §4。
+#: **台账更新（2026-07-28，`docs/opdag_coverage_close_2026-07-28.md`）**：2026-07-25 记的那
+#: 4 处级联根**全部修掉**了，逐条对应关系如下 —— 不变量（"级联根必须逐条在册；修好一处就更新
+#: 台账"）原样保留，只换了例子：
+#:   `hyper_connection.py:408` → `shape_infer` 的**权重派生节点**通路（`param_shapes` 喂回）
+#:                               + walker 的**跨行调用权重归属**修复；
+#:   `vocab_embedding.py:85`   → `mint.gather` 的产出形 = index 形（算子定义）；
+#:   `linear.py:132`           → `init_dims` 支持 `weight_shape = (output_size, input_size)`
+#:                               这种局部元组 + `Linear.__init__` 位置形参种子；
+#:   `loss.py:197`             → `_LogSoftmax` 的产出形声明（`loss.py:134-143` 逐字）。
 LEDGER_BLOCKERS = {
-    "hyper_connection.py:408",     # alpha = concat(3 个 Parameter) —— 权重派生节点 ins 为空
-    "vocab_embedding.py:85",       # embedding gather 的 index 常量形状未知
-    "linear.py:132",               # 权重转置 —— 同上，权重派生节点
-    "loss.py:197",                 # _LogSoftmax.apply 的常量形状未知
+    # `_apply_forward_rope` 的 `split(t, [nope_dim, pos_dim], -1)`：两个 size 是 construct
+    # **局部标量**（`deepseek_v4_hybrid_attention.py:203-204`），walker 未导出 → 解不出。
+    "deepseek_v4_hybrid_attention.py:205",
+    # lm_head 的 `matmul(input_, weight)`：`out_dim` 不在 attrs 里（`Linear` 作为**顶层** Cell
+    # 抽取时没有 `build_module(..., output_size=…)` 那个调用点），权重又走 `param_operands`。
+    "linear.py:135",
 }
 
 
 @pytest.mark.parametrize("key", ["fused", "unfused"])
 def test_coverage_is_partial_and_the_blockers_are_the_recorded_ones(cfg, key):
-    """**如实记账**：图还不完备，级联根就是这 4 处。修好一处 → 这个测试变红，提醒更新记录。"""
+    """**如实记账**：图还不完备，级联根就是这 2 处。修好一处 → 这个测试变红，提醒更新记录。"""
     cov = _graph(cfg, key).coverage
     assert cov.is_partial
     got = {src for (src, _op, _r), _k in cov.blockers(10)}
     assert got <= LEDGER_BLOCKERS, f"出现了台账之外的级联根：{got - LEDGER_BLOCKERS}"
-    assert "hyper_connection.py:408" in got, "mHC 那条主数据路的断点应该还在（修好了就更新台账）"
+    assert "deepseek_v4_hybrid_attention.py:205" in got, \
+        "dsv4 RoPE split 的断点应该还在（修好了就更新台账）"
 
 
 def test_param_census_resolves_more_than_it_gets_into_the_graph(cfg):
