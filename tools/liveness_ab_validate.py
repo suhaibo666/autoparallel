@@ -48,7 +48,9 @@ import copy
 import hashlib
 import json
 import os
+import re
 import sys
+import traceback
 import warnings
 from dataclasses import dataclass, field
 
@@ -232,6 +234,56 @@ def _hidden_layers_per_stage(spec, bundle) -> dict:
 # 一跑的评估结果（桶模型 + 每个 graph source 一份 liveness）
 # ═══════════════════════════════════════════════════════════════════════════
 
+#: **默认必须绿**的来源。其余来源（今天 = `extracted`）是 **advisory**：它们的列照常打、
+#: 不变量照常算并打印，但**不参与 `--gate` 的退出码** —— 见 `SourceFailure` 的论证。
+#: `--expect-green` 可显式提名（`extracted` 成熟后加进去即可，不必改这个脚本的逻辑）。
+GATE_REQUIRED_SOURCES = ("bucket", "hand_spec")
+
+_LOC_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9]*\.py):(\d+)")
+
+
+@dataclass(frozen=True)
+class SourceFailure:
+    """一个 graph source **解不出图**的记录（按来源隔离，不连坐其它来源）。
+
+    为什么要有这个类（而不是让异常冒上去炸掉整张表）：验收台的存在意义就是让 `bucket` /
+    `hand_spec` 在 `extracted` 成熟过程中**持续出数**。而抽取侧的 fail-loud（walker 走不动某条
+    语句 / 快照指纹不符 / layer_type 不支持）是**设计要的行为**，不该被吞成"静默跳过"，也不该
+    被"把 walker 放宽"糊过去 —— 正确的处置是：**该来源那一列显式标 ERR，附原因与 `file:line`**，
+    其余来源照常评分，`--gate` 只对 `GATE_REQUIRED_SOURCES`（或 `--expect-green` 提名者）判死。
+
+    ⚠ 与 `liveness/sources.py` 那条「文件不存在→静默跳过；文件存在但入口点缺失→fail-loud」的
+    契约**不冲突**：那条管的是**注册**是否坏了（假绿的最坏情形）；本类管的是**模型是否已完备**
+    （注册好着，只是图还抽不全）。两件事必须分开，否则「模型未完备」会被当成「注册坏了」。
+    """
+    source: str
+    kind: str
+    message: str
+    locator: str = ""
+
+    def short(self, n: int = 160) -> str:
+        msg = " ".join(self.message.split())
+        return msg if len(msg) <= n else msg[:n] + "…"
+
+    def __str__(self) -> str:
+        loc = f" @{self.locator}" if self.locator else ""
+        return f"{self.source}: {self.kind}{loc}: {self.short()}"
+
+
+def _source_failure(source: str, exc: BaseException) -> SourceFailure:
+    """异常 → `SourceFailure`。`locator` 尽力从**消息**里取 `file.py:line`（抽取侧的 fail-loud
+    都把源定位符写进消息里），取不到再退回 traceback 最深一层的 `cost_eval/opdag` 帧。"""
+    msg = str(exc)
+    m = _LOC_RE.search(msg)
+    loc = f"{m.group(1)}:{m.group(2)}" if m else ""
+    if not loc:
+        for fr in reversed(traceback.extract_tb(exc.__traceback__) or []):
+            if "opdag" in (fr.filename or ""):
+                loc = f"{os.path.basename(fr.filename)}:{fr.lineno}"
+                break
+    return SourceFailure(source=source, kind=type(exc).__name__, message=msg, locator=loc)
+
+
 @dataclass
 class RunResult:
     variant: Variant
@@ -240,16 +292,34 @@ class RunResult:
     liveness_res: dict = field(default_factory=dict)   # source -> LivenessResult
     derivation_violations: list = field(default_factory=list)
     n_stages: int = 0
+    #: source -> SourceFailure（该来源在本跑上解不出图）。
+    source_failures: dict = field(default_factory=dict)
+    #: source -> Coverage 报告串（来源自报的覆盖度；`extracted` 用它证明"峰值是下界"）。
+    source_coverage: dict = field(default_factory=dict)
 
     def real(self, stage: int):
         return REAL[self.variant.tag][stage]
 
     def series(self, key: str) -> tuple:
-        return self.bucket_mib if key == "bucket" else self.liveness_mib[key]
+        """per-stage 值；该来源本跑失败 → 全 `None`（打表时显示 `ERR`，不入任何统计）。"""
+        if key == "bucket":
+            return self.bucket_mib
+        got = self.liveness_mib.get(key)
+        return got if got is not None else (None,) * self.n_stages
+
+    def failed(self, key: str):
+        return self.source_failures.get(key)
+
+    def ok(self, key: str) -> bool:
+        return key == "bucket" or key in self.liveness_mib
 
 
 def evaluate_run(base_dir: str, variant: Variant, sources, grad_mode: str) -> RunResult:
-    """跑一份配置：桶模型 + 每个 graph source 的 liveness（bundle-direct 路径）。"""
+    """跑一份配置：桶模型 + 每个 graph source 的 liveness（bundle-direct 路径）。
+
+    **按来源隔离**：某个来源解不出图 → 记 `SourceFailure`、继续跑下一个来源。桶模型与
+    `hand_spec` 不受影响（这是验收台的存在意义）。
+    """
     from cost_eval.liveness import simulate_liveness
     from cost_eval.report import Evaluator
     mf = derive_mf_config(base_dir, variant)
@@ -258,20 +328,52 @@ def evaluate_run(base_dir: str, variant: Variant, sources, grad_mode: str) -> Ru
     rep = Evaluator(spec, b.parallel, b.optimizer, b.hardware, b.recompute, b.swap,
                     check_feasibility=False).evaluate(record_timeline=True)
     bucket = tuple(p.peak_bytes / MiB for p in rep.per_stage)
-    lv_mib, lv_res = {}, {}
+    lv_mib, lv_res, fails, cov = {}, {}, {}, {}
     for src in sources:
-        res = simulate_liveness(spec, b.parallel, b.optimizer, b.hardware, b.recompute,
-                                b.swap, record_timeline=True, grad_mode=grad_mode,
-                                graph_source=src)
+        try:
+            res = simulate_liveness(spec, b.parallel, b.optimizer, b.hardware, b.recompute,
+                                    b.swap, record_timeline=True, grad_mode=grad_mode,
+                                    graph_source=src)
+        except Exception as e:                       # noqa: BLE001 —— 按来源隔离，见 SourceFailure
+            fails[src] = _source_failure(src, e)
+            continue
         lv_res[src] = res
         lv_mib[src] = tuple(st.peak_bytes / MiB for st in res.per_stage)
+        cv = _coverage_of(spec, b, src)
+        if cv:
+            cov[src] = cv
     return RunResult(variant=variant, bucket_mib=bucket, liveness_mib=lv_mib,
                      liveness_res=lv_res, derivation_violations=viol,
-                     n_stages=len(bucket))
+                     n_stages=len(bucket), source_failures=fails, source_coverage=cov)
+
+
+def _coverage_of(spec, bundle, src: str):
+    """来源若自报覆盖度（`ExtractedGraph.coverage_report()`）就取回来 —— 让"这是下界，不是
+    估计"在表上可见。没有该能力的来源（`hand_spec`）返回 None。"""
+    try:
+        from cost_eval.liveness import resolve_graph
+        from cost_eval.parallel_model import ParallelModel
+        p = bundle.parallel
+        world = p.dp_replicate * p.dp_shard * p.cp * p.tp * p.pp
+        g = resolve_graph(spec, ParallelModel(p, spec.dims.n_layers, world), src)
+        fn = getattr(g, "coverage_report", None)
+        return fn() if callable(fn) else None
+    except Exception:                                # noqa: BLE001
+        return None
 
 
 def run_matrix(base_dir: str, sources, grad_mode: str) -> dict:
     return {v.tag: evaluate_run(base_dir, v, sources, grad_mode) for v in VARIANTS}
+
+
+def source_health(results: dict, keys) -> list:
+    """每个来源的健康状况：`(source, n_ok, n_err, 首个 SourceFailure|None)`。"""
+    out = []
+    for k in keys:
+        oks = [t for t, r in results.items() if r.ok(k)]
+        errs = [r.failed(k) for r in results.values() if r.failed(k)]
+        out.append((k, len(oks), len(errs), errs[0] if errs else None))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -283,9 +385,21 @@ class Check:
     name: str
     passed: bool
     detail: str
+    #: 该项**无法评估**（如某来源本跑解不出图 → delta 无从计算）。SKIP **不算失败**，
+    #: 但也绝不算通过 —— 它必须在表上可见（"不知道"和"通过"是两件事）。
+    skipped: bool = False
+    #: 该项只作**参考**（来源不在 `--expect-green` 里）：照常评估、照常打印，不参与退出码。
+    advisory: bool = False
+
+    @property
+    def status(self) -> str:
+        if self.skipped:
+            return "SKIP"
+        return "PASS" if self.passed else ("WARN" if self.advisory else "FAIL")
 
     def __str__(self) -> str:
-        return f"{'PASS' if self.passed else 'FAIL'}  {self.name}: {self.detail}"
+        tail = "  [advisory]" if self.advisory and not self.skipped else ""
+        return f"{self.status}  {self.name}: {self.detail}{tail}"
 
 
 def _delta(series_u, series_f, stage: int):
@@ -318,22 +432,36 @@ def real_invariants() -> list:
     return out
 
 
-def model_invariants(results: dict, key: str) -> list:
+def model_invariants(results: dict, key: str, *, advisory: bool = False) -> list:
     """**任何图来源都必须满足**的同两条 ×1 结构（正确的模型是导出它们，不是被公式告知）。
 
     断言的是**结构**（delta 在层数/微批数上不动），**不**断言幅值 —— 幅值另行如实报告
-    （见 `magnitude_report`），因为今天两条来源都欠读这个 delta，不该被断言掩盖。"""
+    （见 `magnitude_report`），因为今天两条来源都欠读这个 delta，不该被断言掩盖。
+
+    该来源在某跑上**解不出图**（`SourceFailure`）→ delta 无从计算 → 该项标 **SKIP**
+    （不算通过、也不算失败；在表上可见）。
+    """
     out: list = []
     d = {lbl: _delta(results[ut].series(key), results[ft].series(key), INVARIANT_STAGE)
          for lbl, ft, ut in PAIRS}
+    missing = sorted(lbl for lbl, v in d.items() if v is None)
+    if missing:
+        why = next((str(r.failed(key)) for r in results.values() if r.failed(key)),
+                   "该来源无值")
+        for name in (f"I1 {key} ×1 于层数", f"I2 {key} ×1 于微批数"):
+            out.append(Check(name, False, f"无法评估：{missing} 无值（{why}）",
+                             skipped=True, advisory=advisory))
+        return out
     ok = abs(d["L8 m4"] - d["L4 m4"]) <= TOL_LAYERS_MIB
     out.append(Check(f"I1 {key} ×1 于层数", ok,
                      f"stage{INVARIANT_STAGE} delta L8={d['L8 m4']:.1f} L4={d['L4 m4']:.1f}"
-                     f" |diff|={abs(d['L8 m4'] - d['L4 m4']):.1f} <= {TOL_LAYERS_MIB}"))
+                     f" |diff|={abs(d['L8 m4'] - d['L4 m4']):.1f} <= {TOL_LAYERS_MIB}",
+                     advisory=advisory))
     ok = abs(d["L8 m4"] - d["L8 m8"]) <= TOL_MICROBATCH_MIB
     out.append(Check(f"I2 {key} ×1 于微批数", ok,
                      f"stage{INVARIANT_STAGE} delta m4={d['L8 m4']:.1f} m8={d['L8 m8']:.1f}"
-                     f" |diff|={abs(d['L8 m4'] - d['L8 m8']):.1f} <= {TOL_MICROBATCH_MIB}"))
+                     f" |diff|={abs(d['L8 m4'] - d['L8 m8']):.1f} <= {TOL_MICROBATCH_MIB}",
+                     advisory=advisory))
     return out
 
 
@@ -344,18 +472,20 @@ def magnitude_report(results: dict, keys) -> list:
         rd = _delta(REAL[ut], REAL[ft], INVARIANT_STAGE)
         for key in keys:
             md = _delta(results[ut].series(key), results[ft].series(key), INVARIANT_STAGE)
-            rows.append((lbl, key, rd, md, (md / rd) if rd else None))
+            ratio = (md / rd) if (rd and md is not None) else None
+            rows.append((lbl, key, rd, md, ratio))
     return rows
 
 
 def aggregate(results: dict, key: str) -> dict:
-    """可评分格（真机非 OOM）的 `sim/real` 聚合。run d 全 OOM → 不入统计。"""
+    """可评分格（真机非 OOM **且**该来源有值）的 `sim/real` 聚合。run d 全 OOM → 不入统计。"""
     vals = []
     for tag, r in results.items():
         for i in range(r.n_stages):
             real = r.real(i)
-            if real:
-                vals.append(r.series(key)[i] / real)
+            got = r.series(key)[i]
+            if real and got is not None:
+                vals.append(got / real)
     if not vals:
         return {"n": 0}
     return {"n": len(vals), "mean": sum(vals) / len(vals),
@@ -371,18 +501,23 @@ def unscorable_cells(results: dict) -> list:
 # 打表
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _fmt(x, w=10, p=1):
-    return ("%*.*f" % (w, p, x)) if x is not None else ("%*s" % (w, "OOM"))
+def _fmt(x, w=10, p=1, none="OOM"):
+    return ("%*.*f" % (w, p, x)) if x is not None else ("%*s" % (w, none))
 
 
 def print_matrix_table(results: dict, keys, grad_mode: str) -> None:
-    """主表：run × stage × {real, bucket, liveness(每来源)} + 逐格 sim/real + 峰值事件。"""
+    """主表：run × stage × {real, bucket, liveness(每来源)} + 逐格 sim/real + 峰值事件。
+
+    某来源本跑解不出图 → 该格打 `ERR`（不是 0、不是空白）；其余来源照常出数。
+    """
     hdr = "%-20s %-3s %10s" % ("run", "st", "real")
     for k in keys:
         hdr += " %10s" % (k[:10] if k == "bucket" else ("lv:" + k)[:10])
     for k in keys:
         hdr += " %9s" % (k[:7] + "/re")
-    hdr += "  peak@%s" % keys[-1]
+    peak_src = next((k for k in reversed(keys)
+                     if k != "bucket" and any(r.ok(k) for r in results.values())), "bucket")
+    hdr += "  peak@%s" % peak_src
     print(hdr)
     print("-" * len(hdr))
     for v in VARIANTS:
@@ -392,16 +527,35 @@ def print_matrix_table(results: dict, keys, grad_mode: str) -> None:
             line = "%-20s %-3d %10s" % (v.tag if i == 0 else "", i,
                                         ("%.1f" % real) if real else "OOM")
             for k in keys:
-                line += " %10.1f" % r.series(k)[i]
+                line += " " + _fmt(r.series(k)[i], 10, 1, none="ERR")
             for k in keys:
-                line += " %9s" % (("%.3f" % (r.series(k)[i] / real)) if real else "-")
-            last = keys[-1]
-            if last == "bucket":
+                got = r.series(k)[i]
+                line += " %9s" % (("%.3f" % (got / real)) if (real and got is not None)
+                                  else ("-" if real else ("ERR" if got is None else "-")))
+            if peak_src == "bucket" or not r.ok(peak_src):
                 line += "  -"
             else:
-                st = r.liveness_res[last].per_stage[i]
+                st = r.liveness_res[peak_src].per_stage[i]
                 line += "  %s/%s" % (st.peak_event, st.peak_substep)
             print(line)
+
+
+def print_source_health(results: dict, keys) -> None:
+    """**来源健康**：哪一列出了数、哪一列 ERR（附原因 + `file:line`）+ 来源自报的覆盖度。
+
+    这是"不是不报，是还抽不出来 —— 缺的是这个"的落点：immature 的来源在这里说清自己缺什么，
+    而不是把整张表拖下水。"""
+    print("\n-- 来源健康（按来源隔离；ERR 不连坐其它来源，也不参与任何统计）--")
+    for k, n_ok, n_err, first in source_health(results, keys):
+        req = "必须绿" if k in GATE_REQUIRED_SOURCES else "advisory"
+        print("  %-12s %-8s 出数 %d/%d 跑" % (k, req, n_ok, len(results)))
+        if first is not None:
+            print("      ERR %d 跑：%s" % (n_err, first))
+        cov = next((r.source_coverage.get(k) for r in results.values()
+                    if r.source_coverage.get(k)), None)
+        if cov:
+            for ln in str(cov).splitlines():
+                print("      " + ln)
 
 
 def print_aggregate(results: dict, keys) -> None:
@@ -410,6 +564,9 @@ def print_aggregate(results: dict, keys) -> None:
           % (len(uns), ", ".join("%s@s%d" % (t.split()[0], i) for t, i in uns) or "无"))
     for k in keys:
         a = aggregate(results, k)
+        if not a["n"]:
+            print("  %-12s n=0  （该来源无任何可评分格：解不出图或全 OOM）" % k)
+            continue
         print("  %-12s n=%d  mean=%.3f  min=%.3f  max=%.3f"
               % (k, a["n"], a["mean"], a["min"], a["max"]))
     if uns:
@@ -435,26 +592,31 @@ def print_deltas(results: dict, keys) -> None:
             for k in keys:
                 d = _delta(results[ut].series(k), results[ft].series(k), i)
                 ds.append(d)
-                line += " %10.1f" % d
+                line += " " + _fmt(d, 10, 1, none="ERR")
             for d in ds:
-                line += " %9s" % (("%.3f" % (d / rd)) if rd else "-")
+                line += " %9s" % (("%.3f" % (d / rd)) if (rd and d is not None) else "-")
             print(line)
 
 
-def print_invariants(results: dict, keys) -> list:
+def print_invariants(results: dict, keys, expect_green=None) -> list:
+    """打三段：真机不变量 / 模型不变量（逐来源）/ delta 幅值。
+
+    `expect_green` 里没提名的来源，其模型不变量标 `[advisory]` —— 照常评估、照常打印，
+    **不参与退出码**（见 `GATE_REQUIRED_SOURCES` 的论证）。"""
+    green = set(expect_green if expect_green is not None else GATE_REQUIRED_SOURCES)
     checks = real_invariants()
     print("\n-- 真机不变量（REAL 表自身；这是本项目的两条核心物理发现）--")
     for c in checks:
         print("  " + str(c))
     print("-- 模型不变量（**任何 graph source 都必须满足同样的 ×1 结构**）--")
     for k in keys:
-        for c in model_invariants(results, k):
+        for c in model_invariants(results, k, advisory=(k not in green)):
             checks.append(c)
             print("  " + str(c))
     print("-- delta 幅值（**不做断言**，如实报告：两条来源今天都欠读这个 delta）--")
     for lbl, key, rd, md, ratio in magnitude_report(results, keys):
-        print("  %-8s %-12s stage%d  model=%9.1f  real=%9.1f  ratio=%s"
-              % (lbl, key, INVARIANT_STAGE, md, rd,
+        print("  %-8s %-12s stage%d  model=%s  real=%9.1f  ratio=%s"
+              % (lbl, key, INVARIANT_STAGE, _fmt(md, 9, 1, none="ERR"), rd,
                  ("%.3f" % ratio) if ratio else "-"))
     return checks
 
@@ -464,6 +626,10 @@ def print_live_set(results: dict, source: str, top: int, stages) -> None:
     print("\n-- 峰值时刻逐张量 live-set（source=%s，top %d）--" % (source, top))
     for v in VARIANTS:
         r = results[v.tag]
+        if not r.ok(source):
+            print("\n  [%s] source=%s 解不出图 → 无 live-set：%s"
+                  % (v.tag, source, r.failed(source)))
+            continue
         res = r.liveness_res[source]
         want = range(r.n_stages) if stages == "all" else (res.tightest_stage,)
         for si in want:
@@ -499,9 +665,20 @@ def to_json(results: dict, keys, grad_mode: str) -> dict:
                             for i in range(results[v.tag].n_stages)} for k in keys},
         } for v in VARIANTS},
         "aggregate": {k: aggregate(results, k) for k in keys},
-        "invariants": [{"name": c.name, "passed": c.passed, "detail": c.detail}
+        "invariants": [{"name": c.name, "passed": c.passed, "detail": c.detail,
+                        "status": c.status}
                        for c in real_invariants()
                        + [c for k in keys for c in model_invariants(results, k)]],
+        "source_health": [
+            {"source": k, "runs_ok": n_ok, "runs_err": n_err,
+             "gate_required": k in GATE_REQUIRED_SOURCES,
+             "first_error": (None if first is None else
+                             {"kind": first.kind, "locator": first.locator,
+                              "message": first.message})}
+            for k, n_ok, n_err, first in source_health(results, keys)],
+        "coverage": {k: cov for k in keys
+                     for cov in [next((r.source_coverage.get(k) for r in results.values()
+                                       if r.source_coverage.get(k)), None)] if cov},
     }
 
 
@@ -523,11 +700,15 @@ def run_single(config: str, sources, grad_mode: str, top: int) -> int:
     rep = Evaluator(spec, b.parallel, b.optimizer, b.hardware, b.recompute, b.swap,
                     check_feasibility=False).evaluate(record_timeline=True)
     print("config=%s  grad_mode=%s  sources=%s" % (config, grad_mode, ",".join(sources)))
-    res = {}
+    res, errs = {}, {}
     for src in sources:
-        res[src] = simulate_liveness(spec, b.parallel, b.optimizer, b.hardware, b.recompute,
-                                     b.swap, record_timeline=True, grad_mode=grad_mode,
-                                     graph_source=src)
+        try:
+            res[src] = simulate_liveness(spec, b.parallel, b.optimizer, b.hardware,
+                                         b.recompute, b.swap, record_timeline=True,
+                                         grad_mode=grad_mode, graph_source=src)
+        except Exception as e:                       # noqa: BLE001 —— 按来源隔离
+            errs[src] = _source_failure(src, e)
+            print("  !! source=%s 解不出图：%s" % (src, errs[src]))
     hdr = "%-6s %12s" % ("stage", "bucket_MiB")
     for s in sources:
         hdr += " %14s" % ("lv:%s" % s)[:14]
@@ -535,7 +716,8 @@ def run_single(config: str, sources, grad_mode: str, top: int) -> int:
     for i in range(len(rep.per_stage)):
         line = "%-6d %12.1f" % (i, rep.per_stage[i].peak_bytes / MiB)
         for s in sources:
-            line += " %14.1f" % (res[s].per_stage[i].peak_bytes / MiB)
+            line += (" %14.1f" % (res[s].per_stage[i].peak_bytes / MiB)) if s in res \
+                else " %14s" % "ERR"
         print(line)
     # 契约体检：每个来源的图逐层过 ResolvedLayer 契约。
     from cost_eval.parallel_model import ParallelModel
@@ -546,13 +728,25 @@ def run_single(config: str, sources, grad_mode: str, top: int) -> int:
     pm = ParallelModel(p, spec.dims.n_layers, world)
     rc = 0
     for src in sources:
-        v = validate_resolved_graph(resolve_graph(spec, pm, src))
+        try:
+            g = resolve_graph(spec, pm, src)
+        except Exception as e:                       # noqa: BLE001 —— 按来源隔离
+            print("\n契约体检 source=%s: 解不出图 —— %s" % (src, _source_failure(src, e)))
+            rc |= (1 if src in GATE_REQUIRED_SOURCES else 0)
+            continue
+        v = validate_resolved_graph(g)
         print("\n契约体检 source=%s: %d 条违约" % (src, len(v)))
         for x in v[:20]:
             print("  " + str(x))
+        cov = getattr(g, "coverage_report", None)
+        if callable(cov):
+            for ln in str(cov()).splitlines():
+                print("  " + ln)
         rc |= (1 if v else 0)
     if top:
         for src in sources:
+            if src not in res:
+                continue
             st = res[src].per_stage[res[src].tightest_stage]
             print("\n-- stage%d 峰值 live-set（source=%s）--" % (st.stage, src))
             for it in st.top_live(top):
@@ -583,6 +777,9 @@ def main(argv=None) -> int:
     ap.add_argument("--json", default=None, help="把结果写成 JSON")
     ap.add_argument("--gate", action="store_true",
                     help="验收门模式：派生反查 + 真机/模型不变量全过才 exit 0")
+    ap.add_argument("--expect-green", default=",".join(GATE_REQUIRED_SOURCES),
+                    help="逗号分隔：哪些来源**必须绿**（其余来源的不变量只作 advisory、不参与"
+                         "退出码）。默认 bucket,hand_spec —— `extracted` 成熟后加进来即可")
     args = ap.parse_args(argv)
     warnings.simplefilter("ignore")
 
@@ -622,13 +819,17 @@ def main(argv=None) -> int:
               " compress_ratios / pp·dp·ep·tp·cp / seq / 每 stage 隐藏层数）\n")
 
     keys = ["bucket"] + sources
+    green = [s.strip() for s in args.expect_green.split(",") if s.strip()]
     print_matrix_table(results, keys, args.grad_mode)
+    print_source_health(results, keys)
     print_aggregate(results, keys)
     if args.deltas:
         print_deltas(results, keys)
-    checks = print_invariants(results, keys)
+    checks = print_invariants(results, keys, expect_green=green)
     if args.dump_top:
-        src = args.dump_source or sources[-1]
+        src = args.dump_source or next(
+            (k for k in reversed(sources) if any(r.ok(k) for r in results.values())),
+            sources[-1])
         print_live_set(results, src, args.dump_top, args.dump_stages)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
@@ -636,14 +837,27 @@ def main(argv=None) -> int:
                       ensure_ascii=False, indent=2)
         print("\nJSON → %s" % args.json)
 
-    failed = [c for c in checks if not c.passed]
+    # 判死只算**非 advisory、非 SKIP** 的失败项（`--expect-green` 决定谁算）。
+    failed = [c for c in checks if not c.passed and not c.skipped and not c.advisory]
+    advisory_bad = [c for c in checks if not c.passed and not c.skipped and c.advisory]
+    skipped = [c for c in checks if c.skipped]
+    src_err = [(k, first) for k, _ok, n_err, first in source_health(results, keys)
+               if n_err]
+    hard_src_err = [(k, e) for k, e in src_err if k in green]
     if args.gate:
         print("\n== 验收门 ==")
+        print("  必须绿的来源: %s" % ",".join(green))
         print("  派生反查违规: %d" % len(dv))
-        print("  不变量失败  : %d / %d" % (len(failed), len(checks)))
+        print("  不变量失败  : %d / %d（advisory 失败 %d、无法评估 %d，均不判死）"
+              % (len(failed), len(checks), len(advisory_bad), len(skipped)))
         for c in failed:
             print("   " + str(c))
-        ok = not dv and not failed
+        for c in advisory_bad + skipped:
+            print("   (不判死) " + str(c))
+        print("  来源解图失败 : %d（其中必须绿的 %d）" % (len(src_err), len(hard_src_err)))
+        for k, e in src_err:
+            print("   %s %s" % ("!!" if k in green else "(不判死)", e))
+        ok = not dv and not failed and not hard_src_err
         print("  结论: %s" % ("PASS" if ok else "FAIL"))
         return 0 if ok else 1
     return 0
