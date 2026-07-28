@@ -127,6 +127,17 @@ class SubExtract:
     # param_operands —— 子里出现的权重(Parameter)操作数,同理上浮。
     detached: list = field(default_factory=list)
     param_operands: list = field(default_factory=list)
+    # ── G3 / G5(2026-07-25):子 Cell 的**符号环境**也必须过边界 ────────────────────────
+    # dims_ctx —— 子类 `__init__` 求出的 `self.<attr>` → 符号维度。为什么不能在调用方"并表":
+    #   `Compressor` 有两个构造点,`self.head_dim` 一处是 `v_head_dim`(csa.py:604)、
+    #   一处是 `index_head_dim`(indexer.py:128)——**同名不同值**,扁平并表只能 fail-loud
+    #   或静默取一个(`shape_infer.merge_dims_ctx` 的两难)。故按**内联帧**挂到节点上。
+    # scalar_binds —— 子 construct 里的 `seqlen, bsz, _ = x.shape`(indexer.py:173)这类解包。
+    #   walker 内部已把它们求成具体值,但此前不过边界 → 内联后子里的 `reshape(q, (seqlen, …))`
+    #   整个解不出(实测 `CompressedSparseAttention` 的 `scalar_binds` 只剩 1 条)。
+    #   同样按帧携带:子里的 `seqlen` 与父里可能同名而指不同张量。
+    dims_ctx: dict = field(default_factory=dict)
+    scalar_binds: list = field(default_factory=list)
 
 # 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
@@ -2444,6 +2455,12 @@ class _Walker:
 
         # 2)+3) 偏移平移 + 形参操作数重映射 + 跨界边
         offset = self._next_id - 1
+        # ── G3/G5:本次内联的**帧**标签 ────────────────────────────────────────────────
+        # 帧 = 「哪个构造点的哪一次内联」。根帧是空串(父自己的节点)。嵌套时把子里已有的帧
+        # 追加在后面(`indexer@36/compressor@42`),于是每个节点的 `self.<attr>` / 局部标量名
+        # 都在**它自己那个类**的环境里解 —— 这正是扁平 `merge_dims_ctx` 做不到的事。
+        frame = f"{attrs.get('field') or attrs.get('cell') or 'sub'}@{offset}"
+        sub_dims = dict(getattr(sub, "dims_ctx", {}) or {})
         for n in sub.nodes:
             new_id = n.id + offset
             new_ins: list[str] = []
@@ -2458,10 +2475,27 @@ class _Walker:
                         seen_prod.add(cprod)
                 else:
                     new_ins.append(ref)   # 子内部 SSA 操作数:原样保留(边由下面的子内部边补)
+            new_attrs = dict(n.attrs)
+            inner = new_attrs.get("frame")
+            new_attrs["frame"] = f"{frame}/{inner}" if inner else frame
+            # 更深的帧已经带着自己那份 dims_ctx(setdefault 语义):只给还没有的补本类那份。
+            if sub_dims and "dims_ctx" not in new_attrs:
+                new_attrs["dims_ctx"] = sub_dims
             self.nodes.append(OpNode(
                 id=new_id, op=n.op, src=n.src, module=n.module,
-                ins=new_ins, out=n.out, attrs=dict(n.attrs),
+                ins=new_ins, out=n.out, attrs=new_attrs,
             ))
+        # G5:子的 construct 局部标量绑定按帧上浮。`src` 若是子的 construct 形参 → 换成调用方
+        # 那一侧的**基名**(不然 `_fill_scalar_bind` 在父的 env 里查不到子形参名)。
+        for sb in (getattr(sub, "scalar_binds", ()) or ()):
+            src = sb.get("src", "")
+            if src in param_map:
+                src = param_map[src][0].split(":")[0]
+            inner = sb.get("frame")
+            self.scalar_binds.append({
+                "names": list(sb.get("names", [])), "src": src,
+                "frame": f"{frame}/{inner}" if inner else frame,
+            })
         for s, d in sub.edges:
             self.edges.append([s + offset, d + offset])
         self._next_id = offset + len(sub.nodes) + 1
@@ -2507,6 +2541,16 @@ class _Walker:
         injected = {kw: self.binds[a] for kw, a in (attrs.get("kw_self") or {}).items()
                     if a in self.binds}
         spec = attrs.get("spec")        # 调用点手搭的 submodules(见 _inline_submodules_spec)
+        # G2:`build_module(...)` / 直接实例化的**构造点维度关键字**(extractor._ctor_seeds 求出)。
+        # 它决定子 `__init__` 里 `proj_out_dim = self.coff * head_dim` 这类维度的真值 ——
+        # 同一个类的两个构造点 head_dim 差 4× 就靠这条区分。
+        seeds = attrs.get("ctor_seeds") or None
+        try:
+            return self._subcell_resolver(cell, field, bare, method=method,
+                                          injected_binds=injected, spec=spec,
+                                          ctor_seeds=seeds)
+        except TypeError:
+            pass
         try:
             return self._subcell_resolver(cell, field, bare, method=method,
                                           injected_binds=injected, spec=spec)

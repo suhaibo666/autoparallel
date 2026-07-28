@@ -33,10 +33,33 @@ _KNOWN_DIM_SYMS = set(CONFIG2SYM.values())
 #:   * `CompressedSparseAttention(compress_ratio=...)`(`csa.py:556`)缺省 `0`,真机是 4/128 ——
 #:     拿缺省去凑正是 walker 文档 §2.1 拒绝的那个反例(会静默算出与真机相反的 `enable_compress`)。
 #:
-#: 形态:`{形参名: "符号 token 串"}`(按**维度符号**处理,如 `{"head_dim": "v_head_dim"}`)
-#: 或 `{形参名: int|bool}`(具体值,如 `{"compress_ratio": 4}` —— 既进维度也进条件判定)。
+#: 形态(三种,可混用):
+#:   * `{形参名: "符号 token 串"}` —— 按**维度符号**处理,如 `{"head_dim": "v_head_dim"}`;
+#:   * `{形参名: int|bool}` —— 具体值,如 `{"compress_ratio": 4}`(既进维度也进条件判定);
+#:   * `{形参名: {"dim": "符号串"|None, "val": int|bool|None}}` —— **同时**给符号维度与具体值。
+#:     G2(2026-07-25)需要它:构造点 `head_dim=config.v_head_dim`(csa.py:604)既该按符号
+#:     `v_head_dim` 参与维度代数(出 `2·v_head_dim`,随 DimTable 变),又在 `config_flags` 里
+#:     有具体值 512 可供 `if` 判定;二者**不是**二选一。
 #: 不给 → 该形参判不出 → 相关维度记 None(上层保留 `?`),**决不**编造。
 INIT_PARAM_SEEDS = "__init_param_seeds__"
+
+
+def _seed_cell(seed) -> "_Cell | None":
+    """把一条 `INIT_PARAM_SEEDS` 条目变成 `_Cell`;形态不认则 None(**不猜**)。"""
+    if isinstance(seed, dict):
+        d, v = seed.get("dim"), seed.get("val")
+        dim = parse_axis(d) if isinstance(d, str) and d else None
+        if dim is None and isinstance(v, int) and not isinstance(v, bool):
+            dim = Factors(coeff=v)
+        known = isinstance(v, (int, bool))
+        return _Cell(dim=dim, val_known=known, val=v if known else None)
+    if isinstance(seed, str):
+        return _Cell(dim=parse_axis(seed))
+    if isinstance(seed, bool):
+        return _Cell(val_known=True, val=seed)
+    if isinstance(seed, int):
+        return _Cell(dim=Factors(coeff=seed), val_known=True, val=seed)
+    return None
 
 #: mindspore dtype 名 → 本库规范串(与 `consumer._DTYPE_BYTES` 的键域一致)。
 _MSTYPE2DTYPE = {
@@ -79,6 +102,13 @@ class InitDims:
     # self.<param_attr> -> dtype 串(逐字来自源的 `dtype=` 实参;缺省用 config.params_dtype)。
     #   `csa.py:589` 明写 `dtype=mstype.float32` → "fp32"(**不是** params_dtype 的 bf16)。
     param_dtypes: dict = field(default_factory=dict)
+    # self.<attr> -> `INIT_PARAM_SEEDS` 的 dict 形态种子(G2,2026-07-25)。
+    #   **父给子**的通路:构造点写 `head_dim=self.index_head_dim`(indexer.py:128)时,
+    #   子 `Compressor.__init__` 的 `head_dim` 形参该拿到父这一侧 `self.index_head_dim`
+    #   求出来的东西。本表就是「父 `__init__` 里每个 `self.<attr>` 求出了什么」的可传播形式:
+    #   `{"dim": 符号串|None, "val": int|bool|None}`。dims_ctx 只有符号、self_kinds 只有种类,
+    #   都不足以传播(见 `extractor._ctor_seeds`)。
+    self_seeds: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -87,6 +117,12 @@ class _Cell:
     val_known: bool = False             # 是否求得具体值(用于条件判定)
     val: object = None                  # 具体值(int/bool/None/str)
     kind: str = "scalar"                # "param" / "scalar" / "module"(见 InitDims.self_kinds)
+    # `tainted` —— 该值(传递地)来自某个 `__init__` **形参缺省**,而不是调用方声明的种子 /
+    # config / 字面量。铁律「**不得从 `__init__` 缺省推结构**」的落地:实测反例
+    # `compress_ratio` 在 `csa.py:556` 缺省 `0`,而真机是 4/128 —— 用它推出的
+    # `enable_compress=False` 与真机**相反**。这些值在类内做 best-effort 剪枝尚可,
+    # 但**绝不允许**经 `self_seeds` 传播到子 Cell 的构造点(那会把一个假前提扩散出去)。
+    tainted: bool = False
 
 
 def _find_class(tree, name):
@@ -336,7 +372,26 @@ class _Eval:
     def _cell_for(self, value, local) -> _Cell:
         dim = self.eval_dim(value, local)
         vk, vv = self.eval_val(value, local)
-        return _Cell(dim=dim, val_known=vk, val=vv)
+        return _Cell(dim=dim, val_known=vk, val=vv,
+                     tainted=self._tainted(value, local))
+
+    def _tainted(self, node, local) -> bool:
+        """本表达式是否(传递地)读到了「来自 `__init__` 形参缺省」的值 —— 见 `_Cell.tainted`。
+
+        判据是**语法可达**:表达式里任何一个 `<name>` / `self.<attr>` 若解到一个已标 tainted
+        的 cell,整条即 tainted。保守方向正确:宁可少传播一个种子(子 Cell 退回全局种子,
+        与本轮之前逐字同行为),也不把一个假前提扩散出去。
+        """
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                c = local.get(sub.id)
+            elif isinstance(sub, ast.Attribute) and self._self_attr(sub) is not None:
+                c = self.self_env.get(self._self_attr(sub))
+            else:
+                continue
+            if c is not None and c.tainted:
+                return True
+        return False
 
     @staticmethod
     def _ctor_name(value):
@@ -480,14 +535,23 @@ def _param_defaults(init_fn: ast.FunctionDef) -> dict:
 
 
 def eval_init_dims(tree: ast.AST, cls_name: str, config_flags: dict,
-                   mro_units: list | None = None) -> InitDims:
+                   mro_units: list | None = None,
+                   param_seeds: dict | None = None) -> InitDims:
     """求值 cls_name 的 __init__(沿 MRO base→derived),返回 linear_dims + dims_ctx + self_kinds。
 
     `mro_units`(可选,P0#3):`[(tree, 类名), ...]`,**derived→base** 顺序,用于**跨文件** MRO
     (`DSv4HybridSelfAttention` 的基类 `MultiLatentAttention` 在另一个文件里,单 tree 找不到)。
     不给时退化为在 `tree` 内做同文件 BFS(既有调用逐字不变)。
+
+    `param_seeds`(可选,G2/2026-07-25):**按构造点**的形参种子,逐键覆盖
+    `config_flags[INIT_PARAM_SEEDS]` 里那份全局种子。为什么必须按构造点:
+    `Compressor` 在本快照里有**两个**构造点 —— `csa.py:604` `head_dim=config.v_head_dim`(512)
+    与 `indexer.py:128` `head_dim=self.index_head_dim`(128)。给一个全局 `head_dim` 必然把
+    另一处算错 **4×**(见 `docs/opdag_bytes_2026-07-25.md` §5 的 G2)。
     """
     ev = _Eval(config_flags)
+    if param_seeds:
+        ev.param_seeds.update(param_seeds)
     if mro_units is None:
         classes = _init_classes(tree, cls_name)     # derived→base
         units = [(tree, c) for c in classes]
@@ -499,24 +563,34 @@ def eval_init_dims(tree: ast.AST, cls_name: str, config_flags: dict,
         if init_fn is None:
             continue
         local: dict[str, _Cell] = {}
-        # 形参缺省(input_size=None / is_expert=False 等)注入 local
+        # 形参缺省(input_size=None / is_expert=False 等)注入 local。
+        # **标 tainted**:缺省不是真机事实(`compress_ratio` 缺省 0 vs 真机 4/128,csa.py:556),
+        # 类内 best-effort 剪枝可以用,但不得经 `self_seeds` 传播到子 Cell 的构造点。
         for pname, pval in _param_defaults(init_fn).items():
-            local[pname] = _Cell(val_known=True, val=pval)
+            local[pname] = _Cell(val_known=True, val=pval, tainted=True)
         # 调用方**显式**给的形参种子(`INIT_PARAM_SEEDS`)覆盖缺省 —— 见该常量的 docstring:
         # `compress_ratio` 缺省 0 而真机 4/128、`head_dim` 同名于另一个维度,都不能靠推。
         _names = {a.arg for a in init_fn.args.args} | {a.arg for a in init_fn.args.kwonlyargs}
         for pname, seed in ev.param_seeds.items():
             if pname not in _names:
                 continue
-            if isinstance(seed, str):
-                local[pname] = _Cell(dim=parse_axis(seed))
-            elif isinstance(seed, bool):
-                local[pname] = _Cell(val_known=True, val=seed)
-            elif isinstance(seed, int):
-                local[pname] = _Cell(dim=Factors(coeff=seed), val_known=True, val=seed)
+            cell = _seed_cell(seed)
+            if cell is not None:
+                local[pname] = cell
         ev.exec_body(init_fn.body, local)
     dims_ctx = {k: render_term(c.dim) for k, c in ev.self_env.items()
                 if c.dim is not None and _all_known_dim(c.dim)}
     self_kinds = {k: c.kind for k, c in ev.self_env.items()}
+    # G2:`self.<attr>` 的**可传播**求值结果(供构造点把父的 self 值传给子的 __init__ 形参)。
+    # 只收 `kind != "module"`(module 是算子,不是值/维度)且**确有内容**的项。
+    self_seeds = {}
+    for k, c in ev.self_env.items():
+        if c.kind == "module" or c.tainted:
+            continue
+        dim = render_term(c.dim) if (c.dim is not None and _all_known_dim(c.dim)) else None
+        val = c.val if (c.val_known and isinstance(c.val, (int, bool))) else None
+        if dim is not None or val is not None:
+            self_seeds[k] = {"dim": dim, "val": val}
     return InitDims(linear_dims=ev.linear_dims, dims_ctx=dims_ctx, self_kinds=self_kinds,
-                    param_shapes=ev.param_shapes, param_dtypes=ev.param_dtypes)
+                    param_shapes=ev.param_shapes, param_dtypes=ev.param_dtypes,
+                    self_seeds=self_seeds)

@@ -34,6 +34,7 @@ from .construct_walker import (
 from .module_resolver import ResolvedSpec, LEAF_OPTYPE, _NAME_ALIAS
 from .construct_walker import _self_attr
 from .init_dims import eval_init_dims
+from .sym_shape import CONFIG2SYM
 from .module_index import ClassIndex
 from . import fn_saves
 
@@ -260,7 +261,8 @@ _DTYPE_SHORT = {
 def _named_module_binds(
     tree: ast.AST, init_cls: str, spec: ResolvedSpec, config_flags: dict, src_file: str,
     recurse: bool = False, subcell_specs: dict | None = None,
-    linear_dims: dict | None = None,
+    linear_dims: dict | None = None, self_seeds: dict | None = None,
+    param_seed_env: dict | None = None,
 ) -> dict[str, Binding]:
     cls = _find_class(tree, init_cls)
     init = _method_of(cls, "__init__")
@@ -295,6 +297,8 @@ def _named_module_binds(
             binds[name] = _bind_build_module(
                 stmt.value, name, spec, compute_dtype, ln_compute_dtype, src_file,
                 recurse, subcell_specs, linear_dims, _param_to_attr(init),
+                ctor_seeds=_ctor_seeds(stmt.value, self_seeds, config_flags,
+                                       _param_to_attr(init), param_seed_env),
             )
         elif fname in LEAF_OPTYPE:
             # **直接实例化的叶子层** `self.mapping_proj = Linear(input_size=..., ...)`
@@ -404,11 +408,87 @@ def _kw_self_args(call: ast.Call, param_to_attr: dict | None = None) -> dict:
     return out
 
 
+#: 构造点关键字里**不是**「子 Cell 的维度/开关形参」的键 —— 它们是 dtype / 初始化器 / 模块注入,
+#: 硬塞进子的 `INIT_PARAM_SEEDS` 只会污染维度代数(`params_dtype="bf16"` 会被 `parse_axis`
+#: 当成一个**符号维度**)。纪律:白名单式排除 + 值形态门(见 `_ctor_seeds`),宁少勿错。
+_CTOR_SEED_SKIP = frozenset({
+    "config", "submodules", "params_dtype", "compute_dtype", "init_method",
+    "layernorm_compute_dtype", "eps", "bias", "dtype", "rotary_pos_emb",
+    "name", "activation_type", "attention_type", "layout", "input_layout",
+})
+
+
+def _ctor_seeds(call: ast.Call, self_seeds: dict | None, config_flags: dict,
+                param_to_attr: dict | None = None,
+                param_seed_env: dict | None = None) -> dict:
+    """构造点的**维度/开关**关键字实参 → 子 Cell `__init__` 形参种子(G2,2026-07-25)。
+
+    为什么必须**按构造点**:`Compressor` 在本快照里有两个构造点,`head_dim` 一个是
+    `config.v_head_dim`(`csa.py:604`,512)、另一个是 `self.index_head_dim`
+    (`indexer.py:128`,128)。给一个全局 `INIT_PARAM_SEEDS["head_dim"]` 必然把另一处算错
+    **4×**,故此前刻意不给 → 那 58 个内联 compressor 节点的 `linear_wkv/wgate` 报 `no_out_dim`。
+
+    四种可解形态(逐条对应真源),**其它一律不收**(缺种子 = 未知,下游落 `unresolved`):
+      ① 字面量 int/bool —— `rotate=False`(`csa.py:601`)/ `rotate=True`(`indexer.py:130`);
+      ② `config.<X>` / `self.config.<X>` —— `head_dim=config.v_head_dim`(`csa.py:604`):
+         维度取 `CONFIG2SYM` 符号(**随 DimTable 变**,不写死数),值取 `config_flags[X]`;
+      ③ `self.<X>` —— `compress_ratio=self.compress_ratio`(`csa.py:598`)、
+         `head_dim=self.index_head_dim`(`indexer.py:128`):从**父**这一侧的
+         `InitDims.self_seeds` 逐字取(父 `__init__` 已静态求过值);
+      ④ 裸 `<name>` —— `compress_ratio=compress_ratio`,转发父自己的 `__init__` 形参:
+         从父的形参种子环境 `param_seed_env` 取(它就是父这一层收到的 `param_seeds`)。
+    """
+    out: dict = {}
+    for kw in call.keywords:
+        if not kw.arg or kw.arg in _CTOR_SEED_SKIP:
+            continue
+        v = kw.value
+        seed = None
+        if isinstance(v, ast.Constant) and isinstance(v.value, (int, bool)):
+            # bool 先判(bool 是 int 的子类):`rotate=False` 是**开关**,不是维度 0。
+            seed = ({"dim": None, "val": v.value} if isinstance(v.value, bool)
+                    else {"dim": str(v.value), "val": v.value})
+        elif isinstance(v, ast.Attribute):
+            cfg = _ctor_config_attr(v)
+            if cfg is not None:
+                cv = config_flags.get(cfg)
+                seed = {"dim": CONFIG2SYM.get(cfg, cfg),
+                        "val": cv if isinstance(cv, (int, bool)) else None}
+            elif _self_attr(v) is not None:
+                seed = (self_seeds or {}).get(_self_attr(v))
+        elif isinstance(v, ast.Name):
+            seed = (param_seed_env or {}).get(v.id)
+            if seed is None:
+                # `<kw>=<父形参>` 且父把它存在 `self.<attr>` 上(`_kw_self_args` 形态 2 的同源判据)。
+                attr = (param_to_attr or {}).get(v.id)
+                if attr is not None:
+                    seed = (self_seeds or {}).get(attr)
+        if seed is None:
+            continue
+        seed = seed if isinstance(seed, dict) else {"dim": None, "val": seed}
+        if seed.get("dim") is None and seed.get("val") is None:
+            continue
+        out[kw.arg] = dict(seed)
+    return out
+
+
+def _ctor_config_attr(node: ast.Attribute) -> str | None:
+    """`config.X`(形参名 config)或 `self.config.X` → X;否则 None(与 init_dims 同口径)。"""
+    v = node.value
+    if isinstance(v, ast.Name) and v.id == "config":
+        return node.attr
+    if (isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name)
+            and v.value.id == "self" and v.attr == "config"):
+        return node.attr
+    return None
+
+
 def _bind_build_module(
     call: ast.Call, self_name: str, spec: ResolvedSpec, compute_dtype: str,
     ln_compute_dtype: str, src_file: str,
     recurse: bool = False, subcell_specs: dict | None = None,
     linear_dims: dict | None = None, param_to_attr: dict | None = None,
+    ctor_seeds: dict | None = None,
 ) -> Binding:
     if not call.args:
         raise ValueError(
@@ -441,14 +521,16 @@ def _bind_build_module(
     if isinstance(leaf, ResolvedSpec):
         # 子 Cell(submodules 已解成嵌套 ResolvedSpec):挂 SubCell,recurse 时按 field 取该子 spec 递归。
         return Binding(op="SubCell", attrs={"cell": leaf.cell, "field": field, "bare": False,
-                                            "kw_self": _kw_self_args(call, param_to_attr)})
+                                            "kw_self": _kw_self_args(call, param_to_attr),
+                                            "ctor_seeds": dict(ctor_seeds or {})})
     if isinstance(leaf, str):
         op = LEAF_OPTYPE.get(leaf)
         if op is None:
             # 裸 Cell 类名(如 experts="FFNGroupedGEMM"):recurse 且 subcell_specs 提供其 ResolvedSpec
             # → 挂 SubCell(bare),由 resolver 按类名从 subcell_specs 取子 spec 递归;否则维持 fail-loud。
             if recurse and subcell_specs and leaf in subcell_specs:
-                return Binding(op="SubCell", attrs={"cell": leaf, "field": field, "bare": True})
+                return Binding(op="SubCell", attrs={"cell": leaf, "field": field, "bare": True,
+                                                    "ctor_seeds": dict(ctor_seeds or {})})
             raise ValueError(
                 f"extractor: 叶子类 {leaf!r} 不在 LEAF_OPTYPE（self.{self_name} @ {src_file}）—— fail-loud"
             )
@@ -710,7 +792,8 @@ def _make_subcell_resolver(
     """
     def resolver(cell_name: str, field: str, bare: bool,
                  method: str = "construct", injected_binds: dict | None = None,
-                 spec: ResolvedSpec | None = None) -> SubExtract:
+                 spec: ResolvedSpec | None = None,
+                 ctor_seeds: dict | None = None) -> SubExtract:
         if isinstance(spec, ResolvedSpec):
             # 调用点(`__init__` 手搭 submodules,见 `_inline_submodules_spec`)直接给的 spec。
             sub_spec = spec
@@ -761,12 +844,18 @@ def _make_subcell_resolver(
             host_call_allow=host_call_allow, entry_method=entry,
             kernel_call_allow=kernel_call_allow, kernel_saves=kernel_saves,
             param_cells=param_cells, input_axes=input_axes,
-            injected_binds=injected_binds, _class_index=class_index,
+            injected_binds=injected_binds, ctor_seeds=ctor_seeds,
+            _class_index=class_index,
         )
+        # G3/G5:子 Cell 的 `dims_ctx` 与 construct 局部标量绑定一并上浮,由 `_inline_subcell`
+        # 按**帧**挂到内联节点上(见那里的 docstring:同名 `self.<attr>` 在两个构造点解出不同
+        # 符号时,扁平合并会静默取一个 —— 故必须按帧,不能并表)。
         return SubExtract(nodes=dag.nodes, edges=dag.edges, param_names=params, returns=returns,
                           opaque_calls=dag.opaque_calls, diagnostics=dag.diagnostics,
                           detached=list(getattr(dag, "detached", ()) or ()),
-                          param_operands=list(getattr(dag, "param_operands", ()) or ()))
+                          param_operands=list(getattr(dag, "param_operands", ()) or ()),
+                          dims_ctx=dict(getattr(dag, "dims_ctx", {}) or {}),
+                          scalar_binds=list(getattr(dag, "scalar_binds", ()) or ()))
     return resolver
 
 
@@ -844,6 +933,7 @@ def _extract_meta(
     input_axes: dict | None = None,
     entry_method: str = "construct",
     injected_binds: dict | None = None,
+    ctor_seeds: dict | None = None,
     _class_index=None,
     _stack: set | None = None,
 ):
@@ -873,18 +963,6 @@ def _extract_meta(
     if class_index is not None:
         class_index.load(cell_file_relpath, tree=tree, src=src)
 
-    # 0) recurse 时给 walker 备一个子 Cell resolver(携带把自己压栈后的递归链)。
-    resolver = None
-    if recurse:
-        resolver = _make_subcell_resolver(
-            mf_root, spec, config_flags, subcell_specs, stack | {cls_name},
-            parent_tree=tree, parent_rel=cell_file_relpath,
-            cross_file=cross_file, runtime_predicates=runtime_predicates,
-            host_call_allow=host_call_allow, class_index=class_index,
-            kernel_call_allow=kernel_call_allow, kernel_saves=kernel_saves,
-            param_cells=param_cells, input_axes=input_axes,
-        )
-
     # 1) 沿 __init__ 的 MRO 链(base→derived)做基础 + 具名绑定并合并(derived 覆盖 base)。
     #    **跨文件(P0#3)**:cross_file=True 时用 ClassIndex 顺 import 解析基类。
     units = _mro_units(mf_root, tree, src, cell_file_relpath, cls_name, class_index)
@@ -902,9 +980,46 @@ def _extract_meta(
                 tree, cls_name, entry_method):
             raise ValueError(
                 f"extractor: {cls_name} 既无 __init__ 也无 {entry_method}（fail-loud）")
+    # G2:构造点种子里**具体值已知**的那些,同时注入 `config_flags` —— `bind_init` 的三元形态
+    # (`self.hadamard = Hadamard(head_dim) if rotate else IdentityOp()`,compressor.py:129)
+    # 是按 `config_flags[<形参名>]` 判定的,只喂 `INIT_PARAM_SEEDS` 判不出它。
+    # 两道门,免得污染真 config 键:① 该名必须是本 MRO 某个 `__init__` 的**形参**;
+    # ② 值必须是 int/bool 字面值(符号串**不注入** —— 那会被当成一个 config 值参与比较)。
+    # 这一条同时修掉一个**静默解错**:全局 `rotate=True` 让 CSA 直挂的 compressor
+    # (`csa.py:601` 逐字 `rotate=False`)也长出 Hadamard,而真机上它是 IdentityOp。
+    if ctor_seeds:
+        _init_param_names: set = set()
+        for _c, _ut, _us, _ur in units:
+            _cn = _find_class(_ut, _c)
+            _if = _method_of(_cn, "__init__") if _cn else None
+            if _if is None:
+                continue
+            _init_param_names |= {a.arg for a in _if.args.args} | {
+                a.arg for a in _if.args.kwonlyargs}
+        _inject = {k: v["val"] for k, v in ctor_seeds.items()
+                   if k in _init_param_names and isinstance(v, dict)
+                   and isinstance(v.get("val"), (int, bool))}
+        if _inject:
+            config_flags = {**config_flags, **_inject}
+
+    # 0) recurse 时给 walker 备一个子 Cell resolver(携带把自己压栈后的递归链)。
+    #    **必须在上面的 G2 flags 注入之后**建:它要把本构造点已订正的 flags 传给子抽取。
+    resolver = None
+    if recurse:
+        resolver = _make_subcell_resolver(
+            mf_root, spec, config_flags, subcell_specs, stack | {cls_name},
+            parent_tree=tree, parent_rel=cell_file_relpath,
+            cross_file=cross_file, runtime_predicates=runtime_predicates,
+            host_call_allow=host_call_allow, class_index=class_index,
+            kernel_call_allow=kernel_call_allow, kernel_saves=kernel_saves,
+            param_cells=param_cells, input_axes=input_axes,
+        )
+
     # PART A:一次求值 __init__(全 MRO,跨文件)得 linear (in,out) 维度 + dims_ctx + self_kinds。
+    # `ctor_seeds`(G2):**本构造点**传下来的形参种子,逐键覆盖全局 `INIT_PARAM_SEEDS`。
     init_dims = eval_init_dims(tree, cls_name, config_flags,
-                               mro_units=[(u[1], u[0]) for u in units])
+                               mro_units=[(u[1], u[0]) for u in units],
+                               param_seeds=ctor_seeds)
 
     base_binds: dict[str, Binding] = {}
     named: dict[str, Binding] = {}
@@ -916,7 +1031,8 @@ def _extract_meta(
                                     init_param_binds=injected_binds))
         named.update(_named_module_binds(
             utree, cname, spec, config_flags, ufile, recurse, subcell_specs,
-            linear_dims=init_dims.linear_dims,
+            linear_dims=init_dims.linear_dims, self_seeds=init_dims.self_seeds,
+            param_seed_env=ctor_seeds,
         ))
         method_aliases.update(_morph_aliases(utree, cname))  # Morph(self.method) 别名
         for a in unbound_aliases(usrc, cname, file=ufile):
@@ -953,7 +1069,12 @@ def _extract_meta(
             # 与步骤 1 的 `reversed(...)+update 覆盖`(等效 derived wins)MRO 方向一致。
             if recurse and subcell_specs and ctor in subcell_specs and tgt.attr not in combined:
                 attrs = {"cell": ctor, "field": tgt.attr, "bare": True,
-                         "kw_self": _kw_self_args(stmt.value, _param_to_attr(init_fn))}
+                         "kw_self": _kw_self_args(stmt.value, _param_to_attr(init_fn)),
+                         # G2:直接实例化的子 Cell 同样按**构造点**传维度/开关形参
+                         # (`self.output_cell = FusedHyperConnectionOutputCell(n, hidden, dtype)`)。
+                         "ctor_seeds": _ctor_seeds(
+                             stmt.value, init_dims.self_seeds, config_flags,
+                             _param_to_attr(init_fn), ctor_seeds)}
                 # `__init__` 里**手搭**的 submodules 直接传给子 Cell(spec 树给不出):
                 #   `submodules = MLPSubmodules(linear_fc1=Linear, linear_fc2=Linear)`
                 #   `self.shared_experts = SharedExpertMLP(config, submodules)`

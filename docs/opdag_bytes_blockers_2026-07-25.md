@@ -143,3 +143,75 @@ cd /e/97-codes/torch_parallel/pynative-cost-evaluator && git log --oneline -1 &&
 （详见 §6 的改动清单与 §7 的测试。）
 
 ---
+
+## 2. G2 / G3 / G5 —— 按构造点传维度 + 按内联帧解符号 [RAN] + [SRC]
+
+### 2.1 三件事其实是**同一个**结构缺陷的三个面
+
+抽取器把子 Cell **内联**进父图后,子节点身上带的还是**子那个类**的符号世界
+(`self.head_dim`、局部 `seqlen`),而 `dag.dims_ctx` / `dag.scalar_binds` 只装**顶层**那份。
+此前的缓解手段是调用方侧 `shape_infer.merge_dims_ctx(*ctxs)`(同名不同值 fail-loud)——
+它在 `Compressor` 上**必然失效**,因为同一个类的两个构造点让 `self.head_dim` 解出
+**两个不同**的符号:
+
+| 构造点 | 逐字源 | `head_dim` |
+|---|---|---|
+| `csa.py:596-603` | `build_module(submodules.compressor, config=config, compress_ratio=self.compress_ratio, head_dim=config.v_head_dim, rotate=False, rotary_pos_emb=self.rotary_pos_emb)` | `v_head_dim` = **512** |
+| `indexer.py:126-132` | `build_module(submodules.compressor, config=self.config, compress_ratio=self.compress_ratio, head_dim=self.index_head_dim, rotate=True, rotary_pos_emb=rotary_pos_emb)` | `index_head_dim` = **128** |
+
+⇒ 一张扁平表**装不下**,必须按**内联帧**分作用域。故 G2(构造点维度)、G3(子 `dims_ctx`)、
+G5(子 `scalar_binds`)一并落地。
+
+### 2.2 落地(逐文件)
+
+| 文件 | 改动 | 判据 |
+|---|---|---|
+| `init_dims.py` | `INIT_PARAM_SEEDS` 增第三形态 `{"dim": 符号串, "val": 具体值}` | 构造点 `head_dim=config.v_head_dim` **既**要按符号 `v_head_dim` 参与维度代数(随 DimTable 变)、**又**在 flags 里有 512 可供 `if` 判定;不是二选一 |
+| `init_dims.py` | `eval_init_dims(..., param_seeds=)`:**按构造点**逐键覆盖全局种子 | G2 本体 |
+| `init_dims.py` | `InitDims.self_seeds`:`self.<attr>` 的可传播求值结果 | 构造点写 `head_dim=self.index_head_dim` 时,子要拿父这一侧求出来的东西 |
+| `init_dims.py` | **`_Cell.tainted`** —— 传递地来自 `__init__` **形参缺省**的值**不得**经 `self_seeds` 传播 | 铁律「不得从 `__init__` 缺省推结构」。实测反例:`csa.py:556` `compress_ratio: int = 0`,若传播下去,子 `Compressor` 的 `ratio=0` 让 `cutoff = (sq // ratio) * ratio` 直接判不出 —— 20 条既有测试当场变红,**正是该铁律要挡的东西** |
+| `extractor.py` | `_ctor_seeds(call, self_seeds, config_flags, …)`:构造点关键字 → 子形参种子,四种可解形态(字面量 / `config.X` / `self.X` / 裸转发形参),其余**不收** | 见函数 docstring 的逐条源定位符 |
+| `extractor.py` | 具体值(int/bool)同时注入子的 `config_flags`,两道门(须是本 MRO 某 `__init__` 的形参 + 值须是 int/bool) | `bind_init` 的三元形态 `self.hadamard = Hadamard(head_dim) if rotate else IdentityOp()`(`compressor.py:129`)按 `config_flags[<形参名>]` 判,只喂 `INIT_PARAM_SEEDS` 判不出 |
+| `construct_walker.py` | `SubExtract` 携 `dims_ctx` / `scalar_binds`(G3/G5 的契约变更) | 见该 dataclass 的 docstring |
+| `construct_walker.py` | `_inline_subcell`:给每次内联生成**帧标签**(`compressor@28`,嵌套用 `/` 连),写 `attrs["frame"]` / `attrs["dims_ctx"]`;子 `scalar_binds` 按帧上浮且 `src` 重映射到调用方基名 | 同名 `self.<attr>` / 局部 `seqlen` 在父子帧里指不同东西 |
+| `shape_infer.py` | `scalar_map` 改按 `(帧, 名)` 键;`_frame_chain` 给可见链(当前帧 → 逐级外层 → 根帧);`_attr_dim` 先查节点自带的 `dims_ctx` 再退顶层 | 同上 |
+
+### 2.3 实测:两个构造点各自解对了 [RAN]
+
+```bash
+PYTHONIOENCODING=utf-8 python scratchpad/probe_dsv4_bytes.py fused
+```
+`CompressedSparseAttention` 里新解出的两项**逐字带 `index_head_dim`**(= indexer 那条链上的
+compressor,`indexer.py:128` head_dim=128),而 `Compressor` 单抽时是 `v_head_dim`(=512):
+
+```
+CompressedSparseAttention  __arg__i5  ~((B·S·index_head_dim)+(B·S·index_head_dim))  fp32   4.0000 MiB
+                           weights    ~((B·S·index_head_dim)+(B·S·index_head_dim))  bf16   2.0000 MiB
+Compressor(单抽,= CSA 直挂那个) __arg__i5  ~((B·S·v_head_dim)+(B·S·v_head_dim))    fp32  16.0000 MiB
+                                 weights    ~((B·S·v_head_dim)+(B·S·v_head_dim))    bf16   8.0000 MiB
+```
+比值恰为 512/128 = **4×** —— 正是任务书点名「单一全局种子必然错 4×」的那个量。
+
+| Cell(fused) | 节点 | out 已解析 | 改前 | saves 字节 | 改前 | node-gaps | 改前 |
+|---|---|---|---|---|---|---|---|
+| `Compressor` | 29 | 15 | 15 | 56.000 MiB | 56.000 | 13 | 13 |
+| `CSAIndexer` | 7 | 0 | 0 | 0 | 0 | 7 | 7 |
+| `CompressedSparseAttention` | 90 | **43** | 11 | **306.000 MiB** | 300.000 | **45** | 68 |
+| `DSv4HybridSelfAttention` | 123 | **53** | 21 | **318.000 MiB** | 312.000 | **68** | 91 |
+
+### 2.4 回归 + 字节中性 [RAN]
+
+```bash
+python -m pytest tests -q     ->  3 failed, 1792 passed
+```
+3 条失败全部是 `tests/test_acceptance_gate.py`,**与本轮无关**:把本轮 4 个改动文件
+`git stash` 掉后**同样 3 failed**(并行 agent 的未跟踪 `cost_eval/opdag/to_resolved.py` 一落地就
+激活了惰性探测的 `extracted` 源)。即 1792 + 3 = **1795 = 基线**,本轮**零回归**。
+
+字节中性(**diff,不是断言**):
+```bash
+git worktree add <sc>/wt-base 48c68a1
+cd <wt-base> && PYTHONPATH=. python scratchpad/dump_numbers.py > before.txt   # 650 行
+cd <主树>    && PYTHONPATH=. python scratchpad/dump_numbers.py > after.txt    # 650 行
+diff before.txt after.txt   ->  *** 0 diff ***
+```

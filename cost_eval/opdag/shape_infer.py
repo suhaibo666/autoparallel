@@ -65,7 +65,15 @@ class _Ctx:
     env: dict = field(default_factory=dict)          # 张量基名 -> shape 串(已解出的才入)
     dims_ctx: dict = field(default_factory=dict)     # self.<attr> -> 符号 token 串
     scalar_binds: list = field(default_factory=list) # [{"names":[...], "src": var}]
-    scalar_map: dict = field(default_factory=dict)   # 标量轴名 -> Factors | None
+    scalar_map: dict = field(default_factory=dict)   # (帧, 标量轴名) -> Factors | None
+    # ── 内联帧作用域(G3/G5,2026-07-25)────────────────────────────────────────────────
+    # `frame` = 当前正在推断的节点所属的内联帧(`OpNode.attrs["frame"]`,根帧 = "");
+    # `node_dims` = 该节点所属类的 `dims_ctx`(`OpNode.attrs["dims_ctx"]`),优先于全局那份。
+    # 为什么必须按帧:同一个类的两个构造点会让 `self.head_dim` 解出不同符号
+    # (`v_head_dim` @ csa.py:604 vs `index_head_dim` @ indexer.py:128),局部标量名
+    # (`seqlen`)也会在父子帧里指不同张量。扁平一张表只能 fail-loud 或静默取一个。
+    frame: str = ""
+    node_dims: dict | None = None
     # 逐节点"解不出"台账(调用方传 `report=[]` 才收):每条 {node,op,src,name,reason}。
     # 纪律(任务书第 2 点):**任何解不出的东西都必须显式带 `file:line` 出现在这里**,
     # 绝不用一个"看起来合理"的数替代。
@@ -149,16 +157,29 @@ def _lookup(env: dict, name: str):
 
 # ── 标量轴名解析(scalar_binds 惰性 + View shape 节点即时)────────────────────────
 def _scalar(ctx: _Ctx, name: str):
-    if name in ctx.scalar_map:
-        return ctx.scalar_map[name]
-    for sb in ctx.scalar_binds:
-        if name in sb.get("names", []):
-            _fill_scalar_bind(ctx, sb)
-            return ctx.scalar_map.get(name)
+    """标量轴名 → Factors。**按帧**查:先当前帧,再根帧(父自己的名字对子也可见 —— 子的
+    `reshape` 表达式里不会引用父的局部名,故这一档只是既有单帧行为的自然延续)。"""
+    for fr in _frame_chain(ctx.frame):
+        if (fr, name) in ctx.scalar_map:
+            return ctx.scalar_map[(fr, name)]
+        for sb in ctx.scalar_binds:
+            if sb.get("frame", "") == fr and name in sb.get("names", []):
+                _fill_scalar_bind(ctx, sb, fr)
+                return ctx.scalar_map.get((fr, name))
     return None
 
 
-def _fill_scalar_bind(ctx: _Ctx, sb: dict) -> None:
+def _frame_chain(frame: str) -> list[str]:
+    """帧的**可见链**:当前帧 → 逐级外层 → 根帧("")。`a@1/b@7` → `["a@1/b@7", "a@1", ""]`。"""
+    out, cur = [], frame
+    while cur:
+        out.append(cur)
+        cur = cur.rsplit("/", 1)[0] if "/" in cur else ""
+    out.append("")
+    return out
+
+
+def _fill_scalar_bind(ctx: _Ctx, sb: dict, frame: str = "") -> None:
     """`names = src.shape`:按 src 当前 env shape 逐轴填 names(仅在 src 已解出时填,setdefault
     避免覆盖 shape 节点的权威登记;src 未解出则暂不缓存,留待后续重试)。
 
@@ -172,11 +193,11 @@ def _fill_scalar_bind(ctx: _Ctx, sb: dict) -> None:
     shp, numel_only = strip_numel_only(raw)
     if numel_only:
         for nm in sb.get("names", []):
-            ctx.scalar_map.setdefault(nm, None)
+            ctx.scalar_map.setdefault((frame, nm), None)
         return
     axes = parse_shape(shp)
     for i, nm in enumerate(sb.get("names", [])):
-        ctx.scalar_map.setdefault(nm, axes[i] if i < len(axes) else None)
+        ctx.scalar_map.setdefault((frame, nm), axes[i] if i < len(axes) else None)
 
 
 # ── 维度表达式解析:token 串 -> Factors | NEG1 | None ──────────────────────────
@@ -232,8 +253,12 @@ def _attr_dim(node: ast.Attribute, ctx: _Ctx):
     if isinstance(v, ast.Name) and v.id == "config":
         return parse_axis(CONFIG2SYM.get(node.attr, node.attr))
     # self.<X> → dims_ctx(__init__ 求得的符号维度),退 CONFIG2SYM,再无 → None(保 ?)
+    # G3:**先查本节点所属类那份**(`attrs["dims_ctx"]`,由 `_inline_subcell` 按帧挂上),
+    # 再退顶层那份。次序不能反 —— `self.head_dim` 在两个 compressor 构造点解出不同符号。
     if isinstance(v, ast.Name) and v.id == "self":
         attr = node.attr
+        if ctx.node_dims and attr in ctx.node_dims:
+            return parse_axis(ctx.node_dims[attr])
         if attr in ctx.dims_ctx:
             return parse_axis(ctx.dims_ctx[attr])
         if attr in CONFIG2SYM:
@@ -551,6 +576,9 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
 
     for n in dag.nodes:
         node_out_name[n.id] = _base(n.out) if n.out else ""
+        # G3/G5:切到本节点所属的内联帧(根帧 = "")+ 它那个类的 dims_ctx。
+        ctx.frame = n.attrs.get("frame", "") or ""
+        ctx.node_dims = n.attrs.get("dims_ctx") or None
 
         # 1) 解各输入 shape(先按名/种子,内联后缀容忍)
         shapes = [_lookup(ctx.env, _base(r)) for r in n.ins]
@@ -584,7 +612,8 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
             src_axes = (None if (in_numel_only and in_numel_only[0])
                         else (in_axes_list[0] if in_axes_list else None))
             for i, nm in enumerate(n.attrs.get("shape_unpack", [])):
-                ctx.scalar_map[nm] = (src_axes[i] if (src_axes and i < len(src_axes)) else None)
+                ctx.scalar_map[(ctx.frame, nm)] = (
+                    src_axes[i] if (src_axes and i < len(src_axes)) else None)
             node_out_name[n.id] = _base(n.out) if n.out else ""
             continue
 
