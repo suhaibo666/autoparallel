@@ -1150,8 +1150,15 @@ class _Folder:
         dims = self._dims_of(node.src)
         base = (node.src or "").rsplit("/", 1)[-1].split(":", 1)[0]
         # ── A ──────────────────────────────────────────────────────────────
+        # **按构造点**的 `Parameter` 声明优先（`attrs["param_decl"]`，由 `_inline_subcell`
+        # 按内联帧挂上；它是那次 `eval_init_dims(param_seeds=ctor_seeds)` 的结果）。全局
+        # `self.book.param` 只是兜底 —— 同一个类的两个构造点会让形状差 4×（`Compressor.ape`）。
+        decl = node.attrs.get("param_decl") or {}
         for pn in (node.attrs.get("param_operands") or ()):
             rec = self.book.param.get((base, pn))
+            d = decl.get(pn)
+            if isinstance(d, dict) and d.get("axes"):
+                rec = (tuple(str(a) for a in d["axes"]), d.get("dtype"), "<ctor-site>")
             if rec is None:
                 self.cov.unresolved_params.append(
                     (pn, node.src, "Parameter 形状未由 __init__ 求出（或声明不在同一文件）"))

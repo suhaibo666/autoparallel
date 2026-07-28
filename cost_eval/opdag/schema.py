@@ -66,6 +66,20 @@ class OpDAG:
     #   排在 `scalar_binds` / View-shape 的符号档之后 —— 符号优先,数值兜底)。
     #   纪律:一个名字被绑成过两个不同的值就**不导出**(按名取值可能取到另一段的那个)。
     const_scalars: dict = field(default_factory=dict)
+    # param_decl —— `__init__` 逐字读出的 `Parameter` 声明,**按本 Cell 的构造点**求值
+    #   (2026-07-28):`{属性名: {"axes": [轴串...], "dtype": 串}}`,来自
+    #   `init_dims.param_shapes/param_dtypes`(该次 `eval_init_dims(param_seeds=ctor_seeds)`)。
+    #   内联时由 `_inline_subcell` 按**帧**挂到节点 `attrs["param_decl"]` —— 与 `dims_ctx`
+    #   同一条论证:`Compressor` 有两个构造点,`head_dim` 一处 `v_head_dim`(csa.py:604)、
+    #   一处 `index_head_dim`(indexer.py:128) ⇒ `ape` 的形状 `(compress_ratio, coff·head_dim)`
+    #   逐点不同,扁平一张全局表必然把其中一处算错 4×。
+    param_decl: dict = field(default_factory=dict)
+    # scalar_exprs —— construct 局部标量的**赋值表达式原文**(2026-07-28),名 → 串。
+    #   与 `const_scalars`(host 整数)配对:表达式能递归解成**符号**(`n_compressed` →
+    #   `cutoff // ratio` → `S//4`),而 host 整数会把符号压成数字、让 reshape 的 `-1`
+    #   消元约不干净(实测 `compressor.py:196-203` 整条压缩链因此断掉)。
+    #   `shape_infer._scalar` 里排在符号档之后、`const_scalars` 数值档之前。
+    scalar_exprs: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)

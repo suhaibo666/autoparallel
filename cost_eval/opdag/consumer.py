@@ -91,7 +91,12 @@ def _sym_value(sym, dims):
             return None
         b = _axis_value(parse_axis(base), dims) if base.strip() else None
         return None if b is None else b // n
-    if "-" in sym and not sym.lstrip("-").lstrip("0123456789") == "":
+    if sym.lstrip("-").isdigit():
+        # **纯整数单元**（2026-07-28）：和式/差式的子项可能是字面量（`64+v_head_dim-64` 里的
+        # `64` 来自 `pos_dim = self.config.qk_pos_emb_head_dim` 的 host 值）。此前这一档缺失 →
+        # 整个和式解不出 → 承载它的节点被跳过（实测 CSA 主链因此断掉）。
+        return int(sym)
+    if "-" in sym:
         # **差式单元** `a-b`（`sym_shape.sub`，2026-07-28）：左结合地剥最外层。真源
         # `indexer.py:179` `self.index_head_dim - self.qk_pos_emb_head_dim`、
         # `deepseek_v4_hybrid_attention.py:204` `self.config.v_head_dim - pos_dim`。

@@ -856,7 +856,9 @@ def _make_subcell_resolver(
                           param_operands=list(getattr(dag, "param_operands", ()) or ()),
                           dims_ctx=dict(getattr(dag, "dims_ctx", {}) or {}),
                           scalar_binds=list(getattr(dag, "scalar_binds", ()) or ()),
-                          const_scalars=dict(getattr(dag, "const_scalars", {}) or {}))
+                          const_scalars=dict(getattr(dag, "const_scalars", {}) or {}),
+                          param_decl=dict(getattr(dag, "param_decl", {}) or {}),
+                          scalar_exprs=dict(getattr(dag, "scalar_exprs", {}) or {}))
     return resolver
 
 
@@ -1164,6 +1166,11 @@ def _extract_meta(
         entry_method=entry_method,
     )
     dag.dims_ctx = init_dims.dims_ctx           # self.<attr> → 符号 token(供 shape 推断解析)
+    # `Parameter` 声明(**本构造点**求值,`param_seeds=ctor_seeds`)→ 供 shape 推断给
+    # 「操作数全是权重」的节点定形。按帧挂到节点上的动作在 `_inline_subcell` 里。
+    dag.param_decl = {k: {"axes": list(v),
+                          "dtype": (init_dims.param_dtypes or {}).get(k)}
+                      for k, v in (init_dims.param_shapes or {}).items() if v}
     # ── Task 2(P0#1):把 `__init__` 侧的**裸函数别名**(pynative 惯用法,_CLS2OP 绑不上)并入诊断。
     # 调用点若真用到它们,`_handle_self_call` 会 fail-loud;但**没被调用**的那些今天完全不可见
     # (评估文档 §2.4:dsv4 链上 39 原语 / 196 调用点)。此处让它们出现在计数里,不静默跳过。

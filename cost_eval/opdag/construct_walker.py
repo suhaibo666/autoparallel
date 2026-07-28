@@ -145,6 +145,11 @@ class _ScalarEnv(dict):
         return {k: v for k, v in self._seen.items()
                 if isinstance(v, int) and not isinstance(v, bool) and k not in self.rebound}
 
+    def exported_str(self) -> dict:
+        """字符串档(`scalar_exprs` 用):同名不同串 → 剔除。"""
+        return {k: v for k, v in self._seen.items()
+                if isinstance(v, str) and v and k not in self.rebound}
+
 
 @dataclass
 class SubExtract:
@@ -184,6 +189,10 @@ class SubExtract:
     #   同样必须过边界:内联后子里的 `split(t, [nope_dim, pos_dim], -1)` 的两个 size
     #   都是子帧局部名,父侧解不出。
     const_scalars: dict = field(default_factory=dict)
+    # param_decl —— 子 Cell 的 `Parameter` 声明(按**该构造点**求值),同样按帧挂到节点上。
+    param_decl: dict = field(default_factory=dict)
+    # scalar_exprs —— 子里局部标量的赋值表达式原文(见 `_Walker.scalar_exprs`)。
+    scalar_exprs: dict = field(default_factory=dict)
 
 # 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
@@ -539,6 +548,16 @@ class _Walker:
         # ── 标量 / dtype 环境(P0#5 的另一半:把"标量记账"与"张量建节点"分开)────────────
         self.scalars: dict[str, object] = _ScalarEnv({**dict(module_consts or {}),
                                                       **dict(self._param_literals)})
+        # ── construct 局部标量的**赋值表达式原文**(2026-07-28)────────────────────────────
+        # 为什么在 `const_scalars`(host 整数)之外还要这一档:host 值把**符号**压成了数字,
+        # 于是 reshape 的 `-1` 消元会失败。实测 `compressor.py:196-203`:
+        #     cutoff = (sq // ratio) * ratio ;  n_compressed = cutoff // ratio
+        #     kv = self.reshape(kv, (n_compressed, ratio, b, -1))
+        # `n_compressed` 的 host 值是 1024,而输入 shape 里那一轴是**符号** `S`(=4096)
+        # → 已知积 `1024·4·B` 与总积 `S·B·2·index_head_dim` 约不干净 → 整条压缩链断。
+        # 换成表达式 `cutoff // ratio` 递归解,得 `S//4`,消元就干净了。
+        # 纪律与 `const_scalars` 相同:同名不同表达式 → 剔除(按名取会取到另一段那个)。
+        self.scalar_exprs: dict[str, str] = _ScalarEnv()
         self.dtypes: dict[str, str] = {}     # 变量名 -> dtype 短标签(`ori_dtype = x.dtype`)
         # ── 块级 detach(P0#4)/ 逐点 detach(P1#11)────────────────────────────────────
         self._nograd_depth = 0
@@ -1425,9 +1444,13 @@ class _Walker:
         kind = self._classify(val)
         if kind == _Kind.SCALAR:
             v = self._scalar_of(val)
+            expr = self._describe(val)
             for t in targets:
                 self._forget(t)
                 self.scalars[t] = v
+                # 表达式原文(供 `shape_infer` 递归解成**符号**;见 `self.scalar_exprs`)。
+                if expr and t not in expr.split():
+                    self.scalar_exprs[t] = expr
             return
         if kind != _Kind.TENSOR:
             self._diag("dropped_assigns", src=f"{self.src_file}:{lineno}",
@@ -2201,6 +2224,9 @@ class _Walker:
         if op == "Constant" and call.args:
             if prim in ("arange",):
                 out["const_shape"] = [self._describe(call.args[0])]
+                # 位置实参个数:`arange(stop)` 的产出是 `(stop,)`,而 `arange(start, stop[, step])`
+                # 的第 0 位是 **start**。消费方必须能区分,否则会把 `start` 当长度。
+                out["const_argc"] = len(call.args)
             else:
                 elts = self._tuple_elts(call.args[0])
                 if elts is not None:
@@ -2547,6 +2573,7 @@ class _Walker:
         # 都在**它自己那个类**的环境里解 —— 这正是扁平 `merge_dims_ctx` 做不到的事。
         frame = f"{attrs.get('field') or attrs.get('cell') or 'sub'}@{offset}"
         sub_dims = dict(getattr(sub, "dims_ctx", {}) or {})
+        sub_pdecl = dict(getattr(sub, "param_decl", {}) or {})
         for n in sub.nodes:
             new_id = n.id + offset
             new_ins: list[str] = []
@@ -2567,6 +2594,9 @@ class _Walker:
             # 更深的帧已经带着自己那份 dims_ctx(setdefault 语义):只给还没有的补本类那份。
             if sub_dims and "dims_ctx" not in new_attrs:
                 new_attrs["dims_ctx"] = sub_dims
+            # 同上(按帧、setdefault):`Parameter` 声明也必须跟着**它自己那个构造点**。
+            if sub_pdecl and "param_decl" not in new_attrs:
+                new_attrs["param_decl"] = sub_pdecl
             self.nodes.append(OpNode(
                 id=new_id, op=n.op, src=n.src, module=n.module,
                 ins=new_ins, out=n.out, attrs=new_attrs,
@@ -2603,6 +2633,8 @@ class _Walker:
         # 局部名参与父帧的名字解析);同名不同值 → 双方都剔除,见 `_ScalarEnv.note_external`。
         for k, v in (getattr(sub, "const_scalars", None) or {}).items():
             self.scalars.note_external(k, v)
+        for k, v in (getattr(sub, "scalar_exprs", None) or {}).items():
+            self.scalar_exprs.note_external(k, v)
 
         # 4) 子返回值绑回调用点目标
         for tgt, r in zip(target_names, sub.returns):
@@ -3362,7 +3394,8 @@ def _run_walker(
                 diagnostics=walker.diagnostics,
                 detached=list(walker.detached), deletes=list(walker.deletes),
                 param_operands=list(walker.param_operands),
-                const_scalars=walker.scalars.exported())
+                const_scalars=walker.scalars.exported(),
+                scalar_exprs=walker.scalar_exprs.exported_str())
 
     # ── 0 节点硬门(Task 2 / P0#1;**恒开**,与 strict 无关)────────────────────────────────
     # 实测反例:`CSAIndexer` fused 支整块在 `with _no_grad():`(indexer.py:214)里 → 整块丢 →

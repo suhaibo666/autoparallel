@@ -68,6 +68,10 @@ class _Ctx:
     scalar_map: dict = field(default_factory=dict)   # (帧, 标量轴名) -> Factors | None
     # construct 局部标量的 host 整数值(`dag.const_scalars`)——`_scalar` 的**最后一档**。
     const_scalars: dict = field(default_factory=dict)
+    # construct 局部标量的赋值表达式原文(`dag.scalar_exprs`)——`_scalar` 的**表达式档**,
+    # 排在符号档之后、数值档之前(见 `_scalar` 的论证)。`_resolving` 是递归护栏。
+    scalar_exprs: dict = field(default_factory=dict)
+    _resolving: set = field(default_factory=set)
     # ── 内联帧作用域(G3/G5,2026-07-25)────────────────────────────────────────────────
     # `frame` = 当前正在推断的节点所属的内联帧(`OpNode.attrs["frame"]`,根帧 = "");
     # `node_dims` = 该节点所属类的 `dims_ctx`(`OpNode.attrs["dims_ctx"]`),优先于全局那份。
@@ -136,14 +140,21 @@ def _param_axes(n: OpNode, param_shapes: dict):
     退一档接受裸属性名(合成源单测用)。
     """
     names = n.attrs.get("param_operands") or ()
-    if not names or not param_shapes:
+    if not names:
         return None
+    # **按构造点**的那份优先(`attrs["param_decl"]`,由 `_inline_subcell` 按帧挂上):
+    # `Compressor.ape` 的形状 `(compress_ratio, coff·head_dim)` 在两个构造点不同
+    # (`csa.py:604` v_head_dim vs `indexer.py:128` index_head_dim)—— 全局表只能取一个。
+    decl = n.attrs.get("param_decl") or {}
     base = (n.src or "").rsplit("/", 1)[-1].split(":", 1)[0]
     out = []
     for pn in names:
-        sym = param_shapes.get((base, pn))
-        if sym is None:
-            sym = param_shapes.get(pn)
+        sym = None
+        rec = decl.get(pn)
+        if isinstance(rec, dict) and rec.get("axes"):
+            sym = "·".join(str(a) for a in rec["axes"])
+        if sym is None and param_shapes:
+            sym = param_shapes.get((base, pn)) or param_shapes.get(pn)
         if not sym:
             return None
         out.append(str(sym))
@@ -254,6 +265,19 @@ def _scalar(ctx: _Ctx, name: str):
             if sb.get("frame", "") == fr and name in sb.get("names", []):
                 _fill_scalar_bind(ctx, sb, fr)
                 return ctx.scalar_map.get((fr, name))
+    # **表达式档**:局部标量的赋值原文,递归解 —— 优先于数值档,因为它能保住**符号**
+    # (`n_compressed` → `cutoff // ratio` → `S//4`),而数值档会把符号压成数字、让
+    # reshape 的 `-1` 消元约不干净(实测 `compressor.py:196-203` 整条压缩链因此断掉)。
+    expr = ctx.scalar_exprs.get(name)
+    if expr and name not in ctx._resolving:
+        ctx._resolving.add(name)
+        try:
+            f = _resolve_token(str(expr), ctx)
+        finally:
+            ctx._resolving.discard(name)
+        if f is not None and f is not NEG1:
+            ctx.scalar_map[(ctx.frame, name)] = f      # 缓存(同帧后续直接命中)
+            return f
     v = ctx.const_scalars.get(name)
     if isinstance(v, int) and not isinstance(v, bool) and v > 0:
         return Factors(coeff=v)
@@ -615,11 +639,41 @@ def _constant(n: OpNode, ctx: _Ctx):
                  "cat 成 [max_seq_len,dim] → reshape(-1,1,1,dim)；"
                  "dim=config.qk_pos_emb_head_dim（deepseek_v4_hybrid_attention.py:175-177）")
         return axes, False
-    if str(n.attrs.get("prim") or "").rsplit(".", 1)[-1] == "tuple_to_array":
+    prim = str(n.attrs.get("prim") or "").rsplit(".", 1)[-1]
+    if prim == "tuple_to_array":
         elts = n.attrs.get("const_shape")
         if not elts:
             return None
         return [Factors(coeff=len(elts))], False
+    # ③ `mint.arange(stop)`:产出是一维 `(stop,)`(算子定义)。**只**在恰好 1 个位置实参时
+    #    才用 —— `arange(start, stop[, step])` 的第 0 位是 start,当成长度会算错
+    #    (`attrs["const_argc"]` 就是为这个判据记的)。真源 `csa.py:452-453`
+    #    `mint.arange(seqlen)` / `mint.arange(window_size)`(滑窗索引矩阵的两条轴)。
+    if prim == "arange" and int(n.attrs.get("const_argc") or 0) == 1:
+        elts = n.attrs.get("const_shape") or ()
+        stop = _resolve_token(str(elts[0]), ctx) if elts else None
+        if stop is None or stop is NEG1:
+            return None
+        return [stop], False
+    # ④ `mint.zeros/ones/full/empty(<shape 元组>, …)`:目标各维由源表达式给出,全部解出才用。
+    if prim in ("zeros", "ones", "full", "empty") and n.attrs.get("const_shape"):
+        axes = []
+        for tok in n.attrs["const_shape"]:
+            f = _resolve_token(str(tok), ctx)
+            if f is None or f is NEG1:
+                return None
+            axes.append(f)
+        return (axes or None) and (axes, False)
+    # ⑤ `mint.full(<x>.shape, v, …)` / `zeros(<x>.shape)`:**与 `<x>` 同形**(算子定义)。
+    #    真源 `csa.py:442/457` `mint.full(matrix.shape, -1, dtype=int32)`。
+    src = str(n.attrs.get("const_shape_src") or "")
+    if prim in ("zeros", "ones", "full", "empty") and src.endswith(".shape"):
+        shp = _lookup(ctx.env, src[: -len(".shape")])
+        if not shp:
+            return None
+        bare, numel_only = strip_numel_only(shp)
+        axes = parse_shape(bare)
+        return (axes, numel_only) if axes else None
     return None
 
 
@@ -645,6 +699,35 @@ def _gather(n: OpNode, in_axes_list, in_numel_only):
         return None
     return ([f.copy() for f in in_axes_list[idx]],
             bool(idx < len(in_numel_only) and in_numel_only[idx]))
+
+
+_INT_DTYPES = ("int8", "int16", "int32", "int64", "uint8", "uint32", "uint64")
+
+
+def _advanced_index(n: OpNode, in_axes_list, in_numel_only):
+    """`x[idx]`(`attrs["advanced_index"]`,**整数索引数组**)→ `idx.shape ++ x.shape[1:]`。
+
+    这是算子定义(NumPy/torch 的 advanced indexing:轴 0 被 index 数组替换成 index 的整个形状)。
+    真源 `csa.py:485` `kv_flat[flat_indices]`:`kv_flat` 是 `[b·sk, d]`、`flat_indices` 是 1 维
+    → 产出 `[len(idx), d]`,紧接着 `:485` reshape 成 `(b, sq, topk, d)`(与本规则一致)。
+
+    守卫(缺一条就返回 None,宁 `?` 勿错):恰两个张量操作数;index **dtype 是整数**
+    (布尔掩码的语义完全不同 —— 那是 `x[mask]`,产出长度取决于**值**而非形状);
+    两侧都有可信轴结构(不是 `~`);被索引侧至少 1 轴。
+    """
+    if not n.attrs.get("advanced_index"):
+        return None
+    if len(n.ins) != 2 or len(in_axes_list) != 2:
+        return None
+    if in_axes_list[0] is None or in_axes_list[1] is None or any(in_numel_only[:2]):
+        return None
+    dt = n.ins[1].split(":")[2] if n.ins[1].count(":") == 2 else ""
+    if dt not in _INT_DTYPES:
+        return None
+    x, idx = in_axes_list[0], in_axes_list[1]
+    if len(x) < 1:
+        return None
+    return [f.copy() for f in idx] + [f.copy() for f in x[1:]], False
 
 
 def _activation(node: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
@@ -828,6 +911,7 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
         dims_ctx=dict(dims_ctx if dims_ctx is not None else getattr(dag, "dims_ctx", {}) or {}),
         scalar_binds=list(getattr(dag, "scalar_binds", []) or []),
         const_scalars=dict(getattr(dag, "const_scalars", {}) or {}),
+        scalar_exprs=dict(getattr(dag, "scalar_exprs", {}) or {}),
         param_shapes=dict(param_shapes or {}),
         report=report,
         declared=declared,
@@ -1094,6 +1178,8 @@ def _dispatch(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
         # 它的产出形 = index 形 **+ input 的尾轴** → 套 gather 规则会**少算**尾轴。
         # 故只对 `prim == "mint.gather"` 生效,其余照旧记账保 `?`(宁 `?` 勿错)。
         r = _gather(n, in_axes_list, in_numel_only)
+        if r is None:
+            r = _advanced_index(n, in_axes_list, in_numel_only)
         if r is not None:
             return r
         _note(ctx, n, "constant_shape_unknown",
