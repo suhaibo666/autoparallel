@@ -335,3 +335,57 @@ unfused : q 256.0 / x 128.0 / topk_idxs__i1 33.0 / aggregated_attn 32.0 / … / 
 - [`to_resolved_adapter_2026-07-25.md`](to_resolved_adapter_2026-07-25.md) —— 上一轮的判决单（本文是它 §6 诚实清单第 1–4 项的执行）。
 - [`resolved_layer_contract_2026-07-25.md`](resolved_layer_contract_2026-07-25.md) —— 18 条硬规则。
 - [`opdag_bytes_2026-07-25.md`](opdag_bytes_2026-07-25.md) / [`opdag_bytes_blockers_2026-07-25.md`](opdag_bytes_blockers_2026-07-25.md) —— 字节底座与阻塞项（本轮 G2 的解法落在这里说的那条通路上）。
+
+---
+
+## 7. 第五批（收尾）与**最终**数字 [RAN]
+
+§4/§5 的表来自第四批。收尾又做了三条（都仍在「一条规则」的范围内，故没停）：
+
+| # | 改动 | 为什么是源读 |
+|---|---|---|
+| M | **`sym_shape.divide_expr`**：reshape 的 `-1` 消元约不干净时形成**整除原子** `(总积)//(已知积)`，而不是整条退 `numel_only`；`consumer._sym_value` 支持**符号分母**（不整除即 None，不取整） | `-1` 位按算子定义**就是** `numel(输入) // ∏(其余目标维)`，两边都是源解出的表达式，值完全由 DimTable 决定 —— 与既有 `S//4` 原子同一条「表达式保形」路子。这正是 §5 第 1 项那块石头的**绕行解**：不需要知道 `4·(S//4)==S`，直接把商保成表达式 |
+| N | `consumer._sym_value` 里 `str.strip("()")` → **配对感知**的 `_strip_outer_parens` | 既有隐藏 bug：`2·((a)//(b))·c·(S//4)` 这种乘积项的**配对**尾括号会被 `strip` 剥掉、整串弄坏。整除原子进乘积项后才暴露 |
+| O | **过期种子**：内联把子 Cell 形参名永久映射成调用方 ref 时，`ins` 全是「从未被本图产出过」的名字且入边 producer 数与 ins 数相等 → 改用边 | `VocabEmbedding.construct(input_)` 内联后 `:83/:84/:85` 三步的 `ins` 都写作调用方的 `input_ids` → gather 产出被算成 `B·S`，而源 docstring `vocab_embedding.py:76` 逐字写着 `output: (B, S, H)` —— **差 `H` 倍**。修正后 embedding 段的数**变大**了，同时也让若干过读的下游**变小**（见下） |
+
+### 7.1 最终八跑 + 覆盖度 [RAN]
+
+```
+  bucket       n=28  mean=0.946  min=0.748  max=1.394     <- 与基线**逐字节相同**
+  extracted    n=28  mean=0.390  min=0.113  max=0.674     <- 基线 0.169
+  hand_spec    n=28  mean=0.955  min=0.729  max=1.400     <- 与基线**逐字节相同**
+
+  覆盖度 extracted：节点 2568 → op 1564（跳过 502）；saves 未解析 0；
+      params 已解析 196 / 未解析 0；shape 冲突 8（= 发现了 8 对同名异形权重，已按 name#k 拆开）
+  param census: 可解析 5823.291 MiB / 真正进图 3967.291 MiB
+  节点原因码: no_input_shape=285, reshape_unresolved=80, constant_shape_unknown=33,
+             needs_axis_structure=16, reduce_axis_unknown=14, slice_bounds_unknown=11,
+             split_size_unresolved=8
+  级联根: ×4 compressor.py:216 needs_axis_structure / ×3 compressor.py:233 slice_bounds_unknown
+         / ×1 deepseek_v4_hybrid_attention.py:205 / ×1 csa.py:485
+  PASS  I1 extracted ×1 于层数  : L8=66.0 L4=66.0 |diff|=0.0  [advisory]
+  PASS  I2 extracted ×1 于微批数: m4=66.0 m8=66.0 |diff|=0.0  [advisory]
+  验收门结论: PASS
+```
+
+⚠ **聚合 mean 从第四批的 0.397 微降到 0.390，而覆盖度在涨**（op 1542→1564、
+`no_input_shape` 310→285、`reshape_unresolved` 103→80）。这不是退步：
+改动 **O** 修掉的是一个**过读**（`input_ids` 这个入口种子被下游误当成中间张量的形状），
+若干格（c@s1 10627.0→9064.2、c@s2 8343.0→7296.1、g@s2 3736.9→3240.4）因此**下降**。
+本来源给出的仍然是**下界**，所以「更接近真值」不是它的判据；**更接近源**才是。
+
+### 7.2 三张最终对照表（基线 → 现在）
+
+| 口径 | 基线 `74d99f4` | 最终 |
+|---|---|---|
+| 八跑 `extracted` mean sim/real | 0.169 | **0.390** |
+| 节点 → op（fused） | 2568 → 820（跳过 874） | 2568 → **1564**（跳过 **502**） |
+| 节点 → op（unfused） | 1116（跳过 1430） | **1956**（跳过 **1010**） |
+| params 未解析 | 33 | **0** |
+| param 真正进图 | 1434.0 MiB | **3967.3 MiB** |
+| `ctx.logits`（1010 MiB） | ❌ 不在图里 | ✅ 在图里，且是 stage3 峰值事件主体 |
+| ×1 于层数（`extracted`） | **WARN** \|diff\|=472.0 | **PASS** \|diff\|=0.0 |
+| ×1 于微批数（`extracted`） | PASS | PASS |
+| 契约违约（10 层 × 两支） | 0 | 0 |
+| `bucket` / `hand_spec` | — | **逐字节不变**（4265 行 dump `diff` 为空） |
+| `pytest tests` | 1838 passed | **1850 passed** |

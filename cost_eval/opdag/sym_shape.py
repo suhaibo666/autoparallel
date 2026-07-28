@@ -319,9 +319,35 @@ def sub(a: Factors, b: Factors) -> Factors | None:
     return Factors(1, {f"{_sum_term(a)}-{_sum_term(b)}": 1})
 
 
-def resolve_reshape(input_axes: list[Factors], target) -> list[Factors] | None:
+def divide_expr(total: Factors, denom: Factors) -> Factors | None:
+    """`total / denom` —— 先走精确消元 `divide`;**约不干净时形成整除原子** `(total)//(denom)`。
+
+    为什么这不是杜撰:reshape 的 `-1` 位按定义**就是** `numel(输入) // ∏(其余目标维)`,
+    两边都是已由源解出的符号表达式,值完全由 DimTable 决定 —— 与 `floordiv` 第 3 档
+    (`S//4`)是同一条"表达式保形"的路子,只是分母也可以是符号。
+
+    动机(实测):`compressor.py:196-203`
+        cutoff = (sq // ratio) * ratio ;  n_compressed = cutoff // ratio
+        kv = self.reshape(kv, (n_compressed, ratio, b, -1))
+    已知积里是 `S//4`、总积里是 `S` —— `sym_shape` 不知道 `4·(S//4) == S`(那要 4 | S),
+    于是消元失败、整条压缩链退成"只知元素数",`:216` 的按轴归约随之被拒。
+    形成整除原子后由 `consumer._sym_value` 用 DimTable 求值(不整除 → None,不取整)。
+    """
+    d = divide(total, denom)
+    if d is not None:
+        return d
+    if denom.coeff == 0:
+        return None
+    return Factors(1, {f"({render_term(total)})//({render_term(denom)})": 1})
+
+
+def resolve_reshape(input_axes: list[Factors], target, *,
+                    allow_expr: bool = False) -> list[Factors] | None:
     """按 reshape 目标(Factors 列表,-1 用 NEG1 哨兵)算出输出各轴;单个 -1 靠总积消元填补。
-    无法解析(多个 -1 / 消元不干净)→ None。"""
+    无法解析(多个 -1 / 消元不干净)→ None。
+
+    `allow_expr=True`(2026-07-28):消元不干净时改用 `divide_expr` 形成整除原子,
+    而不是整条放弃(见 `divide_expr` 的论证)。缺省关 —— 既有调用方逐字不变。"""
     neg_positions = [i for i, t in enumerate(target) if t is NEG1]
     if not neg_positions:
         return [t.copy() for t in target]
@@ -329,7 +355,7 @@ def resolve_reshape(input_axes: list[Factors], target) -> list[Factors] | None:
         return None
     total = product_of(input_axes)
     known = product_of([t for t in target if t is not NEG1])
-    filled = divide(total, known)
+    filled = divide_expr(total, known) if allow_expr else divide(total, known)
     if filled is None:
         return None
     out = [t if t is not NEG1 else filled for t in target]

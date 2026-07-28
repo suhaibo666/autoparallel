@@ -351,14 +351,17 @@ LEDGER_BLOCKERS = {
     # `n_compressed = S//4`（差式/整除原子），总积里是 `S` —— `sym_shape` 不知道
     # `S = 4·(S//4)`，故只解出**元素数**（`~`），归约要按轴去掉一条轴 → 拒绝。
     "compressor.py:216",
-    # `transpose(words_embeddings, …)`：上游 gather 的产出只解出**元素数**（index 自己是
-    # tile 出来的、轴序未记）→ 按轴换形被拒（宁 `?` 勿错）。
-    "language_model_embedding.py:134",
+    # `kv[:cutoff]`（`compressor.py:233`）：切片上界 `cutoff = (sq // ratio) * ratio` 是
+    # construct 局部标量，`_slice` 只支持 `":<stop>"` 且要求 stop 解得出 —— 这里 stop 走的是
+    # 表达式档、但 `_slice` 拿到的是 `attrs["index"]` 原文里那个**未导出**的名字。
+    "compressor.py:233",
     # `_apply_forward_rope` 的 `split(t, [nope_dim, pos_dim], -1)`：`t` 只解出元素数。
     "deepseek_v4_hybrid_attention.py:205",
     # unfused 支：`kv_flat[flat_indices]` 的 advanced indexing —— 规则有了（`_advanced_index`），
     # 但 `kv_flat` 的形状来自上面那条压缩链，仍是 `~`。
     "csa.py:485",
+    # `language_model_embedding.py:134` 的 transpose 已随「过期种子」修复解开，保留在册备查。
+    "language_model_embedding.py:134",
 }
 
 

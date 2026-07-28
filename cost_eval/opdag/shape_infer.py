@@ -869,7 +869,9 @@ def _reshape(n: OpNode, in_axes, reshape_dims, ctx: _Ctx):
             break
         target.append(r)
     if lost is None:
-        out = resolve_reshape(in_axes, target)
+        # `allow_expr=True`:`-1` 消元约不干净时形成整除原子而不是整条退 numel_only
+        # (见 `sym_shape.divide_expr` —— 压缩链 `S` vs `S//4` 就卡在这一步)。
+        out = resolve_reshape(in_axes, target, allow_expr=True)
         if out is not None:
             return out, False
         lost = f"`-1` 消元不干净（目标 {list(reshape_dims)}）"
@@ -959,6 +961,19 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
             if shapes[i] is None and li < len(bridge_prods):
                 shapes[i] = node_out_shape[bridge_prods[li]]
                 li += 1
+        # **过期种子**:某些内联把子 Cell 的形参名**永久**映射成调用方那个 ref
+        # (`VocabEmbedding.construct(input_)` 内联进 `LanguageModelEmbedding` 后,
+        # `input_ = self.reshape(input_, (-1,1))`、`self.tile(...)` 这两步的 `ins`
+        # 仍写作调用方的 `input_ids`)。于是 `_lookup` 拿到的是**入口种子**那个形状,
+        # 而真正的上游是那条边 —— 实测 `vocab_embedding.py:85` 的 gather 因此把产出
+        # 算成 `B·S`(应为 `B·S·H`,源 docstring `:76` `output: (B, S, H)`),整段 embedding
+        # 差 `H` 倍。判据保守到只在**全部 ins 都是"从未被本图节点产出过"的名字**、
+        # 且入边 producer 数与 ins 数**恰好相等**时才改用边(此时配对唯一)。
+        if (bridge_by_edge and n.ins and all(s is not None for s in shapes)
+                and all(_base(r) not in produced_names for r in n.ins)):
+            prods = [p for p in incoming.get(n.id, []) if p in node_out_shape]
+            if len(prods) == len(n.ins):
+                shapes = [node_out_shape[p] for p in prods]
 
         # 3) 回填输入 ref 的 shape 段(供 derive_saves 读到真 shape)+ dtype 订正
         for i, sh in enumerate(shapes):

@@ -14,7 +14,7 @@ import re
 
 from .bprop_rules import derive_saves
 from .sym_shape import (parse_shape, parse_axis, render_term, strip_numel_only,
-                        _split_top)
+                        _split_top, _strip_outer_parens)
 
 
 # 符号 token → DimTable 属性名。token 集来自 sym_shape.CONFIG2SYM（提取器/推断产出的符号）。
@@ -74,6 +74,23 @@ def _cap_value(dims):
     return math.ceil(cf * tokens * topk / E)
 
 
+def _top_floordiv(sym: str) -> int:
+    """最外层（depth 0）**最后**一个 `//` 的下标；没有则 -1。右结合，与既有 `rpartition` 同向；
+    但**括号感知**——`(a)//((b)//c)` 的最外层是第一个 `//`，`rpartition` 会切错。"""
+    depth, last, i = 0, -1, 0
+    while i < len(sym):
+        c = sym[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "/" and depth == 0 and sym[i + 1:i + 2] == "/":
+            last = i
+            i += 1
+        i += 1
+    return last
+
+
 def _sym_value(sym, dims):
     """一个原子 token → 整数值。token 可能是和式 'a+b'（concat 出来的）或整除式 'S//4'
     （`sym_shape.floordiv` 第 3 档，压缩序列长度）。未知/0 → None。"""
@@ -82,15 +99,25 @@ def _sym_value(sym, dims):
     if len(parts) > 1:                       # 和式单元：逐项求和
         vals = [_sym_value(p, dims) for p in parts]
         return sum(vals) if all(v is not None for v in vals) else None
-    if "//" in sym:                          # 整除式单元：`<term>//<n>`（右结合地剥最外层）
-        base, _, denom = sym.rpartition("//")
-        if not denom.strip().lstrip("-").isdigit():
+    cut = _top_floordiv(sym)
+    if cut >= 0:                             # 整除式单元：`<term>//<n>` 或 `(<term>)//(<term>)`
+        base, denom = sym[:cut], sym[cut + 2:]
+        if not base.strip():
             return None
-        n = int(denom.strip())
-        if n == 0:
+        b = _axis_value(parse_axis(base), dims)
+        if b is None:
             return None
-        b = _axis_value(parse_axis(base), dims) if base.strip() else None
-        return None if b is None else b // n
+        d = denom.strip()
+        if d.lstrip("-").isdigit():
+            n = int(d)
+        else:
+            # **符号分母**（`sym_shape.divide_expr`，2026-07-28）：reshape 的 `-1` 位
+            # `numel(输入) // ∏(其余目标维)`。两边都由源解出，值完全由 DimTable 决定。
+            n = _axis_value(parse_axis(d), dims)
+        if not n:
+            return None
+        # **不整除即 None**（不取整）：reshape 的 `-1` 按定义整除；除不尽说明上游解错了。
+        return b // n if b % n == 0 else None
     if sym.lstrip("-").isdigit():
         # **纯整数单元**（2026-07-28）：和式/差式的子项可能是字面量（`64+v_head_dim-64` 里的
         # `64` 来自 `pos_dim = self.config.qk_pos_emb_head_dim` 的 host 值）。此前这一档缺失 →
@@ -112,7 +139,10 @@ def _sym_value(sym, dims):
     if field is None:
         # **乘积项**（concat 的"元素数之和"里每一项都是一个乘积，见 `sym_shape._sum_term`）：
         # 不是单符号 → 按轴重新解析求积。纯符号但无映射的仍落 None（不杜撰）。
-        stripped = sym.strip("()").strip()
+        # ⚠ 必须用**配对感知**的 `_strip_outer_parens`：`str.strip("()")` 会把
+        # `2·((a)//(b))·c·(S//4)` 末尾那个**配对**的 `)` 剥掉、把整串弄坏
+        # （2026-07-28 实测：`sym_shape.divide_expr` 的整除原子进乘积项后就撞上这条）。
+        stripped = _strip_outer_parens(sym).strip()
         if _split_top(stripped, "·")[1:]:
             return _axis_value(parse_axis(stripped), dims)
         return None                          # 无映射 → 未解析（不杜撰）
