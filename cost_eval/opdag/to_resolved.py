@@ -166,11 +166,11 @@ _DECLARED_FACTS = (
     ("iterations", 20, "src:hyper_connection.py:45 SinkhornKnopp.__init__ 形参"),
     ("mhc_layernorm_epsilon", 1e-6, "yaml:layernorm_epsilon"),
     ("apply_residual_connection_post_layernorm", False, "yaml 缺省 False"),
-    ("hidden_dropout", 0.0, "yaml 未给 hidden_dropout → Dropout 恒等（dropout.py:74-75）"),
+    ("hidden_dropout", 0.0, "yaml:hidden_dropout 未给 → 缺省 0.0 ⇒ Dropout 恒等（dropout.py:74-75）"),
     ("use_dropout", False, "src:dropout.py:74-75 `not self.use_dropout` → 恒等"),
     ("enable_hc_head", True,
      "src:transformer_config.py:2158-2159 enable_hc_head 缺省 None → 跟随 enable_hyper_connections"),
-    ("hc", True, "同上"),
+    ("hc", True, "src:transformer_config.py:2158-2159 同 enable_hc_head（同一派生）"),
     # ── DSv4-Flash 注意力 ───────────────────────────────────────────────────
     ("csa_dense_mode", False, "yaml 缺省 False"),
     ("is_tnd", False, "src:input_layout=BSND ⇒ 非 TND"),
@@ -205,16 +205,16 @@ _DECLARED_FACTS = (
     ("use_clamped_swiglu", False, "src:mlp.py:92 `activation_type=='fusedswiglu' and clamp!=None`"),
     # ── embedding / loss ───────────────────────────────────────────────────
     ("add_position_embedding", False, "yaml:position_embedding_type=rope ⇒ 无 learned absolute"),
-    ("num_tokentypes", 0, "yaml 未给 ⇒ 0（language_model_embedding.py:91 ⇒ None）"),
-    ("tokentype_embeddings", None, "同上"),
-    ("position_embeddings", None, "同上"),
+    ("num_tokentypes", 0, "yaml:num_tokentypes 未给 → 缺省 0（language_model_embedding.py:91 ⇒ None）"),
+    ("tokentype_embeddings", None, "src:language_model_embedding.py:91 num_tokentypes=0 ⇒ None"),
+    ("position_embeddings", None, "src:language_model_embedding.py add_position_embedding=False ⇒ None"),
     ("embedding_dropout_prob", 0.0, "yaml 缺省 0.0"),
-    ("chunk_loss_num", 1, "yaml 未给 chunk_loss_num ⇒ CrossEntropyLoss（非 Chunk 版）"),
+    ("chunk_loss_num", 1, "yaml:chunk_loss_num 未给 → 缺省 1 ⇒ CrossEntropyLoss（非 Chunk 版）"),
     ("compensate_loss_sense_tp", True, "yaml 缺省 True"),
     # ── Linear（lm_head 构造点，gpt_model.py:252-258）────────────────────────
     ("skip_weight_param_allocation", False, "src:gpt_model.py:252-258 output_layer 构造点"),
-    ("has_bias", False, "同上（add_bias_linear=False）"),
-    ("skip_add_bias", False, "同上"),
+    ("has_bias", False, "src:linear.py:87 has_bias=bias；yaml:add_bias_linear=False ⇒ 无 bias 参数"),
+    ("skip_add_bias", False, "src:gpt_model.py:252-258 output_layer 构造点（非 rowwise）"),
 )
 
 #: 部署形态谓词（`hasattr` / `isinstance` / 零参 host 函数）。同 `probe_components.py` 的口径，
@@ -630,8 +630,12 @@ _DECLARED_SHAPES = {
         "内核输出无 shape 规则、`alpha`(:408) 又是纯权重派生 → 主数据路在此断开"),
     ("decoder", "aggregated_ffn"): (
         "S·B·H", "hyper_connection.py:397", "同上（同一个 Cell 的第二个实例 ffn_hc）"),
-    ("mtp", "aggregated_attn"): ("S·B·H", "hyper_connection.py:397", "同 decoder"),
-    ("mtp", "aggregated_ffn"): ("S·B·H", "hyper_connection.py:397", "同 decoder"),
+    ("mtp", "aggregated_attn"): (
+        "S·B·H", "hyper_connection.py:397",
+        "同 decoder —— MTP 层复用同一个 `HyperConnectionTransformerLayer` 主体"
+        "（`get_mtp_layer_spec` 拿 decoder block 最后一层 spec，gpt_layer_specs.py:227-256）"),
+    ("mtp", "aggregated_ffn"): (
+        "S·B·H", "hyper_connection.py:397", "同上（同一个 Cell 的第二个实例 ffn_hc）"),
 }
 
 
