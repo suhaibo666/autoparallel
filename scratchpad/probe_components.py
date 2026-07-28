@@ -19,6 +19,7 @@ from cost_eval.opdag.construct_walker import (
     diagnostics_summary, DIAG_KINDS, _format_diagnostics)
 from cost_eval.opdag.bprop_rules import derive_saves
 from cost_eval.opdag.init_binder import Binding
+from cost_eval.opdag.fn_saves import mhc_kernel_saves
 
 SPEC_FLAGS = {   # 取自 dsv4h_fused_pp4_recomp.yaml
     "num_experts": 8, "moe_grouped_gemm": True, "qk_layernorm": True,
@@ -42,12 +43,17 @@ HOST_ALLOW = ("save_to_indexer_losses_tracker", "get_indexer_loss_tracker",
               "save_to_aux_losses_tracker", "get_moe_layer_wise_logging_tracker",
               "Validator.check_type_name")
 KERNEL_ALLOW = ("npu_lightning_indexer", "npu_mhc_pre_sinkhorn", "npu_mhc_post")
-KERNEL_SAVES = {
-    "npu_mhc_pre_sinkhorn": {"saved_ins_idx": "all", "source": "custom_op_impl.py:331/390/588（快照外）",
-                             "reason": "内核 bprop 不在快照里，按 HP DFunction 全走 save_for_backward 的保守上界"},
-    "npu_mhc_post": {"saved_ins_idx": "all", "source": "custom_op_impl.py:331/390/588（快照外）",
-                     "reason": "同上"},
-}
+# 融合 mHC 内核的 saved 集 —— **逐字读自 hyper_parallel 源**(2026-07-25 补入快照)。
+# 此前只能给「张量实参全存」的保守上界;实测那个上界在 `npu_mhc_post` 上恰等于源真值,
+# 但在 `npu_mhc_pre_sinkhorn` 上是**欠读**(漏掉 5 个被保存的自身输出)。
+HP_ROOT = os.environ.get(
+    "HYPER_PARALLEL_ROOT",
+    os.path.join(os.path.dirname(MF), "hyper_parallel"))
+try:
+    KERNEL_SAVES = mhc_kernel_saves(HP_ROOT)
+except ValueError as _e:                    # 快照里没有 hyper_parallel → 明确报出来,不退回猜
+    print(f"[warn] 读不到 hyper_parallel 的 mHC saved 集:{_e}")
+    KERNEL_SAVES = {}
 
 
 def cell_flags(fused_mhc: bool = True, ratio: int = 4, fused_dsa: bool = True) -> dict:

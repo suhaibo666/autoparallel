@@ -57,6 +57,7 @@ __all__ = [
     "SavedSet", "CtxAttr", "DetachSite", "NoGradRegion",
     "UnresolvedSaveForm", "FunctionRecord", "FnSourceTruth",
     "scan_source", "scan_tree",
+    "mhc_kernel_saves", "KERNEL_SAVE_SOURCE_KEYS",
 ]
 
 # `_Function` 是 MindSpore 自定义 autograd 基类（`from mindspore.ops import ...` 各版本导入
@@ -655,3 +656,248 @@ def scan_tree(root: str, strict: bool = False, recurse: bool = True) -> FnSource
             "fn_saves: 看不懂的 save_for_backward 形态（strict=True 拒绝静默丢）：\n  "
             + "\n  ".join(f"{u.src} {u.cls}: {u.reason}" for u in truth.unresolved))
     return truth
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 融合 NPU 自定义算子（`hyper_parallel` 侧 `DFunction`）的 saved 集 —— **从源逐字读**
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 为什么单开一段而不复用上面的 `_Function` 通路：`hyper_parallel` 的包装类基类叫
+# `DFunction`，且它的 `forward` 里 saved 名单**混着两类东西**——
+#   ① `forward` 的形参（= 调用点的**输入**操作数）；
+#   ② 本次调用**自己的输出**（先 `_, _, _, h_pre, ... = result` 解包再存）。
+# 上面的 `SavedSet` 只给名字串，分不出这两类；而字节记账里它们的去向完全不同
+# （输入 → `saved_ins_idx`，输出 → `saved_outs_idx`，后者的形状还得另找源侧依据）。
+#
+# 处置纪律（与 `docs/opdag_component_coverage_2026-07-25.md` §1.4 的「绝不猜」一脉）：
+#   * 名单、位序、输出名 —— **全部** AST 读出，形态不认即 fail-loud；
+#   * 输出**形状** —— 源侧 Python 只给得出**阶数**（tensor_map 元组长度），末轴长度在
+#     `.cc` kernel 里（`custom_op_impl.py:38-41` 列了 4 个 `.cc`，**未纳入快照**）。
+#     故只对「注释里逐字写出且阶数与 tensor_map 对得上」的两项给形状，其余**不给数**。
+
+#: 声明来源在节点 attrs 上的两个键 —— 「从源读出来的」与「调用方声明的上界」必须可区分，
+#: 绝不把上界静默升格为事实（任务书铁律）。
+KERNEL_SAVE_SOURCE_KEYS = ("saved_from_source", "saved_declared_by_caller")
+
+_DFUNCTION_BASES = frozenset({"DFunction"})
+_MHC_IMPL_REL = "platform/mindspore/custom_ops/custom_op_impl.py"
+_MHC_LAYOUT_REL = "core/shard/ops/parallel_mhc_pre_sinkhorn.py"
+
+#: `hyper_parallel` 里 mHC 两个内核的 `DFunction` 包装类（`_op_name` 由 AST 逐字读回校验）。
+_MHC_CLASSES = {
+    "NpuMhcPostDFunction": "npu_mhc_post",
+    "NpuMhcPreSinkhornDFunction": "npu_mhc_pre_sinkhorn",
+}
+
+#: **源侧确定**的输出形状（逐字来自 `parallel_mhc_pre_sinkhorn.py` 的行内注释），
+#: 每条带 `(形状串, 定位符, 期望阶数)`。阶数会与 `infer_output_layouts` 里那个 tensor_map
+#: 元组的长度**逐条对账**（对不上即 fail-loud）——所以这不是裸常量，是有源侧交叉校验的读数。
+#: 其余输出（`h_pre` / `hc_before_norm` / `inv_rms`）共用 `tm_3d = (b_map, s_map, -1)`，
+#: 末轴写 `-1`（复制，与分片无关）**不给长度** → 一律不进本表，消费方落 `unresolved`。
+_MHC_PRE_OUT_SHAPES = {
+    "sum_out": ("2·num_iters·B·S·N", _MHC_LAYOUT_REL + ":262-263", 4),
+    "norm_out": ("2·num_iters·B·S·N·N", _MHC_LAYOUT_REL + ":264-265", 5),
+}
+
+
+def _dfunction_classes(tree: ast.AST) -> dict:
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and (
+                set(_base_names(node)) & _DFUNCTION_BASES):
+            out[node.name] = node
+    return out
+
+
+def _method_named(cls: ast.ClassDef, name: str):
+    return next((n for n in cls.body
+                 if isinstance(n, ast.FunctionDef) and n.name == name), None)
+
+
+def _class_str_attr(cls: ast.ClassDef, attr: str):
+    for stmt in cls.body:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == attr
+                and isinstance(stmt.value, ast.Constant)):
+            return stmt.value.value
+    return None
+
+
+def _result_unpack_names(fwd: ast.FunctionDef, result_name: str) -> list:
+    """`_, _, _, h_pre, hc_before_norm, inv_rms, sum_out, norm_out = result` → 逐位名字。
+
+    `_` 位记为 `None`（源里被丢弃的输出，位序仍占）。找不到这条解包 → 空表。
+    """
+    for stmt in fwd.body:
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
+            continue
+        tgt, val = stmt.targets[0], stmt.value
+        if not (isinstance(tgt, ast.Tuple) and isinstance(val, ast.Name)
+                and val.id == result_name):
+            continue
+        return [None if (isinstance(e, ast.Name) and e.id == "_")
+                else (e.id if isinstance(e, ast.Name) else None)
+                for e in tgt.elts]
+    return []
+
+
+def _output_ranks(layout_tree: ast.AST, cls_name: str, method: str) -> dict:
+    """`infer_output_layouts` 的 `return (_create_output_layout(mesh, tm_X), ...)` →
+    `{输出位序: 该 tm_X 元组的长度}`（= 该输出的**阶数**，源侧确定的那一半）。
+
+    只取 4-D 输入那一支（`if x_tm_len == 4:`，即 BSND；本模型 `input_layout=BSND`）。
+    """
+    cls = next((n for n in ast.walk(layout_tree)
+                if isinstance(n, ast.ClassDef) and n.name == cls_name), None)
+    fn = _method_named(cls, method) if cls is not None else None
+    if fn is None:
+        return {}
+    branch = None
+    for stmt in fn.body:
+        if not isinstance(stmt, ast.If):
+            continue
+        cmp_ = stmt.test
+        if (isinstance(cmp_, ast.Compare) and len(cmp_.comparators) == 1
+                and isinstance(cmp_.comparators[0], ast.Constant)
+                and cmp_.comparators[0].value == 4):
+            branch = stmt.body
+            break
+    if branch is None:
+        return {}
+    tm_len: dict = {}
+    for stmt in branch:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Tuple)):
+            tm_len[stmt.targets[0].id] = len(stmt.value.elts)
+    ranks: dict = {}
+    for stmt in branch:
+        if not isinstance(stmt, ast.Return) or not isinstance(stmt.value, ast.Tuple):
+            continue
+        for i, e in enumerate(stmt.value.elts):
+            if (isinstance(e, ast.Call) and len(e.args) == 2
+                    and isinstance(e.args[1], ast.Name)):
+                ranks[i] = tm_len.get(e.args[1].id)
+        break
+    return ranks
+
+
+def mhc_kernel_saves(hp_root: str) -> dict:
+    """融合 mHC 两个内核的 saved 集 —— **逐字从 `hyper_parallel` 源读**，不是上界。
+
+    背景：`hyper_parallel` 于 2026-07-25 补入权威快照之前，这两个内核的 bprop 读不出来，
+    只能由调用方声明一个「张量实参全存」的保守上界
+    （`docs/opdag_component_coverage_2026-07-25.md` §1.4）。现在可以读了，而且读出来的结果
+    **与那个上界实质不同**：
+
+      * `npu_mhc_post`（`custom_op_impl.py:331`）
+        `ctx.save_for_backward(x, h_res, h_out, h_post)` → 4 个输入全存，**恰等于**旧上界；
+      * `npu_mhc_pre_sinkhorn`（`custom_op_impl.py:390-391`）
+        `ctx.save_for_backward(x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms,
+                               sum_out, norm_out)`
+        → 4 个输入 **+ 自己的 5 个输出**。旧上界漏掉了后 5 项 ⇒ 它**不是上界，是欠读**，
+        其中 `sum_out`（`2·num_iters·B·S·N`）/ `norm_out`（`2·num_iters·B·S·N·N`）
+        还随 `num_iters`（缺省 20，`parallel_mhc_pre_sinkhorn.py:26`）线性放大。
+
+    返回 `{op_name: {saved_ins_idx, saved_outs_idx, saved_out_names, saved_out_shapes,
+                     saved_out_ranks, source, reason, saved_from_source}}`。
+    形态不认一律 `ValueError`（fail-loud），**绝不**退回一个「看起来合理」的名单。
+    """
+    impl_path = os.path.join(hp_root, *_MHC_IMPL_REL.split("/"))
+    if not os.path.isfile(impl_path):
+        raise ValueError(
+            "fn_saves: 找不到 " + _MHC_IMPL_REL
+            + "（hyper_parallel 未纳入快照？）—— fail-loud")
+    with open(impl_path, "r", encoding="utf-8") as fh:
+        impl_tree = ast.parse(fh.read(), filename=impl_path)
+    classes = _dfunction_classes(impl_tree)
+
+    layout_path = os.path.join(hp_root, *_MHC_LAYOUT_REL.split("/"))
+    layout_tree = None
+    if os.path.isfile(layout_path):
+        with open(layout_path, "r", encoding="utf-8") as fh:
+            layout_tree = ast.parse(fh.read(), filename=layout_path)
+
+    out: dict = {}
+    for cls_name, want_op in _MHC_CLASSES.items():
+        cls = classes.get(cls_name)
+        if cls is None:
+            raise ValueError(
+                "fn_saves: " + _MHC_IMPL_REL + " 里没有 DFunction 子类 " + cls_name)
+        op_name = _class_str_attr(cls, "_op_name")
+        if op_name != want_op:
+            raise ValueError(
+                "fn_saves: " + cls_name + "._op_name = " + repr(op_name)
+                + " != " + repr(want_op) + " —— 快照与本表不一致,拒绝按旧假设继续(fail-loud)")
+        fwd = _method_named(cls, "forward")
+        if fwd is None:
+            raise ValueError("fn_saves: " + cls_name + " 无 forward —— fail-loud")
+        params = [a.arg for a in fwd.args.args][1:]        # 去掉 ctx
+        save_call = next(
+            (n for n in ast.walk(fwd)
+             if isinstance(n, ast.Call) and _dotted(n.func).endswith("save_for_backward")),
+            None)
+        if save_call is None:
+            raise ValueError(
+                "fn_saves: " + cls_name + ".forward 里没有 `ctx.save_for_backward(...)` —— "
+                "拒绝当成「无 saved 集」静默放行(fail-loud)")
+        saved, unresolved = _parse_save_call(save_call, _MHC_IMPL_REL, cls_name)
+        if saved is None:
+            raise ValueError("fn_saves: " + cls_name + " 的 save_for_backward 形态看不懂："
+                             + unresolved.reason)
+
+        # 本次调用**自己输出**的逐位名字（`_, _, _, h_pre, ... = result`）。
+        result_name = next(
+            (s.targets[0].id for s in fwd.body
+             if isinstance(s, ast.Assign) and len(s.targets) == 1
+             and isinstance(s.targets[0], ast.Name) and isinstance(s.value, ast.Call)
+             and _dotted(s.value.func).endswith(op_name)), None)
+        out_names = _result_unpack_names(fwd, result_name) if result_name else []
+
+        ins_idx, outs_idx, out_saved_names = [], [], []
+        for nm in saved.names:
+            if nm in params:
+                ins_idx.append(params.index(nm))
+            elif nm in out_names:
+                outs_idx.append(out_names.index(nm))
+                out_saved_names.append(nm)
+            else:
+                raise ValueError(
+                    "fn_saves: " + cls_name + " 存了 " + repr(nm) + ",它既不是 forward 形参 "
+                    + repr(params) + " 也不是输出解包名 " + repr(out_names)
+                    + " —— 不猜,fail-loud")
+
+        ranks: dict = {}
+        if layout_tree is not None and op_name == "npu_mhc_pre_sinkhorn":
+            ranks = _output_ranks(layout_tree, "NpuMhcPreSinkhornDistributedOp",
+                                  "infer_output_layouts")
+        shapes: dict = {}
+        for nm in out_saved_names:
+            spec = _MHC_PRE_OUT_SHAPES.get(nm)
+            if spec is None:
+                continue                    # 源侧不确定 → **不给数**，消费方落 unresolved
+            shp, loc, want_rank = spec
+            got = ranks.get(out_names.index(nm))
+            if got is not None and got != want_rank:
+                raise ValueError(
+                    "fn_saves: " + nm + " 的 tensor_map 阶数 " + str(got)
+                    + " != 本表记的 " + str(want_rank) + "（" + loc
+                    + "）—— 快照变了,拒绝按旧读数继续(fail-loud)")
+            shapes[nm] = shp
+
+        out[op_name] = {
+            "saved_ins_idx": sorted(ins_idx),
+            "saved_outs_idx": sorted(outs_idx),
+            # **按输出位序**建索引（不是一串平表）：`derive_saves` 要按 idx 取名字，
+            # 而源里那些输出被 `*_` 丢弃、图上没有 ref，只能靠这张表登记。
+            "saved_out_names": {out_names.index(n): n for n in out_saved_names},
+            "saved_out_shapes": shapes,
+            "saved_out_ranks": {out_names.index(n): ranks.get(out_names.index(n))
+                                for n in out_saved_names if ranks},
+            "source": _MHC_IMPL_REL + ":" + str(saved.lineno),
+            "reason": ("`ctx.save_for_backward(" + ", ".join(saved.names) + ")` "
+                       "逐字读自 hyper_parallel 快照(commit 41495aa2)"),
+            "saved_from_source": True,
+        }
+    return out

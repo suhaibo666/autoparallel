@@ -108,13 +108,34 @@ def derive_saves(dag) -> list[Save]:
                 idxs = [pos[k] for k in spec["inputs"] if k in pos]
             else:
                 idxs = spec["inputs"]
-        if isinstance(spec.get("outputs"), list):
+        out_idxs = list(spec["outputs"]) if isinstance(spec.get("outputs"), list) else []
+        # 融合内核**保存自己输出**的情形:`npu_mhc_pre_sinkhorn` 的
+        # `ctx.save_for_backward(x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms,
+        #  sum_out, norm_out)`(custom_op_impl.py:390-391)—— 后 5 项是它**自己的输出**。
+        # 源里调用点写 `h_in, h_post, h_res_flat, *_ = npu_mhc_pre_sinkhorn(...)`
+        # (hyper_connection.py:413),`*_` 把它们丢了 —— 但 autograd ctx 仍持有引用,
+        # 显存是**真实占用**的。Python 侧没名字 ≠ 不占显存。
+        out_idxs += [k for k in (n.attrs.get("saved_outs_idx") or ()) if k not in out_idxs]
+        if out_idxs:
             # 存**自己的第 k 个输出**(TopK 的 indices):多输出 ref 在 attrs["outs"] 里。
             outs = n.attrs.get("outs") or ([n.out] if n.out else [])
-            for k in spec["outputs"]:
+            declared_names = n.attrs.get("saved_out_names") or {}
+            declared_shapes = n.attrs.get("saved_out_shapes") or {}
+            for k in sorted(out_idxs):
                 if k < len(outs) and outs[k].count(":") == 2:
                     name, shape, dtype = _parse(outs[k])
                     saves.setdefault(name, Save(name, dtype, n.id, shape))
+                    continue
+                # 该输出在图上**没有 ref**(源里被 `*_` 丢弃)→ 用声明里的名字/形状登记,
+                # 形状不确定就留 `?`,由消费方计进 `unresolved`(**绝不**编一个数)。
+                nm = declared_names.get(k) if isinstance(declared_names, dict) else None
+                if nm is None:
+                    continue
+                sname = f"{nm}__k{n.id}"
+                saves.setdefault(sname, Save(
+                    sname,
+                    n.out.split(":")[2] if n.out.count(":") == 2 else "bf16",
+                    n.id, declared_shapes.get(nm, "?")))
         # **权重派生的操作数不是激活**(W2/W3/W4):`w1 = cast(self.weight1, ...)`(ffn.py:146)
         # 之后 `w1` 进 GroupedMatmul 的 ins,若照 `inputs:"all"` 计入 saves 就是把权重当激活
         # —— 实测 FFNGroupedGEMM「236 MiB」里的 88 MiB(评估文档 §7.2)。walker 在

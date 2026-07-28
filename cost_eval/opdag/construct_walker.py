@@ -1663,13 +1663,28 @@ class _Walker:
             else:
                 decl = self._kernel_saves.get(func.id)
                 if decl is not None:
-                    # 调用方**显式声明**的 saved 集(内核 bprop 在快照外时唯一诚实的通路)。
-                    # 声明的出处/理由留在节点上,使「这不是源读出来的」在图上**可见**。
+                    # saved 集的两个来源,在图上**分开记**(绝不把上界静默升格为事实):
+                    #   * `saved_from_source=True` —— 逐字读自源(`fn_saves.mhc_kernel_saves`
+                    #     从 `hyper_parallel` 的 `ctx.save_for_backward(...)` 读出);
+                    #   * `saved_declared_by_caller=True` —— 调用方声明的**上界**
+                    #     (内核 bprop 在快照外时唯一诚实的通路)。
+                    # 两者都必须带 source/reason,否则与「猜」不可区分。
                     idx = decl.get("saved_ins_idx")
                     n_tensor = len([a for a in operands if isinstance(a, ast.Name)])
                     attrs["saved_ins_idx"] = (list(range(n_tensor)) if idx == "all"
                                               else sorted(set(idx or ())))
-                    attrs["saved_declared_by_caller"] = True
+                    # 融合内核**保存自己输出**的情形(`npu_mhc_pre_sinkhorn` 存 5 个自身输出,
+                    # custom_op_impl.py:390-391)——源里 `h_in, h_post, h_res_flat, *_ = ...`
+                    # 把它们丢弃了,但 autograd ctx 仍持有 ⇒ 显存**真实占用**,不能因为
+                    # Python 侧没名字就漏掉。
+                    if decl.get("saved_outs_idx"):
+                        attrs["saved_outs_idx"] = sorted(set(decl["saved_outs_idx"]))
+                        attrs["saved_out_names"] = dict(decl.get("saved_out_names") or {})
+                        attrs["saved_out_shapes"] = dict(decl.get("saved_out_shapes") or {})
+                    if decl.get("saved_from_source"):
+                        attrs["saved_from_source"] = True
+                    else:
+                        attrs["saved_declared_by_caller"] = True
                     attrs["saved_source"] = decl.get("source", "")
                     attrs["saved_reason"] = decl.get("reason", "")
                     if not attrs["saved_source"] or not attrs["saved_reason"]:
