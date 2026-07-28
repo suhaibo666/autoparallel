@@ -119,3 +119,42 @@ diff before.txt after.txt        ->  *** 0 diff ***
 
 2026-07-25 记的 4 处级联根**全部修掉**，测试的**不变量原样保留**（"级联根必须逐条在册；
 修好一处就更新台账"），只换了例子 —— 新的两处逐条记在该常量的注释里。
+
+---
+
+## 3. 第二批修复：construct 局部标量 / 差式 / 两轴转置 / MatMul 取权重末轴 [RAN]
+
+| # | 改动 | 文件 | 为什么是**源读**不是猜 |
+|---|---|---|---|
+| I | **construct 局部整数标量过 `OpDAG` 边界**（新字段 `OpDAG.const_scalars`，由 `_ScalarEnv.exported()` 产出，`shape_infer._scalar` 的**最后一档**） | `construct_walker.py` + `schema.py` + `extractor.py` + `shape_infer.py` | walker **早就**把 `pos_dim = self.config.qk_pos_emb_head_dim`（`deepseek_v4:203`）、`nope_dim = ... - pos_dim`（`:204`）求成了 host 整数（值全由 `config_flags` 派生），只是不过边界。**安全判据**：一个名字被绑成过两个不同的值就不导出（按名取值会取到另一段的值）；排在符号档之后（`S`/`B` 仍拿符号） |
+| J | `sym_shape.sub` **差式原子** + `consumer._sym_value` 求值 | `sym_shape.py` + `consumer.py` + `shape_infer.py` | `indexer.py:179-180` `self.index_head_dim - self.qk_pos_emb_head_dim`；与既有 `//` 原子同一条路子（表达式保形，值由 DimTable 决定） |
+| K | `mint.transpose(x, d0, d1)` 的**两轴互换**形态：walker 记 `swap_axes`，`shape_infer` 精确换轴（不再退 `numel_only`） | `construct_walker.py` + `shape_infer.py` | `linear.py:132` `self.transpose(weight, 1, 0)` —— 两个轴是源里逐字写着的常数 |
+| L | **MatMul 缺 `out_dim` 时取权重末轴**（先 env 里那份当前形状，再退 `param_shapes`） | `shape_infer.py` | 算子定义 `[...,k] @ [k,n] → [...,n]`（与既有 `_bmm` / `_grouped_matmul` 同一条）。`Linear` 作为**顶层** Cell 抽取时没有 `build_module(..., output_size=…)` 那个调用点 ⇒ `out_dim` 缺席 |
+
+### 3.1 覆盖度（run a，L8 fused）[RAN]
+
+| 阶段 | op | 跳过 | param 可解析 | param 进图 |
+|---|---|---|---|---|
+| 基线 `74d99f4` | 820 | 874 | 3290.9 MiB | 1434.0 MiB |
+| 第一批（§2） | 1226 | 671 | 5310.9 | 3454.0 |
+| + I（局部标量） | 1370 | 599 | 5310.9 | 3454.0 |
+| + J（差式） | 1426 | 571 | 5310.9 | 3454.0 |
+| + K/L（转置 / MatMul 末轴） | **1466** | **551** | **5310.9** | **3454.9** |
+
+unfused 支：op 1116 → **1454**，跳过 1430 → 1261。
+
+### 3.2 八跑门（第二批之后）[RAN]
+
+```
+  bucket       n=28  mean=0.946  min=0.748  max=1.394     <- 逐字节与基线相同
+  extracted    n=28  mean=0.361  min=0.096  max=0.638     <- 基线 0.169
+  hand_spec    n=28  mean=0.955  min=0.729  max=1.400     <- 逐字节与基线相同
+  PASS  I1 extracted ×1 于层数  : stage3 delta L8=66.0 L4=66.0 |diff|=0.0   [advisory]  <- **由 WARN 转 PASS**
+  PASS  I2 extracted ×1 于微批数: stage3 delta m4=66.0 m8=66.0 |diff|=0.0   [advisory]
+  结论: PASS
+```
+
+> ⚠ **两条 ×1 不变量都过了，但 delta 的幅值反而更小（66.0 / 24380.1 = 0.003×，基线 0.023×）。
+> 这不是"更差"，也不是"更好" —— 它说明 stage3 的 `unfused − fused` 差在抽取侧仍然**没有意义**：
+> unfused 支的覆盖度（跳过 1261）明显落后于 fused 支（跳过 551），两支的欠读量互相抵消，
+> 差值就在 0 附近抖。** 幅值可辩护的前提是**两支都补齐**，见 §4。

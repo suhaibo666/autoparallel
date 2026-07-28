@@ -302,6 +302,23 @@ def add(a: Factors, b: Factors) -> Factors:
     return Factors(1, {unit: 1})
 
 
+def sub(a: Factors, b: Factors) -> Factors | None:
+    """两个轴相减,合成一个**差式原子单元**(2026-07-28)。
+
+    真源:`indexer.py:179-180`
+    `self.split(q, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], -1)`
+    与 `deepseek_v4_hybrid_attention.py:204` `nope_dim = self.config.v_head_dim - pos_dim`。
+    两侧都是纯常数时直接折叠(同 `add`);差 ≤ 0 → None(轴长非正 = 解错了,宁 `?` 勿错)。
+
+    差式**不排序**(减法不可交换),由 `consumer._sym_value` 按 DimTable 求值 —— 与 `//`
+    原子同一条路子:表达式保形,值仍完全由 DimTable 决定,不是编造。
+    """
+    if not a.syms and not b.syms:
+        d = a.coeff - b.coeff
+        return Factors(coeff=d) if d > 0 else None
+    return Factors(1, {f"{_sum_term(a)}-{_sum_term(b)}": 1})
+
+
 def resolve_reshape(input_axes: list[Factors], target) -> list[Factors] | None:
     """按 reshape 目标(Factors 列表,-1 用 NEG1 哨兵)算出输出各轴;单个 -1 靠总积消元填补。
     无法解析(多个 -1 / 消元不干净)→ None。"""

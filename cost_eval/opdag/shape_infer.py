@@ -33,7 +33,7 @@ from .schema import OpDAG, OpNode
 from .sym_shape import (
     Factors, NEG1, CONFIG2SYM,
     parse_shape, render_shape, parse_axis, product_of, render_term,
-    mul, add, floordiv, resolve_reshape,
+    mul, add, sub, floordiv, resolve_reshape,
     mark_numel_only, strip_numel_only,
 )
 
@@ -66,6 +66,8 @@ class _Ctx:
     dims_ctx: dict = field(default_factory=dict)     # self.<attr> -> 符号 token 串
     scalar_binds: list = field(default_factory=list) # [{"names":[...], "src": var}]
     scalar_map: dict = field(default_factory=dict)   # (帧, 标量轴名) -> Factors | None
+    # construct 局部标量的 host 整数值(`dag.const_scalars`)——`_scalar` 的**最后一档**。
+    const_scalars: dict = field(default_factory=dict)
     # ── 内联帧作用域(G3/G5,2026-07-25)────────────────────────────────────────────────
     # `frame` = 当前正在推断的节点所属的内联帧(`OpNode.attrs["frame"]`,根帧 = "");
     # `node_dims` = 该节点所属类的 `dims_ctx`(`OpNode.attrs["dims_ctx"]`),优先于全局那份。
@@ -74,6 +76,8 @@ class _Ctx:
     # (`seqlen`)也会在父子帧里指不同张量。扁平一张表只能 fail-loud 或静默取一个。
     frame: str = ""
     node_dims: dict | None = None
+    # 权重形状表(`(源文件基名, 属性名) | 属性名 -> 符号 shape 串`),见 `_param_axes`。
+    param_shapes: dict = field(default_factory=dict)
     # 逐节点"解不出"台账(调用方传 `report=[]` 才收):每条 {node,op,src,name,reason}。
     # 纪律(任务书第 2 点):**任何解不出的东西都必须显式带 `file:line` 出现在这里**,
     # 绝不用一个"看起来合理"的数替代。
@@ -236,7 +240,13 @@ def _lookup(env: dict, name: str):
 # ── 标量轴名解析(scalar_binds 惰性 + View shape 节点即时)────────────────────────
 def _scalar(ctx: _Ctx, name: str):
     """标量轴名 → Factors。**按帧**查:先当前帧,再根帧(父自己的名字对子也可见 —— 子的
-    `reshape` 表达式里不会引用父的局部名,故这一档只是既有单帧行为的自然延续)。"""
+    `reshape` 表达式里不会引用父的局部名,故这一档只是既有单帧行为的自然延续)。
+
+    **最后一档**(2026-07-28):`dag.const_scalars` —— construct 里 host 值已知的整数局部标量
+    (`pos_dim = self.config.qk_pos_emb_head_dim` @ `deepseek_v4_hybrid_attention.py:203`)。
+    排在符号档**之后**是有意的:`x.shape` 解包出的轴名要优先拿到**符号**(`S`/`B`),
+    符号形状对报表与分片都更有信息量;`const_scalars` 只接住那些符号档根本没有的名字。
+    """
     for fr in _frame_chain(ctx.frame):
         if (fr, name) in ctx.scalar_map:
             return ctx.scalar_map[(fr, name)]
@@ -244,6 +254,9 @@ def _scalar(ctx: _Ctx, name: str):
             if sb.get("frame", "") == fr and name in sb.get("names", []):
                 _fill_scalar_bind(ctx, sb, fr)
                 return ctx.scalar_map.get((fr, name))
+    v = ctx.const_scalars.get(name)
+    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+        return Factors(coeff=v)
     return None
 
 
@@ -309,6 +322,11 @@ def _eval_expr(node, ctx: _Ctx):
         if isinstance(node.op, ast.Add):
             b = _eval_expr(node.right, ctx)
             return add(a, b) if (b is not None and b is not NEG1) else None
+        if isinstance(node.op, ast.Sub):
+            # `self.index_head_dim - self.qk_pos_emb_head_dim`(`indexer.py:179-180` 的
+            # split size)、`self.config.v_head_dim - pos_dim`(`deepseek_v4:204`)。
+            b = _eval_expr(node.right, ctx)
+            return sub(a, b) if (b is not None and b is not NEG1) else None
         if isinstance(node.op, ast.FloorDiv):
             if isinstance(node.right, ast.Constant) and isinstance(node.right.value, int):
                 return floordiv(a, node.right.value)
@@ -460,6 +478,29 @@ def _elementwise(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
     return _passthrough(in_axes_list, in_numel_only)     # 退回首输入(既有行为)
 
 
+def _weight_operand_axes(n: OpNode, ctx: _Ctx):
+    """该节点**唯一**权重操作数的当前轴列表(exact,非 numel_only);判不出 → None。
+
+    两档:① `ctx.env[名]` —— 该权重在本图里被某个权重派生节点改过形(转置/cast),env 里是
+    **当前**那份;② `ctx.param_shapes[(文件, 名)]` —— `__init__` 里的声明形状。
+    多于一个权重操作数 → 判不出"哪个是矩阵",返回 None(不猜)。
+    """
+    names = n.attrs.get("param_operands") or ()
+    if len(names) != 1:
+        return None
+    shp = _lookup(ctx.env, names[0])
+    if shp is None:
+        got = _param_axes(n, ctx.param_shapes or {})
+        shp = got[0] if got else None
+    if not shp:
+        return None
+    bare, numel_only = strip_numel_only(shp)
+    if numel_only:
+        return None
+    axes = parse_shape(bare)
+    return axes or None
+
+
 def _matmul(node: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
     a = in_axes_list[0] if in_axes_list else None
     if not a:                          # 输入未知 → 保 ?,不 raise
@@ -470,6 +511,18 @@ def _matmul(node: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
         return None
     out_dim = node.attrs.get("out_dim")
     if not out_dim:
+        # **权重操作数的末轴**(算子定义:`[..., k] @ [k, n] → [..., n]`,同 `_bmm`/`_grouped_matmul`)。
+        # 真源 `pynative/layers/linear.py:132-135`:`weight = transpose(weight, 1, 0)` 之后
+        # `output = matmul(input_, weight)`。`weight` 是 `Parameter` → 走 `param_operands`、
+        # 不进 `ins`(契约 W2/W4),而 `Linear` 作为**顶层** Cell 抽取时也没有
+        # `build_module(..., output_size=…)` 那个调用点 ⇒ `attrs["out_dim"]` 缺席。
+        # 取法:先查 env(转置后的那份**当前**形状,由本图节点产出),再退 `param_shapes`
+        # (未经变换的声明形状)。任一档解不出 → 照旧记账保 `?`。
+        w = _weight_operand_axes(node, ctx)
+        if w is not None and len(w) >= 2:
+            out = [f.copy() for f in a]
+            out[-1] = w[-1].copy()
+            return out, False
         # 输入已知却无 out_dim。**默认 fail-loud**(逐字保留:静默留 `?` 会掩盖 PART A 的 bug);
         # 调用方显式传 `report=` 时改为记账 —— 因为存在**已知的合法缺口**:构造点传入的维度
         # (`Compressor(head_dim=...)` @ csa.py:604/128)没有被 extractor 传播到子 Cell 的
@@ -774,6 +827,8 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
         env=dict(input_shapes or {}),
         dims_ctx=dict(dims_ctx if dims_ctx is not None else getattr(dag, "dims_ctx", {}) or {}),
         scalar_binds=list(getattr(dag, "scalar_binds", []) or []),
+        const_scalars=dict(getattr(dag, "const_scalars", {}) or {}),
+        param_shapes=dict(param_shapes or {}),
         report=report,
         declared=declared,
     )
@@ -1086,6 +1141,27 @@ def _dispatch(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
                 _note(ctx, n, "no_input_shape")
                 return None
             return _reshape(n, a, n.attrs.get("reshape_dims", []), ctx)
+        if view == "transpose" and n.attrs.get("swap_axes"):
+            # `mint.transpose(x, d0, d1)`:**两轴互换**(算子定义)。轴是源里逐字写着的常数
+            # (`linear.py:132` `transpose(weight, 1, 0)`)→ 可以精确换,不必退 numel_only。
+            a = in_axes_list[0] if in_axes_list else None
+            if not a:
+                _note(ctx, n, "no_input_shape")
+                return None
+            if in_numel_only and in_numel_only[0]:
+                _note(ctx, n, "needs_axis_structure", "transpose 要按轴互换")
+                return None
+            d0, d1 = (int(x) for x in n.attrs["swap_axes"][:2])
+            rank = len(a)
+            d0 = d0 if d0 >= 0 else rank + d0
+            d1 = d1 if d1 >= 0 else rank + d1
+            if not (0 <= d0 < rank and 0 <= d1 < rank):
+                _note(ctx, n, "needs_axis_structure",
+                      f"transpose 轴 {n.attrs['swap_axes']} 越界（rank={rank}）")
+                return None
+            out = [f.copy() for f in a]
+            out[d0], out[d1] = out[d1], out[d0]
+            return out, False
         if view in _NUMEL_PRESERVING_VIEWS or view is None:
             # permute/transpose:轴的多重集与元素数不变;轴**序**未记 → `_passthrough` 标
             # numel_only,防下游按假轴序改形。

@@ -104,6 +104,48 @@ def assert_extraction_clean(dag, *, allow=(), check_opaque: bool = False) -> Non
     raise ExtractionDroppedError("\n".join(p for p in parts if p))
 
 
+class _ScalarEnv(dict):
+    """标量环境 = `dict` + **导出账**(2026-07-28)。
+
+    为什么需要它:真源里大量维度表达式引用的是 construct **局部标量**,而不是
+    `self.<attr>` 或 `x.shape` 解包出来的轴名:
+
+        pos_dim  = self.config.qk_pos_emb_head_dim          # deepseek_v4:203
+        nope_dim = self.config.v_head_dim - pos_dim         # deepseek_v4:204
+        t_nope, t_pe = self.split(t, [nope_dim, pos_dim], dim=-1)   # :205
+
+    walker **已经**把它们求成了 host 整数(值全部来自 `config_flags`),但只留在这个环境里、
+    不过 `OpDAG` 边界 → `shape_infer` 解不出 `split_sizes=['nope_dim__i4','pos_dim__i4']`,
+    整条 dsv4 RoPE/注意力链断在这里。
+
+    导出的**安全判据**:一个名字在整次走查里只要被绑成过**两个不同的值**,就从导出账里
+    剔除(`rebound`)——按名取值可能取到另一段的那个值,那是静默错。`_forget`(`pop`)后重绑
+    也算,故用"曾见过的值"而不是"当前字典内容"做比较。**只导出整数**(bool 不算)。
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._seen: dict = dict(self)
+        self.rebound: set = set()
+
+    def __setitem__(self, k, v):
+        if k in self._seen and self._seen[k] != v:
+            self.rebound.add(k)
+        self._seen[k] = v
+        super().__setitem__(k, v)
+
+    def note_external(self, k, v) -> None:
+        """并入**别的 walker**(内联子 Cell)的导出账,不污染本 walker 的活环境。"""
+        if k in self._seen and self._seen[k] != v:
+            self.rebound.add(k)
+            return
+        self._seen[k] = v
+
+    def exported(self) -> dict:
+        return {k: v for k, v in self._seen.items()
+                if isinstance(v, int) and not isinstance(v, bool) and k not in self.rebound}
+
+
 @dataclass
 class SubExtract:
     """一次子 Cell 递归抽取的结果(供父 walker 在调用点内联):
@@ -138,6 +180,10 @@ class SubExtract:
     #   同样按帧携带:子里的 `seqlen` 与父里可能同名而指不同张量。
     dims_ctx: dict = field(default_factory=dict)
     scalar_binds: list = field(default_factory=list)
+    # const_scalars —— 子 construct 里**host 值已知的整数局部标量**(见 `_ScalarEnv`),
+    #   同样必须过边界:内联后子里的 `split(t, [nope_dim, pos_dim], -1)` 的两个 size
+    #   都是子帧局部名,父侧解不出。
+    const_scalars: dict = field(default_factory=dict)
 
 # 直接实例化即调用的算子 `OpClass(...)(...)`(mindspore 无状态原语的常见写法):类名 → (op 类型, attrs)。
 # flatten=True:算子接受"张量列表"操作数(如 GroupedMatmul([x],[w],...)),把 List/Tuple 字面量摊平为多操作数。
@@ -491,8 +537,8 @@ class _Walker:
         self._module_consts: dict = dict(module_consts or {})
 
         # ── 标量 / dtype 环境(P0#5 的另一半:把"标量记账"与"张量建节点"分开)────────────
-        self.scalars: dict[str, object] = {**dict(module_consts or {}),
-                                          **dict(self._param_literals)}
+        self.scalars: dict[str, object] = _ScalarEnv({**dict(module_consts or {}),
+                                                      **dict(self._param_literals)})
         self.dtypes: dict[str, str] = {}     # 变量名 -> dtype 短标签(`ori_dtype = x.dtype`)
         # ── 块级 detach(P0#4)/ 逐点 detach(P1#11)────────────────────────────────────
         self._nograd_depth = 0
@@ -2181,7 +2227,17 @@ class _Walker:
             return out
         if kind == "transpose":
             elts = self._tuple_elts(args[1]) if len(args) >= 2 else None
-            return {"perm": [self._const_int(e) for e in elts]} if elts is not None else {}
+            if elts is not None:
+                return {"perm": [self._const_int(e) for e in elts]}
+            # `mint.transpose(x, dim0, dim1)` —— **两轴互换**形态(真源
+            # `pynative/layers/linear.py:132` `self.transpose(weight, 1, 0)`)。此前完全没记 →
+            # 下游只能按"轴序未知"退 numel_only,于是 lm_head 的 `matmul(input_, weight)`
+            # 取不到权重末轴。两个轴是源里逐字写着的常数。
+            if len(args) >= 3:
+                a0, a1 = self._const_int(args[1]), self._const_int(args[2])
+                if a0 is not None and a1 is not None:
+                    return {"swap_axes": [a0, a1]}
+            return {}
         if kind == "expand_dims":
             ax = self._const_int(args[1]) if len(args) >= 2 else None
             return {"expand_axis": ax} if ax is not None else {}
@@ -2543,6 +2599,10 @@ class _Walker:
         for rec in getattr(sub, "param_operands", ()) or ():
             if rec not in self.param_operands:
                 self.param_operands.append(rec)
+        # 子里 host 值已知的整数局部标量并入**导出账**(不进本 walker 的活环境,免得子帧的
+        # 局部名参与父帧的名字解析);同名不同值 → 双方都剔除,见 `_ScalarEnv.note_external`。
+        for k, v in (getattr(sub, "const_scalars", None) or {}).items():
+            self.scalars.note_external(k, v)
 
         # 4) 子返回值绑回调用点目标
         for tgt, r in zip(target_names, sub.returns):
@@ -3301,7 +3361,8 @@ def _run_walker(
                 scalar_binds=walker.scalar_binds, opaque_calls=walker.opaque_calls,
                 diagnostics=walker.diagnostics,
                 detached=list(walker.detached), deletes=list(walker.deletes),
-                param_operands=list(walker.param_operands))
+                param_operands=list(walker.param_operands),
+                const_scalars=walker.scalars.exported())
 
     # ── 0 节点硬门(Task 2 / P0#1;**恒开**,与 strict 无关)────────────────────────────────
     # 实测反例:`CSAIndexer` fused 支整块在 `with _no_grad():`(indexer.py:214)里 → 整块丢 →

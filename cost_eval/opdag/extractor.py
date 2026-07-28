@@ -855,7 +855,8 @@ def _make_subcell_resolver(
                           detached=list(getattr(dag, "detached", ()) or ()),
                           param_operands=list(getattr(dag, "param_operands", ()) or ()),
                           dims_ctx=dict(getattr(dag, "dims_ctx", {}) or {}),
-                          scalar_binds=list(getattr(dag, "scalar_binds", ()) or ()))
+                          scalar_binds=list(getattr(dag, "scalar_binds", ()) or ()),
+                          const_scalars=dict(getattr(dag, "const_scalars", {}) or {}))
     return resolver
 
 

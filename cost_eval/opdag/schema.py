@@ -59,6 +59,13 @@ class OpDAG:
     param_operands: list = field(default_factory=list)
     # deletes —— `del x`(`indexer.py:211`):无 op 语义,但是 liveness 的显式释放点。
     deletes: list = field(default_factory=list)
+    # const_scalars —— construct 里 **host 值已知的整数局部标量**(2026-07-28),名 → 值。
+    #   来源:`construct_walker._ScalarEnv.exported()`;值全部由 `config_flags` 派生
+    #   (`pos_dim = self.config.qk_pos_emb_head_dim` @ deepseek_v4:203 这类),**不是猜**。
+    #   用途:`shape_infer` 解 reshape/split 表达式里的局部标量名(`_scalar` 的**最后一档**,
+    #   排在 `scalar_binds` / View-shape 的符号档之后 —— 符号优先,数值兜底)。
+    #   纪律:一个名字被绑成过两个不同的值就**不导出**(按名取值可能取到另一段的那个)。
+    const_scalars: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)

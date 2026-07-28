@@ -91,6 +91,16 @@ def _sym_value(sym, dims):
             return None
         b = _axis_value(parse_axis(base), dims) if base.strip() else None
         return None if b is None else b // n
+    if "-" in sym and not sym.lstrip("-").lstrip("0123456789") == "":
+        # **差式单元** `a-b`（`sym_shape.sub`，2026-07-28）：左结合地剥最外层。真源
+        # `indexer.py:179` `self.index_head_dim - self.qk_pos_emb_head_dim`、
+        # `deepseek_v4_hybrid_attention.py:204` `self.config.v_head_dim - pos_dim`。
+        # 与 `//` 同一条路子：表达式保形，值仍完全由 DimTable 决定。
+        head, _, tail = sym.rpartition("-")
+        if head.strip():
+            h = _axis_value(parse_axis(head), dims)
+            t = _axis_value(parse_axis(tail), dims)
+            return (h - t) if (h is not None and t is not None and h - t > 0) else None
     if sym == "cap":
         return _cap_value(dims)
     field = _SYM2FIELD.get(sym)

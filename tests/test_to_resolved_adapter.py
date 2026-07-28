@@ -346,24 +346,31 @@ def test_norm_fp32_prelift_is_undone(mf_pkg):
 #:                               这种局部元组 + `Linear.__init__` 位置形参种子；
 #:   `loss.py:197`             → `_LogSoftmax` 的产出形声明（`loss.py:134-143` 逐字）。
 LEDGER_BLOCKERS = {
-    # `_apply_forward_rope` 的 `split(t, [nope_dim, pos_dim], -1)`：两个 size 是 construct
-    # **局部标量**（`deepseek_v4_hybrid_attention.py:203-204`），walker 未导出 → 解不出。
+    # `reshape(ape, (1, ratio, 1, -1))` —— 权重派生节点，但 `Compressor.ape` 的形状
+    # `(compress_ratio, proj_out_dim)`（`compressor.py:117-118`）里 `proj_out_dim` 由
+    # `head_dim` 派生，而 `Compressor` 有**两个构造点**且 `head_dim` 不同
+    # （`csa.py:604` `config.v_head_dim` vs `indexer.py:128` `self.index_head_dim`）→
+    # extractor 不传播构造实参（既有的 G2 缺口），给一个全局值必然把另一处算错 4×。
+    "compressor.py:209",
+    # `transpose(words_embeddings, …)`：上游 gather 的产出只解出**元素数**（index 自己是
+    # tile 出来的、轴序未记）→ 按轴换形被拒（宁 `?` 勿错）。
+    "language_model_embedding.py:134",
+    # `_apply_forward_rope` 的 `split(t, [nope_dim, pos_dim], -1)`：`t` 只解出元素数。
     "deepseek_v4_hybrid_attention.py:205",
-    # lm_head 的 `matmul(input_, weight)`：`out_dim` 不在 attrs 里（`Linear` 作为**顶层** Cell
-    # 抽取时没有 `build_module(..., output_size=…)` 那个调用点），权重又走 `param_operands`。
-    "linear.py:135",
+    # unfused 支：滑窗/压缩索引的常量构造（`get_window_topk_idxs` 一族），shape 实参未记。
+    "csa.py:452",
 }
 
 
 @pytest.mark.parametrize("key", ["fused", "unfused"])
 def test_coverage_is_partial_and_the_blockers_are_the_recorded_ones(cfg, key):
-    """**如实记账**：图还不完备，级联根就是这 2 处。修好一处 → 这个测试变红，提醒更新记录。"""
+    """**如实记账**：图还不完备，级联根逐条在册。修好一处 → 这个测试变红，提醒更新记录。"""
     cov = _graph(cfg, key).coverage
     assert cov.is_partial
     got = {src for (src, _op, _r), _k in cov.blockers(10)}
     assert got <= LEDGER_BLOCKERS, f"出现了台账之外的级联根：{got - LEDGER_BLOCKERS}"
-    assert "deepseek_v4_hybrid_attention.py:205" in got, \
-        "dsv4 RoPE split 的断点应该还在（修好了就更新台账）"
+    assert "compressor.py:209" in got, \
+        "`Compressor.ape` 的 G2 构造点缺口应该还在（修好了就更新台账）"
 
 
 def test_param_census_resolves_more_than_it_gets_into_the_graph(cfg):
