@@ -1186,10 +1186,24 @@ class _Folder:
                         sym_shape=sym, dtype_name=str(dtn), src=node.src)
             prev = self._t.setdefault(name, t)
             if (prev.local_numel, prev.dtype_bytes) != (t.local_numel, t.dtype_bytes):
+                # **同名不同尺寸的两个物理权重**（2026-07-28 起会真的出现）：`Compressor.ape`
+                # 在两个构造点的形状不同（`head_dim` 一处 `v_head_dim`、一处 `index_head_dim`），
+                # 而 `param_decl` 按帧解出后二者都是**对**的。此前这里 `continue` 会**丢掉**
+                # 第二个（少读一份权重）；现改成按 `name#k` 拆开（与激活侧 `_bykey` 同一条
+                # 契约 S3 处置），冲突仍逐条记账 —— 记的是"发现了两个同名物理张量"，不是错误。
+                k = 2
+                while f"{name}#{k}" in self._t:
+                    prevk = self._t[f"{name}#{k}"]
+                    if (prevk.local_numel, prevk.dtype_bytes) == (t.local_numel, t.dtype_bytes):
+                        break
+                    k += 1
+                disp = f"{name}#{k}"
                 self.cov.shape_conflicts.append(
                     (name, (prev.local_numel, prev.dtype_bytes),
                      (t.local_numel, t.dtype_bytes)))
-                continue
+                self.cov.name_disambiguations.append((name, disp, sym, node.src))
+                t = replace(t, name=disp)
+                prev = self._t.setdefault(disp, t)
             out.append(prev)
             self.cov.resolved_params.append(
                 (name, sym, str(dtn), prev.local_numel * prev.dtype_bytes))
