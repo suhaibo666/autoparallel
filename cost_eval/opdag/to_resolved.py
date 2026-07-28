@@ -61,9 +61,34 @@ from .shape_infer import infer_shapes, merge_dims_ctx
 from .sym_shape import parse_axis
 
 __all__ = ["resolve_graph", "ExtractedGraph", "ExtractedLayer", "Coverage",
-           "RTensor", "ROp", "mf_root", "SNAPSHOT_MD5", "SUPPORTED_LAYER_KINDS"]
+           "RTensor", "ROp", "mf_root", "SNAPSHOT_MD5", "SUPPORTED_LAYER_KINDS",
+           "IncompleteExtraction", "ALLOW_PARTIAL_ENV"]
 
 MiB = 2 ** 20
+
+#: 显式**选择加入**部分图的环境变量（诊断用）。缺省不设 → 部分图 fail-loud，见
+#: `IncompleteExtraction` 的论证。
+ALLOW_PARTIAL_ENV = "COST_EVAL_EXTRACTED_ALLOW_PARTIAL"
+
+
+class IncompleteExtraction(RuntimeError):
+    """**抽出的图还不完备** —— 于是本来源拒绝交出一个峰值。
+
+    为什么这是默认行为（而不是"给个偏小的数 + 备注"）：一个跳过了 N 个节点的图，其峰值是
+    **下界**，不是估计值；一旦它出现在与真机并排的表格里，就必然被当成"模型读到了这么多"。
+    任务纪律是「绝不把未解析张量零填进峰值；部分解析的图必须报成 partial，而不是一个低数」，
+    最诚实的落地就是：**默认不给数**，改为抛出本异常，把「缺什么、缺在哪一行」写进消息里。
+    验收门按来源隔离（`tools/liveness_ab_validate.py::SourceFailure`）→ 该列显示 `ERR` +
+    本消息，`bucket` / `hand_spec` 照常出数。
+
+    要拿那个下界做诊断：设 `COST_EVAL_EXTRACTED_ALLOW_PARTIAL=1`，或
+    `resolve_graph(spec, pm, allow_partial=True)`。此时返回的图仍带 `.coverage`，
+    `coverage.is_partial` 为真。
+    """
+
+    def __init__(self, message: str, coverage: "Coverage" = None):
+        super().__init__(message)
+        self.coverage = coverage
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 0. 权威快照
@@ -152,7 +177,8 @@ _DECLARED_FACTS = (
     ("rotate", True, "src:compressor.py:129 `Hadamard(d) if rotate else IdentityOp()`；yaml 缺省 True"),
     ("sparse_loss", True, "yaml:dsa_indexer_loss_coeff 非零 ⇒ 有 indexer loss 分支"),
     ("use_butterfly", False, "yaml 缺省 False"),
-    ("enable_compress", True, "src:csa.py:556 compress_ratio>0 ⇒ 走压缩支"),
+    # `enable_compress` **不在这里给** —— 它由 ratio 逐字导出（`csa.py:594`
+    # `if compress_ratio > 0 and submodules.compressor is not None:`），见 `_cell_flags`。
     ("dsa_indexer_loss_coeff", 0.001, "yaml:dsa_indexer_loss_coeff"),
     # ── MoE ────────────────────────────────────────────────────────────────
     ("moe_router_dtype", "fp32", "yaml:moe_router_dtype"),
@@ -315,6 +341,16 @@ class Coverage:
     shape_conflicts: list = field(default_factory=list)   # [(name, sigA, sigB)]  S3 风险
     detach_alias_overcount: list = field(default_factory=list)   # [(alias, root, bytes)]
     node_gap_reasons: dict = field(default_factory=dict)  # reason -> count
+    #: **执行序上第一个被跳过的节点** = 级联的**根**（下游 `no_input_shape` 全是它的连带）。
+    first_skipped: tuple = None                           # (node_id, op, src, reason)
+    #: param census 两个口径（**权重的形状来自 `__init__`，与激活数据流无关**，故即使承载它的
+    #: 节点被跳过、权重本身仍可解析）：`census` = 全部可解析的权重字节；`in_graph` = 真正挂在
+    #: 存活 op 上、因而**进了显存记账**的那部分。二者的差 = 「解出来了但因节点被跳过而丢掉」。
+    param_census_bytes: int = 0
+    param_in_graph_bytes: int = 0
+    #: **调用方声明的**中间量形状（`_DECLARED_SHAPES`）：`[(name, sym, src, reason)]`。
+    #: 与"推断出来的"分开记 —— 声明永远不许被洗成事实（`kernel_saves` 的同一条纪律）。
+    declared_shapes: list = field(default_factory=list)
     #: `workspace_bytes` / `bwd_scratch_bytes` 恒 0 的说明（契约 §不要求）。
     absent_calibration_note: str = (
         "workspace_bytes / bwd_scratch_bytes 恒 0：契约 §不要求 明确排除（kernel 实现细节，"
@@ -336,11 +372,27 @@ class Coverage:
                "unresolved_params": len(self.unresolved_params),
                "resolved_params": len(self.resolved_params),
                "shape_conflicts": len(self.shape_conflicts),
-               "detach_alias_overcount": len(self.detach_alias_overcount)}
+               "detach_alias_overcount": len(self.detach_alias_overcount),
+               "param_census_bytes": self.param_census_bytes,
+               "param_in_graph_bytes": self.param_in_graph_bytes,
+               "declared_shapes": len(self.declared_shapes)}
         for c in self.children:
             for k, v in c.totals().items():
                 acc[k] = acc.get(k, 0) + v
         return acc
+
+    def blockers(self, n: int = 5) -> list:
+        """**级联的根**：各 segment 执行序上第一个被跳过的节点，按 `src` 归并计数。
+
+        为什么看这个而不是看 `no_input_shape` 的总数：下游 `?` 绝大多数是**连带**。真正要修的
+        是最早那一个节点（它的输出一旦有形状，后面整条链就活了）。"""
+        cnt: dict = {}
+        for c in [self] + self._all_children():
+            if c.first_skipped:
+                _i, op, src, reason = c.first_skipped
+                key = (src, op, reason.split(" @")[0])
+                cnt[key] = cnt.get(key, 0) + 1
+        return sorted(cnt.items(), key=lambda kv: -kv[1])[:n]
 
     def report(self, *, top: int = 12) -> str:
         """人读的覆盖度报告（验收报告直接贴这段）。"""
@@ -352,6 +404,9 @@ class Coverage:
                    t["shape_conflicts"], t["detach_alias_overcount"]))
         lines = [head, "  判决: %s" % ("PARTIAL（峰值是下界，不是估计）" if self.is_partial
                                       else "FULL")]
+        lines.append("  param census: 可解析 %.3f MiB / 真正进图 %.3f MiB（差额 = 权重解出来了"
+                     "但承载节点被跳过 → 未进显存记账）"
+                     % (t["param_census_bytes"] / MiB, t["param_in_graph_bytes"] / MiB))
         gaps = {}
         for c in [self] + self._all_children():
             for k, v in c.node_gap_reasons.items():
@@ -359,6 +414,19 @@ class Coverage:
         if gaps:
             lines.append("  节点原因码: " + ", ".join(
                 "%s=%d" % (k, v) for k, v in sorted(gaps.items(), key=lambda kv: -kv[1])))
+        decl = {}
+        for c in [self] + self._all_children():
+            for name, sym, src, _why in c.declared_shapes:
+                decl[(name, sym, src)] = decl.get((name, sym, src), 0) + 1
+        if decl:
+            lines.append("  调用方**声明**的中间量形状（源侧 docstring 逐字，非推断）:")
+            for (name, sym, src), k in sorted(decl.items(), key=lambda kv: -kv[1]):
+                lines.append("    ×%-3d %-20s = %-22s  <- %s" % (k, name, sym, src))
+        bl = self.blockers()
+        if bl:
+            lines.append("  级联根（各 segment 首个被跳过的节点，按源归并）:")
+            for (src, op, reason), k in bl:
+                lines.append("    ×%-3d %-14s %-42s %s" % (k, op, src, reason))
         return "\n".join(lines)
 
     def _all_children(self) -> list:
@@ -459,7 +527,10 @@ def _cell_flags(dims, *, fused: bool, ratio: int, moe: bool) -> dict:
         "_tp_size": 1, "_cp_size": 1, "_tp_group": None, "_cp_groups": (),
         # ── ratio 逐字导出的 __init__ 派生量 ───────────────────────────────
         "compress_ratio": int(ratio),
-        "enable_indexer": ratio == 4,            # src:csa.py:556 起的 indexer 门
+        # src:csa.py:594 `if compress_ratio > 0 and submodules.compressor is not None:`
+        "enable_compress": ratio > 0,
+        # src:csa.py:608 `if compress_ratio == 4 and not config.csa_dense_mode and …`
+        "enable_indexer": ratio == 4,
         "overlap": ratio == 4,                   # src:compressor.py:89
         "coff": 1 + int(ratio == 4),             # src:compressor.py:90
         "apply_dsa_kernel_fusion": bool(fused),  # DimTable.dsa_fused
@@ -496,21 +567,77 @@ def _input_axes(dims) -> dict:
     }
 
 
-#: `infer_shapes` 的入口**符号** shape 种子（与 `_input_axes` 同一批源侧 shape 契约；
-#: 这里给的是符号串，值由 `DimTable` 代入）。
+#: `infer_shapes` 的入口**符号** shape 种子，**按 segment 分开**（同一个形参名在不同 Cell 里是
+#: 不同的东西：`input_` 在 `Linear.construct` 是 `[s,b,H]` 激活、在 `VocabEmbedding.construct`
+#: 是 `[b,s]` token id —— 一张扁平表必然把其中一个算错）。
+#: 每条的出处是源侧 shape 契约（docstring / 类型注释），与 `_input_axes` 同一批。
 _SEED_SHAPES = {
-    "hidden_states": "S·B·hc_mult·H",
-    "x": "S·B·H",
-    "qr": "S·B·q_lora_rank",
-    "query": "S·B·n_heads·v_head_dim",
-    "key": "S·B·1·v_head_dim",
-    "input_": "S·B·H",
-    "logits": "B·S·vocab",
-    "label": "B·S",
-    "input_mask": "B·S",
-    "input_ids": "B·S",
-    "position_ids": "B·S",
+    "decoder": {
+        # mHC 层 construct 入参是**打包流** [s, b, n·H]（hyper_connection.py:405 的 reshape）
+        "hidden_states": "S·B·hc_mult·H",
+        "x": "S·B·H",                       # compressor.py:179 / deepseek_v4:233
+        "qr": "S·B·q_lora_rank",            # csa.py:651
+        "query": "S·B·n_heads·v_head_dim",   # csa.py:648
+        "key": "S·B·1·v_head_dim",           # csa.py:649
+        "input_ids": "B·S",
+    },
+    "embedding": {
+        "input_ids": "B·S", "position_ids": "B·S",
+        "input_": "B·S",                     # VocabEmbedding.construct(input_) = token id
+    },
+    "lm_head": {"input_": "S·B·H"},          # Linear.construct(input_)：final-norm 后的 hidden
+    "loss": {"logits": "B·S·vocab", "label": "B·S", "input_mask": "B·S"},
+    "mtp": {
+        "hidden_states": "S·B·hc_mult·H", "input_ids": "B·S", "position_ids": "B·S",
+        "x": "S·B·H", "qr": "S·B·q_lora_rank",
+        "query": "S·B·n_heads·v_head_dim", "key": "S·B·1·v_head_dim",
+    },
 }
+
+#: **调用方声明的中间量形状**（`(seg, name) -> (符号串, 出处, 理由)`）。
+#:
+#: 为什么需要这个通路、以及它为什么不是"杜撰"：`shape_infer` 今天有两类**结构性**盲区 ——
+#:   (a) **权重派生节点**（`ins` 为空、全部操作数是 `Parameter`，如
+#:       `hyper_connection.py:408` `alpha = concat((alpha_pre, alpha_post, alpha_res), -1)`、
+#:       `linear.py:132` 的权重转置）：权重被正确路由去 `param_operands`（契约 W2/W4），
+#:       于是 `ins` 空 → 无从推形状，**尽管 `init_dims.param_shapes` 已经把权重形状读出来了**；
+#:   (b) **opaque `Kernel` 的输出**（`npu_mhc_pre_sinkhorn`）：`shape_infer` 没有规则。
+#: 两者串起来把 mHC 层的**主数据路**掐断：`alpha` → 内核 → `h_in` → 父帧的 `aggregated_*`。
+#: 实测（本文档 §3 的反事实）：只补 `aggregated_{attn,ffn}` 一项，fused r4 层的已解析节点
+#: 从 **10 → 75**（/196），`no_input_shape` 从 126 → 73。
+#:
+#: 纪律（三重，缺一条就是杜撰）：
+#:   1. 值必须**逐字来自源**（下表每条带 `file:line`）；
+#:   2. 该名字**不得被本图任何节点产出** —— 否则就是"覆盖推断结果"，`_declared_seeds` 断言之；
+#:   3. 逐条记进 `Coverage.declared_shapes`，在覆盖度报告里**可见**（不与"推断出来的"混为一谈）。
+_DECLARED_SHAPES = {
+    ("decoder", "aggregated_attn"): (
+        "S·B·H", "hyper_connection.py:397",
+        "`HyperConnectionModule.construct` 的 Returns docstring 逐字："
+        "`aggregated: [s, b, H] weighted input for the sublayer`。它是融合内核 "
+        "`npu_mhc_pre_sinkhorn` 的第 0 个输出 `h_in`（:413）经 `:425 aggregated = h_in` 返回；"
+        "内核输出无 shape 规则、`alpha`(:408) 又是纯权重派生 → 主数据路在此断开"),
+    ("decoder", "aggregated_ffn"): (
+        "S·B·H", "hyper_connection.py:397", "同上（同一个 Cell 的第二个实例 ffn_hc）"),
+    ("mtp", "aggregated_attn"): ("S·B·H", "hyper_connection.py:397", "同 decoder"),
+    ("mtp", "aggregated_ffn"): ("S·B·H", "hyper_connection.py:397", "同 decoder"),
+}
+
+
+def _declared_seeds(seg: str, dag, cov: "Coverage") -> dict:
+    """本 segment 可用的**声明式**种子。已被图内某节点产出的名字 → fail-loud（纪律 2）。"""
+    produced = {n.out.split(":", 1)[0] for n in dag.nodes if n.out}
+    out: dict = {}
+    for (s, name), (sym, src, why) in _DECLARED_SHAPES.items():
+        if s != seg:
+            continue
+        if name in produced:
+            raise RuntimeError(
+                f"声明式 shape 种子 {name!r}（{src}）与图内节点的产出撞名 —— 那会**覆盖**推断"
+                f"结果、把声明洗成事实。请改由 shape_infer 推出它，或改名后再声明。")
+        out[name] = sym
+        cov.declared_shapes.append((name, sym, src, why))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -774,6 +901,27 @@ class _Folder:
         self.dims_for_file = dict(dims_for_file or {})
         self._t: dict = {}                       # name -> RTensor（首见定型）
         self.report: list = []
+        self._detached: set = set()
+        self._census_seen: set = set()            # param census 去重（按名）
+        self._graph_seen: set = set()             # 真正进图的权重去重（按名）
+
+    # ── 记账小工具 ────────────────────────────────────────────────────────
+    @staticmethod
+    def _new_bytes(tensors, seen: set) -> int:
+        """这批张量里**首次出现**（按名去重）的字节和。"""
+        tot = 0
+        for t in tensors:
+            if t.name in seen:
+                continue
+            seen.add(t.name)
+            tot += t.local_numel * t.dtype_bytes
+        return tot
+
+    def _skip(self, node, reason: str) -> None:
+        rec = (node.id, node.op, node.src, reason)
+        self.cov.skipped_ops.append(rec)
+        if self.cov.first_skipped is None:
+            self.cov.first_skipped = rec         # 执行序上第一个 = 级联的根
 
     # ── 求值上下文 ────────────────────────────────────────────────────────
     def _dims_of(self, src: str):
@@ -914,8 +1062,15 @@ class _Folder:
             saves_by_op.setdefault(s.op_id, []).append(s)
         ops: list = []
         for n in dag.nodes:
+            # ── param census 先做，**与激活数据流无关** ──────────────────────────
+            # 权重形状来自 `__init__`（`Parameter(mint.empty(...))` / `build_module` 的
+            # `input_size=/output_size=`），不依赖 shape 推断。故即使承载它的节点因激活
+            # 解不出而被跳过，这个权重**仍然可解析** —— 只是它没能进图。两个口径都记，
+            # 差额就是「解出来了但丢了」（`Coverage.param_census_bytes` vs `param_in_graph_bytes`）。
+            pars = self._weights_of(n)
+            self.cov.param_census_bytes += self._new_bytes(pars, self._census_seen)
             if not n.out:
-                self.cov.skipped_ops.append((n.id, n.op, n.src, "no-output"))
+                self._skip(n, "no-output")
                 continue
             out = self._tensor(n.out, n)
             ins = [self._tensor(r, n) for r in n.ins]
@@ -923,10 +1078,9 @@ class _Folder:
                 bad = ([n.out.split(":")[0]] if out is None else []) + [
                     r.split(":")[0] for r, t in zip(n.ins, ins) if t is None]
                 src, reason = why.get(bad[0], ("", "shape-unresolved"))
-                self.cov.skipped_ops.append(
-                    (n.id, n.op, n.src, f"{reason} @ {src or n.src} ({','.join(bad[:3])})"))
+                self._skip(n, f"{reason} @ {src or n.src} ({','.join(bad[:3])})")
                 continue
-            pars = self._weights_of(n)
+            self.cov.param_in_graph_bytes += self._new_bytes(pars, self._graph_seen)
             sv = []
             for s in saves_by_op.get(n.id, ()):
                 root = alias.get(s.name, s.name)
@@ -993,13 +1147,16 @@ def _build_layer(root: str, dims, pm, *, layer_id: int, layer_type: str, site: _
     book = _init_book(root, site, dims)
     ops: list = []
     cov = Coverage(tag=f"L{layer_id}:{layer_type}")
-    for seg_tag, dag in _segment_dags(root, kind, site, dims):
+    segs = _segment_dags(root, kind, site, dims)
+    for seg_tag, dag in segs:
         folder = _Folder(dag, dims, pm, book=book,
                          tag=f"L{layer_id}:{layer_type}/{seg_tag}",
                          dims_for_file=dims_for_file)
-        seg_ops, seg_cov = folder.fold(dict(_SEED_SHAPES))
+        seeds = dict(_SEED_SHAPES.get(seg_tag, ()))
+        seeds.update(_declared_seeds(seg_tag, dag, folder.cov))
+        seg_ops, seg_cov = folder.fold(seeds)
         # segment 之间**重命名**：两段拼一层时同名张量（`output` / `weight`）不是同一物理量。
-        pre = f"{seg_tag}." if len(_segment_dags(root, kind, site, dims)) > 1 else ""
+        pre = f"{seg_tag}." if len(segs) > 1 else ""
         ops.extend(_rename(seg_ops, pre) if pre else seg_ops)
         cov.children.append(seg_cov)
         cov.n_nodes += seg_cov.n_nodes
@@ -1028,7 +1185,14 @@ def _rename(ops, prefix: str):
 # 9. 约定入口点
 # ═══════════════════════════════════════════════════════════════════════════
 
-def resolve_graph(model_spec, parallel_model) -> ExtractedGraph:
+def _allow_partial(explicit) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    return str(os.environ.get(ALLOW_PARTIAL_ENV, "")).strip().lower() not in ("", "0",
+                                                                             "false", "no")
+
+
+def resolve_graph(model_spec, parallel_model, *, allow_partial=None) -> ExtractedGraph:
     """**`extracted` graph source 的约定入口点**（`liveness/sources.py::EXTRACTED_ENTRY_POINT`）。
 
     `(ModelSpec, ParallelModel)` → `ExtractedGraph`（带 `.stages` + `.coverage`），逐层满足
@@ -1038,8 +1202,10 @@ def resolve_graph(model_spec, parallel_model) -> ExtractedGraph:
     ——与 `hand_spec` 逐项对齐，故 A/B 的差异只可能来自**层内的图**，不可能来自层的编排
     （重算域 `rc.is_full(lid)`、loss 层判定都按 layer_id 走）。
 
-    ⚠ **给出的峰值是下界**：解不出字节的节点被整个跳过（绝不零填），逐条在
-    `.coverage` 里可见；`coverage.is_partial` 为真时任何"这就是模型峰值"的说法都是错的。
+    ⚠ **部分解析 ⇒ 默认不给数**：解不出字节的节点被整个跳过（绝不零填）→ 峰值只是**下界**。
+    这种图默认**不返回**，而是抛 `IncompleteExtraction`（消息里带缺什么、缺在哪一行）——
+    见该异常的论证。要拿下界做诊断：`allow_partial=True` 或设
+    `COST_EVAL_EXTRACTED_ALLOW_PARTIAL=1`；返回的图仍带 `.coverage`。
     """
     dims = model_spec.dims
     for axis in ("tp", "cp"):
@@ -1064,4 +1230,17 @@ def resolve_graph(model_spec, parallel_model) -> ExtractedGraph:
                                   layer_id=layer_id, layer_type=ltype, site=site)
         graph_cov.children.append(cov)
         stages.setdefault(parallel_model.stage_of(layer_id), []).append(layer)
-    return ExtractedGraph(stages=stages, coverage=graph_cov)
+    g = ExtractedGraph(stages=stages, coverage=graph_cov)
+    if graph_cov.is_partial and not _allow_partial(allow_partial):
+        t = graph_cov.totals()
+        bl = "；".join("%s %s（×%d）" % (op, src, k)
+                       for (src, op, _r), k in graph_cov.blockers(3)) or "无"
+        raise IncompleteExtraction(
+            "抽出的图尚不完备，故**拒绝交出峰值**（部分解析的图的峰值是下界，不是估计）："
+            f"节点 {t['n_nodes']} → op {t['n_ops']}（跳过 {t['skipped_ops']}）；"
+            f"param 可解析 {t['param_census_bytes'] / MiB:.1f} MiB / 真正进图 "
+            f"{t['param_in_graph_bytes'] / MiB:.1f} MiB；saves 未解析 {t['unresolved_saves']}。"
+            f"级联根：{bl}。"
+            f"要拿这个下界做诊断请设 {ALLOW_PARTIAL_ENV}=1 或传 allow_partial=True。\n"
+            + graph_cov.report(), graph_cov)
+    return g
