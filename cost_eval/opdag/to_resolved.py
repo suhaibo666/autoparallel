@@ -351,6 +351,11 @@ class Coverage:
     #: **调用方声明的**中间量形状（`_DECLARED_SHAPES`）：`[(name, sym, src, reason)]`。
     #: 与"推断出来的"分开记 —— 声明永远不许被洗成事实（`kernel_saves` 的同一条纪律）。
     declared_shapes: list = field(default_factory=list)
+    #: 同基名不同尺寸 → 被拆成 `name#k` 的记录：`[(基名, 显示名, sym, src)]`。
+    #: 这不是"改名"，是**发现了同名的两个物理张量**（内联后不同帧）。契约 S3 的正解。
+    name_disambiguations: list = field(default_factory=list)
+    #: `dag.detached` 名册里有、但节点级 `attrs["detached"]` 上匹配不到的名字（形状未解析等）。
+    detach_unmatched: list = field(default_factory=list)
     #: `workspace_bytes` / `bwd_scratch_bytes` 恒 0 的说明（契约 §不要求）。
     absent_calibration_note: str = (
         "workspace_bytes / bwd_scratch_bytes 恒 0：契约 §不要求 明确排除（kernel 实现细节，"
@@ -375,7 +380,9 @@ class Coverage:
                "detach_alias_overcount": len(self.detach_alias_overcount),
                "param_census_bytes": self.param_census_bytes,
                "param_in_graph_bytes": self.param_in_graph_bytes,
-               "declared_shapes": len(self.declared_shapes)}
+               "declared_shapes": len(self.declared_shapes),
+               "name_disambiguations": len(self.name_disambiguations),
+               "detach_unmatched": len(self.detach_unmatched)}
         for c in self.children:
             for k, v in c.totals().items():
                 acc[k] = acc.get(k, 0) + v
@@ -407,6 +414,10 @@ class Coverage:
         lines.append("  param census: 可解析 %.3f MiB / 真正进图 %.3f MiB（差额 = 权重解出来了"
                      "但承载节点被跳过 → 未进显存记账）"
                      % (t["param_census_bytes"] / MiB, t["param_in_graph_bytes"] / MiB))
+        if t["name_disambiguations"] or t["detach_unmatched"]:
+            lines.append("  同名异形拆分 %d 处（内联后不同帧的同名物理张量，契约 S3）；"
+                         "detach 名册未匹配 %d 项"
+                         % (t["name_disambiguations"], t["detach_unmatched"]))
         gaps = {}
         for c in [self] + self._all_children():
             for k, v in c.node_gap_reasons.items():
@@ -899,9 +910,23 @@ class _Folder:
         #: `config.ffn_hidden_size` 改写成 shared 尺寸 → MoE 层里 `mlp.py` 链的 `ffn_hidden`
         #: 必须按 `moe_shared_F` 而非 `F` 求值；`consumer._SYM2FIELD` 是全局映射，表达不了改写）。
         self.dims_for_file = dict(dims_for_file or {})
-        self._t: dict = {}                       # name -> RTensor（首见定型）
+        self._t: dict = {}                       # 权重按名缓存（权重名已带 @src，天然唯一）
+        #: **物理张量表**：键 `(基名, local_numel, dtype_bytes)` → `RTensor`。
+        #: 为什么不能只按名：内联后同一个基名在**不同帧**里是**不同的物理张量**。实测（fused r4）
+        #: `q` 有三个：`deepseek_v4:240` 的注意力 query（S·B·n_heads·v_head_dim = 256 MiB，
+        #: 帧 `self_attention@7`）、`indexer.py:177` 的 indexer query（S·B·index_n_heads·
+        #: index_head_dim = 64 MiB，帧 `…/indexer@2`）、`indexer.py:215` 的 detached cast 复本
+        #: （帧 `…/indexer@44`）。只按名首见定型 = 契约 **S3** 明文警告的"同名异形被静默吞掉"。
+        #: 消费者自己的 ref 携带 shape，故 `(名, 尺寸)` 这个键就是**无歧义的连接键**；
+        #: 第 2 个以上的签名给一个 `name#k` 显示名（并记进 `Coverage.name_disambiguations`）。
+        #: 残留近似：同名**同尺寸**但物理不同的两个张量仍会被合成一个 —— 一并记账。
+        self._bykey: dict = {}
+        self._used: dict = {}                    # 基名 -> 已用签名数
         self.report: list = []
-        self._detached: set = set()
+        #: `detached` 的**逐帧**判据：`attrs["detached"]` 是节点级、帧精确的；`dag.detached`
+        #: 只是那些节点输出的**基名**列表（实测二者一一对应），按基名匹配会把注意力的 `q`
+        #: 误标成 detached（它与 indexer 里那个 detached 的 `q` 同名）→ 反向少读 256 MiB。
+        self._det_keys: set = set()
         self._census_seen: set = set()            # param census 去重（按名）
         self._graph_seen: set = set()             # 真正进图的权重去重（按名）
 
@@ -929,15 +954,12 @@ class _Folder:
         return self.dims_for_file.get(base, self.dims)
 
     # ── 张量 ─────────────────────────────────────────────────────────────
-    def _tensor(self, ref: str, node, *, is_weight=False, dtype_override=None):
-        """`"name:符号shape:dtype"` → `RTensor`；解不出 → None（**不零填**）。"""
+    def _sig(self, ref: str, node, *, is_weight=False, dtype_override=None):
+        """`"name:符号shape:dtype"` → `(基名, local_numel, dtype_bytes, sym)`；解不出 → None。"""
         if not ref or ref.count(":") != 2:
             return None
         name, sym, dt = ref.split(":")
         dt = dtype_override or dt
-        prev = self._t.get(name)
-        if prev is not None:
-            return prev
         dims = self._dims_of(getattr(node, "src", ""))
         try:
             elems = local_shape_elems(sym, dims, self.pm, is_weight=is_weight)
@@ -948,13 +970,53 @@ class _Folder:
         nb = _dtype_bytes(dt, dims)
         if nb <= 0:
             return None
-        det = (not is_weight) and name in self._detached
-        t = RTensor(name=name, local_numel=int(elems), dtype_bytes=int(nb),
-                    is_weight=is_weight, detached=det,
+        return name, int(elems), int(nb), sym, dt
+
+    def _tensor(self, ref: str, node, *, is_weight=False, dtype_override=None):
+        """`"name:符号shape:dtype"` → `RTensor`；解不出 → None（**不零填**）。
+
+        身份键是 `(基名, numel, dtype_bytes)` 而不是基名 —— 见 `self._bykey` 的论证。"""
+        got = self._sig(ref, node, is_weight=is_weight, dtype_override=dtype_override)
+        if got is None:
+            return None
+        name, elems, nb, sym, dt = got
+        key = (name, elems, nb)
+        prev = self._bykey.get(key)
+        if prev is not None:
+            return prev
+        n_used = self._used.get(name, 0)
+        disp = name if n_used == 0 else f"{name}#{n_used + 1}"
+        self._used[name] = n_used + 1
+        if disp != name:
+            self.cov.name_disambiguations.append(
+                (name, disp, sym, getattr(node, "src", "")))
+        dims = self._dims_of(getattr(node, "src", ""))
+        t = RTensor(name=disp, local_numel=elems, dtype_bytes=nb,
+                    is_weight=is_weight, detached=(not is_weight and key in self._det_keys),
                     dim0=self._dim0(sym, dims), sym_shape=sym, dtype_name=dt,
                     src=getattr(node, "src", ""))
-        self._t[name] = t
+        self._bykey[key] = t
         return t
+
+    def _collect_detached(self) -> None:
+        """建 `_det_keys`：**帧精确**的 detach 集合 = 带 `attrs["detached"]` 的节点的输出签名。
+
+        `dag.detached` 只是这些输出的**基名**列表（实测一一对应），按基名匹配会误伤同名张量
+        （注意力 `q` vs indexer 里那个 detached 的 `q`）→ 反向少读 256 MiB/r4 层。
+        `stop_gradient` 的产物与 `with _no_grad():` 块内产物都由该 attr 覆盖。"""
+        for n in self.dag.nodes:
+            if not n.attrs.get("detached") or not n.out:
+                continue
+            got = self._sig(n.out, n)
+            if got is None:
+                continue                          # 形状未解析 → 该张量本来也进不了图
+            self._det_keys.add((got[0], got[1], got[2]))
+        listed = set(self.dag.detached or ())
+        covered = {k[0] for k in self._det_keys}
+        miss = sorted(n for n in listed if n not in covered)
+        if miss:
+            # 名册里有、但节点级 attr 上找不到（或形状没解出）→ 记账，绝不静默丢 detach 信息。
+            self.cov.detach_unmatched.extend(miss)
 
     def _dim0(self, sym: str, dims) -> int:
         """首维（FSDP 判定用，`structure_mem.py:100`）。`~` numel-only 档无轴结构 → 0=未知。"""
@@ -1055,7 +1117,7 @@ class _Folder:
         why = {}
         for r in self.report:
             why.setdefault(r.get("name") or "", (r.get("src", ""), r.get("reason", "")))
-        self._detached = set(dag.detached or ())
+        self._collect_detached()
         alias = detach_aliases(dag)
         saves_by_op: dict = {}
         for s in derive_saves(dag):
