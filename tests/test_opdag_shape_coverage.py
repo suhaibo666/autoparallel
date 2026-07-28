@@ -257,3 +257,165 @@ def test_multiline_call_attributes_its_params_to_the_consuming_node(mf_pkg):
     for n in hits:
         assert n.attrs.get("param_operands") == ["alpha_pre", "alpha_post", "alpha_res"], \
             n.attrs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# (e) 归约 / 转置 / MatMul 末轴 / advanced-index / 整除原子（都是**算子定义**）
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SITE = dict(H=4096, F=4096, n_heads=64, n_kv=1, head_dim=128, S=4096, B=1,
+             vocab=129280, n_layers=8, q_lora_rank=1024, kv_lora_rank=512,
+             qk_rope_head_dim=64, qk_nope_head_dim=0, v_head_dim=512,
+             dsa_indexer_n_heads=64, dsa_indexer_head_dim=128,
+             dsa_indexer_topk=512, o_groups=8, o_lora_rank=1024,
+             csa_window_size=128, num_residual_streams=4)
+
+
+def test_reduce_uses_the_axis_the_walker_already_recorded():
+    """`mint.mean(q*q, dim=-1, keepdim=True)`（`deepseek_v4_hybrid_attention.py:245`）：
+    轴 walker 早就记进 `attrs`（G4），`shape_infer` 此前一律记 `reduce_axis_unknown` 不用它。"""
+    n = _node(1, "Elementwise", "deepseek_v4_hybrid_attention.py:245",
+              ["q:S·B·n_heads·v_head_dim:bf16"], "m:?:bf16",
+              reduce=True, linear=True, prim="mint.mean", reduce_dim=-1, keepdim=True)
+    SI.infer_shapes(_dag(n), {"q": "S·B·n_heads·v_head_dim"})
+    assert n.out.split(":")[1] == "S·B·n_heads·1", n.out
+
+
+def test_reduce_without_keepdim_drops_the_axis():
+    n = _node(1, "Elementwise", "x.py:1", ["a:S·B·H:bf16"], "m:?:bf16",
+              reduce=True, prim="mint.sum", reduce_dim=1)
+    SI.infer_shapes(_dag(n), {"a": "S·B·H"})
+    assert n.out.split(":")[1] == "S·H", n.out
+
+
+def test_reduce_all_is_a_source_fact_and_gives_a_scalar():
+    """源侧**根本没传** `dim` ⇒ 全轴归约 ⇒ 标量。与「抠不出轴」必须分开记
+    （真源 `loss.py:344/346` 的 `self.sum(x)`）。"""
+    n = _node(1, "Elementwise", "loss.py:344", ["a:B·S:fp32"], "num:?:fp32",
+              reduce=True, prim="mint.sum", reduce_all=True)
+    SI.infer_shapes(_dag(n), {"a": "B·S"})
+    assert n.out.split(":")[1] == "1", n.out
+
+
+def test_reduce_without_any_axis_info_still_records_and_keeps_qmark():
+    """既没记轴、也不是全轴归约 → 照旧 `?` + 记账（**绝不** passthrough 顶替）。"""
+    n = _node(1, "Elementwise", "compressor.py:216", ["kv:S·B·H:fp32"], "p:?:fp32",
+              reduce=True, prim="<tensor>.sum")
+    rep = []
+    SI.infer_shapes(_dag(n), {"kv": "S·B·H"}, report=rep)
+    assert n.out.split(":")[1] == "?"
+    assert [r["reason"] for r in rep] == ["reduce_axis_unknown"]
+
+
+def test_cumsum_is_not_a_reduction():
+    """`mint.cumsum` 在 `_REDUCE_LIN` 里，但它**不归约**（前缀和，输出同形）。"""
+    n = _node(1, "Elementwise", "x.py:1", ["a:S·B:fp32"], "c:?:fp32",
+              reduce=True, prim="mint.cumsum", reduce_dim=0)
+    SI.infer_shapes(_dag(n), {"a": "S·B"})
+    assert n.out.split(":")[1] == "S·B", n.out
+
+
+def test_two_axis_transpose_is_exact_when_the_axes_are_recorded():
+    """`mint.transpose(weight, 1, 0)`（`linear.py:132`）—— 两个轴是源里逐字写着的常数，
+    可以精确互换，不必退 `numel_only`。"""
+    n = _node(1, "View", "linear.py:132", [], "weight:?:bf16",
+              view="transpose", prim="mint.transpose", swap_axes=[1, 0],
+              param_operands=["weight"])
+    SI.infer_shapes(_dag(n), {}, param_shapes={("linear.py", "weight"): "vocab·H"})
+    assert n.out.split(":")[1] == "H·vocab", n.out
+
+
+def test_matmul_takes_the_weight_last_axis_when_out_dim_is_absent():
+    """`output = matmul(input_, weight)`（`linear.py:135`）：`Linear` 作为**顶层** Cell 抽取时
+    没有 `build_module(..., output_size=…)` 那个调用点 ⇒ `out_dim` 缺席。算子定义补上。"""
+    t = _node(1, "View", "linear.py:132", [], "weight:?:bf16",
+              view="transpose", prim="mint.transpose", swap_axes=[1, 0],
+              param_operands=["weight"])
+    mm = _node(2, "MatMul", "linear.py:135", ["input_:S·B·H:bf16"], "output:?:bf16",
+               prim="mint.matmul", param_operands=["weight"])
+    SI.infer_shapes(_dag(t, mm), {"input_": "S·B·H"},
+                    param_shapes={("linear.py", "weight"): "vocab·H"})
+    assert mm.out.split(":")[1] == "S·B·vocab", mm.out
+
+
+def test_advanced_index_output_is_index_shape_plus_trailing_axes():
+    """`kv_flat[flat_indices]`（`csa.py:485`）：`[b·sk, d][idx] → idx.shape ++ (d,)`。"""
+    n = _node(1, "IndexSelect", "csa.py:485",
+              ["kv_flat:(B·S)·v_head_dim:bf16", "idx:B·S·index_topk:int64"],
+              "g:?:bf16", advanced_index=True)
+    SI.infer_shapes(_dag(n), {"kv_flat": "(B·S)·v_head_dim", "idx": "B·S·index_topk"})
+    assert n.out.split(":")[1] == "B·S·index_topk·v_head_dim", n.out
+
+
+def test_advanced_index_refuses_a_boolean_mask():
+    """`x[mask]` 的产出长度取决于**值**而不是形状 —— 套整数索引规则会算错，必须保 `?`。"""
+    n = _node(1, "IndexSelect", "x.py:1",
+              ["a:(B·S)·H:bf16", "m:B·S:bool"], "g:?:bf16", advanced_index=True)
+    rep = []
+    SI.infer_shapes(_dag(n), {"a": "(B·S)·H", "m": "B·S"}, report=rep)
+    assert n.out.split(":")[1] == "?"
+    assert rep and rep[0]["reason"] == "constant_shape_unknown"
+
+
+def test_reshape_minus_one_forms_a_divide_atom_instead_of_giving_up():
+    """`reshape(kv, (n_compressed, ratio, b, -1))`（`compressor.py:203`）：已知积里是 `S//4`、
+    总积里是 `S`，符号约不干净 —— 但 `-1` 位按定义就是两者之商，保成表达式即可。"""
+    from cost_eval.model_spec import DimTable
+    from cost_eval.opdag.consumer import resolve_shape_elems
+    n = _node(1, "View", "compressor.py:203", ["kv:S·B·(2·v_head_dim):bf16"], "kv:?:bf16",
+              view="reshape", prim="mint.reshape",
+              reshape_dims=["n_compressed", "ratio", "b", "-1"])
+    dag = _dag(n, const_scalars={"ratio": 4},
+               scalar_exprs={"n_compressed": "cutoff // ratio",
+                             "cutoff": "(sq // ratio) * ratio"},
+               scalar_binds=[{"names": ["sq", "b", "_"], "src": "kv", "frame": ""}])
+    SI.infer_shapes(dag, {"kv": "S·B·(2·v_head_dim)"})
+    sym = n.out.split(":")[1]
+    assert not sym.startswith("~"), f"应当解出**轴结构**，而不是退 numel_only：{sym}"
+    # 元素数**必须守恒**：reshape 恒不改元素数。
+    assert resolve_shape_elems(sym, DimTable(**_SITE)) == 4096 * 1 * 2 * 512
+
+
+def test_divide_atom_refuses_when_it_is_not_exact():
+    """整除原子除不尽 → `None`（**不取整**）：reshape 的 `-1` 按定义整除，除不尽说明上游解错了。"""
+    from cost_eval.model_spec import DimTable
+    from cost_eval.opdag.consumer import resolve_shape_elems
+    dims = DimTable(**dict(_SITE, S=4097))
+    assert resolve_shape_elems("(S)//(H)", dims) is None       # 4097 % 4096 != 0
+
+
+def test_paired_paren_stripping_does_not_break_a_product_term():
+    """`consumer._sym_value` 里若用 `str.strip` 剥括号，`2·((a)//(b))·c` 的**配对**尾括号会被
+    剥掉、整串弄坏。回归钉（2026-07-28 实测：整除原子进乘积项后就撞上这条）。"""
+    from cost_eval.model_spec import DimTable
+    from cost_eval.opdag.consumer import resolve_shape_elems
+    dims = DimTable(**_SITE)
+    # 2·((S·H)//(H))·B = 2·4096·1 = 8192
+    assert resolve_shape_elems("(2·((S·H)//(H))·B)", dims) == 8192
+
+
+def test_stale_seed_is_overridden_by_the_dataflow_edge():
+    """内联把子 Cell 形参名永久映射成调用方 ref（`vocab_embedding.py:83-85` 三步的 `ins` 都写作
+    调用方的 `input_ids`）→ 按名查会拿到**入口种子**，而真正的上游是那条边。
+    源 docstring `vocab_embedding.py:76` 逐字：`output: (B, S, H)`。"""
+    n1 = _node(1, "View", "vocab_embedding.py:83", ["input_ids:?:int32"], "input_:?:int32",
+               view="reshape", prim="mint.reshape", reshape_dims=["-1", "1"])
+    n2 = _node(2, "View", "vocab_embedding.py:84", ["input_ids:?:int32"], "input_:?:int32",
+               view="tile", prim="mint.tile", tile_mult=["1", "self.embedding_dim"])
+    n3 = _node(3, "IndexSelect", "vocab_embedding.py:85", ["input_ids:?:int32"],
+               "output:?:bf16", prim="mint.gather", ins_slots=[1], param_operands=["weight"])
+    dag = _dag(n1, n2, n3, edges=[[1, 2], [2, 3]], dims_ctx={"embedding_dim": "H"})
+    SI.infer_shapes(dag, {"input_ids": "B·S"}, bridge_by_edge=True)
+    assert n3.out.split(":")[1] == "(B·S)·H", n3.out
+
+
+def test_stale_seed_override_is_off_by_default():
+    """缺省关（既有调用方逐字不变）——`timesim/producer.py` 的通信注入按「几个输入已解出」判
+    S 分歧，多解出一个就多注入一条 AG，那是另一个子系统的口径。"""
+    n1 = _node(1, "View", "vocab_embedding.py:83", ["input_ids:?:int32"], "input_:?:int32",
+               view="reshape", prim="mint.reshape", reshape_dims=["-1", "1"])
+    n3 = _node(3, "IndexSelect", "vocab_embedding.py:85", ["input_ids:?:int32"],
+               "output:?:bf16", prim="mint.gather", ins_slots=[1])
+    dag = _dag(n1, n3, edges=[[1, 3]])
+    SI.infer_shapes(dag, {"input_ids": "B·S"})
+    assert n3.out.split(":")[1] == "B·S", n3.out       # 拿的是种子，不是边
