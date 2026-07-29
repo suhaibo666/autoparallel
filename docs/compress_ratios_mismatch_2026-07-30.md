@@ -229,12 +229,12 @@ compress_ratios = [_CYCLE[i % 3] for i in range(N)] + [0] * MTP
 ```
 $ git diff 43ff9ab HEAD -U0 -- . ':!docs' ':!scratchpad' \
     | grep -E "^[+-]" | grep -v "^[+-][+-]" | grep -E "REAL|CSV|MEASURED|sha256|SHA256"
-（空）
++#:   `tests/test_pp4_recompute_anchor.py` 的 `REAL_ON` 逐位等于
 ```
 
-**一行都没命中** —— 没有任何 `REAL_*` / `CSV_*` / `MEASURED` / `REAL_SHA256` 行被增删改
-（上一轮还命中过一行新增注释，本轮连注释都没提到这些名字）。
-八跑门的指纹校验也在 §6 里 PASS（`41e279e591ae4ae9…`）。
+唯一命中是**一行新增注释**（在新文件 `tests/test_anchor_site_yaml_agreement.py` 里，
+复述认亲证据时提到了 `REAL_ON` 这个名字），**没有任何 `REAL_*` / `CSV_*` / `MEASURED` /
+`REAL_SHA256` 常数行被增删改**。八跑门的指纹校验也在 §6 里 PASS（`41e279e591ae4ae9…`）。
 
 改动只落在 5 个源文件 + 1 个新测试文件：
 `serve_explorer.py` / `tests/test_flat_query_reachability.py` /
@@ -323,3 +323,96 @@ U2 76585.3、F0 22492.9 **逐 MiB 不变**）。原因：两个桶都被融合 C
 
 处理方式：登记进 `_DECLARED_INERT_DIFFS`，**并让门每次跑都实测一遍那个 0**。
 它哪天开始承重，门就红，逼当场做决定。
+
+---
+
+## 9. 现在已知为 **OOM-不安全** 的锚点（模型欠读真机）
+
+**不调参掩盖。** 记分卡（`python sim_vs_real_report.py`）与 116 std 族**本轮逐字节未动**
+——它们要么走 `dsv4_align_config()`（不经扁平 query），要么是 mha/gqa（`csa_compress_ratios`
+在那条路上根本不进图，`build_llm.py:307`）。我跑了记分卡确认，14 锚一字不差。
+
+| 锚点 | 本轮前 | **本轮后** | 变化 |
+|---|---:|---:|---|
+| `pp2-stage1 (loss,k_ce=8)` | 0.999 | 0.999 | 未动（DSv3，无 CSA） |
+| `cp2-none (loss,k_ce=4)` | 0.991 | 0.991 | 未动（同上） |
+| `DSv3 8L none (dp2)` | 0.981 | 0.981 | 未动（同上） |
+| `select self_attn (keep-FFN)` | 0.970 | 0.970 | 未动（同上） |
+| `select mlp (keep-attn)` | 0.932 | 0.932 | 未动（同上） |
+| `std 116 mha pp2 s0` | 0.934 | 0.934 | 未动（mha 不走 CSA） |
+| `std 116 gqa pp2 s0` | 0.852 | 0.852 | 未动（同上） |
+| `DSv4-fused (base)` | 0.902 | 0.902 | 未动（`dsv4_align_config`，不经扁平 query） |
+| `DSv4 mHC(x4)+MTP` | 0.891 | 0.891 | 未动（同上；且那次跑**本来就用循环**，见 §4.3） |
+| `pp4 OFF` s0 | 0.892 | **0.892** | 层型同档 → 逐 MiB 恒等 |
+| `pp4 OFF` s1 | 0.867 | **0.922** | **收窄**（what-if 预测 0.922，逐位命中） |
+| `pp4 OFF` s2 | 0.815 | **0.859** | **收窄**（预测 0.859，逐位命中） |
+| `pp4 OFF` s3 | 0.832 | **0.833** | 几乎不动 |
+| `pp4 ON` s0–s3（框架缺口档） | 0.668/0.746/0.790/0.894 | **0.668/0.818/0.831/0.895** | s1/s2 **收窄** |
+| `pp8` s0 | 0.827 | **0.827** | 层 0 同档 → 恒等 |
+| `pp8` s7 | 0.956 | **0.956** | 峰在 head/loss 段 → 恒等 |
+| ~~`pp8` s3~~ | 0.963 | **1.059（离开本表）** | 翻回过读（OOM 安全侧），见 §5 |
+| `185 P3-P s0`（框架缺口档） | 0.686 | **0.686** | 恒等 |
+| `185 F 每层差分` | 0.754 | **0.752** | 记录门；仍低于 3109 |
+| `185 F0 绝对` | 0.844 | **0.849** | 微收窄 |
+| ~~`185 U1 峰`~~ | 0.966 | **1.114（离开本表）** | 翻成过读；**本轮唯一"离 1.00 更远"的锚点**，见下 |
+| `185 std ON MHA/GQA s0`（框架缺口档） | 0.747 / 0.749 | 同左 | 未动（mha/gqa） |
+
+**本轮没有把任何一个锚点推进 OOM-不安全**；两个离开（pp8 s3、185 U1，均翻到 OOM 安全侧）。
+
+### 9.1 唯一"变差"的一条：185 U1（0.966 → 1.114）
+
+如实记：|ratio−1| 由 0.034 涨到 0.114。**但方向是过读 = OOM 安全侧**，且我没有为它调任何参数。
+成因是**结构性**的：4 层站点表 `[0,4,128,4]` 的末层是 r4（循环是 r0），而 U 相位是 unfused DSA
+—— unfused 的 r4 层要物化 `index_scores [B,S,64,S]` fp32 与 CSA 的 fp32 副本群
+（`cost_eval/layers/indexer.py:245` / `csa.py:490,531`），单层就值 ~5.9 GB @seq2048。
+**unfused r4 的逐桶归因从来没闭过**：`analysis/dsv4_flash_calibration_handoff_2026-07-22.md:68`
+第 3 行逐字「80%（**未闭，缺逐桶归因**）」。本轮把层型对齐，等于把这个一直存在的过读
+**从"被一个错的层型分布掩盖着"变成"直接可见"**。要收它，需要 unfused r4 的逐桶 micro-anchor，
+不是调层型表。
+
+### 9.2 最大的一笔仍未被处理（**与本轮无关，不由我补偿**）
+
+`lm_head` / loss 段自己的**反向 kernel workspace 从未被测量、留 0**
+（`docs/head_workspace_2026-07-30.md` §6 ①）—— 它是上表前 9 行的峰值事件（`bwd@head`，
+由 2020 MiB 满 vocab fp32 `bwd_scratch` 主导）。**本轮一个字节都没有往上凑**。
+要抬它必须实测 MatMul wgrad / log_softmax / CE 链的 kernel scratch。
+
+---
+
+## 10. 验收
+
+```
+$ PYTHONIOENCODING=utf-8 python -m pytest tests -q
+1964 passed, 268 warnings in 99.26s (0:01:39)
+```
+
+`1949 → 1964`：**新增 15 例**，**没有删除任何用例、没有删除任何不变量**：
+
+| 新增 | 处 | 例数 |
+|---|---|---:|
+| 扁平 query 接线用例（`csa_compress_ratios`）| `test_flat_query_reachability.py` `_WIRING_CASES` | 1 |
+| 逐层压缩比定点回归（落到 r{ratio} 层 key / 缺省保留预设循环 / 非整数 fail-loud） | 同上 | 3 |
+| 锚点 ↔ 站点 yaml 一致性门（①②③④⑤⑥⑦，含 2 组配对参数化） | **新文件** `test_anchor_site_yaml_agreement.py` | 11 |
+
+既有测试只按 `docs/opdag_walker_core_2026-07-25.md` §6.6 精神**移动举例值**，每条都在测试文件里
+就地写了理由：
+- `test_pp4_recompute_anchor.py`：`THEO_ON` / `THEO_MTP` / `THEO_PP8` 三组 pin 值、`BAND_OFF`
+  的 s1/s2 两条带、`_PP8_UNDER`、`_PP8_OVER_BAND`；
+- `test_probe185_recon.py`：U1 带（**带宽 0.13 不变、只平移**）、每层差分记录值；
+- `test_yaml_roundtrip_fidelity.py::test_bundle_to_fields_raises_when_lossy`：判据不变
+  （丢 `llm_json` 必须 fail-loud 并点名被替换字段），只把举例字段从 `csa_compress_ratios`
+  换成 `o_groups`/`dsa_indexer_topk` —— 因为前者现在**能过桥了**（这正是本轮修复的目的）。
+
+---
+
+## Related
+
+- [`fused_mhc_branch_mismatch_2026-07-30.md`](fused_mhc_branch_mismatch_2026-07-30.md) §9 ——
+  本缺陷的发现处与 what-if 预测（本轮逐位对账见 §4.1：pp4-OFF s1/s2、pp8 s3 全部命中）；
+  §8 是上一轮装的分类门，本文 §8 说明它为什么绿着放行了这一例
+- [`census_fix_residual_carrier_2026-07-29.md`](census_fix_residual_carrier_2026-07-29.md) §2 ——
+  167 逐 (微批, 层, 阶段) 直测；「r4 = 4 层均值 / r128 = 3 层均值」是站点层型分布的旁证
+- [`head_workspace_2026-07-30.md`](head_workspace_2026-07-30.md) §6 ① / §9 ——
+  仍未测的 `lm_head`/loss 反向 workspace，是剩余欠读的最大一笔（本轮未触碰）
+- [`opdag_walker_core_2026-07-25.md`](opdag_walker_core_2026-07-25.md) §6.6 ——
+  「保留不变量、只移动举例」的改测试规矩
