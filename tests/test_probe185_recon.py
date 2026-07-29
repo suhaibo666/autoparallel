@@ -82,8 +82,10 @@ def test_fused_per_layer_increment():
     p4 = _peaks(_dsv4_q(4, fused=True))[0]
     p8 = _peaks(_dsv4_q(8, fused=True))[0]
     per_layer = (p8 - p4) / 4
-    assert abs(per_layer - 2702.5) < 5.0, (
-        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 2702.5（真机差分锚 3109，比值 0.869；"
+    # 2026-07-29 二次重钉：2702.5 → 2568.5（融合 mHC ctx + RMSNorm 不 cast，见
+    #   docs/census_fix_mhc_rmsnorm_2026-07-29.md）。/3109 = 0.826，仍在记录带内。
+    assert abs(per_layer - 2568.5) < 5.0, (
+        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 2568.5（真机差分锚 3109，比值 0.826；"
         f"两个真机数不自洽，见 docstring）")
     assert 0.80 <= per_layer / 3109.0 <= 1.05, (
         f"fused 每层差分 sim={per_layer:.1f} vs 真机差分锚 3109 = {per_layer/3109:.3f}——"
@@ -118,7 +120,10 @@ _STD_ON_REAL = {32: {0: 11131.6, 1: 15370.0}, 8: {0: 10747.6, 1: 14986.0}}
 #   (A−ci=568.0);**s1 逐 MiB 不变**——尾 stage 峰在 loss/head 层(非重算层)的 bwd 事件,该事件此桶 0
 #   (真实,不是被门挡掉)。方向:MHA s0 0.661→0.725、GQA s0 0.655→0.707,四点仍全部 sim < 真机 → 缺口
 #   **收窄**,框架缺口方向不变。
-_STD_ON_THEO = {32: {0: 8074.8, 1: 14802.8}, 8: {0: 7594.8, 1: 14490.8}}
+# 2026-07-29 重钉：`FusedRMSNorm` 不 cast（layer_norm.py:151-155）→ std MHA/GQA 的 ln1/ln2/
+#   final_norm 保留输入不再抬 fp32。MHA s0 8074.8→8042.8 / s1 14802.8→14786.8；
+#   GQA s0 7594.8→7562.8 / s1 14490.8→14474.8。四点仍全部 sim < 真机（不变量不动）。
+_STD_ON_THEO = {32: {0: 8042.8, 1: 14786.8}, 8: {0: 7562.8, 1: 14474.8}}
 
 
 @pytest.mark.parametrize("kv,stage", [(32, 0), (32, 1), (8, 0), (8, 1)])
@@ -151,7 +156,9 @@ def test_p3p_m8_theoretical_and_gap():
     #   峰值重算层的 A−ci）。s0 vs 真机 25343.5：0.600 → 0.741，**收窄**且仍欠读（缺口方向不变）。
     # 2026-07-29 重钉：普查订正 18783.7 → 17370.2（−1413.5 = 该 stage 峰值重算层 saves 的降幅）。
     #   s0 vs 真机 25343.5：0.741 → 0.685，**仍欠读**（缺口方向不变，这是本门断言的不变量）。
-    assert abs(pk[0] - 17370.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17370.2"
+    # 2026-07-29 二次重钉：17370.2 → 17102.2（融合 mHC ctx + RMSNorm 不 cast）；
+    #   s0 vs 真机 25343.5：0.685 → 0.675，仍欠读。
+    assert abs(pk[0] - 17102.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17102.2"
     assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="4", split="2,2,2,2"))
