@@ -826,20 +826,41 @@ def _concat(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
 
 
 def _chunk(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
-    """`chunk(x, k, dim=?)`:轴未记,但**份数 k 可由源侧的元组解包元数证得**
-    (`tensor_prev, tensor_next = self.chunk(tensor, 2, dim=-1)` @ `compressor.py:169`
-    —— Python 的元组解包只有在 chunk 恰返回 k 份时才成立,故 `len(attrs['outs'])` 就是 k,
-    这是**源侧事实**,不是猜)。元素数 = 总积 / k,且只在**符号上能精确整除**时才认
-    (不能精确整除 = 各份可能不等长 → 记账,不给一个 floor 值)。
+    """`chunk(x, k, dim=d)`:沿 `d` 切成 k 份等长(算子定义)。
+
+    份数 k 有**两条独立的源侧事实**:字面量实参(`attrs["chunks"]`,walker
+    `construct_walker.py:2286-2295` 记的)与**元组解包元数**(`len(attrs["outs"])` ——
+    `tensor_prev, tensor_next = self.chunk(tensor, 2, dim=-1)` @ `compressor.py:169`
+    只有在恰返回 k 份时才成立)。**两条不一致 = 解错了** → fail-loud 记账。
+
+    轴 `d` 此前**被丢掉**(2026-07-29 前只算总积/k → 一律 `~`),而它 walker 也记了。
+    有轴且该轴长**可证被 k 整除**时给出精确形;证不出就退回既有的"只知元素数"档
+    (不许拿一个 floor 值冒充"每份"—— 除不尽时各份根本不等长)。
     """
     a = in_axes_list[0] if in_axes_list else None
     if not a:
         _note(ctx, n, "no_input_shape")
         return None
-    k = len(n.attrs.get("outs") or ())
+    k_decl = n.attrs.get("chunks")
+    k_unpack = len(n.attrs.get("outs") or ())
+    if k_decl is not None and k_unpack >= 2 and int(k_decl) != k_unpack:
+        _note(ctx, n, "chunk_axis_unknown",
+              f"份数的两条源侧事实不一致：实参 {int(k_decl)} vs 解包元数 {k_unpack}")
+        return None
+    k = int(k_decl) if k_decl is not None else k_unpack
     if k < 2:
         _note(ctx, n, "chunk_axis_unknown", "`outs` 元数 < 2,无法据解包元数证得份数")
         return None
+    dim = n.attrs.get("chunk_dim")
+    if dim is not None and not (in_numel_only and in_numel_only[0]):
+        rank = len(a)
+        ax = int(dim) if int(dim) >= 0 else rank + int(dim)
+        if 0 <= ax < rank:
+            part = _exact_floordiv(a[ax], k, ctx.div_facts)
+            if part is not None:
+                out = [f.copy() for f in a]
+                out[ax] = part
+                return out, False
     total = product_of(a)
     if total.coeff % k != 0:
         _note(ctx, n, "chunk_axis_unknown",

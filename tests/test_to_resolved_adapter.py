@@ -346,30 +346,39 @@ def test_norm_fp32_prelift_is_undone(mf_pkg):
 #:                               这种局部元组 + `Linear.__init__` 位置形参种子；
 #:   `loss.py:197`             → `_LogSoftmax` 的产出形声明（`loss.py:134-143` 逐字）。
 #: **台账更新（2026-07-29，`docs/opdag_symbolic_axes_2026-07-29.md`）**：「符号轴结构恢复」
-#: 落地后，2026-07-28 记的 5 处里**修掉 3 处**、剩 1 处、新暴露 3 处。逐条对应关系：
+#: 落地后，2026-07-28 记的 4 处**全部出表**，新暴露 5 处。逐条对应关系：
 #:   `compressor.py:233` → `_slice` 支持 `":<stop>:<step>"`，且步长整除终点**可证**
 #:                         （`total_seq_len = n_compressed·ratio` @ `:230` ⇒ 系数整除）；
 #:   `deepseek_v4_hybrid_attention.py:205` → `permute` 用 walker 早就记下的 `permute_dims`
 #:                         精确重排（不再退 `~`）⇒ `core_out` 有轴结构 ⇒ split 可解；
 #:   `csa.py:485`        → ① `permute` 精确化让 `kv_t` 拿到 `B·1·S·v_head_dim`；
 #:                         ② `csa.py:482` 的 reshape 目标里**恰好一个**维（`sk`）没导出，
-#:                            由**元素数守恒**唯一确定（与 `-1` 同一条算子定义）。
+#:                            由**元素数守恒**唯一确定（与 `-1` 同一条算子定义）；
+#:   `compressor.py:216` → `_chunk` 用 walker 记下的 `chunks`/`chunk_dim` 精确切轴
+#:                         （`compressor.py:169` `chunk(tensor, 2, dim=-1)`）⇒
+#:                         `_overlap_transform` 的产物恢复 `S//4·8·B·v_head_dim` ⇒ 归约可解。
 #: **不变量逐字保留**：级联根必须逐条在册、每条带一句"为什么还挡着"；修好一处就更新台账。
 LEDGER_BLOCKERS = {
-    # ── 仍在册（未修）───────────────────────────────────────────────────────
-    # `pooled = (out.astype(fp32) * weights).sum(dim=1)` —— 上游 `:203`
-    # `reshape(kv, (n_compressed, ratio, b, -1))` 退 `numel_only`：`n_compressed` / `ratio`
-    # 两个 construct 局部标量**都**没导出（不是一个）→ 元素数守恒那条只解得了"恰好一个"。
-    # 整除事实 `ratio | S` 已经生效（表达式从
-    # `~((2·((2·B·S·v)//(4·B·(S//4)))·B·(S//4))+…)` 折成了 `~(2·B·S·v_head_dim)`），
-    # 但归约仍要按轴去掉一条轴 → 拒绝。
-    "compressor.py:216",
-    # ── 新暴露（都是**上游本来就错、此前被 `~` 盖住**的，现在显式拒绝）─────────
-    # `topk_idxs = cat([window_idxs, compress_topk_idxs], -1)`：两个操作数一个 rank 2、
-    # 一个 rank 3 —— `cat` 的前置条件不成立 ⇒ 至少一处上游 shape 是错的 ⇒ 整条拒绝
-    # （`concat_shape_mismatch`）。没有这条守卫时按轴相加会把 topk 轴从 512 放大成 4224，
-    # 再经 `csa.py:485` 的元素数守恒传导，整层 saves 从 ~22 GiB 变成 **86 GiB**。
+    # ── 新暴露（都是**上游本来就错 / 本来就没解出、此前被 `~` 盖住**的）─────────
+    # `mint.arange(n_compressed)`（`csa.py:777` 的 causal mask）：`n_compressed =
+    # int(compressed_kv.shape[0])`（`csa.py:747`）是 construct 局部标量，且它依赖
+    # 下面那条 `cat` —— 那条 `cat` 一拒，它就无源可解。
+    "csa.py:777",
+    # `cmp_residual_k = Tensor([int(key_length) % self.compress_ratio], …)`
+    # （`indexer.py:219`）：`Tensor([...])` 这种**值列表**构造没有 shape 规则。
+    "indexer.py:219",
+    # `kv_full = cat([key, compressed_kv], dim=0)`（`csa.py:747`）：两个操作数一个 rank 3
+    # （压缩器的**内联返回值**少了 `compressor.py:224` 的 `unsqueeze(pooled, -2)` 那一步）、
+    # 一个 rank 4 —— `cat` 的前置条件不成立 ⇒ 至少一处上游 shape 是错的 ⇒ 整条拒绝
+    # （`concat_shape_mismatch`）。同一守卫在 `csa.py:818` 上抓到过一个更贵的错：
+    # 按轴相加会把 topk 轴从 512 放大成 4224，再经 `csa.py:485` 的元素数守恒传导，
+    # 整层 saves 从 ~22 GiB 变成 **86 GiB**（见 docs/opdag_symbolic_axes_2026-07-29.md §3）。
     "csa.py:747",
+    "csa.py:818",
+    # `pooled = (kv.astype(fp32) * weights).sum(dim=1)`：`compressor.py:169` 的
+    # `chunk(tensor, 2, dim=-1)` 此前丢掉轴 → `_overlap_transform` 的产物退 `~` → 归约被拒。
+    # 现已解开（`_chunk` 用 walker 记下的 `chunks`/`chunk_dim`），保留在册备查。
+    "compressor.py:216",
     # `sink = cast(reshape(attn_sink, (1, n, 1, 1)), fp32)`：`attn_sink` 是 `Parameter`，
     # 按契约 W2/W4 不进 `ins`；该 reshape 节点 `ins` 为空且不是"操作数全是权重"的形态。
     "csa.py:506",
@@ -391,8 +400,13 @@ def test_coverage_is_partial_and_the_blockers_are_the_recorded_ones(cfg, key):
     assert cov.is_partial
     got = {src for (src, _op, _r), _k in cov.blockers(10)}
     assert got <= LEDGER_BLOCKERS, f"出现了台账之外的级联根：{got - LEDGER_BLOCKERS}"
-    assert "compressor.py:216" in got, \
-        "压缩链 `-1` 消元（`S` 与 `S//4` 不可约）的断点应该还在（修好了就更新台账）"
+    # **期望变更台账（2026-07-29）**：原断言钉的是 `compressor.py:216`（压缩链 `-1` 消元），
+    # 它已被 `_chunk` 的精确切轴解开、**出表**。不变量（"台账不许是空的：必须点名一个仍在
+    # 挡着的根，修好了就来改这一行"）逐字保留，只换例子 —— 换成两支各自的当前第一根：
+    #   unfused → `csa.py:747`（`cat` 前置条件不成立，`concat_shape_mismatch`）
+    #   fused   → `router.py:393`（`topk` 的 `k` 未记进 attrs）
+    assert got & {"csa.py:747", "router.py:393", "csa.py:777", "indexer.py:219"}, \
+        f"台账里点名的根一个都不在了（修好了就更新台账）：{got}"
 
 
 def test_param_census_resolves_more_than_it_gets_into_the_graph(cfg):

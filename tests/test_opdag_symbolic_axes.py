@@ -225,6 +225,52 @@ def test_squeeze_refuses_when_the_axis_is_not_provably_one():
     assert n.out.split(":")[1].startswith(SS.NUMEL_ONLY)
 
 
+def test_chunk_splits_the_recorded_axis_exactly():
+    """`self.chunk(tensor, 2, dim=-1)` @ `compressor.py:169`（`_overlap_transform`）。
+
+    份数与轴 walker 都记了（`construct_walker.py:2286-2295` 的 `chunks`/`chunk_dim`），
+    `shape_infer._chunk` 此前**只用份数、丢掉轴**，一律压成"单轴 = 总积/k" ⇒ `~`。
+    于是 `compressor.py:216 ×4` 那条级联根一直挡着：`_overlap_transform` 的产物没有轴结构，
+    `:215` 的 softmax(dim=1) 与 `:216` 的 sum(dim=1) 都按轴走，只能拒绝。
+    """
+    n = _node(1, "View", "compressor.py:169", ins=["t:?:bf16"], out="a:?:bf16",
+              view="chunk", chunks=2, chunk_dim=-1, outs=["a:?:bf16", "b:?:bf16"])
+    _run(_dag(n), {"t": "S·B·(2·v_head_dim)"})
+    assert n.out.split(":")[1] == "S·B·v_head_dim"
+
+
+def test_chunk_refuses_the_axis_when_it_is_not_provably_divisible():
+    """轴长除不尽份数 ⇒ 各份不等长 ⇒ 不许给一个 floor 值当"每份"。
+
+    这里**元素数**仍可精确二分（总积 `2·S·B·H`），故退回既有的"只知元素数"档；
+    轴结构不给（`~`），下游按轴改形的算子照旧拒绝。
+    """
+    n = _node(1, "View", "x.py:1", ins=["t:?:bf16"], out="a:?:bf16",
+              view="chunk", chunks=2, chunk_dim=0, outs=["a:?:bf16", "b:?:bf16"])
+    _run(_dag(n), {"t": "S·B·(2·H)"})
+    assert n.out.split(":")[1].startswith(SS.NUMEL_ONLY)
+    assert "S//2" not in n.out
+
+
+def test_chunk_gives_nothing_when_even_the_element_count_is_unprovable():
+    """连元素数都除不尽 → `?`（既有行为，回归钉）。"""
+    n = _node(1, "View", "x.py:1", ins=["t:?:bf16"], out="a:?:bf16",
+              view="chunk", chunks=2, chunk_dim=0, outs=["a:?:bf16", "b:?:bf16"])
+    rep = _run(_dag(n), {"t": "S·B·H"})
+    assert n.out.split(":")[1] == "?"
+    assert any(r["reason"] == "chunk_axis_unknown" for r in rep)
+
+
+def test_chunk_fails_loud_when_the_two_source_facts_disagree():
+    """份数有两条源侧事实：字面量 `chunks` 与元组解包元数。**不一致就是解错了**。"""
+    n = _node(1, "View", "x.py:1", ins=["t:?:bf16"], out="a:?:bf16",
+              view="chunk", chunks=3, chunk_dim=-1,
+              outs=["a:?:bf16", "b:?:bf16"])
+    rep = _run(_dag(n), {"t": "S·B·(6·H)"})
+    assert n.out.split(":")[1] == "?"
+    assert any(r["reason"] == "chunk_axis_unknown" for r in rep)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. shape_infer：切片边界（`compressor.py:233`）
 # ══════════════════════════════════════════════════════════════════════════════
