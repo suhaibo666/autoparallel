@@ -40,13 +40,20 @@ GOLDEN_OPS = {
 # 2026-07-16：pre-FFN norm(ln2) 补建 → 3 个 MoE 层各 +1 个 ln2_g([H]fp32) 参数 → persistent
 #   +32256 B（4016286720→4016318976）；full 重算下 ln2 saved 激活丢弃 → act_live/recomp/峰值事件
 #   逐字节不变；峰 +32256 B（仍 12500.9 MiB，真机 12473.1 → 1.0022 不变）。
+# **2026-07-29 二次重钉**（`docs/census_fix_mhc_rmsnorm_2026-07-29.md` Fix 2）：
+#   `FusedRMSNorm.construct`（`layer_norm.py:151-155`）**不** cast，`:149` 的 self.cast 是死属性；
+#   DSv3 站点 `normalization="RMSNorm"`（`configuration_deepseek_v3.py:149`）→ `get_norm_cls`
+#   （`:190-191`）恒返回 `FusedRMSNorm` → 其保留输入**不产生 fp32 副本**。norm-fp32 抬升改为
+#   按 norm 种类成立后，DSv3 的 ln1/ln2/q_a_norm/kv_a_norm/final_norm 全部落回自身 dtype。
+#   act_live 3279945728 → 3265265664（−14680064 B = −14.0 MiB）；峰 12500.9 → 12486.9 MiB
+#   （真机 12473.1 → 1.0022 → **1.0011**，仍在保守侧）。逐桶之和 == 峰值的不变量不动。
 GOLDEN_BREAKDOWN = {
-    "persistent": 4016318976, "act_live": 3279945728, "gather_buf": 463346688,
+    "persistent": 4016318976, "act_live": 3265265664, "gather_buf": 463346688,
     "grad_buf": 926686208, "recomp_scratch": 0, "bwd_scratch": 4236247040,
     "swap_buf": 0, "workspace": 0, "framework": 185597952,
 }
 GOLDEN_PEAK_EVENT = "bwd@5"
-GOLDEN_PEAK_BYTES = 13108142592        # = 12500.9 MiB（真机 12473.1 → 1.0022）
+GOLDEN_PEAK_BYTES = 13093462528        # = 12486.9 MiB（真机 12473.1 → 1.0011）
 
 
 def _spec():
@@ -80,6 +87,6 @@ def test_dsv3_breakdown_frozen_and_anchor():
         assert getattr(b, k) == v, (k, getattr(b, k), v)
     assert p.peak_event == GOLDEN_PEAK_EVENT
     assert p.peak_bytes == GOLDEN_PEAK_BYTES
-    assert abs(p.peak_bytes / MiB - 12500.9) < 0.1
+    assert abs(p.peak_bytes / MiB - 12486.9) < 0.1
     # 逐桶之和恰为峰值（无遗漏/重复）
     assert sum(GOLDEN_BREAKDOWN.values()) == GOLDEN_PEAK_BYTES

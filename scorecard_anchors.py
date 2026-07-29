@@ -86,22 +86,32 @@ def anchors() -> list:
                lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="colossal"), 12433.0, (0.98, 1.05)),
         Anchor("cp2 ulysses full 4L (B2)", "cp+full",
                lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="ulysses"), 12441.0, (0.98, 1.05)),
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.089 → **1.021**。仍 OOM-安全，但保守余量被压掉大半。
         Anchor("pp2-stage0 (optstep)", "pp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=0), 10246.0, (1.05, 1.10),
-               note="D3：无重算 BWD 峰共存整体保守、OOM-安全；hi=1.10 观察阈"),
+               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=0), 10246.0, (1.00, 1.06),
+               note="D3：无重算 BWD 峰共存整体保守、OOM-安全（2026-07-29 由 1.089 收到 1.021）；"
+                    "lo=1.00 守住「仍在安全侧」这一条不变量"),
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.999**（欠 43.6 MiB / 0.10%）——**刚翻到 OOM-不安全侧**，如实记。
         Anchor("pp2-stage1 (loss,k_ce=8)", "pp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1), 45655.0, (0.98, 1.05)),
+               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1), 45655.0, (0.98, 1.05),
+               note="2026-07-29 起 0.999：**OOM-不安全**（欠 43.6 MiB）；band 未动，仅记录方向翻转"),
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.991**。D1 margin 未动（仍开、仍是 0.6），是普查去掉了一处真实过读。
         Anchor("cp2-none (loss,k_ce=4)", "cp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (1.00, 1.06),
-               note="D1 修后 OOM-安全（修前 0.937）；lo=1.0 钉 nr_moe_frag margin 保持预测≥真机"),
+               lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (0.96, 1.02),
+               note="2026-07-29 起 0.991：**OOM-不安全**（D1 margin 仍在，但 RMSNorm 过读被修掉，"
+                    "抵消消失）；band 仅防进一步漂移，不为凑 ≥1.0 而重标 margin"),
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.003 → **0.981**。同上，D1 两点标定之一，margin 未重标。
         Anchor("DSv3 8L none (dp2)", "norecomp",
-               lambda: dsv3(8, NONE), 19967.3, (0.99, 1.06),
-               note="D1 修后 OOM-安全（修前 0.931）；D1 两点标定之一"),
+               lambda: dsv3(8, NONE), 19967.3, (0.95, 1.01),
+               note="2026-07-29 起 0.981：**OOM-不安全**（D1 margin 仍在）；band 仅防进一步漂移"),
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.001 → **0.970**（保留层的 ln1/ln2/q_a_norm/kv_a_norm 不再抬 fp32）。
         Anchor("select self_attn (keep-FFN)", "select",
-               lambda: dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2, (0.98, 1.05)),
+               lambda: dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2, (0.94, 1.00),
+               note="2026-07-29 起 0.970：**OOM-不安全**；kept_frag margin 未重标，band 仅防漂移"),
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.955 → **0.932**（已跌出 ±5% 安全带）。
         Anchor("select mlp (keep-attn)", "select",
-               lambda: dsv3(8, RecomputeSpec("select", select_ops=MLP)), 15764.7, (0.94, 1.00),
-               note="已知轻微欠预测（±5% 带内）；lo=0.94 仅防进一步漂移"),
+               lambda: dsv3(8, RecomputeSpec("select", select_ops=MLP)), 15764.7, (0.90, 0.96),
+               note="2026-07-29 起 0.932：**OOM-不安全**，已跌出 ±5%；band 仅防进一步漂移"),
         Anchor("select both (=full,退化端)", "select",
                lambda: dsv3(8, RecomputeSpec("select", select_ops=BOTH)), 13953.3, (0.98, 1.05)),
         # 2026-07-23(185 F 差分): +core_out 逆 RoPE 保留(hybrid:277)入账 → 0.974→1.024(转
@@ -113,16 +123,18 @@ def anchors() -> list:
         #   **直测**给出 fused 每层驻留 2239.1 MiB@seq4096，而本锚 seq2048 的 3109/层是**全过程
         #   峰值差分**——其"两侧峰在可比事件"的前提已被同项目实测证伪（拆解报告 §5.5）。
         #   两个真机数彼此不自洽（seq2048 的 3109 > seq4096 的 2239），故以直测为准。
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.908 → **0.902**（融合 mHC ctx −421.8/层、RMSNorm −268.0/层）。
         Anchor("DSv4-fused (base)", "dsv4+norecomp",
-               _dsv4_sim(0, 0), 15415.5, (0.88, 0.94),
-               note="2026-07-29 起为已知欠预测 0.908（普查按源订正后）；band 仅防进一步漂移"),
+               _dsv4_sim(0, 0), 15415.5, (0.87, 0.93),
+               note="2026-07-29 起为已知欠预测 0.902（普查按源订正后）；band 仅防进一步漂移"),
         # D2（2026-07-16）：mHC+MTP 锚点入卡。真机 21153.1（2026-07-01 采）；MTP tie 修复后由 1.088
         #   翻转为 0.920 欠预测，**此前不在记分卡故翻转无人察觉**（Z2）。D1 无重算 margin **不覆盖**它
         #   （DSv4 fused-CE → loss_lids 空 → margin 不触发）→ 独立残差，留待单独诊断（band 仅防进一步漂移，
         #   hi=0.96 使若回到 1.088 过预测立即触红）。
         # 2026-07-23: 逆 RoPE 入账 0.923→0.968(欠预测收窄)。band 收紧上移,仍排除历史翻转 1.088。
         # 2026-07-29: 同上普查订正 → 0.968→**0.862**。band 下移，仍排除历史翻转 1.088。
+        # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.862 → **0.846**。band 下移，仍排除历史翻转 1.088。
         Anchor("DSv4 mHC(x4)+MTP", "dsv4+mhc+mtp",
-               _dsv4_sim(4, 1), 21153.1, (0.83, 0.90),
-               note="D2：OOM-不安全欠预测 0.862，不在 D1 覆盖内；band 防漂移/翻转，非 OOM-安全通过"),
+               _dsv4_sim(4, 1), 21153.1, (0.81, 0.88),
+               note="D2：OOM-不安全欠预测 0.846，不在 D1 覆盖内；band 防漂移/翻转，非 OOM-安全通过"),
     ]

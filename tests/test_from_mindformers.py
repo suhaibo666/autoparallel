@@ -148,7 +148,10 @@ def test_dsv4align_roundtrip_same_peak():
     #   在本项目上并不成立（g/h 对就翻车）。两个真机数彼此不自洽（seq2048 的 3109 > seq4096 的
     #   2239，方向反了），故以**直测**为准、把差分锚降级为参考。见仲裁 §3。
     assert bundle.parallel.dp_shard == 2 and bundle.recompute.mode == "None"
-    assert abs(_peak(bundle) - 13994.8) < 1.0
+    # → **13899.8**（2026-07-29 二次重钉，`docs/census_fix_mhc_rmsnorm_2026-07-29.md`）：
+    #   融合 mHC ctx 按源建 + `FusedRMSNorm` 不 cast。真机 15415.5 → **0.902**。
+    #   ⚠ 仍是 OOM-**不安全**方向，且比 0.908 更欠 —— **如实记，不调参掩盖**。
+    assert abs(_peak(bundle) - 13899.8) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────
@@ -164,7 +167,8 @@ def test_dsv3_roundtrip_llmconfig_field_for_field():
 def test_dsv3_roundtrip_same_peak_12409():
     bundle = from_mindformers_dict(_dsv3_mf())
     assert bundle.recompute.mode == "full" and bundle.recompute.full_layers == {1, 2, 3, 4}
-    assert abs(_peak(bundle) - 12437.9) < 1.0
+    # 2026-07-29 二次重钉：12437.9 → 12423.9（RMSNorm 不 cast；DSv3 同样走 FusedRMSNorm）。
+    assert abs(_peak(bundle) - 12423.9) < 1.0
 
 
 def test_dsv3_8L_roundtrip_peak_matches_preset():

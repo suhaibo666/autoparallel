@@ -149,7 +149,8 @@ def test_dsv3_dp2_full_anchor_byte_stable():
                   RecomputeSpec("full", full_layers={1, 2, 3, 4}), SwapSpec()).evaluate()
     p = r.per_stage[0]
     assert p.peak_event == "bwd@5", p.peak_event
-    assert abs(p.peak_bytes / MiB - 12437.9) < 0.1
+    # 2026-07-29 二次重钉：12437.9 → 12423.9（RMSNorm 不 cast）；experts 拆分仍不改峰值。
+    assert abs(p.peak_bytes / MiB - 12423.9) < 0.1
 
 
 # ---------------------------------------------------------------------------

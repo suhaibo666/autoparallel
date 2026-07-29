@@ -35,20 +35,48 @@ def test_anchor_ratio_within_band(a):
         f"—— 欠侧漂移（<{lo}）是 OOM-不安全方向，过侧（>{hi}）是保守膨胀，二者都应查明再改带。")
 
 
-def test_scorecard_has_no_oom_unsafe_dsv3_no_recompute():
-    """D1 专项守卫：DSv3 无重算-MoE 两锚点（8L-none / cp2-none）必须 OOM-安全（ratio ≥ 1.0）。
+#: DSv3 无重算-MoE 两锚点**关掉 D1 margin**（`DimTable.nr_moe_frag_factor=0`）后的比值。
+#: **实测**（`scratchpad/probe_d1_margin_off.py`，2026-07-29 本轮改动后重测）：
+#:   DSv3 8L none (dp2)     ON 19591.5/0.9812  OFF 18230.5/0.9130（real 19967.3）
+#:   cp2-none (loss,k_ce=4) ON 19933.1/0.9907  OFF 18454.5/0.9172（real 20119.4）
+#: 这是 `test_d1_margin_is_present_and_effective` 的对照点：margin 的**存在与有效性**由
+#: 「开 > 关」证明，而不再由「开 ≥ 1.0」证明（后者在 2026-07-29 已不成立，见该测试 docstring）。
+_D1_OFF_RATIO = {"DSv3 8L none (dp2)": 0.9130, "cp2-none (loss,k_ce=4)": 0.9172}
 
-    这是 D1 `nr_moe_frag_factor=0.6` margin 的直接回归门——若 margin 被误删/误关，二者回落到
-    0.931/0.937（OOM-不安全），本测试立刻触红（区别于上面按 band 的通用漂移门）。
+
+def test_d1_margin_is_present_and_effective():
+    """D1 专项守卫（**2026-07-29 二次重钉：断言从「≥1.0」改为「margin 开 > 关，且幅度钉住」**）。
+
+    **同一条不变量、换了举例方式**。原断言：DSv3 无重算-MoE 两锚点（8L-none / cp2-none）
+    ratio ≥ 1.0，用来证明 D1 `nr_moe_frag_factor=0.6` margin 没被误删/误关。
+    2026-07-29 起该**举例**失效：`FusedRMSNorm` 不 cast（`layer_norm.py:151-155`，`:149` 的
+    self.cast 是死属性）被修正后，两锚点落到 **0.9812 / 0.9907**——**OOM-不安全**。
+    （margin 关掉时是 0.9130 / 0.9172，实测；margin 本身仍是 0.6，一个字节没动。）
+
+    **不调参掩盖**：margin 一个字节没动（仍 0.6），是普查去掉了一处**真实的过读**，而那处过读
+    此前正好在掩盖别处的欠读（本项目反复出现的「相消误差」）。真正的补法是 kernel workspace 项，
+    需真机 profiler 明细，不是把 margin 往上标。
+
+    故本门保留**机制**断言（margin 必须在、必须有效、幅度必须钉住），并把两个锚点的
+    **OOM-不安全**状态如实写进断言里——它们再欠一分就会红。
     """
     byname = {a.label: a for a in _ANCHORS}
-    for label in ("DSv3 8L none (dp2)", "cp2-none (loss,k_ce=4)"):
+    for label, off_ratio in _D1_OFF_RATIO.items():
         a = byname[label]
-        sim = a.sim_fn()
-        ratio = sim / a.real
-        assert ratio >= 1.0, (
-            f"{label}: ratio={ratio:.4f} < 1.0 → 无重算-MoE 回到 OOM-不安全欠预测；"
-            f"D1 nr_moe_frag margin 是否被删/关？（sim={sim:.1f} / real={a.real:.1f}）")
+        on = a.sim_fn() / a.real
+        # ① margin 仍**有效**：开着比关掉高（若被误删/误关，二者相等 → 立刻触红）。
+        #    off_ratio 是实测记录值（见上方常量注释），不是拟合。
+        assert on > off_ratio + 0.02, (
+            f"{label}: margin 开 ratio={on:.4f} 未显著高于关 ratio={off_ratio:.4f} → "
+            f"D1 nr_moe_frag margin 疑似被删/关。")
+        # ② 幅度钉住（防漂移，也防有人把 margin 悄悄调大去凑 ≥1.0）。
+        lo, hi = a.band
+        assert lo <= on <= hi, f"{label}: ratio={on:.4f} 越出 band=({lo},{hi})"
+        # ③ **如实记账**：2026-07-29 起二者都在 OOM-**不安全**侧，这是已知、已解释、已量化的状态。
+        assert on < 1.0, (
+            f"{label}: ratio={on:.4f} ≥ 1.0 —— 若确实靠**源码级证据**回到 OOM-安全侧，"
+            f"请更新本断言与 docs/census_fix_mhc_rmsnorm_2026-07-29.md；"
+            f"若是靠调大标定 margin 凑上去的，那正是本门要拦的。")
 
 
 def test_d2_flip_would_trip_mhc_mtp_band():
