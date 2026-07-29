@@ -28,6 +28,20 @@ _DEF = {"preset": "custom", "ffn": "3072", "select": "attn", "sel_layers": "",
         "dp_replicate": "1", "reshard": "default", "cpu_offload": "0", "prefetch": "1", "sp": ""}
 
 
+#: 站点 launcher 家族的**逐层**压缩比（2026-07-30，`docs/compress_ratios_mismatch_2026-07-30.md`）。
+#:   - 4 层：`analysis/dsv4_flash_calibration_handoff_2026-07-22.md:121` 逐字记着那次跑的配置
+#:     「（185 跑的那个，改 apply_dsa_kernel_fusion/use_fused_mhc 切 fused/unfused）… 4层 /
+#:     seq2048 / … / **compress_ratios[0,4,128,4]** / …」；同文档 `:69` 第 4 行给出该配置真机
+#:     `26499 / 29826` —— 正是下方 F0 锚的 26499（**逐位认亲**，同一跑）。
+#:   - 8 层：`analysis/realmachine/ab_fusion_2026-07-25/dsv4h_fused_pp4_recomp.yaml:121`
+#:     `[0, 4, 128, 4, 128, 4, 128, 4]`（4 层表正是它的前 4 项）。
+#: ⚠ **U2/F1（8L @seq2048）用 8 层站点表是推断**：仓内没有它们自己的 yaml，依据是「与 U1/F0
+#:   同一 launcher 按层数放大」+「4 层记录是 8 层表的前缀」。若日后翻出原始 yaml 与此不符，
+#:   U2/F1 的读数须回滚重钉。
+#: 缺层数 → KeyError（fail-loud）：新层数必须先找出它那次跑的表，不许悄悄退回预设循环近似。
+_SITE_RATIOS = {4: "0,4,128,4", 8: "0,4,128,4,128,4,128,4"}
+
+
 def _dsv4_q(layers, fused, seq="2048", pp="1", recompute="None", mbs="1", split=None):
     q = dict(_DEF)
     q.update({
@@ -45,6 +59,8 @@ def _dsv4_q(layers, fused, seq="2048", pp="1", recompute="None", mbs="1", split=
         #   故此处恒 "1"。认亲证据：本文件 P3-P 的真机 25343.5 == `liveness_ab_validate.py` 的
         #   run `e fused ON L8 m8` s0，即同一批站点跑。
         "hc": "4", "mhc_fused": "1", "dsa_fused": ("1" if fused else "0"), "ce_fused": "1",
+        # `compress_ratios`（2026-07-30 新增）：见上方 `_SITE_RATIOS` 的逐条出处。
+        "compress_ratios": _SITE_RATIOS[layers],
         "dp": "2", "tp": "1", "ep": "2", "pp": pp, "cp": "1", "method": "colossal",
         "optimizer": "muon", "opt_dtype": "fp32", "grad_bytes": "4",
         "maxdev_gib": "58", "recompute": recompute, "mbs": mbs,
@@ -67,11 +83,27 @@ def _peaks(q):
 #   U1 峰 41464.3 → **38834.8**（/40194 = 1.032 → **0.966**，由过读翻为欠读 = OOM-不安全，
 #   如实记；band (0.95,1.08) **未动**、仍绿）。
 #   U2 峰 75734.4 → **70475.6**（/56010 = 1.352 → **1.258**；OOM 翻正断言 `>56010` 未动、仍绿）。
+# 2026-07-30 二次（**逐层压缩比配置错配修复**，`docs/compress_ratios_mismatch_2026-07-30.md`）：
+#   4 层站点表 `[0,4,128,4]` 的末层是 **r4**，而预设循环 `(0,4,128,0)` 末层是 r0 → U 相位
+#   （unfused DSA）由 1 个 r4 层变 2 个：**unfused 的 r4 层要物化 `index_scores [B,S,64,S]` fp32
+#   与 CSA 的 fp32 副本群**（`cost_eval/layers/indexer.py:245` / `csa.py:490,531`，
+#   `analysis/dsv4_flash_calibration_handoff_2026-07-22.md:33`），单层就值 ~5.9 GB @seq2048。
+#   U1 峰 38834.8 → **44760.9**（/40194 = 0.966 → **1.114**）；U2 峰 70475.6 → **76585.3**
+#   （/56010 = 1.258 → **1.367**，OOM 翻正断言 `>56010` 未动、仍绿）。
+#   ⚠ **U1 是本轮唯一"离 1.00 更远"的锚点**（0.966 欠读 → 1.114 过读）。**不调参掩盖**：
+#   4 层站点表有逐字出处（见 `_SITE_RATIOS`），层型分布不是可调的东西；残差归到 unfused r4
+#   分支的逐桶归因——它从来没闭过（同上 handoff `:68` 第 3 行逐字「80%（未闭，缺逐桶归因）」）。
+#   方向上过读是 OOM 安全侧。
 def test_u1_unfused_peak_within_5pct():
+    """（函数名里的 "5pct" 是历史名：带自 2026-07-24 起就是 (0.95,1.08)=±8%，不是 ±5%。）"""
     p = _peaks(_dsv4_q(4, fused=False))[0]
-    assert 0.95 <= p / 40194.0 <= 1.08, (
+    # **不变量未变**：U 相位绝对堆叠必须落在一条**已记录的窄带**里（防 unfused 建模悄悄漂）。
+    # **只移动举例**（按 `docs/opdag_walker_core_2026-07-25.md` §6.6）：(0.95,1.08) → (1.05,1.18)
+    #   —— 带宽 0.13 **原样不变**，只整体平移到新读数 1.114 上。
+    assert 1.05 <= p / 40194.0 <= 1.18, (
         f"U1 unfused 峰 sim={p:.1f} vs 真机 bwd_peak 40194（修前 29516/−27%;逐桶合账:"
-        f"saves 过估 +4.5G 与 floor 欠账 −3.7G 相抵,净 +4.6%,见 probe 报告）")
+        f"saves 过估 +4.5G 与 floor 欠账 −3.7G 相抵,净 +4.6%,见 probe 报告；"
+        f"2026-07-30 起用 4 层站点表 [0,4,128,4]，比预设循环多一个 unfused r4 层）")
 
 
 def test_u2_unfused_oom_flip():
@@ -106,14 +138,22 @@ def test_fused_per_layer_increment():
     #   448 MiB/模块 ×2 模块 @seq2048（= 站点 seq4096 的一半，896/2=448/层）扣掉峰值事件重叠。
     #   **不变量未变**（只钉「同源差分不漂 + F0 绝对值不漂」，不断言命中 3109 —— 两个真机数
     #   彼此不自洽，见 docstring）；**只移动举例值 + 记录带**：(0.80,1.05) → (0.70,0.90)。
-    assert abs(per_layer - 2343.2) < 5.0, (
-        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 2343.2（真机差分锚 3109，比值 0.754；"
+    # 2026-07-30 五次重钉（**逐层压缩比配置错配修复**，`docs/compress_ratios_mismatch_2026-07-30.md`）：
+    #   3000.5 → 2343.2 → **2339.1**（/3109 = **0.752**）。F 相位是 **fused** DSA：r0/r4/r128
+    #   三档在融合分支上的 saves 差很小（稀疏中间量走 kernel scratch 不物化），故层型换档只值
+    #   F0 +135.1 / F1 +118.8，差分几乎不动（−4.1）。**记录带 (0.70,0.90) 未动、仍绿**；
+    #   记录值仍重钉（旧值 2343.2 与新读数只差 4.1、刚好卡在 <5.0 容差内会"侥幸绿"，
+    #   留着会误导下一轮）。
+    assert abs(per_layer - 2339.1) < 5.0, (
+        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 2339.1（真机差分锚 3109，比值 0.752；"
         f"两个真机数不自洽，见 docstring）")
     assert 0.70 <= per_layer / 3109.0 <= 0.90, (
         f"fused 每层差分 sim={per_layer:.1f} vs 真机差分锚 3109 = {per_layer/3109:.3f}——"
         f"越出记录带，说明普查又动了量级，请回到仲裁文档核对")
     # F0 绝对（2026-07-30 mHC 分支修复后）：24987.3 → **22357.8**，/26499 = 0.943 → **0.844**，
     #   仍欠读；band (0.83,1.02) **未动**、仍绿。
+    # 2026-07-30 逐层压缩比修复后：22357.8 → **22492.9**，/26499 = 0.844 → **0.849**，
+    #   仍欠读；band (0.83,1.02) **仍未动**、仍绿。
     assert 0.83 <= p4 / 26499.0 <= 1.02, f"F0 绝对 sim={p4:.1f} vs 锚 26499"
 
 
@@ -198,6 +238,10 @@ def test_p3p_m8_theoretical_and_gap():
     # 2026-07-30 五次重钉（**mHC 分支配置错配修复**，`docs/fused_mhc_branch_mismatch_2026-07-30.md`）：
     #   18696.2 → **17381.8**（−1314.4，与 pp4 全重算解码层 stage 同幅）；
     #   s0 vs 真机 25343.5：0.738 → **0.686**，**仍欠读**（本门断言的不变量方向不变）。
+    # 2026-07-30 六次（**逐层压缩比配置错配修复**）：**逐 MiB 不变 17381.8**（0.686）。
+    #   pp4 = 2 层/stage，s0 = (L0,L1) = (r0,r4) —— 预设循环与站点表在这两层上**同档**
+    #   （两表都以 `0,4,…` 开头）→ 本轮对该 stage 恒等。s1/s2/s3 换档（见 `_peaks` 之外的
+    #   pp4 锚点门），但本门只断言 s0 与「s1-s3 的 m 无关性」，后者两侧同表故仍成立。
     assert abs(pk[0] - 17381.8) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17381.8"
     assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
