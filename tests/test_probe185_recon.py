@@ -38,7 +38,13 @@ def _dsv4_q(layers, fused, seq="2048", pp="1", recompute="None", mbs="1", split=
         "hidden": "4096", "moe_ffn": "2048", "ffn": "16384",
         "q_lora": "1024", "kv_lora": "512", "qk_nope": "448", "qk_rope": "64",
         "v_head": "512", "vocab": "129280",
-        "hc": "4", "dsa_fused": ("1" if fused else "0"), "ce_fused": "1",
+        # `mhc_fused`（2026-07-30 新增，`docs/fused_mhc_branch_mismatch_2026-07-30.md`）：站点
+        #   dsv4h launcher 家族的 **fused 与 unfused 两份 yaml 都**写 `use_fused_mhc: true`
+        #   （`analysis/realmachine/ab_fusion_2026-07-25/dsv4h_{fused,unfused}_pp4_recomp.yaml:109`）
+        #   —— `fused` 这个入参切的是 **DSA kernel**（`apply_dsa_kernel_fusion`），与 mHC 融合无关，
+        #   故此处恒 "1"。认亲证据：本文件 P3-P 的真机 25343.5 == `liveness_ab_validate.py` 的
+        #   run `e fused ON L8 m8` s0，即同一批站点跑。
+        "hc": "4", "mhc_fused": "1", "dsa_fused": ("1" if fused else "0"), "ce_fused": "1",
         "dp": "2", "tp": "1", "ep": "2", "pp": pp, "cp": "1", "method": "colossal",
         "optimizer": "muon", "opt_dtype": "fp32", "grad_bytes": "4",
         "maxdev_gib": "58", "recompute": recompute, "mbs": mbs,
@@ -55,6 +61,12 @@ def _peaks(q):
 
 
 # ── A. unfused 绝对堆叠（U 相位）────────────────────────────────────────────────────
+# 2026-07-30（mHC 分支配置错配修复，`docs/fused_mhc_branch_mismatch_2026-07-30.md`）：
+#   U 相位的 `fused=False` 切的是 **DSA kernel**，站点 yaml 的 mHC 仍是融合
+#   （`dsv4h_unfused_pp4_recomp.yaml:109` 同样 `use_fused_mhc: true`）→ 本组也吃这次修复。
+#   U1 峰 41464.3 → **38834.8**（/40194 = 1.032 → **0.966**，由过读翻为欠读 = OOM-不安全，
+#   如实记；band (0.95,1.08) **未动**、仍绿）。
+#   U2 峰 75734.4 → **70475.6**（/56010 = 1.352 → **1.258**；OOM 翻正断言 `>56010` 未动、仍绿）。
 def test_u1_unfused_peak_within_5pct():
     p = _peaks(_dsv4_q(4, fused=False))[0]
     assert 0.95 <= p / 40194.0 <= 1.08, (
@@ -89,12 +101,19 @@ def test_fused_per_layer_increment():
     #   而 185 的 `fused=True` 相位真机是融合 mHC —— **配置错配**（见
     #   docs/census_fix_residual_carrier_2026-07-29.md §5）。本轮 ④ 因此打在这里 → 数值上移。
     #   记录门只钉「同源差分不漂」，比值 0.965 一并明写，防悄悄回调。
-    assert abs(per_layer - 3000.5) < 5.0, (
-        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 3000.5（真机差分锚 3109，比值 0.965；"
+    # 2026-07-30 四次重钉（**上一条错配已修**，`docs/fused_mhc_branch_mismatch_2026-07-30.md`）：
+    #   3000.5 → **2343.2**（/3109 = **0.754**）。每层差 −657.3 = 融合与非融合两条 mHC 分支的
+    #   448 MiB/模块 ×2 模块 @seq2048（= 站点 seq4096 的一半，896/2=448/层）扣掉峰值事件重叠。
+    #   **不变量未变**（只钉「同源差分不漂 + F0 绝对值不漂」，不断言命中 3109 —— 两个真机数
+    #   彼此不自洽，见 docstring）；**只移动举例值 + 记录带**：(0.80,1.05) → (0.70,0.90)。
+    assert abs(per_layer - 2343.2) < 5.0, (
+        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 2343.2（真机差分锚 3109，比值 0.754；"
         f"两个真机数不自洽，见 docstring）")
-    assert 0.80 <= per_layer / 3109.0 <= 1.05, (
+    assert 0.70 <= per_layer / 3109.0 <= 0.90, (
         f"fused 每层差分 sim={per_layer:.1f} vs 真机差分锚 3109 = {per_layer/3109:.3f}——"
         f"越出记录带，说明普查又动了量级，请回到仲裁文档核对")
+    # F0 绝对（2026-07-30 mHC 分支修复后）：24987.3 → **22357.8**，/26499 = 0.943 → **0.844**，
+    #   仍欠读；band (0.83,1.02) **未动**、仍绿。
     assert 0.83 <= p4 / 26499.0 <= 1.02, f"F0 绝对 sim={p4:.1f} vs 锚 26499"
 
 
@@ -167,7 +186,10 @@ def test_p3p_m8_theoretical_and_gap():
     #   s0 vs 真机 25343.5：0.675 → **0.709**，**仍欠读**（本门断言的不变量方向不变）。
     # 2026-07-29 四次重钉：17966.2 → **18696.2**（+730.0 整，r4 层 bwd 事件加真机实测的
     #   融合稀疏 flash-MLA 反向 kernel workspace；docs/kernel_workspace_2026-07-29.md）。
-    assert abs(pk[0] - 18696.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 18696.2"
+    # 2026-07-30 五次重钉（**mHC 分支配置错配修复**，`docs/fused_mhc_branch_mismatch_2026-07-30.md`）：
+    #   18696.2 → **17381.8**（−1314.4，与 pp4 全重算解码层 stage 同幅）；
+    #   s0 vs 真机 25343.5：0.738 → **0.686**，**仍欠读**（本门断言的不变量方向不变）。
+    assert abs(pk[0] - 17381.8) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17381.8"
     assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="4", split="2,2,2,2"))

@@ -45,12 +45,19 @@ def dsv3(N, rc, *, B=1, dp=2, cp=1, pp=1, ep=1, mbs=1, method="colossal", stage=
     return r.per_stage[stage].peak_bytes / MiB
 
 
-def _dsv4_sim(mhc: int, mtp: int) -> Callable[[], Optional[float]]:
-    """DSv4-align sim MiB（惰性；validate_dsv4align 依赖缺失 → None，让消费者 skip/标 ERR）。"""
+def _dsv4_sim(mhc: int, mtp: int, use_fused_mhc: bool = False) -> Callable[[], Optional[float]]:
+    """DSv4-align sim MiB（惰性；validate_dsv4align 依赖缺失 → None，让消费者 skip/标 ERR）。
+
+    `use_fused_mhc` 显式传（2026-07-30，`docs/fused_mhc_branch_mismatch_2026-07-30.md` §2.2）：
+    本族锚点的真机跑（2026-07-01，`prep_dsv4align.py`）容器 vendor OPP **没有**
+    `aclnnMhcPreSinkhorn` 融合 kernel → mHC 走**非融合**，故 `False` 就是忠实口径。
+    写成显式参数而非依赖默认值，是为了让「这一跑是哪条 mHC 分支」在记分卡这一层可见可审。
+    """
     def f() -> Optional[float]:
         try:
             from validate_dsv4align import evaluate as dsv4_eval
-            return dsv4_eval(num_layers=4, mhc=mhc, mtp=mtp).per_stage[0].peak_bytes / MiB
+            return dsv4_eval(num_layers=4, mhc=mhc, mtp=mtp,
+                             use_fused_mhc=use_fused_mhc).per_stage[0].peak_bytes / MiB
         except Exception:
             return None
     return f
@@ -135,12 +142,21 @@ def anchors() -> list:
         # 2026-07-29: 同上普查订正 → 0.968→**0.862**。band 下移，仍排除历史翻转 1.088。
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.862 → **0.846**。band 下移，仍排除历史翻转 1.088。
         # 2026-07-29 三次重钉（mHC 残差承载归位，docs/census_fix_residual_carrier_2026-07-29.md）：
-        #   0.846 → **0.891**。⚠ 本锚经 `validate_dsv4align.evaluate`，同样**没有** `use_fused_mhc`
-        #   旋钮 → 走**非融合** mHC 分支；上移几乎全部来自 ④（非融合分支自己的三份 fp32 副本，
-        #   `hyper_connection.py:298`/`:109`/`:120`）。真机 21153.1 是 2026-07-01 采的 DSv4 站点跑，
-        #   站点 yaml 为 `use_fused_mhc: true` → **配置错配**（见该文档 §5）。仍 OOM-不安全（<1.0），
-        #   band 上移但仍排除历史翻转 1.088。
+        #   0.846 → **0.891**。上移几乎全部来自 ④（非融合分支自己的三份 fp32 副本，
+        #   `hyper_connection.py:298`/`:109`/`:120`）。
+        #   ⚠ **2026-07-30 订正上一行紧邻的一条事实错误**（`docs/fused_mhc_branch_mismatch_2026-07-30.md`
+        #   §2.2）：上一轮在此写「真机 21153.1 的站点 yaml 为 `use_fused_mhc: true` → 配置错配」。
+        #   **这条是错的** —— 它把 167/185 的 `dsv4h_*_pp4_recomp.yaml` 与本锚点 2026-07-01 的
+        #   **dsv4-align** 跑混为一谈了。本锚点真机跑的 mHC **本来就是非融合**，三处独立源一致：
+        #     · `.claude/skills/real-machine-memory-sim/prep_dsv4align.py:120-122`（生成该跑 yaml 的
+        #       脚本）逐字「容器 vendor OPP 无 aclnnMhcPreSinkhorn 融合 kernel → mHC 走 unfused」，
+        #       键值 `os.environ.get("FUSED_MHC") == "1"`（该跑未设 → False）；
+        #     · `.claude/skills/real-machine-memory-sim/SKILL.md` §7 第 6 条同结论；
+        #     · `specs/2026-07-01-unified-llm-modelspec-design.md:297` 锚点标题逐字
+        #       「fused DSA + **unfused mHC** + MTP」。
+        #   → 模型侧 `use_fused_mhc=False` 就是**对**的分支，本锚点 **ratio 0.891 一个字节不动**；
+        #   仅把该位显式传参（见 `_dsv4_sim`）。仍 OOM-不安全（<1.0），band 仍排除历史翻转 1.088。
         Anchor("DSv4 mHC(x4)+MTP", "dsv4+mhc+mtp",
-               _dsv4_sim(4, 1), 21153.1, (0.86, 0.93),
+               _dsv4_sim(4, 1, use_fused_mhc=False), 21153.1, (0.86, 0.93),
                note="D2：OOM-不安全欠预测 0.891，不在 D1 覆盖内；band 防漂移/翻转，非 OOM-安全通过"),
     ]
