@@ -13,7 +13,7 @@
 --------------------------------------------------------------------
 ``ResolvedLayerContract``  ``layer_id: int``, ``layer_type: str``, ``ops: Sequence[op]``
 ``ResolvedOpContract``     ``name``, ``type``, ``inputs``, ``output``, ``params``, ``saves``,
-                           ``workspace_bytes``, ``bwd_scratch_bytes``
+                           ``workspace_bytes``, ``bwd_scratch_bytes``, ``norm_kind``
 ``ResolvedTensorContract`` ``name``, ``local_numel``, ``dtype_bytes``, ``is_weight``, ``detached``,
                            ``is_expert``, ``pin_under_recompute``, ``dim0``
 
@@ -33,6 +33,13 @@
 - **O1** 每个 op 有非空 `name`；`type` 可取字符串（enum 走 `.value`）。
 - **O2** `inputs` / `params` / `saves` 是序列，`output` 是**单个**张量。
 - **O3** `workspace_bytes` / `bwd_scratch_bytes` 是 ≥0 的 int（**不**要求能从源推出，见 §不要求）。
+- **O4**（2026-07-29）**`type == "norm"` 的 op 必须真实带** `norm_kind` ∈ {`"layernorm"`,
+  `"rmsnorm"`}（与 `detached` 同理由，不接受 getattr 兜底）。它是**非 liveness 桶的直通**：
+  `structure_mem._norm_save_names` 按它决定该 norm op 的 saves 要不要按 `norm_compute_dtype_bytes`
+  抬成 fp32 —— `FusedLayerNorm` 真 cast（`layer_norm.py:93-101`）要抬、`FusedRMSNorm` 输入直通
+  （`:151-155`，`:149` 的 self.cast 是死属性）不抬。缺它 = 「图能建、显存算错」，故与 T2 同级强制。
+  非 norm 的 op 可省（`_norm_save_names` 先按 type 过滤 → 无副作用）；**给了就必须合法**
+  （拼错字符串会静默退回「抬 fp32」，故非法值一律违约）。
 - **T1** 每个张量有非空 `name`、`local_numel: int`、`dtype_bytes: int`、`is_weight: bool`、
   `detached: bool`。`detached` 必须**真实存在**（不接受靠 `getattr(t,"detached",False)` 兜底：
   「没标 detach」和「标了不 detach」在 grad 可达性上是两件事，必须由生产者显式表态）。
@@ -112,6 +119,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
+from ..model_spec import NORM_KIND_CASTING, NORM_KIND_NONCASTING
+
+#: O4 合法取值（见模块 docstring）。
+_NORM_KINDS = frozenset({NORM_KIND_CASTING, NORM_KIND_NONCASTING})
+
 __all__ = [
     "ResolvedTensorContract", "ResolvedOpContract", "ResolvedLayerContract",
     "Violation", "validate_resolved_layer", "assert_resolved_layer",
@@ -161,6 +173,9 @@ class ResolvedOpContract(Protocol):
     saves: Sequence
     workspace_bytes: int
     bwd_scratch_bytes: int
+    #: O4：norm 的种类（"layernorm" = 真 cast 输入 / "rmsnorm" = 输入直通）。决定
+    #: `structure_mem._dt` 的 norm-fp32 抬升对该 op 是否成立。见模块 docstring O4。
+    norm_kind: str
 
 
 @runtime_checkable
@@ -192,6 +207,7 @@ CONTRACT_RULES = {
     "O1": "op.name 非空、op.type 可取字符串",
     "O2": "inputs/params/saves 是序列，output 是单张量",
     "O3": "workspace_bytes/bwd_scratch_bytes 是 >=0 的 int",
+    "O4": "norm_kind ∈ {layernorm, rmsnorm} 且必须真实存在（norm-fp32 抬升按它分辨）",
     "T1": "张量必备字段 name/local_numel/dtype_bytes/is_weight/detached（detached 不可缺省兜底）",
     "T2": "非 liveness 桶直通字段 is_expert/dim0/pin_under_recompute 必须在（structure_mem 直读）",
     "B1": "local_numel>0 且 dtype_bytes>0（挡住 shape='?' → 0 字节的裸抽取图）",
@@ -397,6 +413,16 @@ def validate_resolved_layer(layer, *, check_derived: bool = True) -> tuple:
             v = getattr(op, attr, 0)
             if not isinstance(v, int) or isinstance(v, bool) or v < 0:
                 out.append(Violation("O3", where, f"op.{attr}={v!r} 必须是 >=0 的 int"))
+        # O4：**norm 类型的 op** 必须显式表态 norm 种类（缺 = 图能建、显存按错 dtype 算）。
+        #   非 norm 的 op 给不给都行（`_norm_save_names` 先按 type 过滤 → 给了也无副作用）；
+        #   给了就必须合法，防拼错字符串静默退回「抬 fp32」。
+        _is_norm = _op_type_str(op) == "norm"
+        if _is_norm and not hasattr(op, "norm_kind"):
+            out.append(Violation("O4", where,
+                                 "norm op 缺 norm_kind（norm-fp32 抬升按它分辨，不接受兜底）"))
+        elif hasattr(op, "norm_kind") and getattr(op, "norm_kind") not in _NORM_KINDS:
+            out.append(Violation("O4", where,
+                                 f"op.norm_kind={getattr(op, 'norm_kind')!r} 不在 {sorted(_NORM_KINDS)}"))
 
         ins = list(op.inputs)
         pars = list(op.params)

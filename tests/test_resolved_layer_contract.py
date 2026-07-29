@@ -372,6 +372,7 @@ def test_contract_field_set_is_sufficient_on_real_dsv4_flash():
         saves: tuple
         workspace_bytes: int
         bwd_scratch_bytes: int
+        norm_kind: str          # 契约 O4（2026-07-29）：norm-fp32 抬升按它分辨
 
     @dataclass(frozen=True)
     class FL:
@@ -395,7 +396,8 @@ def test_contract_field_set_is_sufficient_on_real_dsv4_flash():
                                           tuple(_t(x) for x in op.inputs), _t(op.output),
                                           tuple(_t(x) for x in op.params),
                                           tuple(_t(x) for x in op.saves),
-                                          op.workspace_bytes, op.bwd_scratch_bytes)
+                                          op.workspace_bytes, op.bwd_scratch_bytes,
+                                          op.norm_kind)
                                        for op in l.ops))
                              for l in layers]
                          for st, layers in g.stages.items()})

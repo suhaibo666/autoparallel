@@ -50,6 +50,7 @@ import os
 import threading
 from dataclasses import dataclass, field, replace
 
+from ..model_spec import NORM_KIND_NONCASTING
 from .bprop_rules import derive_saves
 from .consumer import _dtype_bytes, axis_value, detach_aliases, local_shape_elems
 from .extractor import extract_cell
@@ -306,6 +307,12 @@ class ROp:
     #: 契约 §不要求：kernel 实现细节，源码里读不出来 → 恒 0（见模块 docstring）。
     workspace_bytes: int = 0
     bwd_scratch_bytes: int = 0
+    #: 契约 O4（2026-07-29）：norm 的种类，决定 `structure_mem._dt` 的 norm-fp32 抬升是否成立。
+    #: 抽取侧默认 `"rmsnorm"`（不抬）—— 本库当前语料（DSv3/DSv4）`normalization` 恒 "RMSNorm"
+    #: （`configuration_deepseek_v{3,4}.py:149/155`）→ `get_norm_cls` 恒返回 `FusedRMSNorm`
+    #: （`layer_norm.py:190-191`），其 `construct`（`:151-155`）**不** cast。若将来抽 LayerNorm
+    #: 模型，此处须按 `get_norm_cls` 的实参判定，不可沿用默认。
+    norm_kind: str = NORM_KIND_NONCASTING
     collectives: tuple = ()
     src: str = ""
 
