@@ -179,7 +179,13 @@ def build_moe_ffn_ops(d: DimTable) -> list:
     act  = TensorRef("e_act", (tlocal, "moe_F"),                shard={0: "ep"})
     # 专家 fc2 输出（H 维，仍按 ep 分片）
     eo   = TensorRef("e_o",   (tlocal, "H"),                    shard={0: "ep"})
-    # combine 输出（all-to-all 还原到原始 token 序列）
+    # combine 输出（all-to-all 还原到原始 token 序列）。
+    # ⚠ 2026-07-29（普查收口 ③）：这是 **mlp 内部**张量（`expert_parallel.py:535` 的 combine
+    # 输出，随后与 shared 输出相加 → `transformer_layer.py:331` 才交给 output_cell 打包），
+    # **不是** mHC 的残差流。此前 `residual._is_residual_carrier` 按 [S,B,H]+{0:"sp"} 签名把它
+    # ×n 放大到 [S,B,n·H] → **每 MoE 层过读 96 MiB**（真值 32 MiB）。现由
+    # `residual._stream_names` 按数据流位置判定，本张量不再被放大；`shard` 保持 {0:"sp"}
+    # （非 mHC 模型下它确实随序列切，改它会让 DSv3 等锚点逐字节漂移）。
     comb = TensorRef("comb",  ("S", "B", "H"),                  shard={0: "sp"})
 
     # ── 专家权重（纯 EP：dim 0 按 ep 轴切分，不含 tp）─────────────────────
@@ -272,9 +278,14 @@ def build_shared_expert_ops(d: DimTable) -> list:
     # 按序列维 {0:"sp"} 切（sequence_dim=0,numel 与旧末维 ÷tp 等价——sp==tp 时;tp=1 锚点两者
     # 恒等,逐字节不变）;输出 sh_o 权重复制下无 partial-sum（各 rank 算自己的 seq 分片）→ 去
     # partial、改 {0:"sp"}。
-    # 注:输出 sh_o 真机同为 seq-SP 分布,但 [S,B,H]+{0:"sp"} 恰是 mHC 残差承载签名
-    # (residual.py _is_residual_carrier 会将其 ×n 重命名)——sh_o 非 saves、只影响 fml,
-    # 故取**全量口径**(≥真实,保守;tp=1 恒等),不标 sp、不标 partial(权重复制下无部分和)。
+    # 注:输出 sh_o 真机同为 seq-SP 分布,但 [S,B,H]+{0:"sp"} 恰是 mHC 残差承载**签名**——
+    # sh_o 非 saves、只影响 fml,故取**全量口径**(≥真实,保守;tp=1 恒等),不标 sp、不标 partial
+    # (权重复制下无部分和)。
+    # 2026-07-29（普查收口 ③）：mHC 的 ×n 判定已由「签名」改为「数据流位置」
+    # （`residual._stream_names`：层入口 + 两个 output_cell 输出，源 `transformer_layer.py:290-334`），
+    # 故即便这里标了 {0:"sp"} 也**不会**再被 ×n —— shared/routed 输出都在 `self.mlp` 内部，
+    # 源里从不打包成流。同一条修正把 `comb`（下方 `build_moe_ffn_ops`）从 [S,B,n·H] 收回
+    # [S,B,H]：**每 MoE 层过读 96 MiB** 的根因。
     hin_sh     = TensorRef("ln2",    ("S", "B", "H"))
     sh_g       = TensorRef("sh_g",   ("S", "B", sh_fc1_out),      shard={0: "sp"})
     sh_act     = TensorRef("sh_act", ("S", "B", "moe_shared_F"),  shard={0: "sp"})
