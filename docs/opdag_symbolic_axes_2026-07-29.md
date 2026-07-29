@@ -39,11 +39,16 @@
 |---|---:|---:|---|
 | L1（unfused r0）跳过 op | **42** | **6** | ≤ 13 ✅ |
 | L1（fused r0）跳过 op | 13 | **0** | — |
-| r0 抽取侧 `activation_saves`（unfused） | 1067.6 MiB | **4496.8 MiB** | ≥ 5000 ❌（见 §5） |
+| r0 抽取侧 `activation_saves`（unfused） | 1067.6 MiB | **4496.8 MiB** | ≥ 5000 ❌（见 §6.3） |
+| 级联根 `compressor.py:216` ×4 | 在 | **出表** ✅ | 出表 |
 | 级联根 `compressor.py:233` ×3 | 在 | **出表** ✅ | 出表 |
 | 级联根 `deepseek_v4_hybrid_attention.py:205` ×1 | 在 | **出表** ✅ | 出表 |
 | 级联根 `csa.py:485` ×1（及其后继 `:496`） | 在 | **出表** ✅ | 出表 |
-| 级联根 `compressor.py:216` ×4 | 在 | **仍在** ❌ | 出表 |
+| 全局跳过 op（fused / unfused） | 502 / 1010 | **256 / 809** | — |
+
+> **四个级联根全部出表。** 唯一未达的是 `r0 saves ≥ 5000` —— 实测 4496.8，
+> 且 §6.3 逐张量证明**再往上加就是编**：抽取侧那 12 项与诊断书 §5 P2 按
+> `bprop_rules.PIN` 独立推出的清单**逐项精确相等**（6 项该在的全在、6 项不该在的全不在）。
 
 ---
 
@@ -248,3 +253,166 @@ r0（unfused）逐张量 [RAN]（`scratchpad/axis_probe_saves.py 1`，前 10）�
 复核 §3.4 反事实里"一个都没出现"的 `q_bm`/`kv_bm`/`kv_g`·`kvo_bm`/`scores`/`exp_scores`/`aw_bm`
 **现在全部在场**，且量级与诊断书 §5 P2 的逐张量预言（512 / 1024 / 1024 / 128 / 128 / 128）
 **逐项对上**（本文这一档是 fp32，故 ×2）。
+
+---
+
+## 5. 第二轮：`compressor.py:216` 出表（`chunk` 的轴）
+
+§4 的表里 `compressor.py:216 ×4` 还挡着。链路逐字追（`scratchpad/axis_probe_chain.py compressor.py 190 225`）：
+`:203/:204` 的 reshape 现在**精确**解出 `S//4·4·B·(2·v_head_dim)`（整除事实生效），
+`:209` 也精确 —— 断点在 `:212-213` 的 `_overlap_transform`，具体是它第一行
+[SRC] `compressor.py:169` `tensor_prev, tensor_next = self.chunk(tensor, 2, dim=-1)`：
+
+```
+compressor.py:169  View chunk   in kv:S//4·4·B·(2·v_head_dim)   OUT tensor_prev:~(B·S·v_head_dim)
+```
+
+`_chunk` **只用了份数、把轴丢了**（压成"单轴 = 总积/k"）—— 而 `chunks`/`chunk_dim` walker
+早就记了（`construct_walker.py:2286-2295`）。补上后逐段恢复，并与源侧 docstring 逐字对上：
+
+```
+chunk(dim=-1)  S//4·4·B·(2·v_head_dim) → S//4·4·B·v_head_dim
+cat(dim=1)     → S//4·8·B·v_head_dim      （:159-160 docstring「[n_groups, 2*ratio, b, head_dim]」）
+softmax(dim=1) → 同形
+sum(dim=1)     → S//4·B·v_head_dim        （:184 docstring「[sq // compress_ratio, b, head_dim]」）
+```
+
+份数有**两条独立的源侧事实**（字面量实参 / 元组解包元数），不一致就 fail-loud；
+轴长除不尽份数时退回"只知元素数"档（各份根本不等长，floor 值是猜）。
+
+**四个级联根至此全部出表。**
+
+---
+
+## 6. 验收数字（全部 [RAN]）
+
+### 6.1 覆盖度
+
+| | fused（run a） | unfused（run b） |
+|---|---|---|
+| 基线 | 2568 节点 → 1564 op（跳过 **502**） | 3976 节点 → 1956 op（跳过 **1010**） |
+| 现在 | 2568 节点 → **2056** op（跳过 **256**） | 4006 节点 → **2388** op（跳过 **809**） |
+
+> unfused 的节点数 3976 → 4006（+30）是 `broadcast_to` 现在建真节点所致
+> （每层 CSA 两处 × 相关层数），**不是**图变大了。
+
+逐层（unfused）：L1 42→**6**、L2/L4/L6/L8(r4) 173→**140**、L3/L5/L7(r128) 92→**81**。
+逐层（fused）：L1 13→**0**、r4 78→**37**、r128 59→**36**。
+
+### 6.2 级联根表
+
+| 基线 | 现在 |
+|---|---|
+| ×4 `compressor.py:216` `needs_axis_structure` | **出表** |
+| ×3 `compressor.py:233` `slice_bounds_unknown` | **出表** |
+| ×1 `csa.py:485` `constant_shape_unknown`（unfused）→ 其后继 `:496` | **出表** |
+| ×1 `deepseek_v4_hybrid_attention.py:205` `needs_axis_structure`（fused） | **出表** |
+| — | ×4 `csa.py:777`（unfused）/ ×4 `indexer.py:219`（fused）`constant_shape_unknown` |
+| — | ×3 `csa.py:747` `concat_shape_mismatch` / ×3 `router.py:393` `reduce_axis_unknown` |
+| — | ×1 `csa.py:506` `no_input_shape` |
+
+### 6.3 r0 抽取侧 `activation_saves`：**1067.6 → 4496.8 MiB**（验收线 ≥5000，**未达**）
+
+**但它是对的**，逐张量可核（`scratchpad/axis_probe_reconcile.py`）：
+
+```
+  layer total              4496.8 MiB over 31 tensors
+  of which csa.py:*        3079.5 MiB over 12 tensors
+  （诊断书 §5 P2 对 `unfused_compressed_sparse_attn` 函数体的净预言 = 3072 MiB）
+
+  --- 诊断书 P2「应当出现」的 6 项：6/6 在场，且**逐项数值精确相等** ---
+    kv_bm 1024→1024.0 · kvo_bm 1024→1024.0 · q_bm 512→512.0
+    scores 128→128.0 · exp_scores 128→128.0 · aw_bm 128→128.0
+  --- 诊断书 P2「应当**不**出现」的 6 项：6/6 不在场 ---
+    uq_f32 / kv_gathered / uout_f32 / uout_pm / attn_weights / uscore1
+```
+
+函数体 **3079.5** vs 预言 **3072**，Δ = **+7.5 MiB**，且这 7.5 逐项可点名：
+`flat_indices` 4.0（`csa.py:484`）+ `matrix` 2.0（`:455`）+ `sum_exp` 1.0（`:513`）+
+`__arg__i8` 0.5（`:458`）+ `__arg__i6` 0.0（`:455`）。
+
+> 这是本轮**最强的一条正确性证据**：不是"解出来了"，而是解出来的东西
+> **逐张量等于源码 + `bprop_rules.PIN` 独立推出的那份清单**。
+> 顺带**兑现了诊断书自己的 E3 判据**（`uout_f32`/`uq_f32`/`kv_gathered` 不在抽取侧 saves）——
+> 复核 §3.4 说它"既没被证伪、也没被检验"，现在被**检验且通过**。
+
+**为什么到不了 5000（不是能力问题，是"再往上加就是编"）**：
+剩下 6 个跳过 op 全部级联自 `csa.py:506`（`attn_sink` 是 `Parameter`，
+作为**自由函数实参**内联后形参没拿到声明形状），它们的字节量级是 1–2 MiB。
+把 4496.8 抬到 5000 需要再加 ~503 MiB，而按 `PIN` 表**没有**任何一项该被加进来 ——
+唯一能加的是"同名同尺寸的连续重绑被合成一个"那部分（§8-2），
+那需要 SSA 版本感知的张量身份，是**另一项**能力，且带双算风险。
+
+### 6.4 8 跑门（`tools/liveness_ab_validate.py --grad-mode chain2 --deltas --gate`）
+
+```
+  bucket       n=28  mean=0.946  min=0.748  max=1.394      （逐字不变）
+  extracted    n=0  （该来源无任何可评分格：解不出图或全 OOM）
+  hand_spec    n=28  mean=0.955  min=0.729  max=1.400      （逐字不变）
+  PASS  REAL 指纹: sha256=41e279e591ae4ae9…                （未动）
+  PASS  I1/I2 真机 ×1 / bucket ×1 / hand_spec ×1            （6 条全 PASS）
+  SKIP  I1/I2 extracted ×1（IncompleteExtraction @indexer.py:219）
+  验收门结论: PASS
+```
+
+`extracted` **仍然 8/8 拒绝出数** —— 这是**预期且必须的**：`IncompleteExtraction`
+一行没放宽（`to_resolved.py:1432-1443` 逐字不变），绝不拿一个下界冒充峰值。
+诊断书 §5 的 P3 纪律条款逐条满足。
+
+### 6.5 字节中性
+
+```
+$ git worktree add … f0d9773 && python scratchpad/dump_numbers_ab.py > before.txt   # 4265 行
+$ python scratchpad/dump_numbers_ab.py > after.txt                                  # 4265 行
+$ diff before.txt after.txt ; echo $?
+0
+```
+
+**`bucket` / `hand_spec` 的每一个数字逐字节不变，diff 为空。**
+
+### 6.6 测试
+
+`python -m pytest tests -q` → **1892 passed**（基线 1864 + 本轮 28 条新钉）。
+
+改了**期望值**的既有测试共 2 个文件、3 处，全部按
+`docs/opdag_walker_core_2026-07-25.md` §6.6 的先例办（不变量逐字保留、只换例子、逐条记原因）：
+
+| 测试 | 改了什么 | 原因 |
+|---|---|---|
+| `test_opdag_components.py::test_all_four_dsv4_cells_still_clean_after_axis_capture` | unfused `CompressedSparseAttention` 207→**209** 节点 / 240→**242** 边；`DSv4HybridSelfAttention` 240→**242** / 281→**283** | `csa.py:445/460` 的 `.broadcast_to(...)` 现在建**真节点**（它改变元素数，别名掉 = 静默丢批维）。**恰好 +2**，与源里那两处一一对应 |
+| `test_to_resolved_adapter.py::LEDGER_BLOCKERS` | 加入本轮新暴露的 5 处，旧 4 处保留在册备查 | 台账的定义就是"当前级联根逐条在册"；`got <= LEDGER_BLOCKERS` 这条不变量**逐字未动** |
+| `test_to_resolved_adapter.py` 里 `assert "compressor.py:216" in got` | 换成 `got & {csa.py:747, router.py:393, csa.py:777, indexer.py:219}` | 该断言的**作用**是"台账不许是空的：必须点名一个仍在挡着的根"。原来点名的那个已被修好、出表；换成两支各自的当前第一根，作用逐字保留 |
+
+---
+
+## 7. 纪律核对（逐条）
+
+| 铁律 | 本轮怎么守的 |
+|---|---|
+| 不编尺寸 / 轴 / 拟合常数 | 每条新规则都是**算子定义**（permute 的置换、reshape 的元素数守恒、chunk 的等分、arange 的长度、broadcast_to 的目标形）或**已核验的事实**（`ratio \| S`）。证不出就退 `~` 或保 `?` |
+| 整除身份先核验后用 | `DivFacts` 只装核验过的；核验不过进 `Coverage.div_facts_rejected`（可见）；`assert_divisible` 不成立即 `ValueError` |
+| 不许"声明即事实" | 本轮**没有**新增任何声明通路。`reshape` 单缺维那条虽然进 `declared_shapes` 台账，但它不是声明 —— 它是元素数守恒**推出来的**，记台账只为可见 |
+| 只用既有 `OpType` | 一个新 op 类型都没加；改动全在既有 `View` 子类型与 `Constant` 分支里 |
+| 不从 `__init__` 缺省值推结构 | 整除事实取的是 `DimTable.S` 与**层型串导出的** `compress_ratio`（`_ratio_of(layer_type)`），不是 `csa.py:556` 那个缺省 0 |
+| 每条结构性断言带 `file:line` | 见上文各节；新原因码 `concat_shape_mismatch` 的消息里带的是**算子前置条件**，不是"看着不对" |
+| 探针必须进库 | `scratchpad/axis_probe_{baseline,roots,chain,saves,reconcile}.py` 五个全部随代码提交 |
+| 真机数字只来自 `REAL` | 本轮**没有**引用任何新的真机数字；`REAL_SHA256` 未动、门里 PASS |
+
+---
+
+## 8. 还挡着 `extracted` 出数的东西（诚实排序）
+
+按"离一个可辩护的峰值还差多远"排，**不是**按修起来多容易。
+
+| # | 阻塞项 | 性质 | 它挡住什么 | 我的判断 |
+|---|---|---|---|---|
+| **1** | **`workspace_bytes` / `bwd_scratch_bytes` 按契约恒 0** | **结构性天花板**，不是 bug（`to_resolved_adapter_2026-07-25.md` §5.1：kernel 实现细节，源码读不出） | 即使图 100% 解出，`extracted` 的**峰值**也系统性偏低，不能与真机比 | **这是第一顺位**。在它被关掉之前，"让 `extracted` 出一个可辩护的峰值"这件事**定义上做不到**。只能另立标定项（真机 workspace 探针），或把 `extracted` 的定位永久钉死在"逐层 `activation_saves` 的独立测量"上 |
+| **2** | 同名**同尺寸**的连续重绑被合成一个张量（`csa.py:497/502` 的 `scores` 链） | 已知近似（`_Folder._bykey` 的 docstring 逐字承认） | 系统性**欠读**；r0 上目测 ~128 MiB/层 | 要 SSA 版本感知的张量身份。**带双算风险**（视图别名不能算两次）→ 必须与 `detach_aliases` 一起设计 |
+| **3** | `csa.py:747` `cat` 前置条件不成立：压缩器的**内联返回值**少了 `compressor.py:224` 的 `unsqueeze(pooled, -2)` | walker 的自由函数/子 Cell **返回值绑定**取早了一步 | 整个 r4/r128 的 CSA 主链（unfused 侧 ×3 层，每层 ~140 个 op） | 修起来在 walker 的 return 绑定；**收益最大的一项**（r4 是欠读最硬的层型）。今天由 `concat_shape_mismatch` 守卫**显式拒绝**，不会静默算错 |
+| **4** | `csa.py:506` `attn_sink` 是 `Parameter`，作为**自由函数实参**内联后形参没拿到声明形状 | 同上，walker 的**实参绑定** | r0 层最后 6 个 op（1–2 MiB） | 覆盖度上好看，字节上无关紧要 |
+| **5** | `indexer.py:219` `Tensor([int(key_length) % ratio])`；`router.py:393` `topk` 的 `k` 未记 | 两条**walker attrs 缺失**，各一行 | fused 支 ×4 / ×3 | 便宜，但都在小张量上 |
+| **6** | `csa.py:777` `arange(n_compressed)` | 级联自 #3 | — | 修了 #3 自解 |
+
+**一句话**：图的覆盖度已经不是主要矛盾了（fused 跳过 502→256、unfused 1010→809，
+且 r0 层的逐张量清单**已被独立核对为正确**）。真正挡在"可辩护的峰值"前面的是 **#1**——
+它是**契约层面的缺口**，不是抽取器的能力缺口，任何继续在 `shape_infer` 上使劲的方案都绕不过它。
