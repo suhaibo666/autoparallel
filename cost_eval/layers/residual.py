@@ -207,6 +207,61 @@ def _hc_params(prefix: str) -> tuple:
 #: `HyperConnectionOutputCell` 反向物化的打包残差流梯度（两条分支同式，见下方逐条注释）。
 _HC_OUTPUT_CELL_BWD = "4*S*B*num_residual_streams*H"
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 融合 mHC `npu_mhc_pre_sinkhorn` kernel 的**前向 workspace**
+#   —— 唯一来源是 **167 真机 memory-tracker 实测**，源码快照里读不出来
+#      （`cost_eval/liveness/contract.py:102` 逐字：workspace 是 kernel 实现细节，契约 §不要求）。
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# **测量**（`docs/kernel_workspace_2026-07-29.md` §4.1/§4.2/§4.3，MS2.10/CANN9.1/910B2，
+# `MS_ALLOC_CONF=memory_tracker:True`，run c = fused/无重算/L8/m4/pp4·dp2·ep2，
+# **S=1024 / 2048 / 4096 三个站点配置**，b=1，tp=1，cp=1，H=4096，n=num_residual_streams=4）：
+#
+#   · FWD 相位**单 kernel workspace 极大值** = **304.001 MiB**，
+#     rank0（stage0 = r0+r4）与 rank2（stage1 = r128+r4）**同值**（§4.1 表）；
+#   · 逐（层，相位）窗口的 `max_ws` 中位数同样是 **304.001 MiB**，
+#     r0 dense 与 r4 moe 各 12 个窗口全同（§4.2 表）；
+#   · **三个 seq 上一个字节不变** → **S 无关**（§8③ 逐字「S=4096/2048 两点确认 S 无关」，
+#     任务交接书按 §9 的三次跑记作 1024/2048/4096 三点；两处都判 S 无关，**只在点数上不一致**，
+#     本项按更弱的那一条用：至少 2048/4096 两点实测 S 无关，且本项**不含 S**，故两读法等价）。
+#
+# **归属证据**（tracker 的 `node_name` 对自定义融合算子是「上一条 pyboost 任务」的陈旧标签，
+# 不可信 —— 该文 §1.3；故按**输出签名**反推）：rank0 layer0 前向窗口原文（§4.3）
+#   t=29620 名义 `Concat` 的 `PyNativeOutput` 依次
+#   `0.000 / 32.000 / 0.063 / 0.250 / 0.063 / 0.375 / 0.016 / 2.500 / 10.000 MiB`
+#   —— 逐张对上本函数 `_fused_hc_ops` 声明的 `npu_mhc_pre_sinkhorn` 输出/ctx 集
+#   （`h_in` 32.0 / `h_post` 0.0625 / `h_res` 0.25 / `h_pre` 0.0625 / `hc_before_norm` 0.375 /
+#    `inv_rms` 0.0156 / `sum_out` 2.5 / `norm_out` 10.0，见本文件 `_fused_hc_ops` 的 ctx 逐字表）；
+#   紧随其后 t=29631 落地 **304.00 MiB 的 WORKSPACE 块**。
+#   同一模式在**该层窗口内出现两次**（t=29631 与 t=29922，后者紧接 dense FFN 的
+#   `RmsNorm→MatMulExt→SplitWithSizeView→SiLU→Mul→MatMulExt`）→ 正是**每层两个 HC 模块**
+#   （attn_hc + ffn_hc），**每次 304.001 MiB**。本常量因此挂在**两个** `*_hc_pre_sinkhorn` op 上。
+#
+# **字节值 318768128 是怎么来的**（观测 vs 推断，分开写）：
+#   · **观测**：tracker 报的是三位小数的 `304.001 MiB`。
+#   · **推断**：分配器块尺寸在本站点全是 **512 B 的整数倍**（仓内既有采集的直证：
+#     `analysis/realmachine/pp2_norecomp/op_816362.csv` 的 `Size(KB)` 列取值形如
+#     `1093379.0` / `904960.5` / `16513.5` / `256.5` —— 半 KB 粒度；
+#     `docs/head_workspace_2026-07-30.md` §1.3 的 `+3072 B` 尾亦是 512 的倍数）。
+#     在 `304.001` 这个三位小数窗口 `[318767628, 318768676)` 里，形如 `304 MiB + k·512 B`
+#     的值**唯一**：`318767104 + 1024 = 318768128`（+512 显示成 304.000、+2048 显示成 304.002）。
+#   · 残余不确定度 ≤ 1.5 KiB = **0.0005 %**，抬不动任何一个锚点；取该值使模型**逐位复现
+#     实测的三位小数显示**（`304.001`），而 304 MiB 整会显示成 `304.000`。
+#
+# **缩放的适用边界（超出即未测，不外推 —— 本项是常数，故"不外推"= 不随任何维变化）**：
+#   · S：**已扫**（S 无关，见上）。本常量不含 S → `shape_eval` 的「含 S 就 ÷cp」规则不触发
+#     （`cost_eval/shape_eval.py:255`），常数不被 cp 除。整体 ÷cp 会让 cp>1 欠读 = OOM-**不安全**。
+#   · **B / num_residual_streams(n) / H / mhc_sinkhorn_iterations：一律未扫**（只有
+#     B=1 / n=4 / H=4096 / 站点默认迭代数这一个点）。故本项**不承诺**随它们变化：
+#     若真值随某维增长，则更大配置上欠读；若真值随某维缩小，则更小配置上过读。
+#     今天全部走本分支的锚点（pp4 / pp8 / MTP / 185 F/U 相位）都恰是 B=1、n=4、H=4096
+#     —— 与测量站点同点，故**没有任何在用锚点依赖这条外推**。
+#   · tp / sp：字符串通道不切分 → tp>1 不 ÷tp = **过读 = OOM 安全侧**；真值未测。
+#   · **非融合 mHC 分支：未测 → 留 0**（`_unfused_hc_ops` 不挂本项）。非融合走的是
+#     `rms_norm/matmul/sinkhorn` 小算子链，**根本不是这个 kernel**；两个插桩 rank 都跑的
+#     fused 配置，非融合分支的 FWD 单 kernel 极大值本轮**没有测**。这是**如实的欠读**，
+#     不是「已确认为 0」——照 r0/r128/unfused 反向 workspace 留 0 的先例。
+_MHC_PRE_SINKHORN_FWD_WS = "318768128"
+
 
 def _unfused_hc_ops(prefix: str, d: DimTable, streams: TensorRef) -> list:
     """非融合 `HyperConnectionModule`（`hyper_connection.py:246-301`）+ 其 `HyperConnectionOutputCell`
@@ -242,6 +297,15 @@ def _unfused_hc_ops(prefix: str, d: DimTable, streams: TensorRef) -> list:
 
     融合分支**没有**这三份：`npu_mhc_pre_sinkhorn` / `npu_mhc_post` 的 ctx 逐字只有
     `custom_op_impl.py:390-391` / `:331` 那两组，fp32 中间量在 kernel 内部。
+
+    ── **前向 kernel workspace：本分支恒 0，是「未测」不是「已测为 0」**（2026-07-30）────────
+    融合分支的 `npu_mhc_pre_sinkhorn` 有一笔 **304.001 MiB** 的实测前向 workspace
+    （见 `_MHC_PRE_SINKHORN_FWD_WS`）。**非融合分支没有那个 kernel**——它是
+    `ops.rms_norm` / `matmul` / sinkhorn 迭代的小算子链（`hyper_connection.py:246-301`），
+    每个小算子各有自己的 workspace，而 167 那次 tracker 跑的是 **fused 配置**，
+    **没有采集非融合分支的 FWD 单 kernel 极大值**。故本函数**不挂任何 workspace**，
+    如实留 0 = **已知欠读**。照 `dsv4_hybrid._FLASHMLA_IDX_BWD_WS` 只挂 r4、r0/r128/unfused
+    留 0 的先例：**不拿融合分支的实测数去顶非融合分支**。
     """
     # RMSNorm 在 fp32 下计算（hyper_connection.py:262-266 cast float32）
     hc_norm = TensorRef(f"{prefix}_hc_norm", ("S", "B", NH), dtype_bytes=4)
@@ -344,9 +408,17 @@ def _fused_hc_ops(prefix: str, d: DimTable, streams: TensorRef) -> list:
         # 1. npu_mhc_pre_sinkhorn 的 ctx 内部量（`*_` 丢名但 ctx 持有）。融合 kernel 非 NORM
         #    —— 建成 ELEMENTWISE，避免被 `_norm_save_names` 误抬 fp32（这些本来就已是 fp32）。
         #    `streams` 逐字是 ctx 首项 `x`（`custom_op_impl.py:390`）→ 收口 ② 后显式 save。
+        #    **前向 kernel workspace（2026-07-30，167 真机 memory-tracker 实测）**：
+        #    `workspace=_MHC_PRE_SINKHORN_FWD_WS` = 304.001 MiB，出处与边界见该常量上方的
+        #    整块注释。走既有的 **fwd** 通道（`OpSpec.workspace` → `ResolvedOp.workspace_bytes`
+        #    → `StructureMemory.workspace`（层内 max）→ `Buckets.workspace`，FWD 事件）——
+        #    与 2026-07-29 那轮为反向新建的 `bwd_workspace{,_ref}` 是**两条不同相位的通道**，
+        #    不可混用。层内取 max 的实测依据同 bwd：块寿命恒 1 tracker tick、任一时刻至多一块在世
+        #    （`docs/kernel_workspace_2026-07-29.md` §3/§4.1）。
         OpSpec(f"{prefix}_hc_pre_sinkhorn", OpType.ELEMENTWISE, [streams], h_pre,
                params=[rms_w, proj_w],
-               saves=[streams, h_pre, hc_before_norm, inv_rms, sum_out, norm_out]),
+               saves=[streams, h_pre, hc_before_norm, inv_rms, sum_out, norm_out],
+               workspace=_MHC_PRE_SINKHORN_FWD_WS),
         # 2. aggregated（h_in）—— 下标位置与非融合的 mapping_proj 对齐，供 `_link` 接段首 ln。
         OpSpec(f"{prefix}_hc_aggregate", OpType.ELEMENTWISE, [streams, h_pre], h_in, saves=[]),
         # 3. h_res / h_post / h_out —— 下标位置与非融合的 sinkhorn 对齐，供 `_link` 接段尾残差 add。
