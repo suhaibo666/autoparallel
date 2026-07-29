@@ -97,19 +97,45 @@ def test_wrap_mapping_proj_weight_present():
 
 
 def test_wrap_scales_residual_hidden_by_n():
-    """A saved residual-carrying tensor becomes [S,B,n*H]; ×n confirmed numerically."""
+    """The layer-entry packed residual stream becomes [S,B,n*H]; ×n confirmed numerically.
+
+    2026-07-29（普查收口 ②，docs/census_fix_residual_carrier_2026-07-29.md）——**不变量未变**
+    （层入口的残差承载张量 `x` 被打包成 `x_xn [S,B,n·H]`，数值恰为 n×），**只换举例位置**：
+    源 `transformer_layer.py:290-311` 逐字，`input_layernorm` 吃的是 `aggregated_attn [s,b,H]`，
+    打包流 `streams_before_attn` 是**送进 attn_hc** 的那一个。故举例改用 attn_hc 的入流。
+    """
     from cost_eval.layers.residual import mhc_wrap
     body = _body(DS)
     wrapped = mhc_wrap(body, N, DS)
 
-    # ln1 saves the residual input x; after wrapping it is [S,B,num_residual_streams*H].
-    # P1-03(2026-07-14): 放大后重命名 x→x_xn(同名异形会被按名去重静默错算)。
-    ln1 = next(op for op in wrapped if op.name == "ln1")
-    x_saved = next(s for s in ln1.saves if s.name == "x_xn")
-    assert "num_residual_streams*H" in x_saved.shape
+    # attn_hc 的入流就是层入口打包流；P1-03(2026-07-14): 放大后重命名 x→x_xn(同名异形会被
+    # 按名去重静默错算)。
+    hc0 = wrapped[0]
+    x_stream = next(t for t in hc0.inputs if t.name == "x_xn")
+    assert "num_residual_streams*H" in x_stream.shape
     # numeric: exactly n× the unscaled [S,B,H] residual save.
     base = next(s for op in body if op.name == "ln1" for s in op.saves if s.name == "x")
-    assert _numel(x_saved, DS) == N * _numel(base, DS)
+    assert _numel(x_stream, DS) == N * _numel(base, DS)
+
+
+def test_prenorm_saves_aggregated_not_packed_stream():
+    """段首 layernorm 保留的是 HC 的 aggregated `[S,B,H]`，**不是**打包流（收口 ②）。
+
+    源 `transformer_layer.py:308-311`：
+        aggregated_attn, h_res_attn, h_post_attn = self.attn_hc(hidden_states)
+        input_layernorm_output = self.input_layernorm(aggregated_attn)
+    → ln1 的输入/saves 必须是 `attn_hc_agg [S,B,H]`；打包流 `x_xn` 不得再出现在 ln1 的 saves 里
+    （那会把 32 MiB 的真值记成 128 MiB，并逼得 HC 模块不敢声明自己的 ctx `x`）。
+    """
+    from cost_eval.layers.residual import mhc_wrap
+    wrapped = mhc_wrap(_body(DS), N, DS)
+    ln1 = next(op for op in wrapped if op.name == "ln1")
+    saved = {s.name for s in ln1.saves}
+    assert "attn_hc_agg" in saved and "x_xn" not in saved
+    agg = next(s for s in ln1.saves if s.name == "attn_hc_agg")
+    assert agg.shape == ("S", "B", "H")
+    # aggregated 由 attn_hc 的第 2 个 op 产出（两条融合分支同名同形，_link 按下标接边）。
+    assert wrapped[1].output.name == "attn_hc_agg"
 
 
 def test_wrap_scales_every_sp_residual_carrier():
