@@ -212,18 +212,18 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         wrapped = mhc_wrap(body, cfg.num_residual_streams, dims)
         # expand→attn_hc_norm 补边(2026-07-11):expand 输出 mtp_hc_streams 即 mhc 段入口流
         # (名字断链;inputs 追加引用,saves 不变零字节)。
+        # ⚠ 用 `dataclasses.replace` 而非手写字段清单（2026-07-29 三轮教训，同
+        #   `residual._rebuild` 的注释）：这里只想**追加一条 inputs 边**，任何漏带的字段都会
+        #   被静默清成默认值。`norm_kind` 已经这样丢过一次。
+        import dataclasses
         w0 = wrapped[0]
-        wrapped[0] = OpSpec(w0.name, w0.type, list(w0.inputs) + [mtp_streams], w0.output,
-                            params=list(w0.params), saves=list(w0.saves),
-                            workspace=w0.workspace, bwd_scratch=w0.bwd_scratch, attrs=dict(w0.attrs),
-                            norm_kind=w0.norm_kind)
+        wrapped[0] = dataclasses.replace(w0, inputs=list(w0.inputs) + [mtp_streams],
+                                         attrs=dict(w0.attrs))
         # collapse←层尾更新流 补边(2026-07-11):collapse 规约的是 mhc 更新后的 streams(wrapped 末
         # op 输出,如 moe_add 的 h2×n),非 expand 的原始流——名字断链致 moe_add 孤立。
-        collapse = OpSpec(collapse.name, collapse.type,
-                          list(collapse.inputs) + [wrapped[-1].output], collapse.output,
-                          params=list(collapse.params), saves=list(collapse.saves),
-                          workspace=collapse.workspace, bwd_scratch=collapse.bwd_scratch,
-                          attrs=dict(collapse.attrs), norm_kind=collapse.norm_kind)
+        collapse = dataclasses.replace(
+            collapse, inputs=list(collapse.inputs) + [wrapped[-1].output],
+            attrs=dict(collapse.attrs))
         ops += [expand] + wrapped + [collapse]
     else:
         ops += body

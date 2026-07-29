@@ -27,6 +27,8 @@
 """
 from __future__ import annotations
 
+import dataclasses
+
 from ..model_spec import DimTable, OpSpec, OpType, TensorRef
 
 __all__ = [
@@ -103,18 +105,38 @@ def _scale_ref(t: TensorRef, streams: frozenset) -> TensorRef:
                      is_weight=t.is_weight, partial=t.partial, dtype_bytes=t.dtype_bytes)
 
 
+#: `OpSpec` 上所有 **TensorRef 型**的非主字段（随 OpSpec 演进，用 hasattr 守护向后兼容）。
+_REF_FIELDS = ("workspace_ref", "bwd_scratch_ref", "bwd_workspace_ref")
+
+
+def _rebuild(op: OpSpec, **changes) -> OpSpec:
+    """重建一个 OpSpec，**只**改 `changes` 里点名的字段，其余全部原样带过。
+
+    ⚠ **必须用 `dataclasses.replace`，不得手写字段清单**（2026-07-29 三轮教训）：
+    `mhc_wrap` 是 mHC 层上**唯一**的 OpSpec 重建通道，手写清单只要漏一个字段，被包装层
+    （= 全部 DSv4 decoder 层）就会**静默丢掉**该字段的语义。已经发生过一次：`norm_kind`
+    在上一轮被漏掉 → 被包装层的全部 norm 悄悄退回「抬 fp32」，正是 `x_xn`/`h1_xn` 被错抬
+    128→256 MiB 的通道。`OpSpec` 还在长字段（`workspace_ref`/`bwd_scratch_ref`/…），
+    用 `replace` 让「漏字段」在结构上不可能发生。`attrs` 做防御性浅拷贝（原实现同）。
+    """
+    changes.setdefault("attrs", dict(op.attrs))
+    return dataclasses.replace(op, **changes)
+
+
 def _scale_op(op: OpSpec, streams: frozenset) -> OpSpec:
-    """对一个 op 的 inputs/output/params/saves 施加 `_scale_ref`（打包残差流 ×n）。"""
-    return OpSpec(
-        op.name, op.type,
-        [_scale_ref(t, streams) for t in op.inputs],
-        _scale_ref(op.output, streams),
+    """对一个 op 的 inputs/output/params/saves(+ 各 *_ref) 施加 `_scale_ref`（打包残差流 ×n）。"""
+    def _opt(t):
+        return None if t is None else _scale_ref(t, streams)
+
+    return _rebuild(
+        op,
+        inputs=[_scale_ref(t, streams) for t in op.inputs],
+        output=_scale_ref(op.output, streams),
         params=[_scale_ref(t, streams) for t in op.params],
         saves=[_scale_ref(t, streams) for t in op.saves],
-        workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs),
-        # norm_kind 必须原样带过（2026-07-29）：mHC 包装重建 OpSpec，丢了它就等于把
-        # 被包装层的全部 norm 悄悄退回「抬 fp32」——这正是 x_xn/h1_xn 曾被错抬的通道。
-        norm_kind=op.norm_kind,
+        # TensorRef 型 workspace/scratch 同样要跟着 ×n（今天恒为 None，但漏了就是下一个
+        # norm_kind 式的静默 bug；`_opt` 保证 None 安全）。
+        **{f: _opt(getattr(op, f)) for f in _REF_FIELDS if hasattr(op, f)}
     )
 
 
@@ -432,10 +454,7 @@ def mhc_wrap(body_ops: list, n_streams: int, d: DimTable) -> list:
     #  ② output_cell 残差更新由段尾残差 add 体现 → 段尾 op inputs += h_res;
     #  ③ ffn_hc 吃的打包流 = attn 段尾输出（已由 `ffn_stream` 直接传入，无需补边）。
     def _add_dep(op: OpSpec, *refs) -> OpSpec:
-        return OpSpec(op.name, op.type, list(op.inputs) + list(refs), op.output,
-                      params=list(op.params), saves=list(op.saves),
-                      workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs),
-                      norm_kind=op.norm_kind)
+        return _rebuild(op, inputs=list(op.inputs) + list(refs))
 
     def _swap_dep(op: OpSpec, old, new: TensorRef) -> OpSpec:
         """把 op 的 inputs/saves 里名为 `old` 的引用换成 `new`；`old` 不在 inputs 里就退回追加。
@@ -444,12 +463,10 @@ def mhc_wrap(body_ops: list, n_streams: int, d: DimTable) -> list:
         """
         if old is None or all(t.name != old.name for t in op.inputs):
             return _add_dep(op, new)
-        return OpSpec(op.name, op.type,
-                      [new if t.name == old.name else t for t in op.inputs], op.output,
-                      params=list(op.params),
-                      saves=[new if t.name == old.name else t for t in op.saves],
-                      workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs),
-                      norm_kind=op.norm_kind)
+        return _rebuild(
+            op,
+            inputs=[new if t.name == old.name else t for t in op.inputs],
+            saves=[new if t.name == old.name else t for t in op.saves])
 
     def _link(hc, seg, stream):
         if not seg:

@@ -187,25 +187,34 @@ def test_delta_magnitude_gap_is_recorded(matrix):
 #: 净 −32.0 MiB/MoE 层、+64.0 MiB/dense 层。八跑全部 `use_fused_mhc: true` → ④（非融合 fp32
 #: 副本）**不触及本表**。同样一条不变量没动，只移动样例值。
 GOLDEN_BUCKET = {
-    "a fused   ON  L8 m4": (17278.6, 11901.1, 11645.1, 22212.8),
+    # 2026-07-29 重钉：**fused 跑**的每个 r4 层 bwd 事件加上真机实测的融合稀疏 flash-MLA
+    # 反向 kernel workspace（seq4096 → **730.0 MiB**，三点验证的实测律，
+    # docs/kernel_workspace_2026-07-29.md）。unfused 四跑（b/d/f/h）**逐字节不变**——
+    # 该 kernel 只在 fused 分支存在，实测律不外推到小算子链。
+    "a fused   ON  L8 m4": (17278.6, 12631.1, 12375.1, 22212.8),
     "b unfused ON  L8 m4": (35393.6, 30774.1, 30518.1, 34807.1),
-    "c fused   OFF L8 m4": (27517.6, 19311.6, 15225.4, 24339.6),
+    "c fused   OFF L8 m4": (28247.6, 20041.6, 15955.4, 24339.6),
     "d unfused OFF L8 m4": (123981.6, 94059.6, 65057.4, 49255.6),
-    "e fused   ON  L8 m8": (17786.6, 11901.1, 11645.1, 22212.8),
+    "e fused   ON  L8 m8": (18516.6, 12631.1, 12375.1, 22212.8),
     "f unfused ON  L8 m8": (36659.6, 30774.1, 30518.1, 34807.1),
-    "g fused   ON  L4 m4": (14195.6, 8344.2, 7942.6, 18911.9),
+    "g fused   ON  L4 m4": (14195.6, 9074.2, 7942.6, 18911.9),
     "h unfused ON  L4 m4": (19438.6, 27217.2, 13985.6, 31506.2),
 }
 #: liveness(hand_spec) per-stage 峰值（MiB），grad_mode=dataflow。（同上，2026-07-29 重钉）
+#: **2026-07-29 三次重钉·补丁**：`mhc_wrap` 的 OpSpec 重建改用 `dataclasses.replace`，修好一处
+#: **静默丢字段** —— 此前它手写字段清单，把被包装层的 `workspace_ref`（flash-attn softmax-LSE
+#: 工作区，`attention.py:225,313` / `dsv4_hybrid.py:331,358,381` 的 `_fa_workspace()`）整个丢掉。
+#: 只有 DSA-unfused 的四跑（b/d/f/h）的 dataflow 峰落在带该 workspace 的事件上 → **+16.0 MiB**；
+#: chain2 与 bucket 逐字节不变。同一通道上一轮丢过 `norm_kind`，现已在结构上不可能再丢。
 GOLDEN_LIVENESS_DATAFLOW = {
     "a fused   ON  L8 m4": (16574.4, 11084.6, 10828.6, 24232.8),
-    "b unfused ON  L8 m4": (33575.8, 28956.3, 28700.3, 32989.3),
+    "b unfused ON  L8 m4": (33591.8, 28972.3, 28716.3, 33005.3),
     "c fused   OFF L8 m4": (27045.6, 18839.6, 14753.4, 26359.6),
-    "d unfused OFF L8 m4": (115615.7, 87613.7, 60659.5, 49227.6),
+    "d unfused OFF L8 m4": (115631.7, 87629.7, 60675.5, 49227.6),
     "e fused   ON  L8 m8": (16970.1, 11084.6, 10828.6, 24232.8),
-    "f unfused ON  L8 m8": (34841.8, 28956.3, 28700.3, 32989.3),
+    "f unfused ON  L8 m8": (34857.8, 28972.3, 28716.3, 33005.3),
     "g fused   ON  L4 m4": (13491.4, 7527.7, 7142.1, 20931.9),
-    "h unfused ON  L4 m4": (18734.4, 25399.4, 13185.1, 29688.4),
+    "h unfused ON  L4 m4": (18734.4, 25415.4, 13185.1, 29704.4),
 }
 #: 同上，grad_mode=chain2。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_CHAIN2 = {
@@ -229,9 +238,15 @@ GOLDEN_LIVENESS_CHAIN2 = {
 #: 1.116→1.110。run c 逐 stage 0.901/0.928/0.865/0.880 → **0.905/0.919/0.857/0.878**
 #: （s0 含 dense r0 层 → +64/层使其**回升**；其余 stage 全是 MoE 层 → −32/层继续下探）。
 GOLDEN_AGG = {
-    ("dataflow", "bucket"): (28, 0.821, 0.700, 1.017),
-    ("dataflow", "hand_spec"): (28, 0.794, 0.659, 1.067),
-    ("chain2", "bucket"): (28, 0.821, 0.700, 1.017),
+    # 2026-07-29 重钉（bucket 两行）：加入真机实测的 bwd kernel workspace 后，桶模型均值
+    # 0.821 → **0.836**（欠读被真实地补上一块），max 1.017 → **1.023**（`g` stage1 由
+    # 0.941 转为 1.023 = 轻度过读，OOM 安全侧，如实记）。min 0.700 未动。
+    # **hand_spec 两行逐字节不变**：`cost_eval/liveness/` 不读 `bwd_workspace_bytes`
+    # （它按 saves + grad 可达性自建图），故该来源与本次改动正交 —— 这也是本次改动
+    # 只动 bucket 一条口径的证据。
+    ("dataflow", "bucket"): (28, 0.836, 0.700, 1.023),
+    ("dataflow", "hand_spec"): (28, 0.795, 0.659, 1.067),
+    ("chain2", "bucket"): (28, 0.836, 0.700, 1.023),
     ("chain2", "hand_spec"): (28, 0.855, 0.670, 1.110),
 }
 
