@@ -262,17 +262,25 @@ def test_fused_drops_kv_gathered_and_attn_weights():
     assert "kv_gathered" in unf and "attn_weights" in unf
 
 
-def test_per_head_q_rmsnorm_and_grouped_output_fp32_saves():
-    """真机 Profiler 定位的两个 fp32 大头（256 MiB/层 @ align 配置）：
-    per-head Q RMSNorm 输出 q_hnorm_fp32（:239-245）+ 分组输出 fp32 输入 cg_fp32（:277-283）。"""
+def test_per_head_q_rmsnorm_and_grouped_output_saves_are_bf16():
+    """顶层两个 `[S,B,n_heads*v_head_dim]` 大头 —— **bf16，不是 fp32**（仲裁 §1.1/§1.3）。
+
+    **不变量没变**（两张都在、都是 n_heads·v_head_dim、`q` 也 saved），只订正 dtype：
+      - `q_hnorm`（`deepseek_v4_hybrid_attention.py:244-245`）逐字是
+        `q = q * mint.rsqrt(mint.mean(q * q, dim=-1, keepdim=True) + eps)` —— 无 fp32 cast；
+        `ops.rms_norm`/`q_rms_gamma`（`:158-161`）在 `construct` 里从未被调用。
+      - `cg`（`:286-291`）源注释 `:288-290` 显式拒绝 fp32 提升（"stays in the model dtype"）。
+    `dtype_bytes is None` = 走 `DimTable.dtype_bytes`（bf16）。"""
     from cost_eval.layers.dsv4_hybrid import build_dsv4_hybrid_attn_ops
     for ratio in (0, 4, 128):                            # 所有 ratio 都有（顶层 wrapper 统一）
         ops = build_dsv4_hybrid_attn_ops(DBIG, ratio)
         saved = {s.name: s for op in ops for s in op.saves}
-        assert "q_hnorm_fp32" in saved and saved["q_hnorm_fp32"].dtype_bytes == 4
-        assert "cg_fp32" in saved and saved["cg_fp32"].dtype_bytes == 4
-        # 尺寸 = n_heads*v_head_dim（fp32），且 q(bf16 输入)也 saved（rms_norm 反向）
-        assert _saved_numel(ops, "q_hnorm_fp32", DBIG) == DBIG.S * DBIG.B * DBIG.n_heads * DBIG.v_head_dim
+        assert "q_hnorm" in saved and saved["q_hnorm"].dtype_bytes is None
+        assert "cg" in saved and saved["cg"].dtype_bytes is None
+        assert "q_hnorm_fp32" not in saved and "cg_fp32" not in saved
+        # 尺寸仍是 n_heads*v_head_dim，且 q(norm 的 bf16 输入)也 saved（两个 mul 的 bprop）
+        assert _saved_numel(ops, "q_hnorm", DBIG) == DBIG.S * DBIG.B * DBIG.n_heads * DBIG.v_head_dim
+        assert _saved_numel(ops, "cg", DBIG) == DBIG.S * DBIG.B * DBIG.n_heads * DBIG.v_head_dim
         assert "q" in saved and saved["q"].dtype_bytes is None   # bf16（走 DimTable.dtype_bytes）
 
 

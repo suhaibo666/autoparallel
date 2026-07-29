@@ -49,14 +49,14 @@ SITE_DIMS = DimTable(
 # forward 形参序 (csa.py:184-191): query, ori_kv, cmp_kv, cmp_sparse_indices,
 #     query_index, key_index, weights, sinks
 ALIAS = {
-    "query": "q_hnorm_fp32",        # csa.py:690 实参 = permute(query)，即顶层 per-head fp32 Q-norm
+    "query": "q_hnorm",             # csa.py:690 实参 = permute(query)，即顶层 per-head Q-norm(**bf16**)
     "ori_kv": "kv_a_out",           # csa.py:691 实参 = permute(key)，即 kv_a_norm 输出
     "cmp_kv": "compressed_kv",      # csa.py:692 实参 = compressor 输出
     "sparse_indices": "topk_indices",   # csa.py:693 实参 = indexer 的 topk_indices
     "query_index": "idx_query",     # csa.py:694 cast(query_index, bf16)
     "key_index": "idx_key",         # csa.py:695 cast(key_index, bf16)
     "weights": "idx_weights",       # csa.py:696 cast(weights, fp32)
-    "sinks": "attn_sink",           # csa.py:687 attn_sink 的 fp32 cast（手写侧在 params，非 saves）
+    "sinks": "sinks",               # csa.py:687 attn_sink 的 **fp32 cast 副本**（≠ params 里的 Parameter）
     "cmp_residual": "cmp_residual",     # _prepare_sparse_flash_mla 第 2 返回（csa.py:203）
     "output": "core_out",           # kernel 输出
     "softmax_lse": "softmax_lse",   # kernel 第 2 输出（csa.py:206）
@@ -86,27 +86,17 @@ def _op(name, ratio, fused):
 
 
 # ── 已知差异台账（每条带字节影响；数字由 `resolve_tensor` 在站点配置下算出，**非**真机测量）──
-KNOWN_GAPS = {
-    "sparse_indices": dict(
-        hand_name="topk_indices",
-        why=("源 `csa.py:228` 逐字 save，手写 `sparse_attn.saves` 没抄；但同名张量已由上游"
-             "`indexer` op 声明 saved（dsv4_hybrid.py:155/159），而 `structure_mem` 的 saves 是"
-             "**按名去重的字典**（structure_mem.py:287 `for s in saves.values()`）"),
-        raw_bytes=8 * MiB,          # [B,S,topk] int32 = 1*4096*512*4
-        net_activation_saves_delta=0,
-        note=("liveness 侧同样 0：`indexer` 在 `sparse_attn` **之前**（fwd 序），故反向序里"
-              "`indexer.bwd` 在 `sparse_attn.bwd` **之后** → 该张量的活跃区间本已覆盖到更晚，"
-              "补声明不延长"),
-    ),
-    "sinks": dict(
-        hand_name="attn_sink",
-        why=("源 `csa.py:233` 逐字 save 的是 `ops.cast(attn_sink, float32)`（`csa.py:687`）"
-             "—— 一份**独立的 fp32 激活复本**，不是那个 Parameter 本身；手写侧只把 `attn_sink` "
-             "放进 `params`（权重），没有这份 cast 复本"),
-        raw_bytes=256,              # [n_heads]=64 fp32
-        net_activation_saves_delta=256,
-        note="0.000244 MiB/层 —— 量级上可忽略，但它证明「saved set 要逐字读、不能靠归类」",
-    ),
+# **2026-07-29：台账清空** —— 两条都已按源修掉（`docs/census_arbitration_2026-07-29.md` §1.7/§1.9），
+# 故按本文件开头声明的「双向棘轮」规则删除条目，改为**正向**断言（源 11 项逐名在场）。
+#   - `sparse_indices`（`csa.py:61-62` `mint.unsqueeze(topk_indices, dim=2)`，视图）：补进
+#     `sparse_attn.saves`。`structure_mem` 按名去重（`structure_mem.py:261-262`）且上游 `indexer`
+#     已声明同名 saved → `activation_saves` **净 0**（下方 `test_byte_impact_*` 仍钉这一点）。
+#   - `sinks`（`csa.py:687` `ops.cast(attn_sink, float32)`）：补进 saves，**+256 B/层**。
+KNOWN_GAPS = {}
+FIXED_2026_07_29 = {
+    "sparse_indices": dict(hand_name="topk_indices", raw_bytes=8 * MiB,
+                           net_activation_saves_delta=0),
+    "sinks": dict(hand_name="sinks", raw_bytes=256, net_activation_saves_delta=256),
 }
 
 # ── ukl1/ukl2：源侧**从不 saved**（KL 目标分布链全在 detach 侧）——单列，因为方向相反 ──
@@ -154,21 +144,16 @@ def test_alias_table_covers_every_source_name(source_saved_names):
 
 
 def test_sparse_attn_saves_vs_source_truth(source_saved_names):
-    """fused r4 的 `sparse_attn.saves` ⊇ 源 11 项 − 台账已登记的缺项。"""
+    """fused r4 的 `sparse_attn.saves` ⊇ 源 11 项（2026-07-29 起台账为空 → 逐名全在场）。"""
     op, _ = _op("sparse_attn", 4, fused=True)
     hand = {t.name for t in op.saves}
-    hand_all = hand | {t.name for t in op.params}      # sinks 落在 params 侧（见台账）
     missing = {s for s in source_saved_names if ALIAS[s] not in hand}
     unlogged_missing = missing - set(KNOWN_GAPS)
     assert not unlogged_missing, _diff_message(
         source_saved_names, hand, unlogged_missing, set())
-    # 台账项确实仍缺（棘轮的另一半，见下方 ledger 测试）
-    assert missing == set(KNOWN_GAPS)
-    # 非台账项必须逐名对上（`sinks` 允许落 params）
+    assert missing == set(KNOWN_GAPS) == set()
     for s in source_saved_names:
-        if s in KNOWN_GAPS:
-            continue
-        assert ALIAS[s] in hand_all, f"{s} → {ALIAS[s]} 既不在 saves 也不在 params"
+        assert ALIAS[s] in hand, f"{s} → {ALIAS[s]} 不在 saves 里"
 
 
 def test_known_gaps_ledger_is_still_accurate(source_saved_names):
@@ -183,12 +168,13 @@ def test_known_gaps_ledger_is_still_accurate(source_saved_names):
             f" —— 请删除该台账项，并复核锚点是否随之移动")
 
 
-def test_hand_saves_count_is_nine_and_source_is_eleven(source_saved_names):
-    """评估文档 §4 的两个数：源 11 项、手写 9 项（缺 sparse_indices / sinks）。"""
+def test_hand_saves_count_matches_source_eleven(source_saved_names):
+    """源 11 项、手写 **11 项**（2026-07-29 补齐 sparse_indices / sinks；此前 9 项）。"""
     op, _ = _op("sparse_attn", 4, fused=True)
     assert len(source_saved_names) == 11
-    assert len(op.saves) == 9
-    assert set(KNOWN_GAPS) == {"sparse_indices", "sinks"}
+    assert len(op.saves) == 11
+    assert set(KNOWN_GAPS) == set()
+    assert set(FIXED_2026_07_29) == {"sparse_indices", "sinks"}
 
 
 # ── 字节影响（数字由 resolve_tensor 现算，非真机测量）────────────────────────────
@@ -198,8 +184,8 @@ def test_byte_impact_sparse_indices_is_activation_saves_neutral():
     names = {t.name for t in indexer.saves}
     assert "topk_indices" in names          # 上游 indexer 已声明 saved → 字典去重
     t = [x for x in indexer.saves if x.name == "topk_indices"][0]
-    assert _bytes(t, d) == KNOWN_GAPS["sparse_indices"]["raw_bytes"] == 8 * MiB
-    assert KNOWN_GAPS["sparse_indices"]["net_activation_saves_delta"] == 0
+    assert _bytes(t, d) == FIXED_2026_07_29["sparse_indices"]["raw_bytes"] == 8 * MiB
+    assert FIXED_2026_07_29["sparse_indices"]["net_activation_saves_delta"] == 0
     # fwd 序：indexer 在 sparse_attn 之前 → 反向序里 indexer.bwd 更晚 → 活跃区间不延长
     order = [o.name for o in build_dsv4_hybrid_attn_ops(_dims(True), 4)]
     assert order.index("indexer") < order.index("sparse_attn")
@@ -208,9 +194,11 @@ def test_byte_impact_sparse_indices_is_activation_saves_neutral():
 def test_byte_impact_sinks_is_256_bytes():
     """`sinks` = `ops.cast(attn_sink, fp32)`（csa.py:687）→ [n_heads] fp32 = 256 B/层。"""
     sinks = TensorRef("sinks", ("n_heads",), dtype_bytes=4)
-    assert _bytes(sinks) == KNOWN_GAPS["sinks"]["raw_bytes"] == 256
-    op, _ = _op("sparse_attn", 4, fused=True)
-    assert [p.name for p in op.params] == ["attn_sink"]   # 手写侧只有权重那份
+    assert _bytes(sinks) == FIXED_2026_07_29["sinks"]["raw_bytes"] == 256
+    op, d = _op("sparse_attn", 4, fused=True)
+    assert [p.name for p in op.params] == ["attn_sink"]   # 权重那份仍在 params
+    saved = [t for t in op.saves if t.name == "sinks"]    # cast 副本在 saves（2026-07-29 补）
+    assert len(saved) == 1 and _bytes(saved[0], d) == 256
 
 
 def test_byte_impact_ukl_pair_if_removed():
@@ -226,7 +214,8 @@ def test_byte_impact_ukl_pair_if_removed():
     assert total == 2048 * MiB
     # 全 saves 里的占比（口径变更的量级参考）
     all_bytes = sum(_bytes(t, d) for t in op.saves)
-    assert all_bytes == 17664 * MiB
+    # 2026-07-29：`q_hnorm` 由 fp32(512 MiB) 改回 bf16(256 MiB) → 17664 → 17408 MiB。
+    assert all_bytes == 17408 * MiB
     assert 0.11 < total / all_bytes < 0.12
 
 

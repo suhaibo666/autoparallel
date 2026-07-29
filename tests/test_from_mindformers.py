@@ -137,8 +137,18 @@ def test_dsv4align_roundtrip_same_peak():
     #   → 0.974,欠预测再收窄。见 tests/test_pp4_recompute_anchor.py）。
     # → 15788.6（2026-07-23 185 F 差分:+core_out 逆 RoPE 保留(hybrid:277,每层 +192@seq2048),
     #   真机 15415.5 → 1.024 转保守侧;F0/F1 每层差分 3152 vs 真机 3109(+1.4%)背书）。
+    # → **13994.8**（2026-07-29 手写普查按权威快照逐条订正，见
+    #   `docs/census_arbitration_2026-07-29.md` §1/§2）：q_hnorm/cg 由 fp32 改回 bf16、去伪 norm
+    #   抬升、去 inv_rope_out、补前向 rope 保留对、cmp_residual 改标量、补 sinks/sparse_indices。
+    #   真机 15415.5 → **0.908**（由 1.024 回到欠侧）。
+    #   ⚠ **如实记账**：这是 OOM-**不安全**方向的移动，且与同源的 185 F 差分锚（3109/层）矛盾。
+    #   之所以仍改：167/2026-07-29 的**逐(微批,层,阶段)直测**给出 fused 每层驻留 2239.1 MiB
+    #   @seq4096，而 185 的 3109 是 **L4/L8 全过程峰值之差**——`docs/.../sim_vs_real_gap_
+    #   decomposition_2026-07-28.md` §5.5 已实测证明这类差分的前提（两侧在**可比事件**上取峰）
+    #   在本项目上并不成立（g/h 对就翻车）。两个真机数彼此不自洽（seq2048 的 3109 > seq4096 的
+    #   2239，方向反了），故以**直测**为准、把差分锚降级为参考。见仲裁 §3。
     assert bundle.parallel.dp_shard == 2 and bundle.recompute.mode == "None"
-    assert abs(_peak(bundle) - 15788.6) < 1.0
+    assert abs(_peak(bundle) - 13994.8) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────

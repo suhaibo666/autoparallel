@@ -16,12 +16,21 @@ mindformers `pynative/.../experimental_attention_variant/` 源码：
 | 128   | HCA  | + 压缩器(non-overlap, coff=1) + dense 压缩位（无 top-k indexer）+ 稀疏注意力 + 分组输出。|
 
 **关键修正（2026-07-03，真机 Profiler 定位 925 MiB 欠计）**：DSv4HybridSelfAttention 顶层
-**对所有 ratio（含 0/1）**都物化两个 fp32 张量到 loss 峰值，此前评估器漏建/错 dtype：
-  1. **per-head Query RMSNorm** —— `deepseek_v4_hybrid_attention.py:239-245`
-     `q = rms_norm(cast(q, fp32), q_rms_gamma)` → fp32 `q[S,B,n_heads*q_head_dim]`（真机 256 MiB/层）。
-  2. **分组输出 bmm 的 fp32 输入** —— `:277-283` `bmm(cast(cg, fp32), cast(wo, fp32))`
-     → fp32 `cg[S,B,n_heads*v_head_dim]`（真机 256 MiB/层）。
+**对所有 ratio（含 0/1）**都物化两个大张量到 loss 峰值，此前评估器漏建：per-head Query
+RMSNorm 的输出（`deepseek_v4_hybrid_attention.py:242-245`）与分组输出 bmm 的输入
+（`:286-291`），各 `[S,B,n_heads*v_head_dim]`。
   ⇒ 故 ratio 0/1 **不再**退化复用 `build_mla_attn_ops`，DSv4 全 ratio 自建 op 图。
+
+> **⚠ 2026-07-29 dtype 订正（`docs/census_arbitration_2026-07-29.md` §1.1/§1.3）**：这两张
+> **不是 fp32**，是 bf16。此前按 fp32 建（各 512 MiB/层）源于对权威快照
+> （`mf-src-167`，即真机实跑那份）的**误读**：
+>   - `:244-245` 逐字是 `q = q * mint.rsqrt(mint.mean(q * q, dim=-1, keepdim=True) + eps)`
+>     —— 纯 `mint` 逐元素算术，**没有 `cast(..., float32)`**；`self.rms_norm = ops.rms_norm`
+>     （`:158`）与 `self.q_rms_gamma`（`:159-161`）在 `construct` 里**从未被调用**。
+>   - `:288-290` 源注释**显式拒绝** fp32 提升（"stays in the model dtype … A FP32 promotion
+>     … is enough to create long-run optimizer drift"），`:291` 是 `bmm(cg, wo)` 直接吃 bf16。
+> 纯 AST 抽图独立同意（`q` 256 MiB bf16 @`:240`、`cg` 256 MiB bf16 @`:286`）。
+> 真机逐层实测（167/2026-07-29）r4 每层驻留 2355 MiB，而修前普查 3703.8 → 1.58×。
 
 **融合 vs 非融合（`d.dsa_fused`，生产默认 True）**：`kv_gathered`/`attn_weights` 是 **unfused
 小算子路径**（`csa.py:187` `unfused_compressed_sparse_attn`）才物化的中间量；**fused kernel**
@@ -29,8 +38,9 @@ mindformers `pynative/.../experimental_attention_variant/` 源码：
 sparse_attn **不 save** 它们（否则幻影多算 ~1312 MiB）。
 
 **内存大头**（评估器建模的重点）：
-  - `q_hnorm_fp32 [S,B,n_heads*v_head_dim] fp32`（per-head Q-norm，256 MiB/层，:239-245）。
-  - `cg_fp32 [S,B,n_heads*v_head_dim] fp32`（分组输出 fp32 输入，256 MiB/层，:277-283）。
+  - `q_hnorm [S,B,n_heads*v_head_dim] bf16`（per-head Q-norm 输出→RoPE→kernel ctx `query`，
+    256 MiB/层，:242-245 + `csa.py:674`）。
+  - `cg [S,B,n_heads*v_head_dim] bf16`（分组输出 bmm 的激活操作数，256 MiB/层，:286-291）。
   - `index_scores [B,S,S] fp32` → O(S²)，indexer op 的 `bwd_scratch="4*B*S*S"`（indexer.py:227-236）。
   - `kv_gathered [B,S,topk,v_head_dim]` / `attn_weights [B,n_heads,S,topk]` —— **仅 unfused** save（csa.py:208/237）。
   - `compressed_kv [S//ratio, B, 1, v_head_dim]`（compressor.py:221）。
@@ -83,16 +93,17 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     ln1          = TensorRef("ln1",          ("S", "B", "H"))
     q_compressed = TensorRef("q_compressed", ("S", "B", "q_lora_rank"))          # :234
     q_a_out      = TensorRef("q_a_out",      ("S", "B", "q_lora_rank"))          # :235
-    q            = TensorRef("q",            ("S", "B", Q_OUT), shard={2: "tp"})  # :237 列并行(bf16)
-    # per-head Q RMSNorm 输出 fp32（:239-245）—— 真机 256 MiB/层，此前漏建
-    q_hnorm      = TensorRef("q_hnorm_fp32", ("S", "B", Q_OUT), shard={2: "tp"}, dtype_bytes=4)
+    q            = TensorRef("q",            ("S", "B", Q_OUT), shard={2: "tp"})  # :240 列并行(bf16)
+    # per-head Q RMSNorm 输出（:242-245）**bf16**：`q * rsqrt(mean(q*q)+eps)` 无 fp32 cast。
+    # 经 RoPE 后由 `csa.py:674` permute 成 BSND 副本进 kernel ctx（`query`）。
+    q_hnorm      = TensorRef("q_hnorm",      ("S", "B", Q_OUT), shard={2: "tp"})
     # KV 侧激活（kv/kv_a_out）标 cp_kv=True（D-1 修正）：colossal 下 KV all-gather 到 full-S；
     # 其余 cp 算法随 body ÷cp。dsv4 走 cp=1（DSv4-align 锚点）→ 恒不生效，逐字节不变。
     kv           = TensorRef("kv",           ("S", "B", "v_head_dim"), cp_kv=True)  # :249 单共享头
     kv_a_out     = TensorRef("kv_a_out",     ("S", "B", "v_head_dim"), cp_kv=True)  # :250
-    core_out     = TensorRef("core_out",     ("S", "B", Q_OUT))                  # :247 [sq,b,n,vd]
-    # 分组输出 bmm 的 fp32 输入 cg（:277-283 cast(cg, fp32)）—— 真机 256 MiB/层，此前错 bf16
-    cg_fp32      = TensorRef("cg_fp32",      ("S", "B", Q_OUT), dtype_bytes=4)
+    core_out     = TensorRef("core_out",     ("S", "B", Q_OUT))                  # :265 [sq,b,n,vd]
+    # 分组输出 bmm 的激活操作数 cg（:286 permute→:291 bmm，**bf16**，源注释 :288-290 拒绝 fp32）
+    cg           = TensorRef("cg",           ("S", "B", Q_OUT))
     o_group_out  = TensorRef("o_group_out",  ("S", "B", O_GROUP_OUT))            # :285
     o            = TensorRef("o",            ("S", "B", "H"))                    # :290
     h1           = TensorRef("h1",           ("S", "B", "H"), shard={0: "sp"})
@@ -110,7 +121,21 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
     qhn_g  = TensorRef("q_hnorm_g",   ("v_head_dim",),   is_weight=True, dtype_bytes=4)
     kvan_g = TensorRef("kv_a_norm_g", ("v_head_dim",),   is_weight=True, dtype_bytes=4)
 
-    # ── base：Q 低秩 down→norm→up→**per-head fp32 norm** + 单头 KV down→norm + RoPE ──
+    # ── RoPE 反向保留对（rope_utils.py:186-187，**每次调用一对**）────────────────────
+    # `output = add(mul(t, cos_), mul(t_rot, sin_))` 的两个 mul 各保留一个操作数 → 每次
+    # `apply_rotary_emb` 留下 `t` 与 `t_rot` 两块 `[S,B,n,rot_dim]`，dtype = `config.rotary_dtype`
+    # = **fp32**（`models/deepseek4/configuration_deepseek_v4.py:149` `rotary_dtype="fp32"`；
+    # `parallel_core/transformer_config.py:166-167` 默认亦 float32；launcher yaml 未覆盖）。
+    # 三次调用：q 前向（:260）、key 前向（:261）、core_out 逆向（:271）——**三次都走非融合分支**
+    # （`mla_output_remove_interleaving=True` 使 `fused_interleaved_mla` 恒 False，
+    # rope_utils.py:160-162）。此前普查只建了逆向那一对，前向两对**漏建**（欠读 130 MiB/层）。
+    ROPE_LANE = "n_heads*qk_rope_head_dim"
+    q_rope_f32  = TensorRef("q_rope_f32",  ("S", "B", ROPE_LANE), dtype_bytes=4)
+    q_rope_rot  = TensorRef("q_rope_rot",  ("S", "B", ROPE_LANE), dtype_bytes=4)
+    k_rope_f32  = TensorRef("k_rope_f32",  ("S", "B", "qk_rope_head_dim"), cp_kv=True, dtype_bytes=4)
+    k_rope_rot  = TensorRef("k_rope_rot",  ("S", "B", "qk_rope_head_dim"), cp_kv=True, dtype_bytes=4)
+
+    # ── base：Q 低秩 down→norm→up→**per-head norm(bf16)** + 单头 KV down→norm + RoPE ──
     ops = [
         OpSpec("ln1",           OpType.NORM,   [x],              ln1, params=[ln1_g], saves=[x]), # 1 Pre-norm
         OpSpec("linear_q_down", OpType.MATMUL, [ln1, wq_down],   q_compressed,                   # 2 :234
@@ -119,13 +144,21 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
                params=[qan_g], saves=[q_compressed]),                                            # 3 :235
         OpSpec("linear_q_up",   OpType.MATMUL, [q_a_out, wq_up], q,                              # 4 :237
                params=[wq_up], saves=[q_a_out]),
-        # 5 per-head Query RMSNorm（:239-245）：rms_norm 反向需 bf16 输入 q（128 MiB/层，saved）；
-        #   fp32 输出 q_hnorm 由下游 attention save（QK 反向需 Q，256 MiB/层）——两者共存至 loss 峰值。
-        OpSpec("q_hnorm",       OpType.NORM,   [q],              q_hnorm, params=[qhn_g], saves=[q]),
+        # 5 per-head Query "RMSNorm"（:242-245）**不是 layernorm 模块**：源逐字
+        #   `q = q * mint.rsqrt(mint.mean(q * q, dim=-1, keepdim=True) + eps)` —— 两个 `mul` 的
+        #   bprop 各保留 `q`（bf16 256 MiB/层，去重后一份）。故建成 ELEMENTWISE：`OpType.NORM`
+        #   会让 `structure_mem._norm_save_names`/`_dt` 按 `layernorm_compute_dtype=fp32` 把 `q`
+        #   抬成 4B（+256 MiB/层），而该 yaml 键管不到这段逐元素算术（仲裁 §1.2）。
+        #   `q_rms_gamma`（:159-161）虽是真 Parameter，但 `construct` 从不用它 → 仍列 params
+        #   （持久态口径不变，2 KiB）。
+        OpSpec("q_hnorm",       OpType.ELEMENTWISE, [q],         q_hnorm, params=[qhn_g], saves=[q]),
         OpSpec("linear_kv",     OpType.MATMUL, [ln1, wkv],       kv, params=[wkv], saves=[ln1]), # 6 :249
         OpSpec("kv_a_norm",     OpType.NORM,   [kv],             kv_a_out,
                params=[kvan_g], saves=[kv]),                                                     # 7 :250
-        OpSpec("rope",          OpType.ROPE,   [q_hnorm],        q_hnorm, saves=[]),             # 8 :256-261 in-place
+        # 8 :260-261 前向 RoPE（q 与 key 各一次）——in-place 语义不动，但**每次调用保留 (t, t_rot)
+        #   两块 fp32**（rope_utils.py:186-187，dtype=rotary_dtype=fp32）。此前 saves=[] 漏建。
+        OpSpec("rope",          OpType.ROPE,   [q_hnorm],        q_hnorm,
+               saves=[q_rope_f32, q_rope_rot, k_rope_f32, k_rope_rot]),
     ]
 
     # ── core attention ────────────────────────────────────────────────────────
@@ -179,10 +212,23 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         if fused:
             idx_query = TensorRef("idx_query", ("B", "S", "dsa_indexer_n_heads", "dsa_indexer_head_dim"))  # indexer.py:112 wq_b 输出
             idx_key = TensorRef("idx_key", ("B", "S", "dsa_indexer_head_dim"), cp_kv=True)   # indexer.py:126 单头 K
-            idx_weights = TensorRef("idx_weights", ("B", "S", "dsa_indexer_n_heads"))        # indexer.py:134 头权重
-            cmp_residual = TensorRef("cmp_residual", ("S", "B", CMP_PROJ_OUT), cp_kv=True)   # compressor 残差（coff·vd）
+            # `weights` 实参是 `ops.cast(weights, mstype.float32)`（csa.py:696）→ **fp32**（仲裁 §1.8）
+            idx_weights = TensorRef("idx_weights", ("B", "S", "dsa_indexer_n_heads"), dtype_bytes=4)  # csa.py:696
+            # ⚠ 2026-07-29 shape 订正（仲裁 §1.6）：`cmp_residual` **不是** [S,B,coff·vd]。
+            #   `csa.py:64-67`（`_prepare_sparse_flash_mla`，两个 fused _Function 的 forward 首行都调它）
+            #   逐字 `cmp_residual = Tensor([int(ori_length) % kernel_cmp_ratio], dtype=mstype.int32)`
+            #   —— **1 元素 int32 标量**（4 B，块对齐后 512 B）。此前按 8 MiB(r4)/4 MiB(r128) 记。
+            cmp_residual = TensorRef("cmp_residual", ("1",), dtype_bytes=4)                   # csa.py:64-67
             softmax_lse = TensorRef("softmax_lse", ("B", "n_heads", "S"), dtype_bytes=4)     # csa.py:235 fp32
-            _ctx_new = ([idx_query, idx_key, idx_weights] if enable_indexer else []) + [cmp_residual, softmax_lse]
+            # `sinks` = `ops.cast(attn_sink, float32)`（csa.py:687）——一份**独立 fp32 激活副本**，
+            #   逐字进 ctx（csa.py:113/:224）；此前只有 params 里那个 Parameter（仲裁 §1.7，+256 B）。
+            sinks = TensorRef("sinks", ("n_heads",), dtype_bytes=4)                          # csa.py:687
+            _ctx_new = ([idx_query, idx_key, idx_weights] if enable_indexer else []) + [
+                cmp_residual, sinks, softmax_lse]
+            # `sparse_indices = mint.unsqueeze(topk_indices, dim=2)`（csa.py:61-62，视图）亦逐字进 ctx；
+            #   同名张量已由上游 indexer 声明 saved、`structure_mem` 按名去重 → **净 0**（仲裁 §1.9）。
+            #   源侧 `use_sparse_indices` 要求 `has_cmp and cmp_ratio == 4` → 仅 r4 有。
+            _ctx_new += [topk_indices] if enable_indexer else []
             sparse_saves = [q_hnorm, kv_a_out, compressed_kv, core_out] + _ctx_new
         else:
             # ── unfused 反向图 fp32 复本群（2026-07-23,185 U1 相位合账;DAG 审计嫌疑①②）────────
@@ -240,8 +286,14 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         # 驻留）。2026-07-24 口径切换：**不再** pin（save_for_backward 全重算正常释放，报告§7.9）。
         if fused:
             sw_lse = TensorRef("softmax_lse", ("B", "n_heads", "S"), dtype_bytes=4)
+            # r0 与 r128 **同走** `FusedSparseFlashMla`（8 项 ctx，csa.py:113）——`enable_indexer`
+            # 只在 ratio==4 为真（csa.py:607）；r0 另因 `enable_compress = ratio > 0`（csa.py:593）
+            # 使 `cmp_kv=None` 被 `if tensor is not None` 过滤。故 r0 的 ctx =
+            # {query, ori_kv, cmp_residual, sinks, output, softmax_lse}。
+            sw_cmp_res = TensorRef("cmp_residual", ("1",), dtype_bytes=4)      # csa.py:64-67 标量
+            sw_sinks = TensorRef("sinks", ("n_heads",), dtype_bytes=4)         # csa.py:687 fp32 副本
             ops.append(OpSpec("core_attn", OpType.FLASH_ATTN, [q_hnorm, kv_a_out], core_out,
-                              saves=[q_hnorm, kv_a_out, core_out, sw_lse],
+                              saves=[q_hnorm, kv_a_out, core_out, sw_cmp_res, sw_sinks, sw_lse],
                               workspace_ref=_fa_workspace()))
         else:
             # unfused 滑窗（r0/1）真机同样走 `_construct_naive`（csa.py:438-449:ratio==0 →
@@ -267,23 +319,28 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
                                      r0_awbm, r0_o32, r0_opm],
                               workspace_ref=_fa_workspace()))
 
-    # ── core_out 逆 RoPE（2026-07-23,185 F 差分合账;DAG 审计嫌疑③）────────────────────
-    # 真机对 core attention 输出做 inverse-RoPE（deepseek_v4_hybrid_attention.py:277
-    # `_apply_forward_rope(core_out, freqs, inverse=True)`,fused/unfused 两分支都有;inverse
-    # 恒走非融合旋转 rope_utils.py:182）。bprop 保留:输出 bf16 复本 [S,B,n·vd] + 旋转 lane 的
-    # fp32 cast/rotate_half 各一份 [S,B,n·rope_dim]。185 F 差分:fused 每层真机 3109 vs 修前
-    # sim 2960(+149)——本成员 seq2048 记账 128+2×16=160,闭合到 +1.4%。
-    inv_out = TensorRef("inv_rope_out", ("S", "B", Q_OUT))
+    # ── core_out 逆 RoPE（deepseek_v4_hybrid_attention.py:271）────────────────────────
+    # `_apply_forward_rope(core_out, freqs, 1.0, inverse=True)`,fused/unfused 两分支都有;
+    # inverse 恒走非融合旋转（rope_utils.py:186-187）→ bprop 保留旋转 lane 的
+    # `t`/`t_rot` 各一份 fp32 [S,B,n·rope_dim]（与前向 rope 同机理，见上方 ROPE_LANE）。
+    #
+    # ⚠ 2026-07-29 订正（仲裁 §1.4）：**去掉** `inv_rope_out`（输出 bf16 复本 [S,B,n·vd]，256 MiB）。
+    #   `:215` 的 `cat([t_nope, t_pe])` 返回值,其**全部**下游是 `:278` reshape → `:286`
+    #   reshape+permute,二者 VJP 分别是 reshape 与逆 permute,**都不保留输入**；bmm 真正保留的
+    #   操作数是 `cg`（已单列）。抽取图逐 op 佐证：`:215` 的节点 saves=[]，下游首个 save 是 `cg`。
+    #   此前依据是 2026-07-23「185 F 差分合账」（seq2048 补 128+2×16=160）——但那次拟合叠在
+    #   一个已过读的普查之上（q/q_hnorm_fp32/cg_fp32 三处 dtype 错都在），故不能作为「被保留」的证据。
     inv_f32 = TensorRef("inv_rope_f32", ("S", "B", "n_heads*qk_rope_head_dim"), dtype_bytes=4)
     inv_rot = TensorRef("inv_rope_rot", ("S", "B", "n_heads*qk_rope_head_dim"), dtype_bytes=4)
     ops.append(OpSpec("inv_rope", OpType.ROPE, [core_out], core_out,
-                      saves=[inv_out, inv_f32, inv_rot]))
+                      saves=[inv_f32, inv_rot]))
 
     # ── 分组输出：linear_o_group_proj（bmm，fp32 cg save）→ linear_proj → 残差 ────
     ops += [
-        # grouped wo_a：bmm 对 core_out cast fp32（cg_fp32 saved，:274-287）—— 真机 256 MiB/层
+        # grouped wo_a：bmm 的激活操作数是 `cg`（:286 permute 出的 **bf16** 副本，:291 bmm）——
+        # 源注释 :288-290 显式拒绝 fp32 提升（仲裁 §1.3）。256 MiB/层。
         OpSpec("o_group_proj", OpType.MATMUL, [core_out, wo_group], o_group_out,
-               params=[wo_group], saves=[cg_fp32]),
+               params=[wo_group], saves=[cg]),
         OpSpec("o_proj",       OpType.MATMUL, [o_group_out, o_w], o, params=[o_w], saves=[o_group_out]),  # :290
         OpSpec("add1",         OpType.ELEMENTWISE, [o], h1, saves=[]),           # 残差 → h1（reshard SP）
     ]

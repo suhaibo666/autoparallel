@@ -156,53 +156,63 @@ def test_delta_magnitude_gap_is_recorded(matrix):
     rows = magnitude_report(matrix["chain2"], ["bucket", "hand_spec"])
     ratios = {(lbl, key): ratio for lbl, key, _rd, _md, ratio in rows}
     for lbl in ("L8 m4", "L8 m8", "L4 m4"):
-        assert round(ratios[(lbl, "bucket")], 3) == 0.603, ratios
-        assert round(ratios[(lbl, "hand_spec")], 3) == 0.670, ratios
+        # 2026-07-29 重钉：0.603→0.545 / 0.670→0.644。**缺口变大是如实记账**：普查修正
+        # 只动 fused 侧的过读，unfused 侧的欠读（gathered-KV fp32 三份梯度，拆解报告 §4.2）
+        # 一分未修 → `unfused − fused` 的 delta 相应更欠。
+        assert round(ratios[(lbl, "bucket")], 3) == 0.545, ratios
+        assert round(ratios[(lbl, "hand_spec")], 3) == 0.644, ratios
 
 
 # ---------------------------------------------------------------------------
 # D. 逐字节中立（golden 锁）
 # ---------------------------------------------------------------------------
 
-#: 桶模型 per-stage 峰值（MiB）——与 grad_mode 无关。改造前后逐字节相同。
+#: 桶模型 per-stage 峰值（MiB）——与 grad_mode 无关。
+#: **2026-07-29 重钉**（`docs/census_arbitration_2026-07-29.md` §2）：手写普查的注意力主干按
+#: 权威快照逐条订正（q_hnorm/cg 由 fp32 改回 bf16、去伪 norm 抬升、去 inv_rope_out、补前向 rope
+#: 保留对、cmp_residual 改标量、补 sinks/sparse_indices、idx_weights 改 fp32）。**不变量一条没动**
+#: （×1 于层数/微批数、run d 不可评分、真机指纹），只移动了样例值。
 GOLDEN_BUCKET = {
-    "a fused   ON  L8 m4": (19307.1, 14033.1, 13777.1, 22241.8),
-    "b unfused ON  L8 m4": (37518.1, 32898.6, 32642.6, 36931.6),
-    "c fused   OFF L8 m4": (40342.2, 29293.3, 21964.1, 27611.6),
-    "d unfused OFF L8 m4": (136776.2, 104006.8, 71773.1, 52516.1),
-    "e fused   ON  L8 m8": (19918.6, 14033.1, 13777.1, 22241.8),
-    "f unfused ON  L8 m8": (38784.1, 32898.6, 32642.6, 36931.6),
-    "g fused   ON  L4 m4": (16225.6, 10477.7, 10072.6, 18942.4),
-    "h unfused ON  L4 m4": (21468.6, 29343.2, 16111.6, 33632.2),
+    "a fused   ON  L8 m4": (17901.1, 12619.6, 12363.6, 22241.8),
+    "b unfused ON  L8 m4": (36112.1, 31492.6, 31236.6, 35525.6),
+    "c fused   OFF L8 m4": (32904.2, 23638.8, 18109.1, 25812.1),
+    "d unfused OFF L8 m4": (129368.2, 98386.8, 67941.1, 50728.1),
+    "e fused   ON  L8 m8": (18505.1, 12619.6, 12363.6, 22241.8),
+    "f unfused ON  L8 m8": (37378.1, 31492.6, 31236.6, 35525.6),
+    "g fused   ON  L4 m4": (14819.6, 9064.2, 8662.6, 18942.4),
+    "h unfused ON  L4 m4": (20062.6, 27937.2, 14705.6, 32226.2),
 }
-#: liveness(hand_spec) per-stage 峰值（MiB），grad_mode=dataflow。
+#: liveness(hand_spec) per-stage 峰值（MiB），grad_mode=dataflow。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_DATAFLOW = {
-    "a fused   ON  L8 m4": (17963.0, 12592.9, 12336.9, 24261.8),
-    "b unfused ON  L8 m4": (34145.7, 29526.1, 29270.1, 33559.2),
-    "c fused   OFF L8 m4": (40734.2, 29429.3, 21844.1, 29887.6),
-    "d unfused OFF L8 m4": (128976.2, 97998.8, 67557.1, 52744.1),
-    "e fused   ON  L8 m8": (18478.5, 12592.9, 12336.9, 24261.8),
-    "f unfused ON  L8 m8": (35411.7, 29526.1, 29270.1, 33559.2),
-    "g fused   ON  L4 m4": (14881.5, 9037.5, 8648.4, 20962.4),
-    "h unfused ON  L4 m4": (20124.5, 25970.7, 14687.4, 30259.8),
+    "a fused   ON  L8 m4": (17069.0, 11691.5, 11435.5, 24261.8),
+    "b unfused ON  L8 m4": (33763.7, 29144.1, 28888.1, 33177.2),
+    "c fused   OFF L8 m4": (33552.2, 24030.8, 18245.1, 28088.1),
+    "d unfused OFF L8 m4": (121824.2, 92634.8, 63981.1, 50956.1),
+    "e fused   ON  L8 m8": (17577.0, 11691.5, 11435.5, 24261.8),
+    "f unfused ON  L8 m8": (35029.7, 29144.1, 28888.1, 33177.2),
+    "g fused   ON  L4 m4": (13987.5, 8136.0, 7750.4, 20962.4),
+    "h unfused ON  L4 m4": (19230.5, 25588.7, 13793.4, 29877.8),
 }
-#: 同上，grad_mode=chain2。
+#: 同上，grad_mode=chain2。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_CHAIN2 = {
-    "a fused   ON  L8 m4": (17963.0, 12592.9, 12336.9, 24261.8),
-    "b unfused ON  L8 m4": (41194.8, 36575.3, 36319.3, 40608.3),
-    "c fused   OFF L8 m4": (40734.2, 29429.3, 21844.1, 29887.6),
-    "d unfused OFF L8 m4": (136141.0, 105163.6, 74721.9, 52744.1),
-    "e fused   ON  L8 m8": (18478.5, 12592.9, 12336.9, 24261.8),
-    "f unfused ON  L8 m8": (42460.8, 36575.3, 36319.3, 40608.3),
-    "g fused   ON  L4 m4": (14881.5, 9037.5, 8648.4, 20962.4),
-    "h unfused ON  L4 m4": (20928.4, 33019.8, 16211.3, 37308.9),
+    "a fused   ON  L8 m4": (17069.0, 11691.5, 11435.5, 24261.8),
+    "b unfused ON  L8 m4": (40556.8, 35937.3, 35681.3, 39970.3),
+    "c fused   OFF L8 m4": (33552.2, 24030.8, 18245.1, 28088.1),
+    "d unfused OFF L8 m4": (129245.0, 100055.6, 71401.9, 50956.1),
+    "e fused   ON  L8 m8": (17577.0, 11691.5, 11435.5, 24261.8),
+    "f unfused ON  L8 m8": (41822.8, 35937.3, 35681.3, 39970.3),
+    "g fused   ON  L4 m4": (13987.5, 8136.0, 7750.4, 20962.4),
+    "h unfused ON  L4 m4": (20290.4, 32381.8, 15573.3, 36670.9),
 }
 #: 28 个可评分格的 `sim/real` 聚合（run d 真机 OOM → 不入统计）。
+#: **2026-07-29**：mean 0.946→0.867（bucket）/ 0.955→0.899（hand_spec·chain2）。max 从 1.394/1.400
+#: 降到 1.125/1.143 —— 那正是 run c 的**过读**被修掉；均值下降是因为过读此前在掩盖别处的欠读
+#: （unfused 反向工作集、fused 单层成本），两者本是相反方向的误差（拆解报告 §0）。
 GOLDEN_AGG = {
-    ("dataflow", "bucket"): (28, 0.946, 0.748, 1.394),
-    ("dataflow", "hand_spec"): (28, 0.893, 0.672, 1.400),
-    ("chain2", "bucket"): (28, 0.946, 0.748, 1.394),
-    ("chain2", "hand_spec"): (28, 0.955, 0.729, 1.400),
+    ("dataflow", "bucket"): (28, 0.867, 0.717, 1.125),
+    ("dataflow", "hand_spec"): (28, 0.838, 0.663, 1.143),
+    ("chain2", "bucket"): (28, 0.867, 0.717, 1.125),
+    ("chain2", "hand_spec"): (28, 0.899, 0.694, 1.143),
 }
 
 
@@ -247,13 +257,14 @@ def test_run_d_is_unscorable_and_excluded(matrix):
 
 
 def test_unfused_on_cell_ratios_match_recorded_reference(matrix):
-    """回归参照（任务交接记录的已知结果）：unfused ON 的 liveness·chain2 sim/real
-    ≈ 0.821 / 0.832 / 0.837 / 0.848；bucket ≈ 0.748–0.771。"""
+    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.808 / 0.818 / 0.822 / 0.835；
+    bucket ≈ 0.717–0.742。（2026-07-29 重钉，原 0.821/0.832/0.837/0.848 与 0.748–0.771；
+    普查修正只减 fused 侧过读，unfused 欠读未动 → 该跑比值同幅下移。）"""
     r = matrix["chain2"]["b unfused ON  L8 m4"]
     lv = [r.liveness_mib["hand_spec"][i] / r.real(i) for i in range(4)]
     bk = [r.bucket_mib[i] / r.real(i) for i in range(4)]
-    assert [round(x, 3) for x in lv] == [0.821, 0.832, 0.837, 0.848]
-    assert min(bk) >= 0.748 - 5e-4 and max(bk) <= 0.771 + 5e-4
+    assert [round(x, 3) for x in lv] == [0.808, 0.818, 0.822, 0.835]
+    assert min(bk) >= 0.717 - 5e-4 and max(bk) <= 0.742 + 5e-4
 
 
 # ---------------------------------------------------------------------------
