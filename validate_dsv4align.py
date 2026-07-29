@@ -33,10 +33,24 @@ def _cycle_ratios(n):
     return tuple(cyc[i % 3] for i in range(n))
 
 
-def dsv4_align_config(num_layers=4, mhc=0, mtp=0, seq=2048):
+def dsv4_align_config(num_layers=4, mhc=0, mtp=0, seq=2048, use_fused_mhc=False):
     """LLMConfig matching prep_dsv4align.py real-machine dsv4 config (memory subset).
 
     qk_layernorm/add_bias omitted (memory-negligible; would fail-loud in build_llm).
+
+    `use_fused_mhc`（2026-07-30 补齐旋钮，见 `docs/fused_mhc_branch_mismatch_2026-07-30.md`）：
+    选 `cost_eval/layers/residual.py:192` 的 `_fused_hc_ops` / `_unfused_hc_ops` 两条分支。
+    **默认 False 就是本锚点真机跑的口径**，三处独立源一致：
+      - `.claude/skills/real-machine-memory-sim/prep_dsv4align.py:120-122` —— 生成该跑 yaml 的
+        脚本，注释逐字「容器 vendor OPP 无 aclnnMhcPreSinkhorn 融合 kernel → mHC 走 unfused」，
+        键值 `os.environ.get("FUSED_MHC") == "1"`（该跑未设 → False）；
+      - `.claude/skills/real-machine-memory-sim/SKILL.md` §7.6 —— 「融合 mHC kernel
+        (`aclnnMhcPreSinkhorn`) 容器 vendor OPP **没有** → mHC 走 unfused」；
+      - `specs/2026-07-01-unified-llm-modelspec-design.md:297` —— 锚点标题逐字
+        「2026-07-01，fused DSA + **unfused mHC** + MTP」。
+    即：本锚点与 pp4/pp8/185 那批**不同**——它的真机就是非融合 mHC，模型侧不需要翻分支。
+    （站点 pp4 yaml 的 `use_fused_mhc: true` 是 167/185 的 dsv4h 跑，不是本 2026-07-01 的
+    dsv4-align 跑；把两者混为一谈是上一轮 §5 注解的事实错误，本轮已订正。）
     """
     return LLMConfig(
         num_layers=num_layers,
@@ -74,6 +88,7 @@ def dsv4_align_config(num_layers=4, mhc=0, mtp=0, seq=2048):
         # mHC residual
         residual_variant="mhc" if mhc else "plain",
         num_residual_streams=4 if mhc else 1,   # hc_mult=4
+        use_fused_mhc=bool(use_fused_mhc),      # prep_dsv4align.py:122（该跑 = False，见 docstring）
         # MTP
         mtp_num_layers=mtp,
         loss_type="logsoftmax_nll",
@@ -82,11 +97,11 @@ def dsv4_align_config(num_layers=4, mhc=0, mtp=0, seq=2048):
     )
 
 
-def evaluate(num_layers=4, mhc=0, mtp=0, seq=2048, reserve_mib=None):
+def evaluate(num_layers=4, mhc=0, mtp=0, seq=2048, reserve_mib=None, use_fused_mhc=False):
     from validate_dsv3 import RESIDUAL_MiB
     if reserve_mib is None:
         reserve_mib = RESIDUAL_MiB
-    cfg = dsv4_align_config(num_layers, mhc, mtp, seq)
+    cfg = dsv4_align_config(num_layers, mhc, mtp, seq, use_fused_mhc=use_fused_mhc)
     spec = build_llm_spec(cfg)
     pc = ParallelConfig(dp_shard=2, tp=1, ep=1, pp=1, cp=1,
                         sequence_parallel=True, num_microbatches=1)
@@ -104,12 +119,15 @@ def main():
     MHC = int(os.environ.get("MHC", "0"))
     MTP = int(os.environ.get("MTP", "0"))
     SEQ = int(os.environ.get("SIM_SEQ", "2048"))
-    rep = evaluate(N, MHC, MTP, SEQ)
+    # FUSED_MHC 与 prep_dsv4align.py:122 同名同义（该真机跑未设 → 非融合）。
+    FUSED_MHC = os.environ.get("FUSED_MHC") == "1"
+    rep = evaluate(N, MHC, MTP, SEQ, use_fused_mhc=FUSED_MHC)
     p = rep.per_stage[0]
     b = p.breakdown
     pk = p.peak_bytes / MiB
     real = MEASURED.get((MHC, MTP))
-    print(f"=== DSv4-align {N}L seq={SEQ} mHC={MHC} MTP={MTP} (no-recompute, FSDP-2) ===")
+    print(f"=== DSv4-align {N}L seq={SEQ} mHC={MHC} MTP={MTP} "
+          f"fused_mHC={int(FUSED_MHC)} (no-recompute, FSDP-2) ===")
     print(f"[peak] pred = {pk:8.1f} MiB @ {p.peak_event}"
           + (f" ; real = {real} ; ratio = {pk/real:.4f}" if real else ""))
     # 已知残差（源码级已定位，2026-07-06 用户定夺维持纯公式、不加常数；设计 §14.2 / DIAGNOSIS.md）：

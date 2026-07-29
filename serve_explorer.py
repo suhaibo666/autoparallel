@@ -321,6 +321,10 @@ _LLM_FIELD_GATE = {
     "qk_rope_head_dim": "qk_rope", "v_head_dim": "v_head", "vocab_size": "vocab",
     "head_dim": "head_dim", "residual_variant": "hc", "num_residual_streams": "hc",
     "cross_entropy_fused": "ce_fused", "ce_pynative_lean": "ce_lean",
+    # 融合 mHC（2026-07-30 补齐；此前**唯一**没有 UI 键的内存相关 LLMConfig 字段）：
+    #   `hc` 只带残差流数 n，带不了「融合 / 非融合」这条分支选择（两条分支的 saves 差
+    #   448 MiB/模块 @S4096·H4096·n4，见 layers/residual.py:192 的 `_fused_hc_ops`/`_unfused_hc_ops`）。
+    "use_fused_mhc": "mhc_fused",
     "embedding_params_dtype_bytes": "emb_bytes",
 }
 
@@ -551,6 +555,16 @@ def parse_and_validate(p):
     # pp1/pp2-s1 实测一致）。缺省 → 制度常数 8/4（DSv3-era 冻结口径）。
     if (p.get("ce_lean") or "").strip() != "":
         over["ce_pynative_lean"] = _x_flag(p, "ce_lean", base.ce_pynative_lean)
+    # 融合 mHC（yaml `use_fused_mhc`，隐藏字段 mhc_fused；2026-07-30 补齐）：True=融合
+    #   `npu_mhc_pre_sinkhorn`/`npu_mhc_post`（ctx 只有 custom_op_impl.py:390-391/:331 那两组）；
+    #   False=非融合小算子（hyper_connection.py:297-299/:108-109/:119-120 三份 fp32 打包副本，
+    #   +448 MiB/模块 @S4096·H4096·n4）。**此前本函数没有这个旋钮** → 恒取基座默认 False，
+    #   而 pp4/pp8/MTP/185 各锚点比对的真机跑站点 yaml 是 `use_fused_mhc: true`
+    #   （`analysis/realmachine/ab_fusion_2026-07-25/dsv4h_*_pp4_recomp.yaml:109`）→ 那批锚点
+    #   一直在拿**非融合**模型对**融合**真机（`docs/fused_mhc_branch_mismatch_2026-07-30.md`）。
+    #   与 `ce_fused` 同款语义：缺省/空 → 保留基座（手配路径逐字节不变）。
+    if (p.get("mhc_fused") or "").strip() != "":
+        over["use_fused_mhc"] = _x_flag(p, "mhc_fused", base.use_fused_mhc)
     # 2026-07-24 口径切换：去除 std_pin 隐藏字段（std_recompute_ctx_pin 经验保留集已删，纯理论口径）。
     # embedding/head 权重 dtype 字节（隐藏字段 emb_bytes）：116 std fork 的 TransformerConfig 默认
     # embedding_params_dtype=float32（shim 配置转储实证）→ 4;缺省 2 = 全部既有锚点口径。
@@ -1081,6 +1095,9 @@ def _llm_to_fields(llm):
         "hc": (int(llm.num_residual_streams or 1) if llm.residual_variant == "mhc" else 1),
         # DSA/CSA 融合开关(apply_dsa_kernel_fusion)：unfused 激活大得多，丢了会大幅欠估。
         "dsa_fused": int(bool(llm.dsa_fused)),
+        # 融合 mHC(use_fused_mhc)：选 `_fused_hc_ops` / `_unfused_hc_ops` 两条 saves 差
+        #   448 MiB/模块的分支；丢了会让锚点拿错分支对真机（2026-07-30 补齐）。
+        "mhc_fused": int(bool(llm.use_fused_mhc)),
         # 融合 CE / unfused-CE lean / embedding 权重 dtype 字节（隐藏字段，各自有真机口径背书）。
         "ce_fused": int(bool(llm.cross_entropy_fused)),
         "ce_lean": int(bool(llm.ce_pynative_lean)),
@@ -1545,6 +1562,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
            UI 字段只覆盖用户真改过的项，故导入后仍可微调而其余字段逐字忠实。
            选模型预设 → resetRuntimeExtras() 把这些清空（= 放弃导入的权威结构，回手配语义）。 -->
       <input type="hidden" name="head_dim" value="">
+      <input type="hidden" name="mhc_fused" value="">
       <input type="hidden" name="ce_fused" value="">
       <input type="hidden" name="ce_lean" value="">
       <input type="hidden" name="emb_bytes" value="">
@@ -1855,7 +1873,7 @@ function showBuckets(e){
 /* llm_json/head_dim/ce_*/emb_bytes 一并复位:选预设 = 放弃 yaml 导入的**权威结构**,回预设+UI 表达
    (不清 llm_json 会让预设选择看似无效——基座仍是上次导入的那份 config)。 */
 const RT_DEFAULTS={dp_replicate:"1",reshard:"default",cpu_offload:"0",prefetch:"1",maxdev_gib:"64",opt_dtype:"fp32",sp:"",grad_bytes:"4",
-  llm_json:"",head_dim:"",ce_fused:"",ce_lean:"",emb_bytes:""};
+  llm_json:"",head_dim:"",mhc_fused:"",ce_fused:"",ce_lean:"",emb_bytes:""};
 function resetRuntimeExtras(){
   Object.entries(RT_DEFAULTS).forEach(([k,v])=>{const el=document.querySelector(`#side [name=${k}]`);if(el)el.value=v;});
 }
