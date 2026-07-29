@@ -156,11 +156,12 @@ def test_delta_magnitude_gap_is_recorded(matrix):
     rows = magnitude_report(matrix["chain2"], ["bucket", "hand_spec"])
     ratios = {(lbl, key): ratio for lbl, key, _rd, _md, ratio in rows}
     for lbl in ("L8 m4", "L8 m8", "L4 m4"):
-        # 2026-07-29 重钉：0.603→0.545 / 0.670→0.644。**缺口变大是如实记账**：普查修正
-        # 只动 fused 侧的过读，unfused 侧的欠读（gathered-KV fp32 三份梯度，拆解报告 §4.2）
-        # 一分未修 → `unfused − fused` 的 delta 相应更欠。
-        assert round(ratios[(lbl, "bucket")], 3) == 0.545, ratios
-        assert round(ratios[(lbl, "hand_spec")], 3) == 0.644, ratios
+        # 2026-07-29 二次重钉：0.545→0.518（bucket）/ 0.644→0.636（hand_spec）。
+        # **缺口继续变大仍是如实记账**：融合 mHC ctx + RMSNorm 不 cast 两条修正**只减 fused 侧**
+        # （unfused 跑同样吃 RMSNorm 一条，但其欠读大头 —— gathered-KV fp32 三份梯度，拆解报告
+        # §4.2 —— 一分未修）→ `unfused − fused` 的 delta 相应更欠。
+        assert round(ratios[(lbl, "bucket")], 3) == 0.518, ratios
+        assert round(ratios[(lbl, "hand_spec")], 3) == 0.636, ratios
 
 
 # ---------------------------------------------------------------------------
@@ -172,47 +173,54 @@ def test_delta_magnitude_gap_is_recorded(matrix):
 #: 权威快照逐条订正（q_hnorm/cg 由 fp32 改回 bf16、去伪 norm 抬升、去 inv_rope_out、补前向 rope
 #: 保留对、cmp_residual 改标量、补 sinks/sparse_indices、idx_weights 改 fp32）。**不变量一条没动**
 #: （×1 于层数/微批数、run d 不可评分、真机指纹），只移动了样例值。
+#: **2026-07-29 二次重钉**（`docs/census_fix_mhc_rmsnorm_2026-07-29.md`）：①融合 mHC 按
+#: `custom_op_impl.py:390-391` / `mhc_pre_sinkhorn.cc:24-50` 建 ctx（−421.8 MiB/层）；
+#: ②`FusedRMSNorm` 不 cast（`layer_norm.py:151-155`）→ norm-fp32 抬升按种类分辨（−268.0 MiB/层）。
+#: 同样**一条不变量没动**，只移动样例值。
 GOLDEN_BUCKET = {
-    "a fused   ON  L8 m4": (17901.1, 12619.6, 12363.6, 22241.8),
-    "b unfused ON  L8 m4": (36112.1, 31492.6, 31236.6, 35525.6),
-    "c fused   OFF L8 m4": (32904.2, 23638.8, 18109.1, 25812.1),
-    "d unfused OFF L8 m4": (129368.2, 98386.8, 67941.1, 50728.1),
-    "e fused   ON  L8 m8": (18505.1, 12619.6, 12363.6, 22241.8),
-    "f unfused ON  L8 m8": (37378.1, 31492.6, 31236.6, 35525.6),
-    "g fused   ON  L4 m4": (14819.6, 9064.2, 8662.6, 18942.4),
-    "h unfused ON  L4 m4": (20062.6, 27937.2, 14705.6, 32226.2),
+    "a fused   ON  L8 m4": (17214.6, 11933.1, 11677.1, 22212.8),
+    "b unfused ON  L8 m4": (35425.6, 30806.1, 30550.1, 34839.1),
+    "c fused   OFF L8 m4": (27389.6, 19503.6, 15353.4, 24403.6),
+    "d unfused OFF L8 m4": (123853.6, 94251.6, 65185.4, 49319.6),
+    "e fused   ON  L8 m8": (17818.6, 11933.1, 11677.1, 22212.8),
+    "f unfused ON  L8 m8": (36691.6, 30806.1, 30550.1, 34839.1),
+    "g fused   ON  L4 m4": (14131.6, 8376.2, 7974.6, 18911.9),
+    "h unfused ON  L4 m4": (19374.6, 27249.2, 14017.6, 31538.2),
 }
 #: liveness(hand_spec) per-stage 峰值（MiB），grad_mode=dataflow。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_DATAFLOW = {
-    "a fused   ON  L8 m4": (17069.0, 11691.5, 11435.5, 24261.8),
-    "b unfused ON  L8 m4": (33763.7, 29144.1, 28888.1, 33177.2),
-    "c fused   OFF L8 m4": (33552.2, 24030.8, 18245.1, 28088.1),
-    "d unfused OFF L8 m4": (121824.2, 92634.8, 63981.1, 50956.1),
-    "e fused   ON  L8 m8": (17577.0, 11691.5, 11435.5, 24261.8),
-    "f unfused ON  L8 m8": (35029.7, 29144.1, 28888.1, 33177.2),
-    "g fused   ON  L4 m4": (13987.5, 8136.0, 7750.4, 20962.4),
-    "h unfused ON  L4 m4": (19230.5, 25588.7, 13793.4, 29877.8),
+    "a fused   ON  L8 m4": (16510.4, 11132.9, 10876.9, 24232.8),
+    "b unfused ON  L8 m4": (33543.8, 28924.3, 28668.3, 32957.3),
+    "c fused   OFF L8 m4": (28037.6, 19895.6, 15489.4, 26679.6),
+    "d unfused OFF L8 m4": (116575.7, 88637.7, 61363.5, 49547.6),
+    "e fused   ON  L8 m8": (17018.4, 11132.9, 10876.9, 24232.8),
+    "f unfused ON  L8 m8": (34809.8, 28924.3, 28668.3, 32957.3),
+    "g fused   ON  L4 m4": (13427.4, 7575.9, 7190.3, 20931.9),
+    "h unfused ON  L4 m4": (18670.4, 25367.4, 13233.3, 29656.4),
 }
 #: 同上，grad_mode=chain2。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_CHAIN2 = {
-    "a fused   ON  L8 m4": (17069.0, 11691.5, 11435.5, 24261.8),
-    "b unfused ON  L8 m4": (40556.8, 35937.3, 35681.3, 39970.3),
-    "c fused   OFF L8 m4": (33552.2, 24030.8, 18245.1, 28088.1),
-    "d unfused OFF L8 m4": (129245.0, 100055.6, 71401.9, 50956.1),
-    "e fused   ON  L8 m8": (17577.0, 11691.5, 11435.5, 24261.8),
-    "f unfused ON  L8 m8": (41822.8, 35937.3, 35681.3, 39970.3),
-    "g fused   ON  L4 m4": (13987.5, 8136.0, 7750.4, 20962.4),
-    "h unfused ON  L4 m4": (20290.4, 32381.8, 15573.3, 36670.9),
+    "a fused   ON  L8 m4": (16510.4, 11135.5, 10879.5, 24232.8),
+    "b unfused ON  L8 m4": (40337.1, 35717.5, 35461.5, 39750.6),
+    "c fused   OFF L8 m4": (28040.3, 19898.3, 15492.0, 26679.6),
+    "d unfused OFF L8 m4": (124069.3, 96259.2, 68985.0, 49547.6),
+    "e fused   ON  L8 m8": (17021.1, 11135.5, 10879.5, 24232.8),
+    "f unfused ON  L8 m8": (41603.1, 35717.5, 35461.5, 39750.6),
+    "g fused   ON  L4 m4": (13427.4, 7578.6, 7193.0, 20931.9),
+    "h unfused ON  L4 m4": (20069.1, 32160.6, 15352.0, 36449.6),
 }
 #: 28 个可评分格的 `sim/real` 聚合（run d 真机 OOM → 不入统计）。
 #: **2026-07-29**：mean 0.946→0.867（bucket）/ 0.955→0.899（hand_spec·chain2）。max 从 1.394/1.400
 #: 降到 1.125/1.143 —— 那正是 run c 的**过读**被修掉；均值下降是因为过读此前在掩盖别处的欠读
 #: （unfused 反向工作集、fused 单层成本），两者本是相反方向的误差（拆解报告 §0）。
+#: **二次重钉**：0.867→0.822（bucket）/ 0.899→0.862（hand_spec·chain2）；max 1.125→1.019 /
+#: 1.143→1.116。run c 逐 stage 由 1.083/1.125/1.020/0.931 收到 0.901/0.928/0.865/0.880 ——
+#: **过读已被完全消掉、转入欠侧**。均值继续下降同上：抵消消失、欠读露出，不为均值好看而留错字节。
 GOLDEN_AGG = {
-    ("dataflow", "bucket"): (28, 0.867, 0.717, 1.125),
-    ("dataflow", "hand_spec"): (28, 0.838, 0.663, 1.143),
-    ("chain2", "bucket"): (28, 0.867, 0.717, 1.125),
-    ("chain2", "hand_spec"): (28, 0.899, 0.694, 1.143),
+    ("dataflow", "bucket"): (28, 0.822, 0.701, 1.019),
+    ("dataflow", "hand_spec"): (28, 0.800, 0.658, 1.067),
+    ("chain2", "bucket"): (28, 0.822, 0.701, 1.019),
+    ("chain2", "hand_spec"): (28, 0.862, 0.672, 1.116),
 }
 
 
@@ -257,14 +265,14 @@ def test_run_d_is_unscorable_and_excluded(matrix):
 
 
 def test_unfused_on_cell_ratios_match_recorded_reference(matrix):
-    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.808 / 0.818 / 0.822 / 0.835；
-    bucket ≈ 0.717–0.742。（2026-07-29 重钉，原 0.821/0.832/0.837/0.848 与 0.748–0.771；
-    普查修正只减 fused 侧过读，unfused 欠读未动 → 该跑比值同幅下移。）"""
+    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.804 / 0.813 / 0.817 / 0.830；
+    bucket ≈ 0.701–0.728。（2026-07-29 二次重钉，原 0.808/0.818/0.822/0.835 与 0.717–0.742；
+    RMSNorm 不 cast 一条也作用在 unfused 跑上 → 该跑比值再下移一档。）"""
     r = matrix["chain2"]["b unfused ON  L8 m4"]
     lv = [r.liveness_mib["hand_spec"][i] / r.real(i) for i in range(4)]
     bk = [r.bucket_mib[i] / r.real(i) for i in range(4)]
-    assert [round(x, 3) for x in lv] == [0.808, 0.818, 0.822, 0.835]
-    assert min(bk) >= 0.717 - 5e-4 and max(bk) <= 0.742 + 5e-4
+    assert [round(x, 3) for x in lv] == [0.804, 0.813, 0.817, 0.830]
+    assert min(bk) >= 0.701 - 5e-4 and max(bk) <= 0.728 + 5e-4
 
 
 # ---------------------------------------------------------------------------
