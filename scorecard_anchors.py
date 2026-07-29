@@ -94,9 +94,19 @@ def anchors() -> list:
         Anchor("cp2 ulysses full 4L (B2)", "cp+full",
                lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="ulysses"), 12441.0, (0.98, 1.05)),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.089 → **1.021**。仍 OOM-安全，但保守余量被压掉大半。
+        # 2026-07-30 三次重钉（**word-embedding 反向 kernel workspace 实测入账**，
+        #   docs/head_workspace_2026-07-30.md）：1.021 → **1.032**，且**峰值事件由 `bwd@4`
+        #   易主为 `bwd@0`（embedding 反向）**。这是全库唯一被该项抬动的记分卡锚点——只有它的
+        #   `bwd@0` 本来就贴着峰（差 952.9 MiB < 该项 1067.753 MiB）。
+        #   ⚠ 那 1067.753 MiB **正是这条锚点自己那次采集的 profiler 量到的**：
+        #   `analysis/realmachine/pp2_norecomp/op_816362.csv` 里 `GatherDGradV2` 的瞬态块
+        #   `Size(KB)=1093379.0` = 1119620096 B，与模型逐字节相同（守卫门见
+        #   `tests/test_emb_bwd_kernel_workspace.py`）。**band 刻意不放宽**：1.032 仍在
+        #   (1.00, 1.06) 内，继续漂移必须触红。
         Anchor("pp2-stage0 (optstep)", "pp+norecomp",
                lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=0), 10246.0, (1.00, 1.06),
-               note="D3：无重算 BWD 峰共存整体保守、OOM-安全（2026-07-29 由 1.089 收到 1.021）；"
+               note="D3：无重算 BWD 峰共存整体保守、OOM-安全（2026-07-29 由 1.089 收到 1.021；"
+                    "2026-07-30 因 embedding 反向 workspace 实测入账回到 1.032）；"
                     "lo=1.00 守住「仍在安全侧」这一条不变量"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.999**（欠 43.6 MiB / 0.10%）——**刚翻到 OOM-不安全侧**，如实记。
         Anchor("pp2-stage1 (loss,k_ce=8)", "pp+norecomp",
