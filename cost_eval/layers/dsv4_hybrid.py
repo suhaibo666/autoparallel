@@ -234,13 +234,54 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         #   [B,S,dsa_indexer_n_heads,S]、为 indexer KL loss 反向常驻（dsa_indexer_loss.py）——**含 n_idx_heads
         #   维**（此前 [B,S,S] 漏了 ×n_idx=64,是 unfused 大欠算之一）→ 前向 save,不再当小 scratch。
         if enable_indexer:
+            # ── indexer **内部** RoPE 的反向保留对（2026-07-30，`docs/r4_indexer_census_2026-07-30.md`）──
+            # `CSAIndexer.forward_before_topk` 对 `q_pe` 调**一次** `ApplyRotaryPosEmb`
+            # （`indexer.py:182-187`），与顶层 attention 的三次调用是**同一个实现**
+            # （`pynative/base_models/common/embeddings/rope_utils.py`）。
+            # **走非融合分支的判据**：`apply_rope_fusion` 默认 `False`
+            # （`parallel_core/transformer_config.py:1578`，站点 yaml 未覆盖）→ `:182`
+            # `if self.apply_rope_fusion and not inverse:` 恒假 → 落到 `:186-187`
+            #     `t_rot = self._rotate_half(t); output = add(mul(t, cos_), mul(t_rot, sin_))`
+            # → 两个 `mul` 各保留一个操作数，即**每次调用留下 `t` 与 `t_rot` 两块**
+            #   （与本文件上方 ROPE_LANE 那三次调用同一机理、同一口径）。
+            #   ⚠ 上方 ROPE_LANE 注释里「`mla_output_remove_interleaving=True` 使
+            #   `fused_interleaved_mla` 恒 False」这条理由**不足以**推出走非融合分支（`:182`
+            #   的条件里没有 `fused_interleaved_mla`）；真正的判据是 `apply_rope_fusion=False`。
+            #   结论不变，此处补正判据。
+            # **形状**：`q` 经 `indexer.py:178` reshape 成
+            #   `[S,B,index_n_heads,index_head_dim]`，`:179-181` 按
+            #   `[index_head_dim − qk_pos_emb_head_dim, qk_pos_emb_head_dim]` split 出
+            #   `q_pe = [S,B,index_n_heads,qk_pos_emb_head_dim]`；进 rope 后
+            #   `rot_dim = freqs.shape[-1] = qk_pos_emb_head_dim == head_dim` →
+            #   `rope_utils.py:152-153` 不再 narrow，**整块**进旋转。
+            #   dtype = `rotary_dtype` = **fp32**（`rope_utils.py:169` `cast(t, self.rotary_dtype)`；
+            #   站点 `rotary_dtype: "float32"`）。`qk_rope_head_dim` 即 mindformers 的
+            #   `qk_pos_emb_head_dim`（`llm_config.py:40`）。
+            # **梯度确实到达**（否则不是 saved 张量）：入参过了
+            #   `ops.stop_gradient`（`csa.py:665-666`），但 `linear_wq_b` 是 Parameter
+            #   （`indexer.py:116-124`），且融合 kernel 的反向**真的吐** `d_query_index`
+            #   （`csa.py:314`）→ 整条 Q 链带 autograd 节点 → 两块进 saved。
+            # **真机背书**（`docs/kernel_workspace_2026-07-29.md` §5.2 的块台账，run c）：
+            #   r4 层比 r128 层多**恰好 3 块 64.0005 MiB**，r128 侧为 4 块。站点尺寸下
+            #   （S=4096,B=1,index_n_heads=64,qk_pos_emb_head_dim=64）本对**各 64.000 MiB**，
+            #   连同已建的 `idx_query`（64.000 MiB）正好 3 块 —— 与实测块数逐块对上。
+            #   （r128 侧那 4 块 = 顶层 q 前向 rope 对 + 逆向 rope 对，同一机理。）
+            IDX_ROPE_LANE = "dsa_indexer_n_heads*qk_rope_head_dim"
+            idx_rope_f32 = TensorRef("idx_rope_f32", ("S", "B", IDX_ROPE_LANE), dtype_bytes=4)
+            idx_rope_rot = TensorRef("idx_rope_rot", ("S", "B", IDX_ROPE_LANE), dtype_bytes=4)
+            # fused / unfused **两侧都建**：`forward_before_topk` 在两条路径上被逐字调用
+            # （`csa.py:667` 融合、`csa.py:766` 小算子），rope 调用在它内部，与
+            # `apply_dsa_kernel_fusion` 无关（该开关只切 `CSAIndexer.construct` 的打分实现）。
             if fused:
                 ops.append(OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
-                                  params=[idx_wq_b, idx_wproj], saves=[topk_indices], bwd_scratch="4*B*S*S"))
+                                  params=[idx_wq_b, idx_wproj],
+                                  saves=[topk_indices, idx_rope_f32, idx_rope_rot],
+                                  bwd_scratch="4*B*S*S"))
             else:
                 index_scores = TensorRef("index_scores", ("B", "S", "dsa_indexer_n_heads", "S"))  # indexer.py:246 bf16 bmm
                 ops.append(OpSpec("indexer", OpType.MATMUL, [ln1, q_a_out], topk_indices,
-                                  params=[idx_wq_b, idx_wproj], saves=[topk_indices, index_scores]))
+                                  params=[idx_wq_b, idx_wproj],
+                                  saves=[topk_indices, index_scores, idx_rope_f32, idx_rope_rot]))
         # compressor：门控池化 → compressed_kv [S//ratio,B,1,vd]（compressor.py）
         ops.append(OpSpec("compressor", OpType.MATMUL, [ln1], compressed_kv,
                           params=[cmp_wkv, cmp_wgate, cmp_ape], saves=[compressed_kv]))
