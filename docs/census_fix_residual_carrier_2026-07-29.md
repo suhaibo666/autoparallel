@@ -270,6 +270,38 @@ pp4×2 + pp8 + MTP + 185×2 + 记分卡×1 共 ~20 个锚点，量级（≈960 M
 
 ---
 
+## 5b. 附带修好的第二个「静默丢字段」：`mhc_wrap` 从来没带过 `workspace_ref`
+
+改 `mhc_wrap` 时顺手把三个 OpSpec 重建口（`_scale_op` / `_add_dep` / `_swap_dep`，以及
+`head.py` 里 MTP 的两处）从**手写字段清单**改成 `dataclasses.replace`。结果立刻炸出一条
+既有 bug：
+
+- `mhc_wrap` 是 mHC 层上**唯一**的 OpSpec 重建通道 → 手写清单漏一个字段，被包装层
+  （= 全部 DSv4 decoder 层）就**静默丢掉**该字段的语义。
+- 上一轮已经在这条通道上丢过一次 `norm_kind`（`residual.py` 里那条注释就是当时补的）。
+- **本轮发现的第二条**：`workspace_ref` 从来没被带过 —— flash-attn 的 softmax-LSE 工作区
+  （`attention.py:225,313` / `dsv4_hybrid.py:331,358,381` 的 `_fa_workspace()`）在每个 mHC 层
+  上被整个丢掉。
+
+**实测影响**：只有 DSA-unfused 四跑（b/d/f/h）的 **dataflow** liveness 峰恰好落在带该
+workspace 的事件上 → 各 **+16.0 MiB**；`GOLDEN_AGG` dataflow·hand_spec 0.794 → **0.795**。
+chain2 liveness 与 bucket 8×4 表**逐字节不变**，逐层型 `activation_saves` 也逐字节不变。
+
+**为什么值得单独记**：并行的 kernel-workspace 任务线正在给 `OpSpec` 加
+`bwd_workspace` / `bwd_workspace_ref` 两个新字段。若不改这三个口，那条任务线在
+`attention/dsa/dsv4_hybrid` 上加的每一个 kernel workspace 字节，都会在 **mHC 层**（也就是
+DSv4 的全部层）上被 `mhc_wrap` 静默吃掉。现在 `dataclasses.replace` +
+`_REF_FIELDS`（含 `bwd_workspace_ref`，`hasattr` 守护向后兼容）让这类漏字段在**结构上**
+不可能再发生。
+
+> **验证隔离**：本仓当前有第二条任务线在同一工作树上改
+> `dsv4_hybrid/mem_timeline/model_spec/shape_eval/structure_mem`。本轮的每一个数字与
+> 最终 `1893 passed` 都是在**独立 git worktree**（detached HEAD + 仅本轮改动）里复现的，
+> 不含对方的在途改动。（第一次在共享树里跑 `regen_gate_goldens.py` 时读到 bucket 聚合
+> 0.836 —— 那是对方在途改动的读数，不是本轮的；隔离后为 0.821，与 golden 一致。）
+
+---
+
 ## 6. 现在已知为 **OOM-不安全** 的锚点（模型欠读真机）
 
 **不调参掩盖。** 唯一正确的补法是基于真机 profiler 的 kernel workspace 项，不是普查充气。
@@ -335,6 +367,8 @@ pp4×2 + pp8 + MTP + 185×2 + 记分卡×1 共 ~20 个锚点，量级（≈960 M
 ```
 python -m pytest tests -q   →  1893 passed, 268 warnings
 ```
+
+（在独立 worktree 里跑，见 §5b 末的隔离说明。）
 
 1892 → 1893：新增 1 个用例 `test_prenorm_saves_aggregated_not_packed_stream`（正向钉住 ②，
 防静默回退）；`test_wrap_scales_residual_hidden_by_n` 按 §6.6 精神**只移动举例位置**、不变量未变。
