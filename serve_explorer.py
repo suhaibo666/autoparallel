@@ -18,7 +18,7 @@ from urllib.parse import urlparse, parse_qs
 sys.stdout.reconfigure(encoding="utf-8")
 from cost_eval.presets import deepseek_v3, deepseek_v4
 from cost_eval.build_llm import build_llm_spec
-from cost_eval.llm_config import from_jsonable, to_jsonable
+from cost_eval.llm_config import LLMConfig, from_jsonable, to_jsonable
 from cost_eval.structure_mem import estimate_structure_memory, estimate_select_memory
 from cost_eval.specs import ParallelConfig, OptimizerSpec, HardwareSpec, RecomputeSpec, SwapSpec
 from cost_eval.report import Evaluator
@@ -327,6 +327,47 @@ _LLM_FIELD_GATE = {
     "use_fused_mhc": "mhc_fused",
     "embedding_params_dtype_bytes": "emb_bytes",
 }
+
+# ── `llm_json` 专属字段：**扁平 UI dict 表达不了**，只能随权威 LLMConfig 整体过桥 ─────────
+# 为什么要显式列出来（2026-07-30，`docs/fused_mhc_branch_mismatch_2026-07-30.md` §8）：
+#   `_assert_bundle_roundtrip` 只护 **yaml 导入路**，而 `llm_json` 一带全字段，它对
+#   「这个字段在扁平 dict 里有没有承载」**结构上永远绿** —— 新字段自动过桥、判据自动成立。
+#   于是另一条路悄悄漏了：锚点/探针/手配 query **没有 `llm_json`**，基座是预设，凡不在
+#   `_LLM_FIELD_GATE` 里的字段一律**静默取预设值**。`use_fused_mhc` 就是这么错了 ~20 个锚点。
+#   本表把「哪些字段只能靠 llm_json」变成**必须显式声明**的事实：新增 LLMConfig 字段若两表
+#   都不登记，`tests/test_flat_query_reachability.py` 变红，逼作者当场做决定（给 UI 键，还是
+#   承认它在扁平路上恒取预设值）。
+# ⚠ 已知**仍在错**的一条：`csa_compress_ratios` —— pp4/pp8/185 锚点走扁平路拿到预设的
+#   **循环** `(0,4,128,0,4,128,0,4)`，而它们比对的站点 yaml 是**逐层表**
+#   `[0,4,128,4,128,4,128,4]`（层型 3×r0/3×r4/2×r128 vs 1×r0/4×r4/3×r128）。量化见
+#   `scratchpad/probe_compress_ratios_whatif.py`；未修（口径变更，同上文档 §9）。
+_LLM_JSON_ONLY_FIELDS = frozenset({
+    # 注意力前沿结构（逐层/分组，UI 无处安放）
+    "window_size", "window_pattern", "csa_compress_ratios", "csa_window_size",
+    "dsa_indexer_n_heads", "dsa_indexer_head_dim", "dsa_indexer_topk",
+    "o_groups", "o_lora_rank", "cp_kv_allgather_buffer",
+    # MoE 细节
+    "gated_linear_unit", "moe_shared_expert_num", "moe_shared_ffn_hidden_size",
+    "moe_shared_expert_gating", "moe_layer_freq", "moe_capacity_factor",
+    "moe_dispatch_mode", "moe_skew_factor",
+    # norm / 位置编码 / tie
+    "normalization", "layernorm_compute_dtype_bytes", "norm_placement", "qk_layernorm",
+    "position_embedding_type", "tie_word_embeddings",
+    # loss 链与标定 margin
+    "loss_type", "kept_frag_factor", "nr_moe_frag_factor", "chunk_loss_num",
+    # mHC sinkhorn 迭代数：**仅 use_fused_mhc=True 时进内存**（llm_config.py:118-120）。
+    #   站点 yaml `hc_sinkhorn_iters: 20` 与 LLMConfig 默认 20 **恰好相同** → 2026-07-30 起
+    #   锚点走融合分支后它成了承重项，但数值上没有分歧。是巧合，不是设计，故记在此。
+    "mhc_sinkhorn_iterations",
+    # bias / dtype
+    "add_bias_linear", "add_qkv_bias", "compute_dtype_bytes",
+})
+
+
+def unclassified_llm_fields():
+    """既没有 UI 门控键、也没声明为 `llm_json` 专属的 `LLMConfig` 字段（应恒为空）。"""
+    names = {f.name for f in dataclasses.fields(LLMConfig)}
+    return sorted(names - set(_LLM_FIELD_GATE) - _LLM_JSON_ONLY_FIELDS)
 
 
 class ConfigRoundTripError(RuntimeError):

@@ -36,11 +36,13 @@ mHC **本来就走非融合**（三处独立源，§2.2）。上一轮把它和 
 
 | 项 | `dsa_fused` | `ce_fused` | `use_fused_mhc`（本轮前） |
 |---|---|---|---|
-| UI/隐藏字段 | `serve_explorer.py:1540` `<input hidden name="dsa_fused">` | `:1548` `ce_fused` | **无** |
-| `_llm_to_fields` 回填 | `:1083` | `:1085` | **无** |
+| UI/隐藏字段 | `serve_explorer.py:1598` `<input hidden name="dsa_fused">` | `:1607` `ce_fused` | **无** |
+| `_llm_to_fields` 回填 | `:1138` | `:1143` | **无** |
 | `_LLM_FIELD_GATE` 门控键 | `:318` | `:323` | **无** |
-| `parse_and_validate` 解析 | `:541` `_x_flag(p,"dsa_fused",True)` | `:548-549` | **无** |
+| `parse_and_validate` 解析 | `:586` `_x_flag(p,"dsa_fused",True)` | `:593-594` | **无** |
 | 结果 | yaml/UI 值直达 | yaml/UI 值直达 | 恒 = `LLMConfig` 默认 `False`（`cost_eval/llm_config.py:117`） |
+
+（`serve_explorer.py` 的行号是**本轮改动后**的当前值，便于按图索骥。）
 
 `DimTable.use_fused_mhc`（`cost_eval/model_spec.py:97`）与它驱动的分支
 （`cost_eval/layers/residual.py:192` `if getattr(d,"use_fused_mhc",False): _fused_hc_ops else _unfused_hc_ops`）
@@ -111,11 +113,11 @@ DSv4-align 的 mHC 分支钉在非融合上，而它一直是绿的。
 
 | # | 文件:行 | 改动 |
 |---|---|---|
-| ① | `serve_explorer.py:326-330` | `_LLM_FIELD_GATE` 加 `"use_fused_mhc": "mhc_fused"`（未登记门控键时 `_gate_edited` 会 fail-loud，故这行是 llm_json 基座下能覆盖它的前提） |
-| ② | `serve_explorer.py:559-569` | `parse_and_validate`：`if (p.get("mhc_fused") or "").strip() != "": over["use_fused_mhc"] = _x_flag(p,"mhc_fused",base.use_fused_mhc)` —— **与 `ce_fused` 同款语义**（缺省/空 → 保留基座 → 手配路径逐字节不变） |
-| ③ | `serve_explorer.py:1092-1094` | `_llm_to_fields` 回填 `"mhc_fused": int(bool(llm.use_fused_mhc))` |
-| ④ | `serve_explorer.py:1556` / `:1874` | 页面隐藏输入 `<input type="hidden" name="mhc_fused" value="">` + `RT_DEFAULTS` 复位项（否则 web UI 上这条修复只对脚本调用者生效——与 2026-07-25 `ce_fused` 踩过的坑同款） |
-| ⑤ | `validate_dsv4align.py:36,79,88,104,110` | `dsv4_align_config(..., use_fused_mhc=False)` / `evaluate(..., use_fused_mhc=False)` / `main()` 读 `FUSED_MHC` env（与 `prep_dsv4align.py:122` 同名同义）+ 打印该位 |
+| ① | `serve_explorer.py:322-327` | `_LLM_FIELD_GATE` 加 `"use_fused_mhc": "mhc_fused"`（未登记门控键时 `_gate_edited` 会 fail-loud，故这行是 llm_json 基座下能覆盖它的前提） |
+| ② | `serve_explorer.py:599-608` | `parse_and_validate`：`if (p.get("mhc_fused") or "").strip() != "": over["use_fused_mhc"] = _x_flag(p,"mhc_fused",base.use_fused_mhc)` —— **与 `ce_fused` 同款语义**（缺省/空 → 保留基座 → 手配路径逐字节不变） |
+| ③ | `serve_explorer.py:1139-1141` | `_llm_to_fields` 回填 `"mhc_fused": int(bool(llm.use_fused_mhc))` |
+| ④ | `serve_explorer.py:1606` / `:1917` | 页面隐藏输入 `<input type="hidden" name="mhc_fused" value="">` + `RT_DEFAULTS` 复位项（否则 web UI 上这条修复只对脚本调用者生效——与 2026-07-25 `ce_fused` 踩过的坑同款） |
+| ⑤ | `validate_dsv4align.py:36,91,100,104,123-130` | `dsv4_align_config(..., use_fused_mhc=False)` / `evaluate(..., use_fused_mhc=False)` / `main()` 读 `FUSED_MHC` env（与 `prep_dsv4align.py:122` 同名同义）+ 打印该位 |
 | ⑥ | `scorecard_anchors.py` | `_dsv4_sim` 显式传 `use_fused_mhc=False` 并带出处；订正上一轮的错配注解 |
 | ⑦ | `tests/test_pp4_recompute_anchor.py:_BASE` / `tests/test_probe185_recon.py:_dsv4_q` | 加 `"mhc_fused": "1"`（站点 yaml `:109`） |
 
@@ -220,7 +222,124 @@ DSv4-align 的 mHC 分支钉在非融合上，而它一直是绿的。
 
 ## 7. `REAL_*` / `CSV_*` / 指纹未动的 diff 级证明
 
-见 §9 的验收命令输出（`git diff` 过滤 `REAL`/`CSV`/`MEASURED`/`sha256` 后为空）。
+```
+$ git diff 4bcbad1 -U0 -- . ':!docs' ':!scratchpad' \
+    | grep -E "^[+-]" | grep -v "^[+-][+-]" | grep -E "REAL|CSV|MEASURED|sha256|SHA256"
++#   **恒等认亲**：本文件 `REAL_ON` 与 `tools/liveness_ab_validate.py:75` 的 run `a fused ON L8 m4`
+```
+
+唯一命中是一行**新增注释**（提到 `REAL_ON` 这个名字），没有任何 `REAL_*` / `CSV_*` /
+`MEASURED` / `REAL_SHA256` **常数行**被增删改。八跑门的指纹校验也在 §6 里 PASS。
+
+---
+
+## 8. 为什么 `_assert_bundle_roundtrip` 没能拦住它（任务书第 2 项）
+
+### 8.1 它**覆盖**了这个字段，却**问错了问题**
+
+`_assert_bundle_roundtrip`（`serve_explorer.py:1175-1196`）用 `_llm_field_diffs`
+（`:1151-1154` `dataclasses.asdict` 逐字段比）核 bundle 与 round-trip 的 `LLMConfig` ——
+**`use_fused_mhc` 从加进 `LLMConfig` 那天起就在被比的字段集里**。所以答案不是"没覆盖"。
+
+没拦住的原因是那一轮的**修法**：`_llm_to_fields`（`:1147`）把**权威 `LLMConfig` 整体**
+JSON 化塞进隐藏字段 `llm_json`，`parse_and_validate`（`:545-552`）见到 `llm_json` 就以它为
+基座。于是
+
+> **任何**新增字段都自动随 `llm_json` 过桥 → 该判据对「这个字段在扁平 dict 里有没有承载」
+> **结构上永远绿**。
+
+`_llm_to_fields` 的 docstring 自己把这写成了优点（`:1112`「此后**新增 LLMConfig 字段
+自动被带上**，不必再逐个加 UI 字段」）—— 对**导入路**确实是优点；代价是它**同时**熄灭了
+「这个字段在扁平路上没人管」这个信号。判据不是漏判，是**问错了问题**：
+它问「导入的 config 有没有被静默替换」，而这次的病是「**没有导入**的那条路上，字段恒取预设值」。
+
+### 8.2 两条路的不对称（这才是缺陷的容身处）
+
+| | yaml 导入路 | **扁平 query 路**（锚点 / 探针 / 页面手配） |
+|---|---|---|
+| 结构基座 | `llm_json` 里的权威 `LLMConfig` | `PRESETS[preset]` |
+| 没有 UI 键的字段 | 随 `llm_json` 忠实过桥 | **静默取预设/默认值** |
+| 有守卫吗 | 有（`_assert_bundle_roundtrip`，运行时） | **本轮之前：没有** |
+
+`dsa_fused` / `ce_fused` 之所以有 UI 键，正是因为**锚点需要它们**（`ce_fused` 那次还额外踩了
+「回填了但页面没输入框」的坑，见 `_bundle_to_fields` 上方注释）。`use_fused_mhc` 在
+`census_fix_mhc_rmsnorm_2026-07-29` 那轮进 `LLMConfig` 时**只接了 yaml 一条路**
+（`from_mindformers.py:499`），而**没有任何机制**逼作者对第二条路做决定 —— 于是默认沉默。
+
+### 8.3 在守卫处闭环：`tests/test_flat_query_reachability.py`（新增 37 例）
+
+新增的不是"再比一次同样的东西"，而是**补上缺的那个问题**：
+
+| 判据 | 守什么 | 会红于 |
+|---|---|---|
+| ① 分类完备 | 每个 `LLMConfig` 字段**要么**在 `_LLM_FIELD_GATE`（有 UI 键）**要么**在新增的 `_LLM_JSON_ONLY_FIELDS`（显式承认扁平路上恒取预设值） | 新增字段两边都不登记 —— **这正是 2026-07-29 的真实状态** |
+| ② 两表互斥 / ③ 无残留字段 | 登记表与 `LLMConfig` 定义不许漂 | 改名/删字段后残留 |
+| ④ 接线为真（27 个字段 × 2 取值） | 已登记的 UI 键在**无 `llm_json`** 的扁平 query 上**真的**改得动对应字段 | 「登记了但没接 `parse_and_validate`」 |
+| ⑤ 门会响（负例） | monkeypatch 拿掉 `use_fused_mhc` 的登记 → `unclassified_llm_fields()` 必须点名它 | 门本身失效 |
+| ⑥ mHC 分支定点回归 | `mhc_fused=1/0` 必须切到 `_fused_hc_ops` / `_unfused_hc_ops` 两条**不同**的 op 链；缺省/空保留基座 | 有人把旋钮摘掉或接错 |
+
+`_LLM_JSON_ONLY_FIELDS`（`serve_explorer.py:344-365`）里现有 **32** 个字段，逐组带了原因。
+它不是"豁免清单"，是**已知代价清单** —— §9 就是照着它读出来的第二个错配。
+
+---
+
+## 9. ⚠ 同一 bug class 的**第二例**：`csa_compress_ratios`（本轮**发现但未修**）
+
+把 §8.3 的 `_LLM_JSON_ONLY_FIELDS` 逐条对着站点 yaml 读，立刻撞上一条**仍在错**的：
+
+| | 值 | 层型分布（L8） |
+|---|---|---|
+| 锚点扁平路实际解析出的（预设 `dsv4_flash` 的**循环**） | `(0, 4, 128, 0, 4, 128, 0, 4)` | **3×r0 / 3×r4 / 2×r128** |
+| 站点 yaml `dsv4h_fused_pp4_recomp.yaml` 的**逐层表** | `[0, 4, 128, 4, 128, 4, 128, 4]` | **1×r0 / 4×r4 / 3×r128** |
+
+（我跑了并观察到：`scratchpad/probe_compress_ratios_whatif.py` 首行逐字打印这两个元组。
+旁证：`census_fix_residual_carrier_2026-07-29.md` §2 的真机逐层直测正是「r4 **4 层**均
+2341.2 / r128 **3 层**均 2116.1」= 站点表的分布；而 `test_pp4_recompute_anchor.py` 里
+2026-07-29 那条注释写「`compress_ratios=[0,4,128,4,128,4,128,4]` → 只有 s1/s3/s5/s7 是 r4 层」
+—— 那是**站点**的表，不是模型实际用的那个。）
+
+**what-if 量化**（monkeypatch 覆盖该字段，**不改源**）：
+
+| 锚点 | 今天（预设循环） | what-if（站点逐层表） | Δ |
+|---|---|---|---:|
+| pp4-ON s1 / s2 | 0.746 / 0.790 | **0.818 / 0.831** | +1048.5 / +583.5 |
+| pp4-OFF s1 / s2 | 0.867 / 0.815 | **0.922 / 0.859** | +1158.0 / +786.8 |
+| pp8 s3 / s4 / s5 | 0.963 / 1.150 / 1.017 | **1.059 / 1.052 / 1.113** | +1146.1 / −1064.5 / +1064.5 |
+| pp4 s0（两口径） | 0.892 / 0.668 | 不变 | 0.0 |
+
+方向上**也是向真机收敛**（pp4 的 s1/s2 各 +0.05~0.07）。
+
+**我没有修它**，理由与上一轮不修 mHC 错配同款：这是又一次**口径变更**，会再次一次性移动
+pp4×2 + pp8 + MTP + 185 共 ~20 个锚点，且本轮任务书授权的是 `use_fused_mhc`。
+**这是我留给下一轮的第一优先项**；改法两条可选：
+① 给 `csa_compress_ratios` 一个 UI/隐藏字段（逐层表用逗号串编码）+ 登记门控键；
+② 或者让 pp4/pp8/185 锚点**改走 yaml→bundle 路**（八跑门已经是这么干的），从根上不再有第二份结构。
+个人倾向 ②：锚点与八跑门比的本来就是**同一批真机跑**（§2.1 的恒等认亲），却各自维护一份结构。
+
+---
+
+## 10. 验收
+
+```
+$ PYTHONIOENCODING=utf-8 python -m pytest tests -q
+1940 passed, 268 warnings in 123.43s (0:02:03)
+```
+
+`1903 → 1940`：**新增 37 例**（全部在新文件 `tests/test_flat_query_reachability.py`：
+完备/互斥/无残留/门会响 4 例 + 接线为真 27 例（逐字段 parametrize）+ 用例自检 2 例 +
+mHC 分支定点回归 4 例）。**没有删除任何用例，没有删除任何不变量**；
+既有测试只按 `docs/opdag_walker_core_2026-07-25.md` §6.6 精神**移动举例值**
+（`test_fused_per_layer_increment` 的记录值与记录带、`test_pp8_framework_gap` 的方向档举例），
+每条都在测试文件里就地写了理由。
+
+---
+
+## Related
+
+- [`census_fix_residual_carrier_2026-07-29.md`](census_fix_residual_carrier_2026-07-29.md) §5 —— 本缺陷的发现处与 what-if 预测（本轮逐位对账见 §4.1）
+- [`census_fix_mhc_rmsnorm_2026-07-29.md`](census_fix_mhc_rmsnorm_2026-07-29.md) —— `use_fused_mhc` 进 `LLMConfig` 的那一轮（只接了 yaml 一条路）
+- [`kernel_workspace_2026-07-29.md`](kernel_workspace_2026-07-29.md) —— 上一轮（+730 实测 workspace），本轮 s0 与 what-if 预测的差额来源
+- [`opdag_walker_core_2026-07-25.md`](opdag_walker_core_2026-07-25.md) §6.6 —— 「保留不变量、只移动举例」的改测试规矩
 
 ---
 
