@@ -55,6 +55,55 @@ from .attention import _fa_workspace
 
 __all__ = ["build_dsv4_hybrid_attn_ops"]
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 融合稀疏 flash-MLA（**带 indexer** 分支，即 compress_ratio==4）**反向 kernel workspace**
+#   —— 唯一来源是 **167 真机 memory-tracker 实测**，源码快照里读不出来（契约 §不要求）。
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# **测量**（`docs/kernel_workspace_2026-07-29.md`，MS2.10/CANN9.1/910B2，
+# `MS_ALLOC_CONF=memory_tracker:True`，run c = fused/无重算/L8/m4/pp4·dp2·ep2，b=1，tp=1，cp=1）：
+#
+#   | seq_length S | 实测该 kernel 反向 workspace |
+#   |---|---:|
+#   | 1024 | **332.500 MiB** |
+#   | 2048 | **465.000 MiB** |
+#   | 4096 | **730.000 MiB** |
+#
+# 三点**逐点验证线性**（不是两点插值）：斜率 (465.0−332.5)/1024 == (730.0−465.0)/2048
+# == 0.1293945 MiB/token **逐位相等**；外推回 S=0 得截距 **200.0 MiB 整**
+#   200.0 + 1024×0.1293945 = 332.5 ✓ / + 2048× = 465.0 ✓ / + 4096× = 730.0 ✓
+# → **实测律**：`bwd_ws = 209715200 B + B·S · 135680 B`。
+#
+# **归属证据**（tracker 的 `node_name` 对自定义融合算子是「上一条 pyboost 任务」的陈旧标签，
+# 不可信；故按**输出签名**反推）：该笔 workspace 的同批兄弟输出在 S=4096 是
+#   `256.0 / 4.0 / 1.0 / 8.0 / 64.0 / 0.25 / 1.0 / 8.0 MiB`，
+# 在 S=2048 **逐张精确减半** `128.0 / 2.0 / 0.5 / 4.0 / 32.0 / 0.125 / 0.5 / 4.0 MiB`
+# —— 逐张对上 `csa.py:224` ctx 的梯度集（query[B,S,64,512]bf16=256、ori_kv=4、
+# cmp_kv(r=4)=1、query_index=64、key_index=1 …，见 census_arbitration_2026-07-29.md §1.10）。
+# 其中 `query_index`/`key_index` **只有 enable_indexer(ratio==4) 分支才有**（csa.py:694-695）
+# → 该 kernel 确定是 `FusedSparseFlashMlaWithIndexerLoss`，即本 op。
+# 两个插桩 rank（stage0 = r0+r4、stage1 = r128+r4）**都**测到同一个 730.000 MiB，唯一共有的
+# 层型正是 r4 → 交叉印证。
+#
+# **它为什么重要**：真机峰值就是这一笔顶出来的 —— rank0 峰 30307.8 MiB、rank2 峰 21019.5 MiB，
+# 两者的 pool high-water 都恰在这笔 730.00 MiB 落地的那一刻。
+#
+# **缩放的适用边界（超出即未测，不外推）**：
+#   · S：3 点验证线性 ✓（1024/2048/4096）。
+#   · cp：常数项走字符串（不缩放）、线性项走 TensorRef（首个 S 维 ÷cp）→ 结构上正确；
+#     但 cp>1 **未实测**。
+#   · tp：TensorRef **不标 shard** → tp>1 时不切 = **过读 = OOM 安全侧**；真值未测。
+#   · B：线性项含 B（按 token 数 = B·S 类推）。**B 只测过 1**；含 B 是 OOM-安全的那一侧
+#     （若真值不随 B 长，含 B 是过读；若真值随 B 长而模型不含 B，则欠读）。
+#     全部 DSv4 锚点 `local_batch_size=1` → 今天没有任何锚点依赖这一条。
+#   · n_heads / index_topk / v_head_dim：**未做扫描**，故 135680 B/token 这个系数
+#     **不承诺**随它们变化（它也不能被这些维整除分解：135680 = 512×265，265=5×53）。
+_FLASHMLA_IDX_BWD_WS = {
+    # 常数项 200.0 MiB（S→0 截距）。走字符串通道 → 不吃 cp 整除（见 shape_eval 注释）。
+    "bwd_workspace": "209715200",
+    # 线性项 B·S·135680 B = B·S·33920 个 fp32。走 TensorRef 通道 → 首个 S 维按 cp 切。
+    "bwd_workspace_ref": TensorRef("flashmla_idx_bwd_ws", ("B", "S", "33920"), dtype_bytes=4),
+}
+
 # ── DSv4 符号维度表达式（与 DimTable 字段名一致，供 eval_expr 求值）──────────
 # linear_q_up_proj 输出维：num_attention_heads * q_head_dim，其中 q_head_dim=v_head_dim
 # （deepseek_v4_hybrid_attention.py:66 `self.q_head_dim = config.v_head_dim`；:113）。
@@ -279,7 +328,18 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         sparse_ins = ([q_hnorm, kv_a_out, compressed_kv, topk_indices] if enable_indexer
                       else [q_hnorm, kv_a_out, compressed_kv])
         ops.append(OpSpec("sparse_attn", OpType.FLASH_ATTN, sparse_ins, core_out,
-                          params=[attn_sink], saves=sparse_saves, workspace_ref=_fa_workspace()))
+                          params=[attn_sink], saves=sparse_saves, workspace_ref=_fa_workspace(),
+                          # ── 实测项，非源码推导（2026-07-29，167 / MS2.10 / CANN9.1）─────────
+                          # **双重门，缺一即 0（不外推）**：
+                          #  ① `fused` —— unfused 走 `unfused_compressed_sparse_attn` 小算子链，
+                          #     根本不是这个 kernel，其 workspace 未测。
+                          #  ② `enable_indexer`（ratio==4）—— 实测归属靠 `query_index`/`key_index`
+                          #     两个梯度出现在同批输出里，而它们**只有** indexer 分支才有
+                          #     （`csa.py:694-695`）。r128 走的是 `FusedSparseFlashMla`（8 项 ctx，
+                          #     `csa.py:113`），**它的反向 workspace 本轮没有单独测出来**
+                          #     （两个插桩 rank 的 BWD max 都被 r4 那一笔盖住）→ 按纪律留 0、
+                          #     如实记为欠读，不拿 r4 的数去顶（见 docs §7）。
+                          **(_FLASHMLA_IDX_BWD_WS if (fused and enable_indexer) else {})))
     else:
         # 滑窗（ratio 0/1）：纯 flash（sliding-window），saves Q(=q_hnorm)/O(core_out)+lse（[S,S] 从不物化，§7.4）
         # fused：滑窗层同走 hyper_parallel 融合注意力 kernel 家族（自定义 _Function），其 ctx 集

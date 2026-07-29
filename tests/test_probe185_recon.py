@@ -165,7 +165,9 @@ def test_p3p_m8_theoretical_and_gap():
     #   s0 vs 真机 25343.5：0.685 → 0.675，仍欠读。
     # 2026-07-29 三次重钉：17102.2 → **17966.2**（④ 打在非融合 mHC 分支上，同上配置错配）；
     #   s0 vs 真机 25343.5：0.675 → **0.709**，**仍欠读**（本门断言的不变量方向不变）。
-    assert abs(pk[0] - 17966.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17966.2"
+    # 2026-07-29 四次重钉：17966.2 → **18696.2**（+730.0 整，r4 层 bwd 事件加真机实测的
+    #   融合稀疏 flash-MLA 反向 kernel workspace；docs/kernel_workspace_2026-07-29.md）。
+    assert abs(pk[0] - 18696.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 18696.2"
     assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="4", split="2,2,2,2"))

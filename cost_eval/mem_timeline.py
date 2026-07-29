@@ -647,6 +647,16 @@ class MemTimeline:
                             bwd_order, idx, depth) + _recomp_regather_stage   # Fix① §8.5
                         B.grad_buf = sm.grad_full_bytes
                         B.bwd_scratch = sm.bwd_scratch
+                        # ── bwd 期 kernel workspace（2026-07-29，167 真机 memory-tracker 实测）──
+                        # 真机 run c 的**峰值本身就是一笔瞬态 workspace 顶出来的**：rank0 峰
+                        # 30307.8 MiB / rank2 峰 21019.5 MiB，两者都由同一笔 730.00 MiB 的
+                        # workspace 分配设定（该笔落地那一刻 pool 用量 == 全程 high-water）。
+                        # 模型此前在 BWD 事件把 workspace 记 **0** → 结构上够不着真机峰。
+                        # 它是**加法项**（独立桶，不与 bwd_scratch/bwd_working_set 抵消）——
+                        # kernel 向池要 scratch、算完即还，叠在整个反向工作集之上。
+                        # 用 fwd 期同一个 `workspace` 桶（同一物理量、不同相位；FWD 事件已在
+                        # 上面用完并清零 → 不双计）。层内取 max 的实测依据见 structure_mem。
+                        B.workspace = sm.bwd_workspace
                         # ① 无重算下 loss 层：unfused CE 链共存 k_ce 份满 vocab fp32。现 bwd_scratch
                         #   =8·S·B·vocab=2 份（probs+grad）→ 改到 k_ce-1 份（logsm 1 份在 act_live）。
                         #   **k_ce 与制度相关（真机 profiler）**：流水线末 stage（pp>1，有 loss）CE 链保留更多
@@ -755,6 +765,7 @@ class MemTimeline:
                         # 本 stage 有全重算层(_muon_ns_overlap>0)时非零 → 非 Muon/OFF 恒 0,锚点保护。
                         B.optstep = _muon_ns_overlap
                         rec(f"bwd@{lid}", ev_mb, ev_chunk)
+                        B.workspace = 0        # 2026-07-29：bwd kernel workspace 用完即还
                         B.grad_buf = B.recomp_scratch = B.optstep = 0
                         B.bwd_scratch = B.bwd_working_set = B.swap_buf = B.kept_frag = 0
                         B.remat_saves = 0      # 2026-07-25：跑完即清（瞬时项，×1 的机理）

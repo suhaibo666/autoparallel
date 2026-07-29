@@ -197,6 +197,10 @@ class ResolvedOp:
     # norm 种类（2026-07-29）：由 `OpSpec.norm_kind` 直通，供 `structure_mem._norm_save_names`
     # 判断 fp32 抬升是否成立（FusedRMSNorm 不 cast → 不抬）。str，frozen dataclass 可哈希。
     norm_kind: str = NORM_KIND_CASTING
+    #: bwd 期 kernel workspace（2026-07-29，167 真机 memory-tracker 实测；见 OpSpec.bwd_workspace）。
+    #: **尾部追加、默认 0**（照 `norm_kind` 先例，位置参数序不破）→ 未标注该字段的 spec 与
+    #: 抽取图（`opdag.to_resolved.ROp` 无此字段，`structure_mem` 用 getattr 兜 0）逐字节不变。
+    bwd_workspace_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -228,6 +232,14 @@ class ShapeEval:
                 r_sav = tuple(resolve_tensor(t, spec.dims, pm) for t in op.saves)
                 ws = eval_expr(op.workspace, spec.dims) if op.workspace else 0
                 bws = eval_expr(op.bwd_scratch, spec.dims) if op.bwd_scratch else 0
+                # bwd 期 kernel workspace（2026-07-29）。**刻意不进下面那条「含 S 就 ÷cp」的
+                # 字符串规则**：实测的 kernel workspace 是「常数项 + 随本地 token 数线性项」
+                # 的和（见 layers/dsv4_hybrid.py 的实测表），整体 ÷cp 会把常数项也除掉 →
+                # cp>1 时欠读（OOM-不安全）。线性项走 `bwd_workspace_ref` 的 TensorRef 通道，
+                # 由 resolve_tensor 的 shard/cp 机制**只对 S 维 ÷cp**（并按 tp 切）；常数项由
+                # 这里的字符串表达式承担、不缩放。
+                bwws = eval_expr(op.bwd_workspace, spec.dims) if getattr(
+                    op, "bwd_workspace", None) else 0
                 # context-parallel（cp）：含符号 S 的 workspace/bwd_scratch 也 ÷cp 一次（D-1）——
                 # flash-ws(∝S)/loss(∝S)/MoE-staging(∝S)/mHC(∝S) → S/cp；index_scores `4·B·S·S`
                 # → S²/cp（去掉 query 那个 S 因子，与张量口径一致：切 query 维、key 维保持全量）。
@@ -253,6 +265,9 @@ class ShapeEval:
                 if getattr(op, "bwd_scratch_ref", None) is not None:
                     br = resolve_tensor(op.bwd_scratch_ref, spec.dims, pm)
                     bws += br.local_numel * br.dtype_bytes
+                if getattr(op, "bwd_workspace_ref", None) is not None:
+                    bwr = resolve_tensor(op.bwd_workspace_ref, spec.dims, pm)
+                    bwws += bwr.local_numel * bwr.dtype_bytes
                 # ── P1-13（Y1，2026-07-15）：method+cp 门控 workspace —— GQA fused-qkv 的 colossal
                 # CP KV all-gather full-S buffer ─────────────────────────────────────────────────
                 # MLA 靠**独立 KV 激活**标 `cp_kv=True` 表达 colossal 下 KV all-gather 到 full-S；GQA 的
@@ -297,6 +312,7 @@ class ShapeEval:
                     r_in, r_out, r_par, r_sav,
                     ws, tuple(comms), bws,
                     getattr(op, "norm_kind", NORM_KIND_CASTING),
+                    bwws,
                 ))
                 produced[op.output.name] = Placement.of(op.output)
             # P1-03 不变量（2026-07-14 fail-loud）：同一 resolved layer 内张量名 → local_numel

@@ -198,6 +198,19 @@ class OpSpec:
     # ——经 resolve_tensor 的 shard/cp 机制求 local 字节后并入对应 *_bytes。与字符串表达式可叠加。
     workspace_ref: Optional[TensorRef] = None
     bwd_scratch_ref: Optional[TensorRef] = None
+    # ── bwd 期 kernel WORKSPACE（2026-07-29，167 真机 memory-tracker 实测驱动）─────────────
+    # 与 `bwd_scratch` **不是**同一件事，故不能复用它：
+    #   · `bwd_scratch` = 反向**临时物化的张量**（loss probs fp32 等），`mem_timeline` 把它与
+    #     `bwd_working_set` 视为**同一份**反向工作集的两块（`bwd_working_set = max(0,
+    #     forward_max_live − bwd_scratch)`）→ 往里加字节是**零和**，加不进峰值。
+    #   · `bwd_workspace` = kernel 自己向内存池要的 scratch，**叠在**整个工作集之上，用完即还。
+    #     真机 tracker 实测：这类块寿命恒为 1 个 tracker tick、峰值那一刻**至多一块在世**
+    #     → 层内取 **max**（见 `structure_mem.StructureMemory.bwd_workspace`），
+    #     `mem_timeline` 在 BWD 事件把它放进独立的 `workspace` 桶（加法，不与任何桶抵消）。
+    # 与 `workspace`（fwd 期）完全对称：字符串表达式 + TensorRef 两条通道，可叠加。
+    # **这两个字段的值只能来自真机测量**（契约 §不要求：kernel 实现细节，源码里读不出来）。
+    bwd_workspace: Optional[str] = None
+    bwd_workspace_ref: Optional[TensorRef] = None
     attrs: dict = field(default_factory=dict)
     # norm op 的**种类**（仅 type==NORM 时有意义）：NORM_KIND_CASTING / NORM_KIND_NONCASTING。
     # 默认 CASTING = 今日行为（`structure_mem._norm_save_names` 无差别收全部 norm op 的 saves）

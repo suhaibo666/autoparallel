@@ -62,6 +62,17 @@ class StructureMemory:
     #   已删除（见 model_spec.TensorRef.pin_under_recompute 注释）→ 当前无任一 spec 设此标志 →
     #   **恒 0**，全重算 saved 恒 = checkpoint_input（纯理论重算边界）。字段/聚合保留作通用机制占位。
     recompute_pinned_saves: int = 0
+    # ── bwd 期 kernel workspace（2026-07-29，167 真机 memory-tracker 实测）────────────────
+    # `bwd_workspace`：该结构各 op `bwd_workspace_bytes` 的 **max**（不是 sum）。
+    #   取 max 是**实测判据**，不是保守假设：tracker 逐块记录显示这类块的寿命**恒为 1 个
+    #   tracker tick**（rank0 4554/4554、rank2 5565/5565 全部如此），且在真机峰值那一刻
+    #   **只有一块 workspace 在世**（rank0 30307.8 MiB 峰、rank2 21019.5 MiB 峰，均只有一块
+    #   730.00 MiB）→ 同一时刻至多一个 kernel 的 workspace 存活，层内叠加取 max 即精确。
+    # 与 `workspace`（fwd 期，同样是 max）对称；与 `bwd_scratch` **正交**：后者是反向工作集
+    #   的一部分（`mem_timeline` 用 `bwd_working_set = fml − bwd_scratch` 与之互补），前者是
+    #   叠在工作集之上的池 scratch。见 `model_spec.OpSpec.bwd_workspace` 的对比说明。
+    # 尾部追加、默认 0 → 未标注的 spec/抽取图逐字节不变。
+    bwd_workspace: int = 0
     # persistent 组成分解用：本结构内、按 fsdp/efsdp 切后的**驻留参数量**（去重、未乘倍数、未块对齐）。
     #   matrix = Muon 分类的 2D 矩阵权重（is_muon_matrix_weight）；other = 其余。persistent 分量拆解
     #   （参数副本/master/momentum/v）= 这两个计数 × 每分量每元素字节（static_mem.persistent_breakdown）。
@@ -321,6 +332,9 @@ def estimate_structure_memory(
     # scratch op 层取更紧的 max-live（OOM 安全，≤ sum 恒成立）。见 `_backward_max_live` docstring。
     bwd_scratch = _backward_max_live(resolved_ops, conservative=bwd_scratch_conservative)
     workspace = max((op.workspace_bytes for op in resolved_ops), default=0)
+    # bwd 期 kernel workspace：同一时刻至多一块在世（实测，见 StructureMemory.bwd_workspace）
+    # → max。`getattr` 兜 0 让抽取图（`opdag.to_resolved.ROp` 无此字段）与旧构造逐字节不变。
+    bwd_workspace = max((getattr(op, "bwd_workspace_bytes", 0) for op in resolved_ops), default=0)
 
     # 重算边界 checkpoint_input = 层「construct 入参」hidden_states（MS `_InputSaver`,
     # recompute.py:158，以 compute/bf16 dtype 持有），**不是**首个 op 恰好 save 的那张激活。
@@ -354,6 +368,7 @@ def estimate_structure_memory(
         persist_numel_matrix=persist_numel_matrix,
         persist_numel_other=persist_numel_other,
         recompute_pinned_saves=recompute_pinned_saves,
+        bwd_workspace=bwd_workspace,
     )
 
 
