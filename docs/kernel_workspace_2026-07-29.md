@@ -236,16 +236,222 @@ rank2 同名 kernel 只有 16.03 MiB。`GatherDGradV2` 是**真 pyboost 算子**
 
 ---
 
-## 5. 逐层驻留：插桩跑 vs 2026-07-29 直测（第二重扰动对照）
+## 5. 第二重扰动对照：逐层驻留被逐 MiB 复现
 
-（见 §9 表；本节由 `analyze_events.py` 在本跑的 `events_rank<N>.csv` 上复算。）
+tracker 的块台账可以**独立重建**「逐层驻留」这个量：
+
+> `residency(层) = 该层 fwd 窗口内诞生、且在 fwd_exit 那一刻仍然活着的块字节之和`
+
+这与 2026-07-29 事件 tracer 的定义（`memory_allocated()` 在 fwd_exit 减 fwd_enter）是
+**两条完全独立的读法**（一条读分配器计数器、一条数内存池块台账）。实测
+（`analyze_resid.py`，每层 12 个窗口 = 4 微批 × 3 迭代，取中位）：
+
+| rank | layer | 层型 | 本轮 tracker 重建 | 2026-07-29 逐层直测（存量、未改） | 差 |
+|---|---|---|---:|---:|---:|
+| 0 | 0 | r0 | **2235.1** | 2235.1 | **0.0** |
+| 0 | 1 | r4 | **2356.1** | 2355.3 | +0.8（+0.03 %） |
+| 2 | 2 | r128 | **2124.9** | 2124.2 | +0.7（+0.03 %） |
+| 2 | 3 | r4 | **2354.2** | 2354.0 | +0.2（+0.01 %） |
+
+r0 **逐位相同**，其余三层 ≤ 0.03 %。这同时证明：① 插桩没有改变逐层驻留；
+② `Erfinv` 标记的窗口划分是对的（否则不可能凑出这个数）。
+
+### 5.1 驻留里根本没有 workspace —— 逐块可查
+
+`analyze_resid.py` 列出的「仍然活着」的块**全部**是 `PyNativeOutput` 型；
+`analyze_ws.py` 的驻留检查在 8/8 个 `fwd_exit` 边界上给出
+`workspace-class blocks still alive = 0 (0.00 MiB)`。两条口径一致。
+
+> **所以逐层驻留欠读（今天：r0 −5.6 / r4 −260.6 / r128 −110.5 MiB/层）与 kernel workspace 无关。**
+> 上一轮把它归因为 workspace 是**错的**；本轮用测量推翻它，并给出替代定位（§5.2）。
+
+### 5.2 那 −260.6 MiB（r4）在哪：用块直方图定位到 indexer 链
+
+同一 rank 内比较 r128 与 r4（rank2 的 layer 2 vs layer 3），排除 stage/深度差异：
+
+| 量 | r128 (layer 2) | r4 (layer 3) | 差 |
+|---|---:|---:|---:|
+| 实测驻留（中位） | 2124.9 | 2354.2 | **+229.3** |
+| **64.0005 MiB 块 / 窗口** | **4** | **7** | **+3（= +192.0 MiB）** |
+| 32.0005 MiB 块 / 窗口 | 7 | 7 | 0 |
+| 256 / 128 MiB 块 / 窗口 | 4 / 2 | 4 / 2 | 0 |
+| `<1 MiB` 长尾 / 窗口 | 3.0 | 5.3 | +2.3 |
+| **手写普查 `activation_saves`** | **2005.6** | **2080.6** | **+75.0** |
+
+**普查只解释了 229.3 中的 75.0**。缺的 ≈ 154 MiB，实测形态是**三块 64.0005 MiB 中的
+约 2.4 块**——`64.0005 MiB` 在本站点尺寸下正是 `[B, S, dsa_indexer_n_heads, index_head_dim]`
+bf16（`1×4096×64×128×2 B = 64 MiB`），即 **indexer 链的 query/key 侧张量**。
+普查目前只建了其中一张（`idx_query` 64 MiB）。
+
+> 这条线索**本轮不落地**：它属于「普查该建哪些张量」，与本轮的 workspace 口径正交，且
+> `dsv4_hybrid.py` 的 indexer 普查此刻正被另一条任务线动。**如实交接**：真机每个 r4 层
+> 在 indexer 链上驻留 **3 块 64.0005 MiB**，普查只有 1 块；差额与 r4 相对 r128 的
+> 额外欠读（−260.6 vs −110.5 = −150.1）**同量级同方向**。
 
 ---
 
-## 6. 建模（待补：见 §6.x）
+## 6. 建模：一条**加法**的 bwd kernel workspace 通道
+
+### 6.1 为什么不能复用 `bwd_scratch`
+
+`mem_timeline` 对无重算层用
+`bwd_working_set = max(0, forward_max_live − bwd_scratch)`
+→ 往 `bwd_scratch` 里加字节是**零和**（总量 = `max(bwd_scratch, fml)`），加不进峰值。
+而实测的 kernel workspace 是 kernel 向池现要现还的 scratch，**叠在整个反向工作集之上**。
+故新开一条通道，落到 `Buckets` 里**独立的 `workspace` 桶**（`total()` 的加项）。
+
+### 6.2 改了什么（全部尾部追加、默认 0 → 未标注者逐字节不变）
+
+| 文件 | 改动 |
+|---|---|
+| `cost_eval/model_spec.py` | `OpSpec.bwd_workspace`（字符串表达式）+ `bwd_workspace_ref`（TensorRef） |
+| `cost_eval/shape_eval.py` | `ResolvedOp.bwd_workspace_bytes`（尾部追加，照 `norm_kind` 先例）；字符串项**刻意不吃**「含 S 就 ÷cp」那条规则（会把常数项也除掉 → cp>1 欠读），线性项走 TensorRef 由 `resolve_tensor` 只对首个 S 维 ÷cp |
+| `cost_eval/structure_mem.py` | `StructureMemory.bwd_workspace = max(op.bwd_workspace_bytes)`。**取 max 是实测判据不是保守假设**：块寿命恒 1 tick、峰值那一刻只有一块在世 |
+| `cost_eval/mem_timeline.py` | BWD 事件 `B.workspace = sm.bwd_workspace`，`rec()` 后清零 |
+| `cost_eval/layers/dsv4_hybrid.py` | `sparse_attn` 挂实测律，**双重门** `fused and enable_indexer` |
+| `tests/test_bwd_kernel_workspace.py` | **新增 10 道守卫门**（见 §6.5） |
+
+### 6.3 挂上去的值 —— 逐条测量出处
+
+```python
+_FLASHMLA_IDX_BWD_WS = {
+    "bwd_workspace":     "209715200",                                   # 200.0 MiB 截距
+    "bwd_workspace_ref": TensorRef("flashmla_idx_bwd_ws",
+                                   ("B", "S", "33920"), dtype_bytes=4), # B·S·135680 B
+}
+```
+
+**它只标在一个 op 上**（`sparse_attn`），因为测量把它定位到了一个 kernel；
+没有把任何数字摊到层上、也没有为了让总量落位而调过一个字节。
+
+**没测出来的一律留 0**：`r0`（滑窗）、`r128`（无 indexer 的 `FusedSparseFlashMla`）、
+`unfused`（小算子链）。两个插桩 rank 的 BWD 单 kernel 极大值都被 r4 那一笔盖住 →
+它们各自的值本轮**没有单独测出来**，如实欠读。
+
+### 6.4 逐层型 before → after（实测律 vs 模型）
+
+| 层型 | `bwd_workspace` before | after | 真机实测（同 kernel） | 判 |
+|---|---:|---:|---:|---|
+| r4（seq 4096） | 0 | **730.000 MiB** | **730.000 MiB** | 逐字节 |
+| r4（seq 2048） | 0 | **465.000 MiB** | **465.000 MiB** | 逐字节 |
+| r4（seq 1024） | 0 | **332.500 MiB** | **332.500 MiB** | 逐字节 |
+| r128 / r0 | 0 | 0 | **未测** | 如实留空 |
+
+（复现：`PYTHONIOENCODING=utf-8 python scratchpad/probe_bwd_workspace.py`）
+
+### 6.5 新增的 10 道门（守的是**测量**，不是模型自洽）
+
+`tests/test_bwd_kernel_workspace.py`：① 三个 seq 的实测律逐字节穿过
+`builder → mhc_wrap → ShapeEval → StructureMemory`；② 归属只在 `sparse_attn` 这一个 op 上
+（挡「把层级常数摊在层上」）；③ r0/r128/unfused 恒 0（挡「拿 r4 的数去顶」）；
+④ 未标注 spec 默认 0；⑤ `workspace` 是 `total()` 的独立加项；
+⑥ **`mhc_wrap` 不得静默吞字段**——2026-07-29 真实发生过一次（`_rebuild` 的手写字段清单
+把 `workspace_ref` 在全部 DSv4 层上丢掉），本门用「被 mHC 包装的生产层」取数，回潮必红。
 
 ---
 
-## 7. 仍未解释的（诚实清单）
+## 7. 验收
 
-（待补）
+### 7.1 八跑门 before → after
+
+**在隔离 worktree 里各跑一遍**（共享工作树同时被另一条任务线编辑，读数会串；
+`git worktree add --detach <dir> HEAD` @ `96209b1`，before = 裸 HEAD、after = HEAD + 本 patch）。
+两处读数与共享树一致，故本表可信。
+
+| 指标 | before | **after** |
+|---|---|---|
+| bucket 聚合 mean / min / max（n=28） | 0.821 / 0.700 / 1.017 | **0.836 / 0.700 / 1.023** |
+| hand_spec·chain2 mean / min / max | 0.855 / 0.670 / 1.110 | **0.855 / 0.670 / 1.110（逐字节不变）** |
+| hand_spec·dataflow | 0.795 / 0.659 / 1.067 | **同上，逐字节不变** |
+| run `c` bucket 逐 stage sim/real | 0.905 / 0.919 / 0.857 / 0.878 | **0.929 / 0.953 / 0.898 / 0.878** |
+| run `a` s1 / s2 | 0.813 / 0.826 | **0.863 / 0.878** |
+| run `g` s1 | 0.941 | **1.023**（转为轻度过读 = OOM 安全侧，如实记） |
+| run `b`/`d`/`f`/`h`（unfused 四跑） | — | **逐 MiB 不变**（该 kernel 只在 fused 分支存在） |
+| 两条真机不变量 / 模型 ×1 不变量 / `REAL_SHA256` | PASS | **PASS（一条未动）** |
+
+`hand_spec` 两行**逐字节不变**是本次改动**只动一条口径**的证据：
+`cost_eval/liveness/` 按 saves + grad 可达性自建图，不读 `bwd_workspace_bytes`。
+
+run `c` 的 s0/s1/s2 各**恰好** +730.0 MiB —— 就是实测值本身，没有第二个数字介入。
+s3 不动，因为它的峰值事件在 head/loss（`bwd@9/bwd4:nll`）。
+
+### 7.2 记分卡锚点
+
+**14 个锚点一个都没动**（`python scorecard_anchors.py` 逐条比对：DSv4-fused 0.9017、
+mHC+MTP 0.8914、DSv3 系列全同）。原因**已定位**：这两个 DSv4 锚点的峰值事件是
+`bwd@5` / `bwd@6` = **lm_head 段的反向**（`bwd_scratch = 2020.0 MiB` 满 vocab fp32 主导），
+不是 decoder 层的反向 → 本轮加在 decoder 层上的 workspace 顶不到它们的峰。
+**如实记：本轮没有改善这两个 OOM-不安全锚点。** 要改善它们，需要测 **head/loss 段**
+（`GatherDGradV2` 那一档，见 §4.4）的 kernel workspace 并挂到 head 侧 op 上——那是
+`layers/head.py`，本轮不属本人可改范围。
+
+### 7.3 测试
+
+```
+python -m pytest tests -q   →  1903 passed, 268 warnings
+```
+
+基线 **1893**（`96209b1`，含另一条任务线的 7 个提交）+ **10 道新守卫门**。
+**没有删除任何一条既有不变量**；新增用例守的是**本轮新引入的机制**（新字段 +
+新桶相位），照 O4 `norm_kind` 的先例。
+
+### 7.4 重钉台账（old → new，逐条理由）
+
+**未动**：`REAL*` / `CSV*` 一切真机常数、`REAL_SHA256` 指纹表、两条真机不变量与模型 ×1
+不变量、run d 不可评分规则、`nr_moe_frag_factor` / `kept_frag_factor` 两个标定 margin
+（**一个字节没动**），以及全部 14 个记分卡锚点。
+
+| 位置 | old → new | 理由 |
+|---|---|---|
+| `test_acceptance_gate::GOLDEN_BUCKET` | fused 四跑（a/c/e/g）的部分格 **+730.0 整**；unfused 四跑（b/d/f/h）**逐字节不变** | 实测值本身；该 kernel 只在 fused 分支 |
+| `...::GOLDEN_AGG` bucket 两行 | 0.821/0.700/1.017 → **0.836/0.700/1.023** | 欠读被真实补上一块；max 上移来自 `g` s1 由 0.941 转 1.023 |
+| `...::GOLDEN_AGG` hand_spec 两行 | **未动** | liveness 不读该字段 |
+| `test_pp4_recompute_anchor::THEO_ON` | s2 12161.9 → **12448.1**（+286.2） | s0/s1/s3 的峰值事件不在 r4 层 bwd 上；s2 峰值事件因此易主，净上移 286.2 而非 730 |
+| `...::THEO_MTP` | s2 同上；s3 28875.0 → **29605.0**（+730.0 整） | MTP 尾 stage 峰值正落在 r4 层 bwd 上 |
+| `...::THEO_PP8` | s1 13463.7 → **14193.7**；s4 13079.7 → **13809.7**（各 +730.0 整） | 1 层/stage，只有落在 r4 层且峰值事件在其 bwd 上的 stage 会动 |
+| `...::_PP8_OVER_BAND` | (1.00, 1.25) → **(1.00, 1.29)** | s4 由 1.204 → **1.271**。上移**全部**来自一笔实测值；下界仍保 1.00（真翻欠读必须变红） |
+| `test_probe185_recon::test_p3p_m8_theoretical_and_gap` | 17966.2 → **18696.2**（+730.0 整） | 同上 |
+| `tests/test_bwd_kernel_workspace.py` | **新增**（10 例） | 新机制的守卫门，见 §6.5 |
+
+---
+
+## 8. 仍未解释 / 未测的（诚实清单）
+
+| # | 缺口 | 量 | 为什么没闭合 / 闭合它需要什么 |
+|---|---|---:|---|
+| ① | **逐层驻留欠读** r0 −5.6 / r4 −260.6 / r128 −110.5 MiB/层 | 见左 | **不是 workspace**（本轮实测推翻）。已定位到 indexer 链的 **3 块 64.0005 MiB**（普查只有 1 块，§5.2）。属普查口径，本轮不动。 |
+| ② | **r128 / r0 的反向 kernel workspace** | 未知（≤ 730） | 两个插桩 rank 的 BWD 单 kernel 极大值都被 r4 那一笔盖住。闭合需**逐层 backward 窗口**——把 `PROBE_BWD_HOOKS=1` 的逐层反向钩子与 tracker 同时打开（该钩子本身有已知扰动，须配对照跑）。 |
+| ③ | **前向 304.001 MiB**（融合 mHC pre-sinkhorn kernel，每层 2 次） | 每层 max 304.001 | 已测、已归属（输出签名逐张匹配，S=4096/2048 两点确认 **S 无关**），但它的 op 在 `cost_eval/layers/residual.py` —— **本轮不属本人可改范围**。模型当前 fwd `workspace` 只有 16.0 MiB（`_fa_workspace`），欠读 288 MiB/层。**交接项**。 |
+| ④ | **head/loss 段 2228.003 MiB**（`GatherDGradV2` = 词表反向，输出 2020.0 MiB == `vocab×H×fp32`） | 2036.0 + S×49152 B（三点线性，斜率 0.046875 MiB/token 逐位相等） | 已测、律已验证，但归属在 embedding/lm_head 段（`layers/head.py` / embedding builder）——**不属本人可改范围**。这正是两个 OOM-不安全 DSv4 锚点（峰在 `bwd@head`）没被改善的原因。**交接项，且是当前最大的单笔未建模 workspace**。 |
+| ⑤ | 实测律在 **B / n_heads / index_topk / v_head_dim** 上的缩放 | — | 只扫了 S（3 点）。B 只测过 1（模型含 B 是 OOM-安全的那一侧）；其余维**未扫**，故系数 135680 B/token **不承诺**随它们变化（它也不能被这些维整除分解：135680 = 512×265，265 = 5×53）。闭合需按维扫描。 |
+| ⑥ | tp>1 / cp>1 下的真值 | — | tp：TensorRef 不标 shard → 不切 = **过读 = OOM 安全侧**；cp：常数项/线性项已分开处理（结构正确）但**未实测**。 |
+| ⑦ | `node_name` 对自定义融合算子不可信 | — | 它们不进 `task.csv`（走 pyboost 之外的 launch 路径）。本轮靠**输出签名 + S 减半逐张对折**反推，两个 kernel 都对上了；但这是**推断**，不是 tracker 直接告诉我们的。要直接归属需 CANN 侧 profiler 的 kernel 名。 |
+
+**一句话**：本轮把「kernel workspace」从**假设**变成了**测量**——测出它在哪、多大、随什么变，
+证明它**不在驻留里**、却**恰恰顶着峰值**；并把其中**归属明确且在本人范围内**的那一笔
+（融合稀疏 flash-MLA 反向，三点验证的实测律）建进了模型。**没测的一律留 0 并逐条记账。**
+
+---
+
+## 9. 服务器侧产物（可复现）
+
+`192.168.9.167:/home/suhaibo/workspace/`（探针与分析脚本，**共享源码一行未改**）：
+
+| 文件 | 作用 |
+|---|---|
+| `probe_ws0.py` | 单卡微基准：验证「空 type + 1 tick」判据 == `max_memory_allocated()` 瞬态 |
+| `run_memprobe_tracker.py` | 8 卡 tracker 探针（`run_memprobe_events.py` 的严格超集 + 逐 rank tracker + `Erfinv` 标记） |
+| `run_ws_matrix.sh` | 顺序驱动（同 `run_events_matrix.sh` 的启动配方，`PYTHONPATH` **后缀**追加） |
+| `analyze_ws.py` / `ws2` / `ws3` / `ws4` / `analyze_resid.py` | 逐 op / 逐相位 / 峰值邻域 / 原始流 / 逐层驻留分解 |
+| `dsv4h_fused_pp4_norecomp_s{1024,2048}.yaml`、`gen_dsv4h_data_1024.py`、`dsv4h_data_1024/` | seq 扫描的两个新配置与数据集（**新增文件，未改任何既有配置**） |
+| `log_ws_2026-07-29/` | 三次跑的全部原始 CSV 与分析文本 |
+
+```bash
+# 三次跑（每次约 100 s，8 卡；跑前先 npu-smi info 确认空闲）
+cd /home/suhaibo/workspace && ./run_ws_matrix.sh \
+  "c_ws_norecomp_L8_m4:dsv4h_fused_pp4_norecomp_ab.yaml:9360:0,2" \
+  "s2048_ws_norecomp_L8_m4:dsv4h_fused_pp4_norecomp_s2048.yaml:9362:0,2" \
+  "s1024_ws_norecomp_L8_m4:dsv4h_fused_pp4_norecomp_s1024.yaml:9364:0,2"
+docker exec shb_dsv4 bash -lc "cd /home/suhaibo/workspace && \
+  python3 analyze_ws2.py log_ws_2026-07-29/c_ws_norecomp_L8_m4 0,2"
+```
