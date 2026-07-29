@@ -163,8 +163,16 @@ def test_delta_magnitude_gap_is_recorded(matrix):
         # 2026-07-29 三次重钉：0.518→0.517（bucket）/ 0.636→0.633（hand_spec）。同一原因：
         # mHC 残差承载归位的净额（MoE 层 −32/层）落在 fused/unfused **两侧同幅**，stage3 峰
         # 位于 head 段、差值几乎不动；欠读大头依旧未修。
-        assert round(ratios[(lbl, "bucket")], 3) == 0.517, ratios
-        assert round(ratios[(lbl, "hand_spec")], 3) == 0.633, ratios
+        # 2026-07-30 四次重钉（**r4 indexer 内部 RoPE 保留对入账**，
+        # `docs/r4_indexer_census_2026-07-30.md`）：0.517→**0.522**（bucket）/
+        # 0.633→**0.638**（hand_spec）。**方向与前三次相反、缺口收窄**：本项在
+        # `forward_before_topk` 内部，fused 与 unfused **两条路径逐字共用**（`csa.py:667` /
+        # `csa.py:766`）→ 两侧同幅 +128.0 MiB/r4 层；stage3 的 fused 侧峰在 head 段（`bwd@9`
+        # 不含解码层 saves，逐字节不动），unfused 侧峰在 `bwd@8` 的 sparse_attn（吃满 +128.0）
+        # → delta 净 **+128.0**（12594.4→12722.4 / 15421.8→15549.8）。**未调参**：分子变大是因为
+        # unfused 侧真实多了一块，不是把容差放宽。
+        assert round(ratios[(lbl, "bucket")], 3) == 0.522, ratios
+        assert round(ratios[(lbl, "hand_spec")], 3) == 0.638, ratios
 
 
 # ---------------------------------------------------------------------------
@@ -186,19 +194,32 @@ def test_delta_magnitude_gap_is_recorded(matrix):
 #: ②MoE 的 `comb` 不再被误当打包流放大（`_stream_names` 按数据流位置判定）→ **−96.0 MiB/MoE 层**。
 #: 净 −32.0 MiB/MoE 层、+64.0 MiB/dense 层。八跑全部 `use_fused_mhc: true` → ④（非融合 fp32
 #: 副本）**不触及本表**。同样一条不变量没动，只移动样例值。
+#: **2026-07-30 四次重钉**（`docs/r4_indexer_census_2026-07-30.md`）：`CSAIndexer` 内部那次
+#: `ApplyRotaryPosEmb`（`indexer.py:182-187`）的反向保留对 `t`/`t_rot` 入账 → **每个 r4 层
+#: `activation_saves` +128.000 MiB**（seq4096 下各 64.000 MiB fp32）。r0/r128 层**逐字节不动**
+#: （`enable_indexer` 只在 `compress_ratio==4` 为真，`csa.py:608`；已按模型输出核实）。
+#: 与前几轮不同，本项在 `forward_before_topk` 内部，**fused / unfused 两条路径逐字共用**
+#: （`csa.py:667` / `csa.py:766`）→ 八跑**全部**上移，不是只动 fused 四跑。
+#: 一条不变量没动（×1 于层数/微批数、run d 不可评分、真机指纹），只移动样例值。
 GOLDEN_BUCKET = {
     # 2026-07-29 重钉：**fused 跑**的每个 r4 层 bwd 事件加上真机实测的融合稀疏 flash-MLA
     # 反向 kernel workspace（seq4096 → **730.0 MiB**，三点验证的实测律，
     # docs/kernel_workspace_2026-07-29.md）。unfused 四跑（b/d/f/h）**逐字节不变**——
     # 该 kernel 只在 fused 分支存在，实测律不外推到小算子链。
-    "a fused   ON  L8 m4": (17278.6, 12631.1, 12375.1, 22212.8),
-    "b unfused ON  L8 m4": (35393.6, 30774.1, 30518.1, 34807.1),
-    "c fused   OFF L8 m4": (28247.6, 20041.6, 15955.4, 24339.6),
-    "d unfused OFF L8 m4": (123981.6, 94059.6, 65057.4, 49255.6),
-    "e fused   ON  L8 m8": (18516.6, 12631.1, 12375.1, 22212.8),
-    "f unfused ON  L8 m8": (36659.6, 30774.1, 30518.1, 34807.1),
-    "g fused   ON  L4 m4": (14195.6, 9074.2, 7942.6, 18911.9),
-    "h unfused ON  L4 m4": (19438.6, 27217.2, 13985.6, 31506.2),
+    # 2026-07-30 四次重钉的逐跑幅度 = 该 stage 峰值事件在世的 r4 层数 ×128.0：
+    #   a/e s1,s2 +128.0（各 1 层）、s3 +0.0（峰在 head 段 `bwd@9`）；a s0 +100.0 / e s0 +128.0
+    #   （a s0 的**峰值事件由 `bwd@1` 换成 `bwd@2`** —— r4 层那一格实涨 128.0 后越过了原本更高
+    #   的 r0 层那一格，故差额只有 100.0，不是本项只算了一部分）；
+    #   b/f 四格各 +128.0；c s0-s2 +512.0/+384.0/+256.0（无重算 = 在途微批深度 4/3/2 各 ×128）、
+    #   s3 +128.0；d 同 c 的深度律；g s1 +128.0、其余 0.0；h s1/s3 +128.0、s0/s2 0.0。
+    "a fused   ON  L8 m4": (17378.6, 12759.1, 12503.1, 22212.8),
+    "b unfused ON  L8 m4": (35521.6, 30902.1, 30646.1, 34935.1),
+    "c fused   OFF L8 m4": (28759.6, 20425.6, 16211.4, 24467.6),
+    "d unfused OFF L8 m4": (124493.6, 94443.6, 65313.4, 49383.6),
+    "e fused   ON  L8 m8": (18644.6, 12759.1, 12503.1, 22212.8),
+    "f unfused ON  L8 m8": (36787.6, 30902.1, 30646.1, 34935.1),
+    "g fused   ON  L4 m4": (14195.6, 9202.2, 7942.6, 18911.9),
+    "h unfused ON  L4 m4": (19438.6, 27345.2, 13985.6, 31634.2),
 }
 #: liveness(hand_spec) per-stage 峰值（MiB），grad_mode=dataflow。（同上，2026-07-29 重钉）
 #: **2026-07-29 三次重钉·补丁**：`mhc_wrap` 的 OpSpec 重建改用 `dataclasses.replace`，修好一处
@@ -206,26 +227,31 @@ GOLDEN_BUCKET = {
 #: 工作区，`attention.py:225,313` / `dsv4_hybrid.py:331,358,381` 的 `_fa_workspace()`）整个丢掉。
 #: 只有 DSA-unfused 的四跑（b/d/f/h）的 dataflow 峰落在带该 workspace 的事件上 → **+16.0 MiB**；
 #: chain2 与 bucket 逐字节不变。同一通道上一轮丢过 `norm_kind`，现已在结构上不可能再丢。
+#: **2026-07-30 四次重钉**：同 `GOLDEN_BUCKET` 的 +128.0/r4 层。⚠ 与上一轮（bwd kernel
+#: workspace）**不同**：那一项只走桶模型的 `bwd_workspace_bytes` 通道，故 hand_spec 两表当时
+#: 逐字节不动；本项改的是 spec 自己的 `saves`，`cost_eval/liveness/` 按 saves 建图 → 两条来源
+#: **同时**移动。逐跑幅度与 bucket 表一致，唯一例外是 **a/g/h s0 各 +0.0**（其 hand_spec 峰值
+#: 事件是 `bwd@1`/`bwd21:swiglu`、不落在 r4 层上；bucket 侧 a s0 则因换事件得 +100.0）。
 GOLDEN_LIVENESS_DATAFLOW = {
-    "a fused   ON  L8 m4": (16574.4, 11084.6, 10828.6, 24232.8),
-    "b unfused ON  L8 m4": (33591.8, 28972.3, 28716.3, 33005.3),
-    "c fused   OFF L8 m4": (27045.6, 18839.6, 14753.4, 26359.6),
-    "d unfused OFF L8 m4": (115631.7, 87629.7, 60675.5, 49227.6),
-    "e fused   ON  L8 m8": (16970.1, 11084.6, 10828.6, 24232.8),
-    "f unfused ON  L8 m8": (34857.8, 28972.3, 28716.3, 33005.3),
-    "g fused   ON  L4 m4": (13491.4, 7527.7, 7142.1, 20931.9),
-    "h unfused ON  L4 m4": (18734.4, 25415.4, 13185.1, 29704.4),
+    "a fused   ON  L8 m4": (16574.4, 11212.6, 10956.6, 24232.8),
+    "b unfused ON  L8 m4": (33719.8, 29100.3, 28844.3, 33133.3),
+    "c fused   OFF L8 m4": (27557.6, 19223.6, 15009.4, 26487.6),
+    "d unfused OFF L8 m4": (116143.7, 88013.7, 60931.5, 49355.6),
+    "e fused   ON  L8 m8": (17098.1, 11212.6, 10956.6, 24232.8),
+    "f unfused ON  L8 m8": (34985.8, 29100.3, 28844.3, 33133.3),
+    "g fused   ON  L4 m4": (13491.4, 7655.7, 7142.1, 20931.9),
+    "h unfused ON  L4 m4": (18734.4, 25543.4, 13185.1, 29832.4),
 }
-#: 同上，grad_mode=chain2。（同上，2026-07-29 重钉）
+#: 同上，grad_mode=chain2。（同上，2026-07-29 重钉 / 2026-07-30 四次重钉）
 GOLDEN_LIVENESS_CHAIN2 = {
-    "a fused   ON  L8 m4": (16574.4, 11084.6, 10828.6, 24232.8),
-    "b unfused ON  L8 m4": (40241.1, 35621.5, 35365.5, 39654.6),
-    "c fused   OFF L8 m4": (27080.3, 18874.3, 14788.0, 26359.6),
-    "d unfused OFF L8 m4": (123109.3, 95235.2, 68281.0, 49227.6),
-    "e fused   ON  L8 m8": (16970.1, 11084.6, 10828.6, 24232.8),
-    "f unfused ON  L8 m8": (41507.1, 35621.5, 35365.5, 39654.6),
-    "g fused   ON  L4 m4": (13491.4, 7527.7, 7142.1, 20931.9),
-    "h unfused ON  L4 m4": (19973.1, 32064.6, 15256.0, 36353.6),
+    "a fused   ON  L8 m4": (16574.4, 11212.6, 10956.6, 24232.8),
+    "b unfused ON  L8 m4": (40369.1, 35749.5, 35493.5, 39782.6),
+    "c fused   OFF L8 m4": (27592.3, 19258.3, 15044.0, 26487.6),
+    "d unfused OFF L8 m4": (123621.3, 95619.2, 68537.0, 49355.6),
+    "e fused   ON  L8 m8": (17098.1, 11212.6, 10956.6, 24232.8),
+    "f unfused ON  L8 m8": (41635.1, 35749.5, 35493.5, 39782.6),
+    "g fused   ON  L4 m4": (13491.4, 7655.7, 7142.1, 20931.9),
+    "h unfused ON  L4 m4": (19973.1, 32192.6, 15256.0, 36481.6),
 }
 #: 28 个可评分格的 `sim/real` 聚合（run d 真机 OOM → 不入统计）。
 #: **2026-07-29**：mean 0.946→0.867（bucket）/ 0.955→0.899（hand_spec·chain2）。max 从 1.394/1.400
@@ -244,10 +270,18 @@ GOLDEN_AGG = {
     # **hand_spec 两行逐字节不变**：`cost_eval/liveness/` 不读 `bwd_workspace_bytes`
     # （它按 saves + grad 可达性自建图），故该来源与本次改动正交 —— 这也是本次改动
     # 只动 bucket 一条口径的证据。
-    ("dataflow", "bucket"): (28, 0.836, 0.700, 1.023),
-    ("dataflow", "hand_spec"): (28, 0.795, 0.659, 1.067),
-    ("chain2", "bucket"): (28, 0.836, 0.700, 1.023),
-    ("chain2", "hand_spec"): (28, 0.855, 0.670, 1.110),
+    # 2026-07-30 四次重钉（r4 indexer 内部 RoPE 保留对入账，`docs/r4_indexer_census_2026-07-30.md`）：
+    #   bucket    0.836 → **0.841**（min 0.700→0.703，max 1.023→**1.038** = `g` s1 由 1.023 再上移）；
+    #   hand_spec 0.855 → **0.860**（chain2；min 0.670→0.675，max **1.110 逐字节不动** = `h` s2，
+    #             该格峰在 `bwd@12:sparse_attn` 且其所在 stage 无 r4 层 → 本项够不着）。
+    #   dataflow·hand_spec 0.795 → **0.799**（min 0.659→0.662，max 1.067 不动）。
+    #   28 个可评分格里 **0 格下移**：bucket 21 上移 / 7 不动，hand_spec(chain2) 20 上移 / 8 不动。
+    #   欠读被真实补上一块，没有一格由欠读翻成过读（`g` s1 / `g` s2 / `h` s2 本来就在过读侧）。
+    #   **未调参**。
+    ("dataflow", "bucket"): (28, 0.841, 0.703, 1.038),
+    ("dataflow", "hand_spec"): (28, 0.799, 0.662, 1.067),
+    ("chain2", "bucket"): (28, 0.841, 0.703, 1.038),
+    ("chain2", "hand_spec"): (28, 0.860, 0.675, 1.110),
 }
 
 
@@ -292,16 +326,21 @@ def test_run_d_is_unscorable_and_excluded(matrix):
 
 
 def test_unfused_on_cell_ratios_match_recorded_reference(matrix):
-    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.802 / 0.811 / 0.815 / 0.828；
-    bucket ≈ 0.700–0.727。（2026-07-29 二次重钉，原 0.808/0.818/0.822/0.835 与 0.717–0.742；
+    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.804 / 0.814 / 0.818 / 0.831；
+    bucket ≈ 0.703–0.730。（2026-07-29 二次重钉，原 0.808/0.818/0.822/0.835 与 0.717–0.742；
     RMSNorm 不 cast 一条也作用在 unfused 跑上 → 该跑比值再下移一档。
     2026-07-29 三次重钉，原 0.804/0.813/0.817/0.830 与 0.701–0.728：mHC 残差承载归位在
-    MoE 层净 −32/层；该跑八条 yaml 同样 `use_fused_mhc: true`，故只吃 ②③、不吃 ④。）"""
+    MoE 层净 −32/层；该跑八条 yaml 同样 `use_fused_mhc: true`，故只吃 ②③、不吃 ④。
+    2026-07-30 四次重钉，原 0.802/0.811/0.815/0.828 与 0.700–0.727：r4 indexer 内部 RoPE
+    保留对入账（`docs/r4_indexer_census_2026-07-30.md`）。**这一轮 unfused 跑也吃**——本项在
+    `CSAIndexer.forward_before_topk` 内部，融合/小算子两条路径逐字共用（`csa.py:667` /
+    `csa.py:766`），与 `apply_dsa_kernel_fusion` 无关；四个 stage 各 +128.0 MiB（每 stage
+    恰好 1 个 r4 层在峰值事件上）。**未调参**：比值上移是 unfused 侧真实多了一块。）"""
     r = matrix["chain2"]["b unfused ON  L8 m4"]
     lv = [r.liveness_mib["hand_spec"][i] / r.real(i) for i in range(4)]
     bk = [r.bucket_mib[i] / r.real(i) for i in range(4)]
-    assert [round(x, 3) for x in lv] == [0.802, 0.811, 0.815, 0.828]
-    assert min(bk) >= 0.700 - 5e-4 and max(bk) <= 0.727 + 5e-4
+    assert [round(x, 3) for x in lv] == [0.804, 0.814, 0.818, 0.831]
+    assert min(bk) >= 0.703 - 5e-4 and max(bk) <= 0.730 + 5e-4
 
 
 # ---------------------------------------------------------------------------
