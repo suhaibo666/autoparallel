@@ -221,3 +221,105 @@ compress_ratios = [_CYCLE[i % 3] for i in range(N)] + [0] * MTP
 在 `from_mindformers.py:359`（异名映射）+ `:539-541`（转 tuple）早已接通，**它一直用的就是
 站点逐层表**。本轮补的是**扁平 query** 这条路。两条路现在读同一张表 —— 这正是本修复的意义：
 **同一批真机跑此前被两条模型路径用两张不同的压缩比表建模**（与上一轮 mHC 分支错配同款自证）。
+
+---
+
+## 7. `REAL_*` / `CSV_*` / 指纹未动的 diff 级证明
+
+```
+$ git diff 43ff9ab HEAD -U0 -- . ':!docs' ':!scratchpad' \
+    | grep -E "^[+-]" | grep -v "^[+-][+-]" | grep -E "REAL|CSV|MEASURED|sha256|SHA256"
+（空）
+```
+
+**一行都没命中** —— 没有任何 `REAL_*` / `CSV_*` / `MEASURED` / `REAL_SHA256` 行被增删改
+（上一轮还命中过一行新增注释，本轮连注释都没提到这些名字）。
+八跑门的指纹校验也在 §6 里 PASS（`41e279e591ae4ae9…`）。
+
+改动只落在 5 个源文件 + 1 个新测试文件：
+`serve_explorer.py` / `tests/test_flat_query_reachability.py` /
+`tests/test_pp4_recompute_anchor.py` / `tests/test_probe185_recon.py` /
+`tests/test_yaml_roundtrip_fidelity.py` / **新增** `tests/test_anchor_site_yaml_agreement.py`。
+
+---
+
+## 8. 为什么上一轮新装的**分类门**没有拦住它（任务书第 3 点）
+
+### 8.1 它没漏判，是**判据成立而声明为假**
+
+`csa_compress_ratios` **登记在** `_LLM_JSON_ONLY_FIELDS` 里
+（本轮之前的 `serve_explorer.py:346`，那一行逐字：
+`"window_size", "window_pattern", "csa_compress_ratios", "csa_window_size",`）。
+于是 `unclassified_llm_fields()` 返回空、`test_every_llmconfig_field_is_classified` 一直绿。
+
+**这不是漏登记，恰恰是登记了。** 而 `_LLM_JSON_ONLY_FIELDS` 的语义是一句**声明**：
+
+> 「这个字段扁平 UI 表达不了 → 扁平路上恒取预设值 → 这个代价我认了。」
+
+对 `csa_compress_ratios` 而言，这句话的前半段是真的（逐层表确实塞不进一个数字输入框），
+**后半段是假的**：pp4/pp8/MTP/185 那批锚点比对的站点 yaml 明明给了另一张表，代价不是"可接受"，
+是"锚点在给另一个模型打分"。
+
+> **门只问「有没有分类」，从不问「分类是不是真的」。**
+> 一条**没有任何判据背书的自我声明**，被当成了通过条件。
+
+更刺眼的是：上一轮的作者**知道**这条是假的 —— 本轮之前 `serve_explorer.py:340-345` 就写着
+一段 ⚠「**已知仍在错**的一条：`csa_compress_ratios` …」的散文注释，紧挨着那张表。
+**没有任何测试会读散文。** 于是「代码里写着白纸黑字的缺陷自白」与「守卫全绿」同时成立了两天。
+
+### 8.2 更根本的：那道门是**字段视角**的，看不见锚点
+
+`test_flat_query_reachability.py` 的四条判据全部只认识 `LLMConfig` 的字段集与两张登记表。
+它**不知道**「站点 yaml」「锚点」这些东西存在，因此在结构上就不可能回答本 bug class 的那一问：
+
+> **锚点扁平 query 建出来的模型，是不是那次真机跑的模型？**
+
+`use_fused_mhc`（第二例）与 `csa_compress_ratios`（第三例）都不是「字段没接线」，
+而是「**接了线但锚点没给值 / 根本没有线可给**」——两者在字段视角下都可以是"已分类"。
+
+### 8.3 在守卫处闭环：`tests/test_anchor_site_yaml_agreement.py`（新增 12 例）
+
+新增的不是"再比一次字段集"，而是把缺的那一问变成机器判据：**归档的真机 launcher yaml
+与对着它打分的锚点扁平 query，逐字段比对**。
+
+| 判据 | 守什么 | 会红于 |
+|---|---|---|
+| ① 逐字段一致 | yaml 权威 `LLMConfig` == 扁平 query 重建的 `LLMConfig`（未登记差异一律红） | **2026-07-29/30 的真实状态**（`use_fused_mhc` 与 `csa_compress_ratios` 都会被点名） |
+| ② 登记不发霉 | 登记的差异必须**至少在一对上**真的还在 | 残留豁免（会静默放行日后的真分歧） |
+| ③ 对齐后同图 | 按登记表对齐后 `LLMConfig` 全等，且两边 `DimTable`/`layer_pattern` 逐字节相同 | 「口头等价、实际不等价」 |
+| ④ **无假声明** | 真差着又没登记的字段，**不许**停在 `_LLM_JSON_ONLY_FIELDS` | 有人把锚点真需要的字段塞进"已知代价清单"蒙混过去 |
+| ⑤ 门会响（负例） | monkeypatch 拆掉 `compress_ratios` 旋钮 → ①/④ 必须同时点名该字段 | 门本身失效 |
+| ⑥ 推断自洽 | 185 的 4 层表必须是 8 层站点表的前缀（两处出处互不依赖） | 两处出处各自漂 |
+| ⑦ 缺陷本体回归 | 预设循环与站点表的**层型计数**必须不同（3/3/2 vs 1/4/3） | 有人"顺手把预设改成站点表"来消除告警（那会搬走每个 dsv4_flash 消费者） |
+
+**关键设计：豁免必须带证据。** 两张登记表都不接受口头承诺：
+- `_DECLARED_EQUIVALENCES`（写法不同、语义相同）→ 判据 ③ 当场用**图**证明；
+- `_DECLARED_INERT_DIFFS`（取值真不同、影响为 0）→ `test_inert_diffs_are_really_byte_neutral`
+  当场把 yaml 的值**灌回锚点再评一遍**，逐 stage 峰值必须逐 MiB 相同。
+
+这正是上一轮缺的那一环：`_LLM_JSON_ONLY_FIELDS` 收的是**声明**，新表收的是**带判据的声明**。
+
+### 8.4 这道门当场抓到的第二件事（**新发现，已量化，未处理**）
+
+把 unfused 那一对纳入比对，立刻多出两条差异：
+
+| 字段 | 站点 yaml | 锚点扁平路 | 出处 |
+|---|---:|---:|---|
+| `kept_frag_factor` | **1.6** | 0.0 | `from_mindformers.py:515-517` 对「MoE 且非 (dsv4_hybrid ∧ dsa_fused)」注入；`deepseek_v4()` 预设从不设它（`llm_config.py:92` 默认 0.0） |
+| `nr_moe_frag_factor` | **0.6** | 0.0 | `from_mindformers.py:526-528`，同上 |
+
+形式上这与本轮的缺陷**同一个 class**（yaml 路注入、扁平路取默认），而且它落在真实锚点上
+（185 U 相位 = dsv4_hybrid + MoE + unfused DSA + pp1 + 无重算，正好是这两个 margin 的作用域）。
+
+**我跑了并观察到：它对这批锚点的影响是 0.0 MiB**（把 1.6/0.6 强行灌回锚点，U1 44760.9、
+U2 76585.3、F0 22492.9 **逐 MiB 不变**）。原因：两个桶都被融合 CE 挡住
+（`cross_entropy_fused=True` → `loss_lids` 空 → `mem_timeline.py:748` / `:760` 的 gate 不成立）。
+
+**为什么不"顺手修掉"**：这两个是**经验标定 margin**，不是结构量。`from_mindformers.py:519-525`
+自带风险留档，逐字写着 0.6「**仅在 DSv3(MLA+MoE、topk4、S4096) 两锚点标定过**，注入到别的结构
+是**未经真机验证的外推**」；而本评估器自 2026-07-24 起的口径就是**去经验补偿的纯理论**
+（`tests/test_pp4_recompute_anchor.py` 模块 docstring 逐字）。把一个 DSv3 标定常数搬到 DSv4
+扁平路上，等于凭空给锚点加一笔没有真机背书的量 —— 违反「绝不发明拟合常数」。
+
+处理方式：登记进 `_DECLARED_INERT_DIFFS`，**并让门每次跑都实测一遍那个 0**。
+它哪天开始承重，门就红，逼当场做决定。
