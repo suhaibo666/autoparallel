@@ -301,7 +301,7 @@ _EMB_GATHER_DGRAD_BWD_WS = {
 | ⑥ | **MTP 层内那个共享 embedding 的调用点** | 两次采集的站点**都没开 MTP** → 该调用点本身**未被直接测到**。模型给它同一个值，理由是**同一个 op / 同一个 kernel**（`multi_token_prediction.py` 对 roll 后的 input_ids 走同一个 embedding cell）。这是**推断**，不是观测；它是 pp4+MTP s3 那 +1498.0 MiB 的全部来源。 |
 | ⑦ | 采集 ② 的 c/k 拆分 | 采集 ② 只有**一个** S 点 → 单条方程、两个未知量（常数项 c 与每-token 系数 k）。本文取「c 与 H 无关」（来自采集 ① 的 3 点拟合）后解出 `k(1792) = 21504 = 12·1792` —— 与 `k(4096) = 49152 = 12·4096` **同一形式**。这是**自洽解**，不是独立测出的两点。 |
 | ⑧ | `+3072 B` | 在采集 ② 上**逐字节**测得；在采集 ① 上只能从三位小数显示（`+0.003 MiB`）读到，二者一致。 |
-| ⑨ | 上一轮遗留的 ①②③ | `docs/kernel_workspace_2026-07-29.md` §8 的**逐层驻留欠读**（indexer 链 3 块 64.0005 MiB）、**r0/r128 的反向 workspace**、**前向 304.001 MiB 的 mHC pre-sinkhorn** —— 本轮**一条都没动**，仍未闭合。 |
+| ⑨ | 上一轮遗留的 ①②③ | `docs/kernel_workspace_2026-07-29.md` §8 的**逐层驻留欠读**（indexer 链 3 块 64.0005 MiB）、**r0/r128 的反向 workspace**、**前向 304.001 MiB 的 mHC pre-sinkhorn** —— 本轮**一条都没动**，仍未闭合。<br>**→ 其中第三条（前向 mHC pre-sinkhorn）已于 2026-07-30 闭合，见 [`mhc_fwd_workspace_2026-07-30.md`](mhc_fwd_workspace_2026-07-30.md)**；结论与本文同款且更彻底：**项对、落点对，但一个锚点都够不着**（36/36 峰在 BWD）。另两条（逐层驻留欠读 / r0·r128 反向 workspace）仍未闭合。 |
 
 ---
 
@@ -385,4 +385,4 @@ python -m pytest tests -q
    做法与本轮同：`MS_ALLOC_CONF=memory_tracker:True` 跑一次**末 stage** 有 loss 的 config，
    在 `bwd@head` 窗口里取 BWD 相位单 kernel 极大值（本轮的 `Erfinv` 标记法可直接复用）。
 2. r0 / r128 的反向 workspace（上一轮 §8 ②）—— 抬 pp4/pp8 的解码层 stage。
-3. 前向 mHC pre-sinkhorn 的 304.001 MiB（上一轮 §8 ③）。
+3. ~~前向 mHC pre-sinkhorn 的 304.001 MiB（上一轮 §8 ③）。~~ **已于 2026-07-30 建模完成**（[`mhc_fwd_workspace_2026-07-30.md`](mhc_fwd_workspace_2026-07-30.md)）；实测落位逐字节，但**没有抬起任何锚点**——它的峰全在 BWD 侧。本条因此**不再是**「能抬起多少」清单上的候选，第 1 条（lm_head/loss 段反向）仍是首位。
