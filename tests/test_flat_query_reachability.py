@@ -123,8 +123,14 @@ _WIRING_CASES = [
     ("num_residual_streams", "hc", "1", "4", 1, 4),
     ("cross_entropy_fused", "ce_fused", "0", "1", False, True),
     ("ce_pynative_lean", "ce_lean", "0", "1", False, True),
-    # ★ 本轮补的那一条（此前**没有**这行 → ~20 个锚点走错分支）。
+    # ★ 2026-07-30 第一轮补的那一条（此前**没有**这行 → ~20 个锚点走错 mHC 分支）。
     ("use_fused_mhc", "mhc_fused", "0", "1", False, True),
+    # ★ 2026-07-30 第二轮补的那一条（`docs/compress_ratios_mismatch_2026-07-30.md`）：
+    #   逐层压缩比曾停在 `_LLM_JSON_ONLY_FIELDS` 里（声明「扁平路上恒取预设值」），
+    #   于是同一批锚点用预设的 0/4/128 **循环** 去对站点**逐层表**的真机跑。
+    ("csa_compress_ratios", "compress_ratios",
+     "0,4,128,4,128,4,128,4", "0,4,128,0,4,128,0,4",
+     (0, 4, 128, 4, 128, 4, 128, 4), (0, 4, 128, 0, 4, 128, 0, 4)),
     ("embedding_params_dtype_bytes", "emb_bytes", "2", "4", 2, 4),
 ]
 
@@ -218,3 +224,55 @@ def test_two_hc_branches_have_same_op_count_and_prefixes():
     _, unfused = _hc_op_names("0")
     assert len(fused) == len(unfused) == 6, (fused, unfused)
     assert [n.split("_hc_")[0] for n in fused] == [n.split("_hc_")[0] for n in unfused]
+
+
+# ── ⑤ 第二个 bug 的定点回归：逐层压缩比（2026-07-30，本 bug class 的第三例）───────────
+#    `docs/compress_ratios_mismatch_2026-07-30.md`
+def _layer_keys(compress_ratios, layers="8"):
+    q = dict(_DSV4_FLAT)
+    q["layers"] = layers
+    q["mhc_fused"] = "1"
+    if compress_ratios is not None:
+        q["compress_ratios"] = compress_ratios
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        errs, cfg, pa = S.parse_and_validate(q)
+    assert not errs, errs
+    spec = build_llm_spec(cfg)
+    return cfg.csa_compress_ratios, [k for k in spec.layer_pattern if k.startswith("dsv4hyb_")]
+
+
+def test_compress_ratios_flat_query_selects_per_layer_table():
+    """扁平 query 的逐层表必须**逐层**落到 `dsv4hyb_r{ratio}_*` 层 key 上。
+
+    站点表 `[0,4,128,4,128,4,128,4]`（`ab_fusion_2026-07-25/dsv4h_fused_pp4_recomp.yaml:121`）
+    的层型分布是 1×r0 / 4×r4 / 3×r128 —— 与预设**循环**的 3/3/2 不同，而三种层型驻留实测
+    各不相同（167 逐层直测 r0 2235.1 / r4 2341.2 / r128 2116.1 MiB）。"""
+    ratios, keys = _layer_keys("0,4,128,4,128,4,128,4")
+    assert ratios == (0, 4, 128, 4, 128, 4, 128, 4)
+    assert [k.split("_")[1] for k in keys] == ["r0", "r4", "r128", "r4", "r128", "r4", "r128", "r4"]
+    mix = {r: [k.split("_")[1] for k in keys].count(f"r{r}") for r in (0, 4, 128)}
+    assert mix == {0: 1, 4: 4, 128: 3}, mix
+
+
+def test_compress_ratios_absent_or_blank_keeps_preset_cycle():
+    """缺省/空串 → 保留基座（预设 `dsv4_flash` 的 0/4/128 循环近似）→ 手配路径逐字节不变。
+
+    这条**同时**把缺陷本体钉成回归：基座那张表是 3×r0/3×r4/2×r128，与站点表不同；
+    若哪天有人把旋钮摘掉，锚点会静默退回这张近似表（= 2026-07-30 之前的真实状态）。"""
+    for v in (None, ""):
+        ratios, keys = _layer_keys(v)
+        assert ratios == (0, 4, 128, 0, 4, 128, 0, 4), (v, ratios)
+        mix = {r: [k.split("_")[1] for k in keys].count(f"r{r}") for r in (0, 4, 128)}
+        assert mix == {0: 3, 4: 3, 128: 2}, (v, mix)
+
+
+def test_compress_ratios_rejects_non_integer_items():
+    """fail-loud 而非静默截断（`4.9 → 4` 会错走 `dsv4hyb_r4_*` 图，同 build_llm §F5c 的判据）。"""
+    for bad in ("0,4,128,4.9,128,4,128,4", "0,4,128,,128,4,128,4", "0,4,128,x,128,4,128,4"):
+        q = dict(_DSV4_FLAT, layers="8", compress_ratios=bad)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            errs, cfg, pa = S.parse_and_validate(q)
+        assert errs and cfg is None, (bad, errs)
+        assert "compress_ratios" in errs[0], (bad, errs)

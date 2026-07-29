@@ -325,6 +325,16 @@ _LLM_FIELD_GATE = {
     #   `hc` 只带残差流数 n，带不了「融合 / 非融合」这条分支选择（两条分支的 saves 差
     #   448 MiB/模块 @S4096·H4096·n4，见 layers/residual.py:192 的 `_fused_hc_ops`/`_unfused_hc_ops`）。
     "use_fused_mhc": "mhc_fused",
+    # 逐层压缩比（yaml `compress_ratios`；2026-07-30 补齐，见
+    #   `docs/compress_ratios_mismatch_2026-07-30.md`）：**逗号串**编码的逐层表。
+    #   此前它在 `_LLM_JSON_ONLY_FIELDS` 里被声明为「扁平路上恒取预设值、代价可接受」——
+    #   而那个声明是**假的**：pp4/pp8/MTP/185 锚点走扁平路拿到预设 `dsv4_flash` 的
+    #   **循环** (0,4,128,0,4,128,0,4)，站点 yaml 是**逐层表** [0,4,128,4,128,4,128,4]
+    #   （`analysis/realmachine/ab_fusion_2026-07-25/dsv4h_fused_pp4_recomp.yaml:121`），
+    #   层型分布 3×r0/3×r4/2×r128 vs 1×r0/4×r4/3×r128 —— 锚点在给**另一个模型**打分。
+    #   预设自己的 `source` 字符串就逐字写着「compress_ratios 逐层按 0/4/128 循环**近似**」
+    #   （`serve_explorer.py` PRESETS["dsv4_flash"]），近似值不该被真机锚点当口径用。
+    "csa_compress_ratios": "compress_ratios",
     "embedding_params_dtype_bytes": "emb_bytes",
 }
 
@@ -337,13 +347,16 @@ _LLM_FIELD_GATE = {
 #   本表把「哪些字段只能靠 llm_json」变成**必须显式声明**的事实：新增 LLMConfig 字段若两表
 #   都不登记，`tests/test_flat_query_reachability.py` 变红，逼作者当场做决定（给 UI 键，还是
 #   承认它在扁平路上恒取预设值）。
-# ⚠ 已知**仍在错**的一条：`csa_compress_ratios` —— pp4/pp8/185 锚点走扁平路拿到预设的
-#   **循环** `(0,4,128,0,4,128,0,4)`，而它们比对的站点 yaml 是**逐层表**
-#   `[0,4,128,4,128,4,128,4]`（层型 3×r0/3×r4/2×r128 vs 1×r0/4×r4/3×r128）。量化见
-#   `scratchpad/probe_compress_ratios_whatif.py`；未修（口径变更，同上文档 §9）。
+# ⚠ 本表是**声明**，不是证明 —— 2026-07-30 教训（`docs/compress_ratios_mismatch_2026-07-30.md`）：
+#   `csa_compress_ratios` 曾登记在本表里（= 声明「扁平路上恒取预设值，代价可接受」），于是
+#   `test_flat_query_reachability.py` 的「分类完备」判据**绿着**，而那条声明本身是假的：
+#   锚点比对的站点 yaml 明明给了另一张逐层表。分类门只问「有没有分类」，不问「分类是不是真的」。
+#   现已在 `tests/test_anchor_site_yaml_agreement.py` 补上后一问：**归档的真机 launcher yaml
+#   与锚点扁平 query 逐字段比对**，凡有分歧的字段就不许停在本表里（本表 = 已知代价清单，
+#   只能收纳「归档真机配置与预设一致 / 或今天没有锚点依赖它」的字段）。
 _LLM_JSON_ONLY_FIELDS = frozenset({
     # 注意力前沿结构（逐层/分组，UI 无处安放）
-    "window_size", "window_pattern", "csa_compress_ratios", "csa_window_size",
+    "window_size", "window_pattern", "csa_window_size",
     "dsa_indexer_n_heads", "dsa_indexer_head_dim", "dsa_indexer_topk",
     "o_groups", "o_lora_rank", "cp_kv_allgather_buffer",
     # MoE 细节
@@ -391,6 +404,31 @@ def _gate_edited(p, canon, field):
     return str(p.get(key)).strip() != str(canon[key]).strip()
 
 
+def _parse_compress_ratios(raw):
+    """UI 键 `compress_ratios`（逗号串）→ `csa_compress_ratios` 元组。返回 `(err|None, tuple|None)`。
+
+    编码选逗号串而不是再加 N 个输入框：这是**逐层**表，长度随 `layers` 变（站点 8 层
+    `[0,4,128,4,128,4,128,4]`、MTP 现场 44 项）。空串/缺键 = 未设 → 保留基座（预设或 llm_json），
+    手配路径逐字节不变（与 `dsa_fused`/`ce_fused`/`mhc_fused` 同款语义）。
+
+    **只做「能不能读成整数序列」这一层校验**：取值档位（0/1/4/128）、长度（==num_layers 或
+    +mtp）、seq 整除性由 `build_llm._validate_structure` 统一 fail-loud（单一来源，不在这里
+    复制一份会漂的副本）。
+    """
+    items = [s.strip() for s in raw.split(",")]
+    out = []
+    for s in items:
+        if s == "":
+            return (f"compress_ratios={raw!r} 含空项——逐层压缩比必须每层一个整数"
+                    "（如 8 层写 `0,4,128,4,128,4,128,4`）", None)
+        try:
+            out.append(int(s))
+        except ValueError:
+            return (f"compress_ratios={raw!r} 含非整数项 {s!r}——逐层压缩比取值 0/1(滑窗)/"
+                    "4(CSA)/128(HCA)，拒绝静默截断", None)
+    return None, tuple(out)
+
+
 def parse_and_validate(p):
     """query dict → (errors:list[str], cfg:LLMConfig|None, pc_args:dict|None)。全部校验先行、报中文。
 
@@ -420,6 +458,13 @@ def parse_and_validate(p):
         errs.append("mtp 层数必须是 ≥0 的整数")
     if hc_raw and hc < 1:
         errs.append("mHC残差流数必须 ≥1(1=无 mHC;≥2=开 hidden×n 残差流,DSv4=4)")
+    # 逐层压缩比（隐藏字段 compress_ratios，2026-07-30）：空/缺键 → 保留基座（预设或 llm_json）。
+    cr_raw = (p.get("compress_ratios") or "").strip()
+    cr_over = None
+    if cr_raw:
+        cr_err, cr_over = _parse_compress_ratios(cr_raw)
+        if cr_err:
+            errs.append(cr_err)
     T = N + max(0, mtp)      # 可切分总层数 = transformer + MTP（2026-07-11 用户口径:mtp 计入切分）
     attn = p.get("attn", "mla"); method = p.get("method", "colossal")
     rmode = p.get("recompute", "None"); sel = p.get("select", "attn")
@@ -606,6 +651,16 @@ def parse_and_validate(p):
     #   与 `ce_fused` 同款语义：缺省/空 → 保留基座（手配路径逐字节不变）。
     if (p.get("mhc_fused") or "").strip() != "":
         over["use_fused_mhc"] = _x_flag(p, "mhc_fused", base.use_fused_mhc)
+    # 逐层压缩比（yaml `compress_ratios` → `csa_compress_ratios`，隐藏字段 compress_ratios；
+    #   2026-07-30 补齐，`docs/compress_ratios_mismatch_2026-07-30.md`）：**此前本函数没有这个
+    #   旋钮** → 扁平路恒取预设 `dsv4_flash` 的 0/4/128 **循环**近似
+    #   （`PRESETS["dsv4_flash"]["source"]` 逐字自称「循环近似」），而 pp4/pp8/MTP/185 锚点比对的
+    #   真机跑站点 yaml 是**逐层表** `[0,4,128,4,128,4,128,4]`
+    #   （`analysis/realmachine/ab_fusion_2026-07-25/dsv4h_fused_pp4_recomp.yaml:121`）。
+    #   两者层型分布 3×r0/3×r4/2×r128 vs 1×r0/4×r4/3×r128，而三种层型驻留实测各不相同
+    #   （167 逐层直测 r0 2235.1 / r4 2341.2 / r128 2116.1 MiB）→ 锚点一直在给另一个模型打分。
+    if cr_over is not None:
+        over["csa_compress_ratios"] = cr_over
     # 2026-07-24 口径切换：去除 std_pin 隐藏字段（std_recompute_ctx_pin 经验保留集已删，纯理论口径）。
     # embedding/head 权重 dtype 字节（隐藏字段 emb_bytes）：116 std fork 的 TransformerConfig 默认
     # embedding_params_dtype=float32（shim 配置转储实证）→ 4;缺省 2 = 全部既有锚点口径。
@@ -1139,6 +1194,11 @@ def _llm_to_fields(llm):
         # 融合 mHC(use_fused_mhc)：选 `_fused_hc_ops` / `_unfused_hc_ops` 两条 saves 差
         #   448 MiB/模块的分支；丢了会让锚点拿错分支对真机（2026-07-30 补齐）。
         "mhc_fused": int(bool(llm.use_fused_mhc)),
+        # 逐层压缩比(csa_compress_ratios)：逗号串编码；None（无 CSA 的 v3 族）→ 空串 = 未设。
+        #   canon 与回填**同源**，故 yaml 导入后未手改时 `_gate_edited` 判「未改」→ 权威元组原样
+        #   保留（含 None 语义）；扁平路（锚点/探针/手配）显式填则以该表为准（2026-07-30 补齐）。
+        "compress_ratios": ("" if llm.csa_compress_ratios is None
+                            else ",".join(str(int(r)) for r in llm.csa_compress_ratios)),
         # 融合 CE / unfused-CE lean / embedding 权重 dtype 字节（隐藏字段，各自有真机口径背书）。
         "ce_fused": int(bool(llm.cross_entropy_fused)),
         "ce_lean": int(bool(llm.ce_pynative_lean)),
@@ -1604,6 +1664,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-w
            选模型预设 → resetRuntimeExtras() 把这些清空（= 放弃导入的权威结构，回手配语义）。 -->
       <input type="hidden" name="head_dim" value="">
       <input type="hidden" name="mhc_fused" value="">
+      <input type="hidden" name="compress_ratios" value="">
       <input type="hidden" name="ce_fused" value="">
       <input type="hidden" name="ce_lean" value="">
       <input type="hidden" name="emb_bytes" value="">
@@ -1914,7 +1975,7 @@ function showBuckets(e){
 /* llm_json/head_dim/ce_*/emb_bytes 一并复位:选预设 = 放弃 yaml 导入的**权威结构**,回预设+UI 表达
    (不清 llm_json 会让预设选择看似无效——基座仍是上次导入的那份 config)。 */
 const RT_DEFAULTS={dp_replicate:"1",reshard:"default",cpu_offload:"0",prefetch:"1",maxdev_gib:"64",opt_dtype:"fp32",sp:"",grad_bytes:"4",
-  llm_json:"",head_dim:"",mhc_fused:"",ce_fused:"",ce_lean:"",emb_bytes:""};
+  llm_json:"",head_dim:"",mhc_fused:"",compress_ratios:"",ce_fused:"",ce_lean:"",emb_bytes:""};
 function resetRuntimeExtras(){
   Object.entries(RT_DEFAULTS).forEach(([k,v])=>{const el=document.querySelector(`#side [name=${k}]`);if(el)el.value=v;});
 }

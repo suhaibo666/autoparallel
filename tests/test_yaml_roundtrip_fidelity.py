@@ -180,7 +180,18 @@ def test_bundle_to_fields_raises_when_lossy(monkeypatch):
     monkeypatch.setattr(S, "_llm_to_fields", _lossy)
     with pytest.raises(S.ConfigRoundTripError) as ei:
         S._bundle_to_fields(b)
-    assert "csa_compress_ratios" in str(ei.value)
+    # **不变量未变**：丢 `llm_json` 必须 fail-loud 并**点名**被预设静默替换的字段。
+    # **只移动举例**（2026-07-30，`docs/compress_ratios_mismatch_2026-07-30.md`，按
+    #   `docs/opdag_walker_core_2026-07-25.md` §6.6 的改测试规矩）：原举例是
+    #   `csa_compress_ratios`，本轮它拿到了 UI 门控键 `compress_ratios` → 丢 `llm_json` 后
+    #   **仍能忠实过桥**，故它已不在被替换名单里（这正是本轮修复的目的）。改举 `o_groups`
+    #   （站点 yaml 8 vs 预设 dsv4_flash 16）与 `dsa_indexer_topk`（512 vs 1024）——它们仍是
+    #   `_LLM_JSON_ONLY_FIELDS` 成员，是本判据现在真正守着的字段。
+    msg = str(ei.value)
+    assert "o_groups" in msg and "dsa_indexer_topk" in msg, msg
+    assert "csa_compress_ratios" not in msg, (
+        "`csa_compress_ratios` 又被静默替换了 —— 它应有 UI 门控键 `compress_ratios`，"
+        f"丢 llm_json 也能过桥（见 tests/test_flat_query_reachability.py）：{msg}")
 
 
 def test_import_handler_surfaces_roundtrip_error(monkeypatch):
