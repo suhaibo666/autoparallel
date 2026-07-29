@@ -160,8 +160,11 @@ def test_delta_magnitude_gap_is_recorded(matrix):
         # **缺口继续变大仍是如实记账**：融合 mHC ctx + RMSNorm 不 cast 两条修正**只减 fused 侧**
         # （unfused 跑同样吃 RMSNorm 一条，但其欠读大头 —— gathered-KV fp32 三份梯度，拆解报告
         # §4.2 —— 一分未修）→ `unfused − fused` 的 delta 相应更欠。
-        assert round(ratios[(lbl, "bucket")], 3) == 0.518, ratios
-        assert round(ratios[(lbl, "hand_spec")], 3) == 0.636, ratios
+        # 2026-07-29 三次重钉：0.518→0.517（bucket）/ 0.636→0.633（hand_spec）。同一原因：
+        # mHC 残差承载归位的净额（MoE 层 −32/层）落在 fused/unfused **两侧同幅**，stage3 峰
+        # 位于 head 段、差值几乎不动；欠读大头依旧未修。
+        assert round(ratios[(lbl, "bucket")], 3) == 0.517, ratios
+        assert round(ratios[(lbl, "hand_spec")], 3) == 0.633, ratios
 
 
 # ---------------------------------------------------------------------------
@@ -177,37 +180,43 @@ def test_delta_magnitude_gap_is_recorded(matrix):
 #: `custom_op_impl.py:390-391` / `mhc_pre_sinkhorn.cc:24-50` 建 ctx（−421.8 MiB/层）；
 #: ②`FusedRMSNorm` 不 cast（`layer_norm.py:151-155`）→ norm-fp32 抬升按种类分辨（−268.0 MiB/层）。
 #: 同样**一条不变量没动**，只移动样例值。
+#: **2026-07-29 三次重钉**（`docs/census_fix_residual_carrier_2026-07-29.md`）：mHC 残差承载判定
+#: 归位 —— ①段首 layernorm 保留 aggregated `[S,B,H]` 而非打包流（`transformer_layer.py:308-311,
+#: 326-329`），打包流改由融合 ctx 的 `x` 声明（`custom_op_impl.py:390`）→ **+64.0 MiB/层**；
+#: ②MoE 的 `comb` 不再被误当打包流放大（`_stream_names` 按数据流位置判定）→ **−96.0 MiB/MoE 层**。
+#: 净 −32.0 MiB/MoE 层、+64.0 MiB/dense 层。八跑全部 `use_fused_mhc: true` → ④（非融合 fp32
+#: 副本）**不触及本表**。同样一条不变量没动，只移动样例值。
 GOLDEN_BUCKET = {
-    "a fused   ON  L8 m4": (17214.6, 11933.1, 11677.1, 22212.8),
-    "b unfused ON  L8 m4": (35425.6, 30806.1, 30550.1, 34839.1),
-    "c fused   OFF L8 m4": (27389.6, 19503.6, 15353.4, 24403.6),
-    "d unfused OFF L8 m4": (123853.6, 94251.6, 65185.4, 49319.6),
-    "e fused   ON  L8 m8": (17818.6, 11933.1, 11677.1, 22212.8),
-    "f unfused ON  L8 m8": (36691.6, 30806.1, 30550.1, 34839.1),
-    "g fused   ON  L4 m4": (14131.6, 8376.2, 7974.6, 18911.9),
-    "h unfused ON  L4 m4": (19374.6, 27249.2, 14017.6, 31538.2),
+    "a fused   ON  L8 m4": (17278.6, 11901.1, 11645.1, 22212.8),
+    "b unfused ON  L8 m4": (35393.6, 30774.1, 30518.1, 34807.1),
+    "c fused   OFF L8 m4": (27517.6, 19311.6, 15225.4, 24339.6),
+    "d unfused OFF L8 m4": (123981.6, 94059.6, 65057.4, 49255.6),
+    "e fused   ON  L8 m8": (17786.6, 11901.1, 11645.1, 22212.8),
+    "f unfused ON  L8 m8": (36659.6, 30774.1, 30518.1, 34807.1),
+    "g fused   ON  L4 m4": (14195.6, 8344.2, 7942.6, 18911.9),
+    "h unfused ON  L4 m4": (19438.6, 27217.2, 13985.6, 31506.2),
 }
 #: liveness(hand_spec) per-stage 峰值（MiB），grad_mode=dataflow。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_DATAFLOW = {
-    "a fused   ON  L8 m4": (16510.4, 11132.9, 10876.9, 24232.8),
-    "b unfused ON  L8 m4": (33543.8, 28924.3, 28668.3, 32957.3),
-    "c fused   OFF L8 m4": (28037.6, 19895.6, 15489.4, 26679.6),
-    "d unfused OFF L8 m4": (116575.7, 88637.7, 61363.5, 49547.6),
-    "e fused   ON  L8 m8": (17018.4, 11132.9, 10876.9, 24232.8),
-    "f unfused ON  L8 m8": (34809.8, 28924.3, 28668.3, 32957.3),
-    "g fused   ON  L4 m4": (13427.4, 7575.9, 7190.3, 20931.9),
-    "h unfused ON  L4 m4": (18670.4, 25367.4, 13233.3, 29656.4),
+    "a fused   ON  L8 m4": (16574.4, 11084.6, 10828.6, 24232.8),
+    "b unfused ON  L8 m4": (33575.8, 28956.3, 28700.3, 32989.3),
+    "c fused   OFF L8 m4": (27045.6, 18839.6, 14753.4, 26359.6),
+    "d unfused OFF L8 m4": (115615.7, 87613.7, 60659.5, 49227.6),
+    "e fused   ON  L8 m8": (16970.1, 11084.6, 10828.6, 24232.8),
+    "f unfused ON  L8 m8": (34841.8, 28956.3, 28700.3, 32989.3),
+    "g fused   ON  L4 m4": (13491.4, 7527.7, 7142.1, 20931.9),
+    "h unfused ON  L4 m4": (18734.4, 25399.4, 13185.1, 29688.4),
 }
 #: 同上，grad_mode=chain2。（同上，2026-07-29 重钉）
 GOLDEN_LIVENESS_CHAIN2 = {
-    "a fused   ON  L8 m4": (16510.4, 11135.5, 10879.5, 24232.8),
-    "b unfused ON  L8 m4": (40337.1, 35717.5, 35461.5, 39750.6),
-    "c fused   OFF L8 m4": (28040.3, 19898.3, 15492.0, 26679.6),
-    "d unfused OFF L8 m4": (124069.3, 96259.2, 68985.0, 49547.6),
-    "e fused   ON  L8 m8": (17021.1, 11135.5, 10879.5, 24232.8),
-    "f unfused ON  L8 m8": (41603.1, 35717.5, 35461.5, 39750.6),
-    "g fused   ON  L4 m4": (13427.4, 7578.6, 7193.0, 20931.9),
-    "h unfused ON  L4 m4": (20069.1, 32160.6, 15352.0, 36449.6),
+    "a fused   ON  L8 m4": (16574.4, 11084.6, 10828.6, 24232.8),
+    "b unfused ON  L8 m4": (40241.1, 35621.5, 35365.5, 39654.6),
+    "c fused   OFF L8 m4": (27080.3, 18874.3, 14788.0, 26359.6),
+    "d unfused OFF L8 m4": (123109.3, 95235.2, 68281.0, 49227.6),
+    "e fused   ON  L8 m8": (16970.1, 11084.6, 10828.6, 24232.8),
+    "f unfused ON  L8 m8": (41507.1, 35621.5, 35365.5, 39654.6),
+    "g fused   ON  L4 m4": (13491.4, 7527.7, 7142.1, 20931.9),
+    "h unfused ON  L4 m4": (19973.1, 32064.6, 15256.0, 36353.6),
 }
 #: 28 个可评分格的 `sim/real` 聚合（run d 真机 OOM → 不入统计）。
 #: **2026-07-29**：mean 0.946→0.867（bucket）/ 0.955→0.899（hand_spec·chain2）。max 从 1.394/1.400
@@ -216,11 +225,14 @@ GOLDEN_LIVENESS_CHAIN2 = {
 #: **二次重钉**：0.867→0.822（bucket）/ 0.899→0.862（hand_spec·chain2）；max 1.125→1.019 /
 #: 1.143→1.116。run c 逐 stage 由 1.083/1.125/1.020/0.931 收到 0.901/0.928/0.865/0.880 ——
 #: **过读已被完全消掉、转入欠侧**。均值继续下降同上：抵消消失、欠读露出，不为均值好看而留错字节。
+#: **三次重钉**：0.822→0.821（bucket）/ 0.862→0.855（hand_spec·chain2）；max 1.019→1.017 /
+#: 1.116→1.110。run c 逐 stage 0.901/0.928/0.865/0.880 → **0.905/0.919/0.857/0.878**
+#: （s0 含 dense r0 层 → +64/层使其**回升**；其余 stage 全是 MoE 层 → −32/层继续下探）。
 GOLDEN_AGG = {
-    ("dataflow", "bucket"): (28, 0.822, 0.701, 1.019),
-    ("dataflow", "hand_spec"): (28, 0.800, 0.658, 1.067),
-    ("chain2", "bucket"): (28, 0.822, 0.701, 1.019),
-    ("chain2", "hand_spec"): (28, 0.862, 0.672, 1.116),
+    ("dataflow", "bucket"): (28, 0.821, 0.700, 1.017),
+    ("dataflow", "hand_spec"): (28, 0.794, 0.659, 1.067),
+    ("chain2", "bucket"): (28, 0.821, 0.700, 1.017),
+    ("chain2", "hand_spec"): (28, 0.855, 0.670, 1.110),
 }
 
 
@@ -265,14 +277,16 @@ def test_run_d_is_unscorable_and_excluded(matrix):
 
 
 def test_unfused_on_cell_ratios_match_recorded_reference(matrix):
-    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.804 / 0.813 / 0.817 / 0.830；
-    bucket ≈ 0.701–0.728。（2026-07-29 二次重钉，原 0.808/0.818/0.822/0.835 与 0.717–0.742；
-    RMSNorm 不 cast 一条也作用在 unfused 跑上 → 该跑比值再下移一档。）"""
+    """回归参照：unfused ON 的 liveness·chain2 sim/real ≈ 0.802 / 0.811 / 0.815 / 0.828；
+    bucket ≈ 0.700–0.727。（2026-07-29 二次重钉，原 0.808/0.818/0.822/0.835 与 0.717–0.742；
+    RMSNorm 不 cast 一条也作用在 unfused 跑上 → 该跑比值再下移一档。
+    2026-07-29 三次重钉，原 0.804/0.813/0.817/0.830 与 0.701–0.728：mHC 残差承载归位在
+    MoE 层净 −32/层；该跑八条 yaml 同样 `use_fused_mhc: true`，故只吃 ②③、不吃 ④。）"""
     r = matrix["chain2"]["b unfused ON  L8 m4"]
     lv = [r.liveness_mib["hand_spec"][i] / r.real(i) for i in range(4)]
     bk = [r.bucket_mib[i] / r.real(i) for i in range(4)]
-    assert [round(x, 3) for x in lv] == [0.804, 0.813, 0.817, 0.830]
-    assert min(bk) >= 0.701 - 5e-4 and max(bk) <= 0.728 + 5e-4
+    assert [round(x, 3) for x in lv] == [0.802, 0.811, 0.815, 0.828]
+    assert min(bk) >= 0.700 - 5e-4 and max(bk) <= 0.727 + 5e-4
 
 
 # ---------------------------------------------------------------------------
