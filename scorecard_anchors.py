@@ -134,7 +134,13 @@ def anchors() -> list:
         # 2026-07-23: 逆 RoPE 入账 0.923→0.968(欠预测收窄)。band 收紧上移,仍排除历史翻转 1.088。
         # 2026-07-29: 同上普查订正 → 0.968→**0.862**。band 下移，仍排除历史翻转 1.088。
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.862 → **0.846**。band 下移，仍排除历史翻转 1.088。
+        # 2026-07-29 三次重钉（mHC 残差承载归位，docs/census_fix_residual_carrier_2026-07-29.md）：
+        #   0.846 → **0.891**。⚠ 本锚经 `validate_dsv4align.evaluate`，同样**没有** `use_fused_mhc`
+        #   旋钮 → 走**非融合** mHC 分支；上移几乎全部来自 ④（非融合分支自己的三份 fp32 副本，
+        #   `hyper_connection.py:298`/`:109`/`:120`）。真机 21153.1 是 2026-07-01 采的 DSv4 站点跑，
+        #   站点 yaml 为 `use_fused_mhc: true` → **配置错配**（见该文档 §5）。仍 OOM-不安全（<1.0），
+        #   band 上移但仍排除历史翻转 1.088。
         Anchor("DSv4 mHC(x4)+MTP", "dsv4+mhc+mtp",
-               _dsv4_sim(4, 1), 21153.1, (0.81, 0.88),
-               note="D2：OOM-不安全欠预测 0.846，不在 D1 覆盖内；band 防漂移/翻转，非 OOM-安全通过"),
+               _dsv4_sim(4, 1), 21153.1, (0.86, 0.93),
+               note="D2：OOM-不安全欠预测 0.891，不在 D1 覆盖内；band 防漂移/翻转，非 OOM-安全通过"),
     ]

@@ -84,8 +84,13 @@ def test_fused_per_layer_increment():
     per_layer = (p8 - p4) / 4
     # 2026-07-29 二次重钉：2702.5 → 2568.5（融合 mHC ctx + RMSNorm 不 cast，见
     #   docs/census_fix_mhc_rmsnorm_2026-07-29.md）。/3109 = 0.826，仍在记录带内。
-    assert abs(per_layer - 2568.5) < 5.0, (
-        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 2568.5（真机差分锚 3109，比值 0.826；"
+    # 2026-07-29 三次重钉：2568.5 → **3000.5**（/3109 = 0.965）。⚠ 本探针的 `_dsv4_q`
+    #   同样经 `serve_explorer`，故与 pp4 锚一样走**非融合** mHC 分支（`use_fused_mhc` 无旋钮），
+    #   而 185 的 `fused=True` 相位真机是融合 mHC —— **配置错配**（见
+    #   docs/census_fix_residual_carrier_2026-07-29.md §5）。本轮 ④ 因此打在这里 → 数值上移。
+    #   记录门只钉「同源差分不漂」，比值 0.965 一并明写，防悄悄回调。
+    assert abs(per_layer - 3000.5) < 5.0, (
+        f"fused 每层差分 sim={per_layer:.1f} 漂离记录值 3000.5（真机差分锚 3109，比值 0.965；"
         f"两个真机数不自洽，见 docstring）")
     assert 0.80 <= per_layer / 3109.0 <= 1.05, (
         f"fused 每层差分 sim={per_layer:.1f} vs 真机差分锚 3109 = {per_layer/3109:.3f}——"
@@ -158,7 +163,9 @@ def test_p3p_m8_theoretical_and_gap():
     #   s0 vs 真机 25343.5：0.741 → 0.685，**仍欠读**（缺口方向不变，这是本门断言的不变量）。
     # 2026-07-29 二次重钉：17370.2 → 17102.2（融合 mHC ctx + RMSNorm 不 cast）；
     #   s0 vs 真机 25343.5：0.685 → 0.675，仍欠读。
-    assert abs(pk[0] - 17102.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17102.2"
+    # 2026-07-29 三次重钉：17102.2 → **17966.2**（④ 打在非融合 mHC 分支上，同上配置错配）；
+    #   s0 vs 真机 25343.5：0.675 → **0.709**，**仍欠读**（本门断言的不变量方向不变）。
+    assert abs(pk[0] - 17966.2) < 0.5, f"P3-P s0 理论漂移 sim={pk[0]:.1f} vs 17966.2"
     assert pk[0] < 25343.5, f"P3-P s0 理论 {pk[0]:.1f} 应 < 真机 25343.5（框架缺口={25343.5-pk[0]:.0f}MiB）"
     m4 = _peaks(_dsv4_q(8, fused=True, seq="4096", pp="4", recompute="full",
                         mbs="4", split="2,2,2,2"))
