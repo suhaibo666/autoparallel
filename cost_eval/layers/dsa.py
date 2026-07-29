@@ -63,7 +63,7 @@ v_head_dim）。三个 indexer 维必须 >0（fail-loud，不静默产错图）�
 """
 from __future__ import annotations
 
-from ..model_spec import DimTable, OpSpec, OpType, TensorRef
+from ..model_spec import DimTable, OpSpec, OpType, TensorRef, norm_kind_of
 from .attention import QKV_PROJ, QB_OUT, ATTN_OUT
 
 __all__ = ["build_dsa_attn_ops"]
@@ -157,11 +157,14 @@ def build_dsa_attn_ops(d: DimTable) -> list:
 
     return [
         # ── MLA base（同 build_mla_attn_ops 前 6 op；无 linear_kvb）───────────────
-        OpSpec("ln1",        OpType.NORM,   [x],               ln1_out, params=[ln1_g], saves=[x]),
+        OpSpec("ln1",        OpType.NORM,   [x],               ln1_out, params=[ln1_g], saves=[x],
+               norm_kind=norm_kind_of(d)),
         OpSpec("linear_qkv", OpType.MATMUL, [ln1_out, qkv_w],  qkv_out,
                params=[qkv_w], saves=[ln1_out]),
-        OpSpec("q_a_norm",   OpType.NORM,   [q_a_in, qkv_out], q_a_out, params=[qan_g], saves=[q_a_in]),
-        OpSpec("kv_a_norm",  OpType.NORM,   [kv_a_in, qkv_out], kv_a_out, params=[kvan_g], saves=[kv_a_in]),
+        OpSpec("q_a_norm",   OpType.NORM,   [q_a_in, qkv_out], q_a_out, params=[qan_g], saves=[q_a_in],
+               norm_kind=norm_kind_of(d)),
+        OpSpec("kv_a_norm",  OpType.NORM,   [kv_a_in, qkv_out], kv_a_out, params=[kvan_g], saves=[kv_a_in],
+               norm_kind=norm_kind_of(d)),
         OpSpec("linear_qb",  OpType.MATMUL, [q_a_out, qb_w],   qb_out,
                params=[qb_w], saves=[q_a_out]),
         OpSpec("rope",       OpType.ROPE,   [qb_out],          qb_out, saves=[]),
@@ -170,7 +173,8 @@ def build_dsa_attn_ops(d: DimTable) -> list:
                params=[idx_wq_b], saves=[q_a_out]),               # dsa_indexer.py:284
         OpSpec("idx_k",      OpType.MATMUL, [ln1_out, idx_wk],  idx_k,
                params=[idx_wk], saves=[ln1_out]),                 # :303
-        OpSpec("idx_k_norm", OpType.NORM,   [idx_k],            idx_kn, params=[ikn_g], saves=[idx_k]),  # :304
+        OpSpec("idx_k_norm", OpType.NORM,   [idx_k],            idx_kn, params=[ikn_g], saves=[idx_k],
+               norm_kind=norm_kind_of(d)),  # :304
         OpSpec("idx_weights", OpType.MATMUL, [ln1_out, idx_wproj], idx_w,
                params=[idx_wproj], saves=[ln1_out]),              # :330
         # top-k 选择：bwd_scratch = dense-warmup 的 head-sum 后 index_scores [B,S,S] fp32

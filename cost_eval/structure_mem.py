@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .specs import is_muon_matrix_weight
+from .model_spec import NORM_KIND_CASTING, NORM_KIND_NONCASTING
 
 
 @dataclass(frozen=True)
@@ -120,15 +121,29 @@ def _norm_save_names(resolved_ops) -> set:
     fp32 cast 供反向（profiler 的 Cast 大头）。**只标 op.saves**（保留的输入 fp32）：norm 输出会被
     下游 cast 回 bf16、不 fp32；且该 fp32 cast 是**反向保留量**，只进 activation_saves（no-recompute
     act_live），**不进 forward_max_live**（重算瞬态里 fp32 cast 转瞬即释、不共存,故 full 重算不受影响,
-    DSv3 锚点不动）。"""
+    DSv3 锚点不动）。
+
+    **2026-07-29 按 norm 种类分辨（普查收口 Fix 2）**：抬升只对**真的 cast 输入**的 norm 成立。
+    权威快照 `mindformers/pynative/layers/layer_norm.py`：
+      · `FusedLayerNorm.construct:93-101` —— `x = self.cast(x, compute_type)`（:97）**真 cast** → 抬。
+      · `FusedRMSNorm.construct:151-155` —— `output = self.norm(x, _to_local(self.weight), self.eps)[0]`，
+        `x` **直通**；`self.cast`（:149）是**死属性**，`construct` 从不调用 → **不抬**。
+        `layernorm_compute_dtype` 在 RMSNorm 里只决定 gamma 参数 dtype（:146）。
+    故按 `ResolvedOp.norm_kind`（由 `OpSpec.norm_kind` ← `DimTable.norm_kind` ← yaml `normalization`
+    经 `get_norm_cls`（:187-191）派生）逐 op 过滤，而**不是**整体翻 `norm_compute_dtype_bytes`
+    ——后者是**跨模型**口径，翻它会把真的 cast 的 norm 一并关掉。默认 CASTING → 未标注的 op（含
+    全部手搭测试 spec、mHC 非融合的 hc_norm）行为逐字节不变。"""
     out = set()
     for op in resolved_ops:
         tv = getattr(getattr(op, "type", ""), "value", getattr(op, "type", ""))
         # 仅 **layernorm/RMSNorm**（layernorm_compute_dtype 驱动）；**排除 softmax/logsoftmax**
         # ——它是 softmax_compute_dtype 的事、且 loss 区 logsm/probs 已显式建 fp32,勿重复放大 logits。
-        if tv == "norm" and "softmax" not in op.name.lower():
-            for s in op.saves:
-                out.add(s.name)
+        if tv != "norm" or "softmax" in op.name.lower():
+            continue
+        if getattr(op, "norm_kind", NORM_KIND_CASTING) == NORM_KIND_NONCASTING:
+            continue                      # FusedRMSNorm：输入直通，无 fp32 副本
+        for s in op.saves:
+            out.add(s.name)
     return out
 
 

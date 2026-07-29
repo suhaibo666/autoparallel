@@ -50,7 +50,7 @@ o_groups/o_lora_rank/csa_window_size`；`dsa_fused: bool`（融合开关，默�
 """
 from __future__ import annotations
 
-from ..model_spec import DimTable, OpSpec, OpType, TensorRef
+from ..model_spec import DimTable, OpSpec, OpType, TensorRef, norm_kind_of
 from .attention import _fa_workspace
 
 __all__ = ["build_dsv4_hybrid_attn_ops"]
@@ -137,11 +137,12 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
 
     # ── base：Q 低秩 down→norm→up→**per-head norm(bf16)** + 单头 KV down→norm + RoPE ──
     ops = [
-        OpSpec("ln1",           OpType.NORM,   [x],              ln1, params=[ln1_g], saves=[x]), # 1 Pre-norm
+        OpSpec("ln1",           OpType.NORM,   [x],              ln1, params=[ln1_g], saves=[x],
+               norm_kind=norm_kind_of(d)),                                                                  # 1 Pre-norm
         OpSpec("linear_q_down", OpType.MATMUL, [ln1, wq_down],   q_compressed,                   # 2 :234
                params=[wq_down], saves=[ln1]),
         OpSpec("q_a_norm",      OpType.NORM,   [q_compressed],   q_a_out,
-               params=[qan_g], saves=[q_compressed]),                                            # 3 :235
+               params=[qan_g], saves=[q_compressed], norm_kind=norm_kind_of(d)),                          # 3 :235
         OpSpec("linear_q_up",   OpType.MATMUL, [q_a_out, wq_up], q,                              # 4 :237
                params=[wq_up], saves=[q_a_out]),
         # 5 per-head Query "RMSNorm"（:242-245）**不是 layernorm 模块**：源逐字
@@ -154,7 +155,7 @@ def build_dsv4_hybrid_attn_ops(d: DimTable, compress_ratio: int) -> list:
         OpSpec("q_hnorm",       OpType.ELEMENTWISE, [q],         q_hnorm, params=[qhn_g], saves=[q]),
         OpSpec("linear_kv",     OpType.MATMUL, [ln1, wkv],       kv, params=[wkv], saves=[ln1]), # 6 :249
         OpSpec("kv_a_norm",     OpType.NORM,   [kv],             kv_a_out,
-               params=[kvan_g], saves=[kv]),                                                     # 7 :250
+               params=[kvan_g], saves=[kv], norm_kind=norm_kind_of(d)),                                   # 7 :250
         # 8 :260-261 前向 RoPE（q 与 key 各一次）——in-place 语义不动，但**每次调用保留 (t, t_rot)
         #   两块 fp32**（rope_utils.py:186-187，dtype=rotary_dtype=fp32）。此前 saves=[] 漏建。
         OpSpec("rope",          OpType.ROPE,   [q_hnorm],        q_hnorm,

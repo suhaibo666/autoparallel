@@ -72,40 +72,84 @@ def _scale_op(op: OpSpec) -> OpSpec:
         params=[_scale_ref(t) for t in op.params],
         saves=[_scale_ref(t) for t in op.saves],
         workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs),
+        # norm_kind 必须原样带过（2026-07-29）：mHC 包装重建 OpSpec，丢了它就等于把
+        # 被包装层的全部 norm 悄悄退回「抬 fp32」——这正是 x_xn/h1_xn 曾被错抬的通道。
+        norm_kind=op.norm_kind,
     )
 
 
 def build_hyper_connection_ops(prefix: str, d: DimTable) -> list:
-    """单个 mHC HyperConnection 模块的 op 列表（3 op，源：`hyper_connection.py:178-233`）。
+    """单个 mHC HyperConnection 模块的 op 列表（**恒 3 op**；融合与否由 `d.use_fused_mhc` 门控）。
 
     prefix ∈ {"attn","ffn"}（`transformer_layer.py:278-285` 的 attn_hc / ffn_hc）。
+
+    ── **融合门（2026-07-29 普查收口 Fix 1）**───────────────────────────────────────────────
+    与 `d.dsa_fused` / `apply_dsa_kernel_fusion` 同一范式：**配置驱动**，两条分支都保留。
+      · `use_fused_mhc=False`（默认）→ `_unfused_hc_ops`：非融合 `HyperConnectionModule.construct`
+        （`hyper_connection.py:246-299`），`rms_norm(cast(hidden_states, float32), ...)`（`:262-266`）
+        **确实**物化 `[S,B,n·H]` fp32（256 MiB/模块），被 `:273` mapping_proj 的 bprop 保留。
+      · `use_fused_mhc=True`（站点 `dsv4h_*_pp4_recomp.yaml:109`）→ `_fused_hc_ops`：
+        `FusedHyperConnectionModule`（`:368`）走 `npu_mhc_pre_sinkhorn`（`:413-419`）+
+        `npu_mhc_post`（`:363`），**没有那张 256 MiB fp32**，改为 ctx 持有一批小张量 + `h_out`。
+    两条分支的 **op 数（3）、名字前缀、params 集合完全一致** —— `mhc_wrap._link` 按下标接边、
+    `test_param_conservation` 按 params 求和，故切换融合门**不**改 op 图拓扑、**不**改参数守恒。
 
     2026-07-24 口径切换：去除 `fused_ctx_pin`。fused mHC HyperConnection 的 ctx 走
     `save_for_backward`（custom_op_impl.py:331/390/588），受控 A/B（报告§7.9 E1b：真实
     FusedHyperConnectionModule 重算 ON fwd 末 0、OFF 821）证其在全重算下**正常释放** →
     纯理论口径不 pin，全重算只留层入口 checkpoint_input；真机残留归框架释放缺口显式暴露。
 
-    op 序列（吃打包残差流 `streams [S,B,n*H]`）：
+    op 序列（吃打包残差流 `streams [S,B,n*H]`）：见 `_unfused_hc_ops` / `_fused_hc_ops`。
+
+    aggregate（`h_pre @ streams → [S,B,H]`，:228-231）与 output_cell（:319/:329）不单列 op：
+    前者产生的 `[S,B,H]` aggregated 即 sublayer 的输入（由 body 的 ln1 承接），后者的残差流
+    更新已由 body 尾部残差承载张量（×n）体现。
+
+    > **已知残差（如实记，不补）**：源里 `input_layernorm`/`pre_mlp_layernorm` 吃的是
+    > **aggregated `[S,B,H]`**（`transformer_layer.py:311,329`），其 RMSNorm 保留的输入是
+    > 32 MiB/次；而普查让 body 的 `ln1`/`ln2` 保留**打包流** `x_xn`/`h1_xn`（`[S,B,n·H]` bf16
+    > = 128 MiB/次）——后者数值上正是融合 ctx 的 `x`（`custom_op_impl.py:390` 首项，同一块设备
+    > 张量），故融合分支**不再重复声明** `x`，以免双计。代价是那 2×32 MiB 的 aggregated 没人建
+    > → **每层欠读 64 MiB**。修它要动 `mhc_wrap` 的残差承载判定（两条分支同时变），超出本轮口径。
+    """
+    if getattr(d, "use_fused_mhc", False):
+        return _fused_hc_ops(prefix, d)
+    return _unfused_hc_ops(prefix, d)
+
+
+def _hc_params(prefix: str) -> tuple:
+    """两条分支**共用**的 mHC 参数（`FusedHyperConnectionModule.__init__` 直接 `super().__init__`，
+    `hyper_connection.py:387` → 参数名/形状/初始化与非融合完全一致 → 参数守恒逐字节不变）。"""
+    # rms_weight：fp32 buffer（requires_grad=False），量级 n*H（hyper_connection.py:157-161）
+    rms_w = TensorRef(f"{prefix}_hc_rms_w", (NH,), is_weight=True, dtype_bytes=4)
+    # mapping_proj.weight：fp32（params_dtype=float32），[n*H, dim]（hyper_connection.py:143-150）
+    proj_w = TensorRef(f"{prefix}_hc_proj_w", (NH, PROJ_OUT), is_weight=True, dtype_bytes=4)
+    return rms_w, proj_w
+
+
+#: `HyperConnectionOutputCell` 反向物化的打包残差流梯度（两条分支同式，见下方逐条注释）。
+_HC_OUTPUT_CELL_BWD = "4*S*B*num_residual_streams*H"
+
+
+def _unfused_hc_ops(prefix: str, d: DimTable) -> list:
+    """非融合 `HyperConnectionModule.construct`（`hyper_connection.py:246-299`），3 op：
+
       1. `{prefix}_hc_norm`（NORM）: RMSNorm(n·H, fp32) → `hc_norm [S,B,n*H]` fp32（saved，
          mHC 的主激活大头：×n 且 fp32）。权重 `rms_weight [n*H]` fp32 buffer。
       2. `{prefix}_hc_mapping_proj`（MATMUL）: `Linear(n*H → dim)`，权重 fp32 `[n*H, dim]`。
       3. `{prefix}_hc_sinkhorn`（ELEMENTWISE）: sinkhorn 投影 → `h_res [S,B,n,n]`（saved，
          供 output_cell 反向 `h_res @ streams`）。
 
-    aggregate（`h_pre @ streams → [S,B,H]`，:228-231）与 output_cell（:319/:329）不单列 op：
-    前者产生的 `[S,B,H]` aggregated 即 sublayer 的输入（由 body 的 ln1 承接），后者的残差流
-    更新已由 body 尾部残差承载张量（×n）体现。
+    `hc_norm` 的 fp32 是**源里真有**的：`:262-266` `rms_norm(self.cast(hidden_states, mstype.float32),
+    ...)`，`:269-271` 注释逐字说明「MindSpeed keeps the weightless RMSNorm and mHC projection in FP32」。
+    该 op 因此**不标** `norm_kind`（保持 CASTING）—— 它确实 cast，与 `FusedRMSNorm` 不同。
     """
     streams = TensorRef(f"{prefix}_streams", ("S", "B", NH), shard={0: "sp"})
-    # RMSNorm 在 fp32 下计算（hyper_connection.py:194-198 cast float32）
+    # RMSNorm 在 fp32 下计算（hyper_connection.py:262-266 cast float32）
     hc_norm = TensorRef(f"{prefix}_hc_norm", ("S", "B", NH), dtype_bytes=4)
     h_proj = TensorRef(f"{prefix}_hc_proj", ("S", "B", PROJ_OUT), dtype_bytes=4)
     h_res = TensorRef(f"{prefix}_h_res", ("S", "B", "num_residual_streams", "num_residual_streams"))
-
-    # rms_weight：fp32 buffer（requires_grad=False），量级 n*H（hyper_connection.py:157-161）
-    rms_w = TensorRef(f"{prefix}_hc_rms_w", (NH,), is_weight=True, dtype_bytes=4)
-    # mapping_proj.weight：fp32（params_dtype=float32），[n*H, dim]（hyper_connection.py:143-150）
-    proj_w = TensorRef(f"{prefix}_hc_proj_w", (NH, PROJ_OUT), is_weight=True, dtype_bytes=4)
+    rms_w, proj_w = _hc_params(prefix)
 
     return [
         # 1. RMSNorm(n·H) → fp32 归一化流（saved：mapping_proj 反向需其输入）
@@ -122,7 +166,81 @@ def build_hyper_connection_ops(prefix: str, d: DimTable) -> list:
         #    dtype(bf16=2B) → `bwd_scratch = 2 张量 × 2B × S·B·(n·H) = 4·S·B·n·H`。**∝ num_residual_streams**
         #    （n=1 plain 时退化为普通 [S,B,H] 残差反向，四分之一）。仅在该 mHC 层反向事件计入。
         OpSpec(f"{prefix}_hc_sinkhorn", OpType.ELEMENTWISE, [h_proj], h_res, saves=[h_res],
-               bwd_scratch="4*S*B*num_residual_streams*H"),
+               bwd_scratch=_HC_OUTPUT_CELL_BWD),
+    ]
+
+
+def _fused_hc_ops(prefix: str, d: DimTable) -> list:
+    """融合 `FusedHyperConnectionModule`（`hyper_connection.py:368-424`），同样 3 op、同样 params。
+
+    **前向只有两个 kernel**：`npu_mhc_pre_sinkhorn`（`:413-419`）与 `npu_mhc_post`（`:363`，
+    在 `FusedHyperConnectionOutputCell.construct` 里）。这里把它们摊成 3 个 OpSpec，只是为了让
+    `mhc_wrap._link` 的下标接边（hc[1].output→段首 ln、hc[2].output→段尾残差 add）与非融合同构；
+    **字节全部落在 `saves` 上**，中间 op 的 output 只是数据流占位（小张量，不 saved）。
+
+    ── ctx 逐字（`hyper_parallel/platform/mindspore/custom_ops/custom_op_impl.py:390-391`）────
+        ctx.save_for_backward(x, phi, alpha, bias,
+                              h_pre, hc_before_norm, inv_rms, sum_out, norm_out)
+    形状逐字（`mhc_pre_sinkhorn.cc:24-50`，`bs=S, seq_len=B, n=num_residual_streams, c=H,
+    fusion_size=n²+2n, num_iters=mhc_sinkhorn_iterations`）：
+
+      · `x`        `[S,B,n,H]` bf16 —— **本函数不声明**：它就是打包残差流本身，已由 body 的
+                   `x_xn`/`h1_xn` 承担（见 `build_hyper_connection_ops` docstring 的残差说明）。
+      · `phi`/`alpha`/`bias` —— **参数**（`rms_w`/`proj_w` 已在 params；alpha/bias 两条分支都没建，
+                   量级 ~1.5 MiB 常驻、非激活，保持不建以维持参数守恒逐字节可比）。
+      · `h_pre`          `[S,B,n]`                fp32  `.cc:36,40`
+      · `hc_before_norm` `[S,B,n²+2n]`            fp32  `.cc:37,41`
+      · `inv_rms`        `[S,B,1]`                fp32  `.cc:38,42`
+      · `sum_out`        `[2·num_iters,S,B,n]`    fp32  `.cc:38,43`
+      · `norm_out`       `[2·num_iters,S,B,n,n]`  fp32  `.cc:39-40,44`
+
+    后 5 项在调用点被 `h_in, h_post, h_res_flat, *_ = npu_mhc_pre_sinkhorn(...)`（`:413`）的 `*_`
+    丢掉 Python 名字，**但 ctx 仍强引用** —— `mhc_pre_sinkhorn.cc:61` `ms::TensorAllocate({...})`
+    无条件分配全部 8 个输出。**没有 Python 名 ≠ 没有设备内存**。
+
+    另外两项 kernel 输出被下游 `output_cell` 消费、故同样活到反向：
+      · `h_res`  `[S,B,n²]` **fp32**（`.cc:33` `kNumberTypeFloat32`；非融合分支建的是 bf16）
+      · `h_post` `[S,B,n]`  **fp32**（`.cc:32`）
+
+    `npu_mhc_post` 另存（`custom_op_impl.py:331`）`ctx.save_for_backward(x, h_res, h_out, h_post)`：
+    `x`/`h_res`/`h_post` 与上面同名同物（按名去重）；`h_out` = **sublayer 输出** `[S,B,H]` bf16
+    （`hyper_connection.py:363` 第 3 实参 `sublayer_out`，`:358` 已 cast 到 compute dtype）——
+    普查此前完全没建，这里补上。
+    """
+    streams = TensorRef(f"{prefix}_streams", ("S", "B", NH), shard={0: "sp"})
+    rms_w, proj_w = _hc_params(prefix)
+    # 2·num_iters 作为 sum_out/norm_out 的首维（`.cc:38-40`）——符号表达式，随 DimTable 求值。
+    IT2 = "2*mhc_sinkhorn_iterations"
+    n = "num_residual_streams"
+
+    h_pre = TensorRef(f"{prefix}_hc_h_pre", ("S", "B", n), dtype_bytes=4)
+    hc_before_norm = TensorRef(f"{prefix}_hc_before_norm",
+                               ("S", "B", f"{n}*{n} + 2*{n}"), dtype_bytes=4)
+    inv_rms = TensorRef(f"{prefix}_hc_inv_rms", ("S", "B", "1"), dtype_bytes=4)
+    sum_out = TensorRef(f"{prefix}_hc_sum_out", (IT2, "S", "B", n), dtype_bytes=4)
+    norm_out = TensorRef(f"{prefix}_hc_norm_out", (IT2, "S", "B", n, n), dtype_bytes=4)
+    # h_in：kernel 主输出 aggregated [S,B,H]（`.cc:31`，dtype 同 x = bf16）。**不 saved**
+    #   （ctx 里没有它）——只作数据流占位，供段首 ln 接边。
+    h_in = TensorRef(f"{prefix}_hc_agg", ("S", "B", "H"), shard={0: "sp"})
+    h_res = TensorRef(f"{prefix}_h_res", ("S", "B", n, n), dtype_bytes=4)
+    h_post = TensorRef(f"{prefix}_h_post", ("S", "B", n), dtype_bytes=4)
+    # npu_mhc_post 的 ctx `h_out` = sublayer 输出 [S,B,H] bf16（custom_op_impl.py:331）。
+    h_out = TensorRef(f"{prefix}_h_out", ("S", "B", "H"), shard={0: "sp"})
+
+    return [
+        # 1. npu_mhc_pre_sinkhorn 的 ctx 内部量（`*_` 丢名但 ctx 持有）。融合 kernel 非 NORM
+        #    —— 建成 ELEMENTWISE，避免被 `_norm_save_names` 误抬 fp32（这些本来就已是 fp32）。
+        OpSpec(f"{prefix}_hc_pre_sinkhorn", OpType.ELEMENTWISE, [streams], h_pre,
+               params=[rms_w, proj_w],
+               saves=[h_pre, hc_before_norm, inv_rms, sum_out, norm_out]),
+        # 2. aggregated（h_in）—— 下标位置与非融合的 mapping_proj 对齐，供 `_link` 接段首 ln。
+        OpSpec(f"{prefix}_hc_aggregate", OpType.ELEMENTWISE, [streams, h_pre], h_in, saves=[]),
+        # 3. h_res / h_post / h_out —— 下标位置与非融合的 sinkhorn 对齐，供 `_link` 接段尾残差 add。
+        #    **反向瞬态（bwd_scratch）与非融合同式**：`npu_mhc_post_backward`（custom_op_impl.py:353）
+        #    同样要产出打包残差流梯度 `grad_x [s,b,n,H]` 并重建残差项，量级不因融合而变
+        #    → 保持 `4·S·B·n·H`，不因换 kernel 就改一个没有源码依据的数。
+        OpSpec(f"{prefix}_hc_sinkhorn", OpType.ELEMENTWISE, [h_pre], h_res,
+               saves=[h_res, h_post, h_out], bwd_scratch=_HC_OUTPUT_CELL_BWD),
     ]
 
 
@@ -202,7 +320,8 @@ def mhc_wrap(body_ops: list, n_streams: int, d: DimTable) -> list:
     def _add_dep(op: OpSpec, *refs) -> OpSpec:
         return OpSpec(op.name, op.type, list(op.inputs) + list(refs), op.output,
                       params=list(op.params), saves=list(op.saves),
-                      workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs))
+                      workspace=op.workspace, bwd_scratch=op.bwd_scratch, attrs=dict(op.attrs),
+                      norm_kind=op.norm_kind)
 
     def _link(hc, seg, prev_carrier):
         if not seg:

@@ -9,7 +9,13 @@
 from __future__ import annotations
 
 from ..llm_config import LLMConfig
-from ..model_spec import OpSpec, OpType, TensorRef
+from ..model_spec import OpSpec, OpType, TensorRef, norm_kind_of
+
+
+def _cfg_norm_kind(cfg: LLMConfig) -> str:
+    """`LLMConfig` → norm 种类（head 段无 DimTable 在手，直接走 `to_dimtable` 的同一条派生）。"""
+    from ..llm_config import to_dimtable
+    return norm_kind_of(to_dimtable(cfg))
 
 
 def build_embedding_ops(cfg: LLMConfig) -> list:
@@ -115,7 +121,11 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
         nll_op = OpSpec("nll", OpType.ELEMENTWISE, [logsm], loss, saves=[logsm], bwd_scratch=bwd)
 
     return [
-        OpSpec("final_norm", OpType.NORM, [h_last], x, params=[fn_g], saves=[h_last]),
+        # norm_kind：final_layernorm 亦由 `get_norm_cls` 产出（layer_norm.py:187-191）→ 随配置
+        # 分辨是否 cast（RMSNorm 不 cast）。`logsoftmax` **不标**：它不是 get_norm_cls 的 norm
+        # （softmax_compute_dtype 的事），且其 saves 已按名被 `_norm_save_names` 排除。
+        OpSpec("final_norm", OpType.NORM, [h_last], x, params=[fn_g], saves=[h_last],
+               norm_kind=_cfg_norm_kind(cfg)),
         head_op,
         OpSpec("logsoftmax", OpType.NORM, [logits], logsm, saves=[logits]),
         nll_op,
@@ -161,8 +171,10 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
     en_g = TensorRef("enorm_g", ("H",), is_weight=True, dtype_bytes=4)   # P1-01 norm gamma
     hn_g = TensorRef("hnorm_g", ("H",), is_weight=True, dtype_bytes=4)
     ops += [
-        OpSpec("enorm", OpType.NORM, [dec_in, emb_out_ref], en_out, params=[en_g], saves=[dec_in]),
-        OpSpec("hnorm", OpType.NORM, [hid], hn_out, params=[hn_g], saves=[hid]),
+        OpSpec("enorm", OpType.NORM, [dec_in, emb_out_ref], en_out, params=[en_g], saves=[dec_in],
+               norm_kind=norm_kind_of(dims)),
+        OpSpec("hnorm", OpType.NORM, [hid], hn_out, params=[hn_g], saves=[hid],
+               norm_kind=norm_kind_of(dims)),
         OpSpec("eh_cat", OpType.ELEMENTWISE, [en_out, hn_out], eh_cat, saves=[]),
         OpSpec("eh_proj", OpType.MATMUL, [eh_cat, eh_w], eh_out, params=[eh_w], saves=[eh_cat]),
     ]
@@ -203,14 +215,15 @@ def build_mtp_ops(cfg: LLMConfig) -> list:
         w0 = wrapped[0]
         wrapped[0] = OpSpec(w0.name, w0.type, list(w0.inputs) + [mtp_streams], w0.output,
                             params=list(w0.params), saves=list(w0.saves),
-                            workspace=w0.workspace, bwd_scratch=w0.bwd_scratch, attrs=dict(w0.attrs))
+                            workspace=w0.workspace, bwd_scratch=w0.bwd_scratch, attrs=dict(w0.attrs),
+                            norm_kind=w0.norm_kind)
         # collapse←层尾更新流 补边(2026-07-11):collapse 规约的是 mhc 更新后的 streams(wrapped 末
         # op 输出,如 moe_add 的 h2×n),非 expand 的原始流——名字断链致 moe_add 孤立。
         collapse = OpSpec(collapse.name, collapse.type,
                           list(collapse.inputs) + [wrapped[-1].output], collapse.output,
                           params=list(collapse.params), saves=list(collapse.saves),
                           workspace=collapse.workspace, bwd_scratch=collapse.bwd_scratch,
-                          attrs=dict(collapse.attrs))
+                          attrs=dict(collapse.attrs), norm_kind=collapse.norm_kind)
         ops += [expand] + wrapped + [collapse]
     else:
         ops += body

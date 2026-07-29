@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from ..model_spec import DimTable, OpSpec, OpType, TensorRef
+from ..model_spec import DimTable, OpSpec, OpType, TensorRef, norm_kind_of
 
 # ── GQA 符号维度别名（与 DimTable 字段名一致，eval_expr 可求值）──────────────
 QKV = "(n_heads+2*n_kv)*head_dim"   # qkv 投影输出维：(H + 2·n_kv)·d_h，对称 GQA
@@ -133,7 +133,7 @@ def build_gqa_attn_ops(d: DimTable) -> list:
     ops = [
         # 1. Pre-norm（LayerNorm / RMSNorm）
         OpSpec("ln1",    OpType.NORM,        [x],          ln1,
-               params=[ln1_g], saves=[x]),
+               params=[ln1_g], saves=[x], norm_kind=norm_kind_of(d)),
         # 2. QKV 投影
         OpSpec("qkv",    OpType.MATMUL,      [ln1, qkv_w], qkv,
                params=[qkv_w], saves=[ln1]),
@@ -158,9 +158,11 @@ def build_gqa_attn_ops(d: DimTable) -> list:
         k_norm_g  = TensorRef("k_norm_g", ("head_dim",), is_weight=True, dtype_bytes=4)
         ops += [
             # 2a. Q RMSNorm（per-head head_dim；in-place 回写 qkv 的 Q 分量，saves=Q 切片 fp32 cast）
-            OpSpec("q_norm", OpType.NORM, [qkv], qkv, params=[q_norm_g], saves=[q_norm_in]),
+            OpSpec("q_norm", OpType.NORM, [qkv], qkv, params=[q_norm_g], saves=[q_norm_in],
+                   norm_kind=norm_kind_of(d)),
             # 2b. K RMSNorm（per-head head_dim；in-place 回写 qkv 的 K 分量，saves=K 切片 fp32 cast）
-            OpSpec("k_norm", OpType.NORM, [qkv], qkv, params=[k_norm_g], saves=[k_norm_in]),
+            OpSpec("k_norm", OpType.NORM, [qkv], qkv, params=[k_norm_g], saves=[k_norm_in],
+                   norm_kind=norm_kind_of(d)),
         ]
 
     # ── 标准路径 pynative 全保留 census（2026-07-23，116 std MHA/GQA 锚点定标）──────────────
@@ -284,7 +286,7 @@ def build_mla_attn_ops(d: DimTable) -> list:
     return [
         # 1. Pre-norm
         OpSpec("ln1",        OpType.NORM,        [x],               ln1_out,
-               params=[ln1_g], saves=[x]),
+               params=[ln1_g], saves=[x], norm_kind=norm_kind_of(d)),
         # 2. linear_qkv（列并行：H → q_lora+kv_lora+k_pe）
         OpSpec("linear_qkv", OpType.MATMUL,      [ln1_out, qkv_w],  qkv_out,
                params=[qkv_w], saves=[ln1_out]),
@@ -292,10 +294,10 @@ def build_mla_attn_ops(d: DimTable) -> list:
         #    inputs 含 qkv_out = 切片视图的**数据流依赖**（qkv_out→q_a_norm 边;字节仍按切片 q_a_in 计,
         #    saves 不变——此前名字断链致 op 图出现孤立叶节点）。
         OpSpec("q_a_norm",   OpType.NORM,        [q_a_in, qkv_out], q_a_out,
-               params=[qan_g], saves=[q_a_in]),
+               params=[qan_g], saves=[q_a_in], norm_kind=norm_kind_of(d)),
         # 4. kv_a LayerNorm（在 kv_lora_rank 维上）
         OpSpec("kv_a_norm",  OpType.NORM,        [kv_a_in, qkv_out], kv_a_out,
-               params=[kvan_g], saves=[kv_a_in]),
+               params=[kvan_g], saves=[kv_a_in], norm_kind=norm_kind_of(d)),
         # 5. linear_qb（列并行：q_lora → n_heads*(nope+rope)）
         OpSpec("linear_qb",  OpType.MATMUL,      [q_a_out, qb_w],   qb_out,
                params=[qb_w], saves=[q_a_out]),

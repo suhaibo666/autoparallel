@@ -4,7 +4,7 @@ import ast
 import operator
 from dataclasses import dataclass
 from math import prod
-from .model_spec import DimTable, ModelSpec, TensorRef
+from .model_spec import DimTable, ModelSpec, TensorRef, NORM_KIND_CASTING
 
 _BINOPS = {
     ast.Add: operator.add,
@@ -194,6 +194,9 @@ class ResolvedOp:
     workspace_bytes: int
     collectives: tuple
     bwd_scratch_bytes: int = 0
+    # norm 种类（2026-07-29）：由 `OpSpec.norm_kind` 直通，供 `structure_mem._norm_save_names`
+    # 判断 fp32 抬升是否成立（FusedRMSNorm 不 cast → 不抬）。str，frozen dataclass 可哈希。
+    norm_kind: str = NORM_KIND_CASTING
 
 
 @dataclass(frozen=True)
@@ -293,6 +296,7 @@ class ShapeEval:
                     op.name, op.type.value,
                     r_in, r_out, r_par, r_sav,
                     ws, tuple(comms), bws,
+                    getattr(op, "norm_kind", NORM_KIND_CASTING),
                 ))
                 produced[op.output.name] = Placement.of(op.output)
             # P1-03 不变量（2026-07-14 fail-loud）：同一 resolved layer 内张量名 → local_numel

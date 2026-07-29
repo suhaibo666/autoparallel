@@ -12,7 +12,7 @@
 """
 from __future__ import annotations
 
-from ..model_spec import DimTable, OpSpec, OpType, TensorRef
+from ..model_spec import DimTable, OpSpec, OpType, TensorRef, norm_kind_of
 
 # 每卡 token 数（balanced dispatch，design §7：T_local = S·B·topk·C/ep）。
 # capacity_factor=C 影响 dispatched token 数（内存相关）；ep 切分由 shard={0:"ep"} 在
@@ -90,7 +90,8 @@ def build_pre_ffn_norm_op(d: DimTable) -> "OpSpec":
     h1    = TensorRef("h1",   ("S", "B", "H"), shard={0: "sp"})   # attn 残差输出（sp 切）
     ln2   = TensorRef("ln2",  ("S", "B", "H"))                    # 归一输出（全 S，进 FFN 列并行前 all-gather）
     ln2_g = TensorRef("ln2_g", ("H",), is_weight=True, dtype_bytes=4)   # P1-01 norm gamma（fp32）
-    return OpSpec("ln2", OpType.NORM, [h1], ln2, params=[ln2_g], saves=[h1])
+    return OpSpec("ln2", OpType.NORM, [h1], ln2, params=[ln2_g], saves=[h1],
+                  norm_kind=norm_kind_of(d))
 
 
 def build_dense_ffn_ops(d: DimTable) -> list:

@@ -63,6 +63,8 @@ _MAPPED_MODEL_KEYS = {
     "moe_shared_expert_intermediate_size", "use_shared_expert_gating",   # C3：shared 门
     "first_k_dense_replace", "moe_layer_freq",
     "enable_hyper_connections", "hc_mult", "num_nextn_predict_layers",
+    # mHC 融合门 + sinkhorn 迭代数（2026-07-29）：改 HC 模块 op 图/ctx → 非中性，必须映射。
+    "use_fused_mhc", "hc_sinkhorn_iters", "mhc_sinkhorn_iterations",
     "add_bias_linear", "add_qkv_bias",
     "normalization", "norm_placement",
     "compute_dtype", "params_dtype", "position_embedding_type", "tie_word_embeddings",
@@ -90,14 +92,17 @@ _IGNORED_MODEL_KEYS = {
     "layernorm_compute_dtype", "softmax_compute_dtype", "rotary_dtype", "initializer_range",
     "csa_compress_rotary_base", "csa_dense_mode",
     "dsa_indexer_loss_coeff", "dsa_indexer_use_sparse_loss",
-    "hc_sinkhorn_iters", "hc_eps", "use_fused_mhc",
+    "hc_eps",
+    # `use_fused_mhc` / `hc_sinkhorn_iters`（+ 同义 `mhc_sinkhorn_iterations`）**2026-07-29 从
+    #   忽略集移入 _MAPPED**：此前判「内存中性」是错的 —— 融合 mHC 走 npu_mhc_pre_sinkhorn，
+    #   ctx 与非融合完全不同（前者无 [S,B,n·H] fp32、后者有；且 sum_out/norm_out ∝ 迭代数）。
+    #   见 residual._fused_hc_ops 与 docs/census_fix_mhc_rmsnorm_2026-07-29.md。
     # ── 现场 DSv4-Flash yaml 的数值/算法旋钮（不改 op 图、不改驻留字节）──────────────────────
     "activation_func_clamp_value",   # 激活函数数值 clamp（数值稳定，不改张量形）
     "compress_rotary_base",          # 压缩注意力 rotary base（同 csa_compress_rotary_base，数值）
     "compress_rope_theta",           # 同上别名（167 A/B launcher dsv4h_*_pp4_recomp.yaml 用此拼写）；
                                      # rotary base 是频率标量,全库无任何 shape/字节路径引用 → 内存中性
     "mhc_init_gating_factor",        # mHC 门控初值（数值 init）
-    "mhc_sinkhorn_iterations",       # mHC sinkhorn 迭代次数（同 hc_sinkhorn_iters，计算时非驻留）
     "moe_router_score_function",     # router 打分函数名（logits 形不变，同 scoring_func）
     "num_hash_layers",               # 哈希路由层数（无学习参数的确定性哈希，假设结构中性）
     "mtp_loss_scaling_factor",
@@ -352,6 +357,8 @@ _MODEL_KEY_ALIASES = {
     "index_head_dim": "dsa_indexer_head_dim",     # DSA indexer 头维
     "index_topk": "dsa_indexer_topk",             # DSA indexer topk
     "compress_ratios": "csa_compress_ratios",     # dsv4_hybrid 每层压缩比 {0/1,4=CSA,128=HCA}
+    # megatron 名 → 站点 yaml 名（config_converter_deepseek_v4.py:70 的反向；二者同一个字段）
+    "mhc_sinkhorn_iterations": "hc_sinkhorn_iters",
 }
 _REQUIRED_MODEL_KEYS = ("num_hidden_layers", "num_attention_heads", "hidden_size",
                         "vocab_size", "seq_length")
@@ -487,6 +494,12 @@ def _build_llm_config(model: dict) -> LLMConfig:
         residual_variant=("mhc" if model.get("enable_hyper_connections") else "plain"),
         num_residual_streams=(int(model.get("hc_mult", 1))
                               if model.get("enable_hyper_connections") else 1),
+        # 融合 mHC（yaml `use_fused_mhc`，站点 dsv4h_*_pp4_recomp.yaml:109 = true）→
+        #   FusedHyperConnectionModule（hyper_connection.py:368）。缺省 False = 非融合小算子路径。
+        use_fused_mhc=bool(model.get("use_fused_mhc", False)),
+        # sinkhorn 迭代数：yaml `hc_sinkhorn_iters`（megatron 同义名已由 _MODEL_KEY_ALIASES 归一）；
+        #   缺省取 transformer_config.py:2084 的 mhc_sinkhorn_iterations 默认 20。
+        mhc_sinkhorn_iterations=int(model.get("hc_sinkhorn_iters", 20) or 20),
         mtp_num_layers=int(model.get("num_nextn_predict_layers", 0) or 0),
         add_bias_linear=bool(model.get("add_bias_linear", False)),
         add_qkv_bias=bool(model.get("add_qkv_bias", False)),

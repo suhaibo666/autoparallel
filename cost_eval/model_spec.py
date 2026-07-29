@@ -5,6 +5,30 @@ from enum import Enum
 from typing import Optional
 
 
+# ── norm 的两个「种类」（2026-07-29 普查收口）────────────────────────────────────────────
+# 权威快照 `mindformers/pynative/layers/layer_norm.py` 里 `get_norm_cls`（:187-191）只会返回两个类，
+# 二者对**输入 dtype** 的处理**根本不同**：
+#   · `FusedLayerNorm.construct`（:93-101）**真 cast**：`x = self.cast(x, compute_type)`（:97）
+#     → `layernorm_compute_dtype=fp32` 时确实物化一份 fp32 输入副本供反向（profiler 的 Cast 大头）。
+#   · `FusedRMSNorm.construct`（:151-155）**不 cast**：`self.norm(x, _to_local(self.weight), self.eps)[0]`
+#     —— `x` 直通 `ops.rms_norm`；`self.cast`（:149）是**死属性**，`construct` 从不调用它。
+#     `layernorm_compute_dtype` 在这里只决定 **gamma 参数** 的 dtype（:146），**不产生 fp32 激活**。
+# 故 `structure_mem._dt` 的 norm-fp32 抬升必须**按种类**施加，而不是靠整体翻
+# `norm_compute_dtype_bytes`（后者是**跨模型口径**，翻它会把「真的 cast 的 norm」一并关掉）。
+NORM_KIND_CASTING = "layernorm"       # FusedLayerNorm：cast 输入 → 抬升成立
+NORM_KIND_NONCASTING = "rmsnorm"      # FusedRMSNorm：输入直通 → **不**抬升
+
+
+def norm_kind_of(d) -> str:
+    """builder 助手：**由 `get_norm_cls` 产出的** norm op 该标的种类（读 `DimTable.norm_kind`）。
+
+    缺省 `NORM_KIND_CASTING` = 今日行为（手搭 DimTable / 老 spec 逐字节不变）。
+    **不要**用在非 `get_norm_cls` 的 norm 上：`logsoftmax`（softmax_compute_dtype 的事）与
+    mHC 非融合的 `hc_norm`（`hyper_connection.py:263` 显式 `cast(..., float32)`，真 cast）。
+    """
+    return getattr(d, "norm_kind", NORM_KIND_CASTING)
+
+
 class OpType(Enum):
     MATMUL = "matmul"
     FLASH_ATTN = "flash_attn"
@@ -62,6 +86,27 @@ class DimTable:
     # mHC residual streams (设计 §9)：hidden 打包为 n 条残差流 [S,B,n*H]。
     # 默认 1 → 完全惰性（plain 残差，n*H==H），不影响任何现有 spec。
     num_residual_streams: int = 1
+    # ── 融合 mHC（2026-07-29；与 `dsa_fused` 同一套「配置驱动融合分支」范式）─────────────────
+    # use_fused_mhc=True（yaml `use_fused_mhc`）→ `FusedHyperConnectionModule`
+    #   （`hyper_connection.py:368,413-419`）走 `npu_mhc_pre_sinkhorn` / `npu_mhc_post` 两个融合
+    #   kernel：**不物化** 非融合分支那张 `[S,B,n·H]` fp32 归一化流（256 MiB/模块），改为 ctx 持有
+    #   `h_pre/hc_before_norm/inv_rms/sum_out/norm_out`（`custom_op_impl.py:390-391`，形状见
+    #   `mhc_pre_sinkhorn.cc:24-50`）+ `npu_mhc_post` 的 `h_out`（`custom_op_impl.py:331`）。
+    # False（默认，惰性）→ 保持非融合 `HyperConnectionModule.construct`（`hyper_connection.py:262-266`）
+    #   的建模：那条路径**确实**物化 256 MiB fp32。仅 residual.build_hyper_connection_ops 读。
+    use_fused_mhc: bool = False
+    # sinkhorn 迭代次数（yaml `hc_sinkhorn_iters` / megatron `mhc_sinkhorn_iterations`，
+    #   `transformer_config.py:2084` 默认 20）。**只在 use_fused_mhc=True 时进内存**：融合 ctx 的
+    #   `sum_out [2·num_iters,S,B,n]` / `norm_out [2·num_iters,S,B,n,n]` 正比于它
+    #   （`mhc_pre_sinkhorn.cc:38-39`）。非融合分支该量走 kernel 内部循环、不物化。
+    mhc_sinkhorn_iterations: int = 20
+    # ── norm 种类（2026-07-29）：驱动 `structure_mem._dt` 的 norm-fp32 抬升是否成立 ───────────
+    # 取 NORM_KIND_CASTING（默认，= 今日行为，手搭 DimTable 逐字节不变）或 NORM_KIND_NONCASTING。
+    # 由 `llm_config.to_dimtable` 从 `LLMConfig.normalization` 派生（RMSNorm→noncasting、
+    # LayerNorm→casting，忠实 `layer_norm.py:187-191` 的 `get_norm_cls`）；builder 把它逐 op 盖在
+    # **由 `get_norm_cls` 产出的** NORM op 上（`OpSpec.norm_kind`）。**不**盖 mHC 的 hc_norm
+    # （非融合 mHC 在 `hyper_connection.py:263` 显式 `cast(..., float32)`，是真 cast）与 logsoftmax。
+    norm_kind: str = NORM_KIND_CASTING
     # gated_linear_unit（SwiGLU）：True→fc1 输出 2·F（gate+up）；False→ungated MLP，fc1 输出 F
     # （plain gelu/relu，D-6）。默认 True（现有全部 spec 走 SwiGLU，故 DSv3/preset 不变）。
     gated_linear_unit: bool = True
@@ -154,6 +199,12 @@ class OpSpec:
     workspace_ref: Optional[TensorRef] = None
     bwd_scratch_ref: Optional[TensorRef] = None
     attrs: dict = field(default_factory=dict)
+    # norm op 的**种类**（仅 type==NORM 时有意义）：NORM_KIND_CASTING / NORM_KIND_NONCASTING。
+    # 默认 CASTING = 今日行为（`structure_mem._norm_save_names` 无差别收全部 norm op 的 saves）
+    # → 未显式标注的 op（含全部手搭测试 spec）逐字节不变。builder 按 `DimTable.norm_kind` 显式标注
+    # 由 `get_norm_cls` 产出的 norm；标成 NONCASTING 的 op，其 saves **不**吃 fp32 抬升
+    # （源：`layer_norm.py:151-155` FusedRMSNorm 输入直通，`:149` 的 self.cast 是死属性）。
+    norm_kind: str = NORM_KIND_CASTING
 
 
 @dataclass

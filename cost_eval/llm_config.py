@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 
-from .model_spec import DimTable
+from .model_spec import DimTable, NORM_KIND_CASTING, NORM_KIND_NONCASTING
 
 
 @dataclass(frozen=True)
@@ -111,6 +111,13 @@ class LLMConfig:
     # ---- ③ 残差变体（横切）----
     residual_variant: str = "plain"         # plain | mhc
     num_residual_streams: int = 1           # mhc：hidden ×n
+    # 融合 mHC（yaml `use_fused_mhc`，站点 dsv4h_*_pp4_recomp.yaml:109 = true）：走
+    #   `npu_mhc_pre_sinkhorn`/`npu_mhc_post`（hyper_connection.py:368,413-419）。默认 False =
+    #   非融合小算子路径（该路径**确实**物化 [S,B,n·H] fp32 归一化流）→ 现有 spec 惰性。
+    use_fused_mhc: bool = False
+    # sinkhorn 迭代次数（yaml `hc_sinkhorn_iters`；megatron 名 `mhc_sinkhorn_iterations`，
+    #   transformer_config.py:2084 默认 20）。仅 use_fused_mhc=True 时进内存（sum_out/norm_out ∝ 它）。
+    mhc_sinkhorn_iterations: int = 20
 
     # ---- MTP ----
     mtp_num_layers: int = 0                 # DeepSeek-V3/V4 多 token 预测头
@@ -224,10 +231,17 @@ def to_dimtable(cfg: LLMConfig) -> DimTable:
         cp_kv_allgather_buffer=cfg.cp_kv_allgather_buffer,
         # ③ 残差变体（mHC）：hidden ×n 的符号维（设计 §9）；plain 时 =1 惰性。
         num_residual_streams=cfg.num_residual_streams,
+        # 融合 mHC 门 + sinkhorn 迭代数（residual.build_hyper_connection_ops 读）。
+        use_fused_mhc=cfg.use_fused_mhc,
+        mhc_sinkhorn_iterations=cfg.mhc_sinkhorn_iterations,
         gated_linear_unit=cfg.gated_linear_unit,   # D-6：ungated MLP（fc1 不 2×）
         cross_entropy_fused=cfg.cross_entropy_fused,   # ①：fused CE（DSv4）lean / unfused fat
         ce_pynative_lean=cfg.ce_pynative_lean,         # unfused CE lean K=4（116 std 实测口径）
         norm_compute_dtype_bytes=cfg.layernorm_compute_dtype_bytes,   # norm 激活 fp32（真机 layernorm_compute_dtype）
+        # norm 种类（2026-07-29）：`get_norm_cls`（layer_norm.py:187-191）按 `normalization` 返回
+        # FusedRMSNorm（:151-155 输入直通，**不** cast → 不抬 fp32）或 FusedLayerNorm（:93-101 真 cast
+        # → 抬）。抬升本身仍由 `norm_compute_dtype_bytes` 控幅度，本字段只决定它对哪类 norm 成立。
+        norm_kind=(NORM_KIND_NONCASTING if cfg.normalization == "RMSNorm" else NORM_KIND_CASTING),
         kept_frag_factor=cfg.kept_frag_factor,   # B 标定 margin（select-kept-MoE loss 峰碎片长尾）
         nr_moe_frag_factor=cfg.nr_moe_frag_factor,   # D1 标定 margin（无重算-MoE loss 峰碎片长尾，pp==1）
         dtype_bytes=cfg.compute_dtype_bytes,
