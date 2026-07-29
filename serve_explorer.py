@@ -321,9 +321,13 @@ _LLM_FIELD_GATE = {
     "qk_rope_head_dim": "qk_rope", "v_head_dim": "v_head", "vocab_size": "vocab",
     "head_dim": "head_dim", "residual_variant": "hc", "num_residual_streams": "hc",
     "cross_entropy_fused": "ce_fused", "ce_pynative_lean": "ce_lean",
-    # 融合 mHC（2026-07-30 补齐；此前**唯一**没有 UI 键的内存相关 LLMConfig 字段）：
-    #   `hc` 只带残差流数 n，带不了「融合 / 非融合」这条分支选择（两条分支的 saves 差
-    #   448 MiB/模块 @S4096·H4096·n4，见 layers/residual.py:192 的 `_fused_hc_ops`/`_unfused_hc_ops`）。
+    # 融合 mHC（2026-07-30 补齐）：`hc` 只带残差流数 n，带不了「融合 / 非融合」这条分支选择
+    #   （两条分支的 saves 差 448 MiB/模块 @S4096·H4096·n4，见 layers/residual.py:192 的
+    #   `_fused_hc_ops`/`_unfused_hc_ops`）。
+    #   ⚠ **订正**：这行原本写「此前**唯一**没有 UI 键的内存相关 LLMConfig 字段」——**不对**。
+    #   同一天下方的 `csa_compress_ratios` 也没有，而且当时就已知
+    #   （`docs/fused_mhc_branch_mismatch_2026-07-30.md` §9 把它列为「下一轮第一优先项」）。
+    #   "唯一"这个词把一条已知未修的同类缺陷说成了不存在，故就地订正、不删原文。
     "use_fused_mhc": "mhc_fused",
     # 逐层压缩比（yaml `compress_ratios`；2026-07-30 补齐，见
     #   `docs/compress_ratios_mismatch_2026-07-30.md`）：**逗号串**编码的逐层表。

@@ -285,6 +285,13 @@ JSON 化塞进隐藏字段 `llm_json`，`parse_and_validate`（`:545-552`）见�
 
 ## 9. ⚠ 同一 bug class 的**第二例**：`csa_compress_ratios`（本轮**发现但未修**）
 
+> **[2026-07-30 后记]** 已在下一轮修复：[`compress_ratios_mismatch_2026-07-30.md`](compress_ratios_mismatch_2026-07-30.md)。
+> 采用了下面的改法 ①（补 UI/隐藏字段 + 门控键）；本节的 what-if 数字
+> （pp4-OFF s1 0.922 / s2 0.859、pp8 s3 1.059）**逐位命中**实测。
+> 并回答了本文 §8 没能回答的那一问 —— 分类门当时是**绿的**，因为该字段**登记在**
+> `_LLM_JSON_ONLY_FIELDS` 里；门只问「有没有分类」，不问「分类是不是真的」。
+> 新增 `tests/test_anchor_site_yaml_agreement.py` 补上后一问。
+
 把 §8.3 的 `_LLM_JSON_ONLY_FIELDS` 逐条对着站点 yaml 读，立刻撞上一条**仍在错**的：
 
 | | 值 | 层型分布（L8） |
