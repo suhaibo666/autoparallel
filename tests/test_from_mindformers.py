@@ -151,7 +151,13 @@ def test_dsv4align_roundtrip_same_peak():
     # → **13899.8**（2026-07-29 二次重钉，`docs/census_fix_mhc_rmsnorm_2026-07-29.md`）：
     #   融合 mHC ctx 按源建 + `FusedRMSNorm` 不 cast。真机 15415.5 → **0.902**。
     #   ⚠ 仍是 OOM-**不安全**方向，且比 0.908 更欠 —— **如实记，不调参掩盖**。
-    assert abs(_peak(bundle) - 13899.8) < 1.0
+    # → **13963.8**（2026-07-30 三次重钉，`docs/r4_indexer_census_2026-07-30.md`）：`CSAIndexer`
+    #   内部那次 `ApplyRotaryPosEmb`（`indexer.py:182-187`）走非融合分支（`apply_rope_fusion`
+    #   默认 False，`parallel_core/transformer_config.py:1578-1579`）→ `rope_utils.py:186-187`
+    #   两个 `mul` 各留一个操作数 `t`/`t_rot`。本配置 `cyc=[0,4,128]`、n=4 → `compress=[0,4,128,0]`
+    #   **只有 1 个 r4 层**，seq2048 下该对各 32.000 MiB → **+64.0 整**。
+    #   真机 15415.5 → 0.902 → **0.906**：仍是 OOM-**不安全**方向，但缺口收窄。
+    assert abs(_peak(bundle) - 13963.8) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────
