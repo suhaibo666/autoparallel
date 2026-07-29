@@ -234,6 +234,12 @@ def _dotted_path(node) -> str | None:
 # 表已合并到 `primitives.VIEW_METHODS`(单点维护),此处保留旧名做别名以免动既有引用。
 _VIEW_METHODS = prims.VIEW_METHODS
 
+#: 张量方法形态里**会改变元素数**的"视图"方法(2026-07-29)。其余 `_VIEW_METHODS` 成员
+#: (reshape/permute/transpose/squeeze/…)元素数恒不变,故按别名处理不会算错字节;
+#: 这两个会**放大**元素数,别名掉它们等于静默少读被扩出来的那些轴(实测 `csa.py:445/460`
+#: 的 `.broadcast_to((batch_size, seqlen, W))` 因此丢掉批维)。
+_EXPANDING_METHODS = frozenset({"broadcast_to", "expand"})
+
 # ── `with` 上下文管理器的语义分类(路线 B P0#4,2026-07-25)────────────────────────────────
 # `walk_stmt` 此前对 `ast.With` 只记账不走查(`7b9aa86` 的理由是对的:走进去发普通节点会造出
 # 一批**看起来梯度可达**的假节点,比丢更危险)。正确做法是**走进去 + 带上块级语义**:
@@ -1850,7 +1856,15 @@ class _Walker:
         # 形态四.六:张量方法形态的视图 `<Name>.unsqueeze(1)` / `.broadcast_to(...)`(链首是 Name/Attribute)。
         if (isinstance(func, ast.Attribute) and func.attr in _VIEW_METHODS
                 and self._classify(func.value) in (_Kind.TENSOR, _Kind.PARAM)):
-            self._emit("View", {"view": func.attr}, call.lineno, [func.value], target_names,
+            attrs = {"view": func.attr}
+            if func.attr in _EXPANDING_METHODS:
+                # 同 `_handle_chained_call`:改变元素数的"视图"必须带上目标 shape,
+                # 否则下游只能保 `?`(而不是拿一个丢了轴的形状往下算)。
+                attrs["view"] = "broadcast"
+                elts = self._tuple_elts(call.args[0]) if call.args else None
+                if elts is not None:
+                    attrs["broadcast_shape"] = [self._describe(e) for e in elts]
+            self._emit("View", attrs, call.lineno, [func.value], target_names,
                        self._promote_dtype([func.value]))
             return
         # 形态四.六五:**非梯度 buffer 的原地更新** `self.<buf>.<method>_(...)`,无赋值目标。
@@ -2131,6 +2145,19 @@ class _Walker:
         if method == "astype":
             out_dtype = self._resolve_cast_dtype(call.args, 0, {})
             self._emit("Cast", {}, call.lineno, [ast.Name(id=tmp, ctx=ast.Load())], target_names, out_dtype)
+        elif method in _EXPANDING_METHODS:
+            # **改变元素数**的方法(`broadcast_to` / `expand`)绝不能只做别名(2026-07-29)。
+            # 真源 `csa.py:445/460`
+            #     matrix = mint.unsqueeze(matrix, 0).broadcast_to((batch_size, seqlen, W))
+            # 别名掉它 = 静默丢掉**批维**:实测 `flat_indices`(`csa.py:484`)因此解成 `128·S`
+            # 而不是 `B·S·128` —— 在 B=1 的配置上数值恰好相同、B>1 就整层少读一个 B 倍。
+            # 发射真节点 + 记下目标 shape,由 `shape_infer` 的 `broadcast` 规则按算子定义定形。
+            attrs = {"view": "broadcast"}
+            elts = self._tuple_elts(call.args[0]) if call.args else None
+            if elts is not None:
+                attrs["broadcast_shape"] = [self._describe(e) for e in elts]
+            self._emit("View", attrs, call.lineno, [ast.Name(id=tmp, ctx=ast.Load())],
+                       target_names, self.ssa.get(tmp, f"{tmp}:?:bf16").split(":")[2])
         else:
             # reshape/view/transpose 等:纯视图/元数据,反向不新增激活 → 目标承接内层产物(保 producer 边);
             # ref 用目标名(而非合成临时名),使 save-set 可读。
@@ -2223,9 +2250,12 @@ class _Walker:
         # ── 常量产出的 shape(`mint.zeros(shape, dtype)` / `full` / `arange`)────────────
         if op == "Constant" and call.args:
             if prim in ("arange",):
-                out["const_shape"] = [self._describe(call.args[0])]
-                # 位置实参个数:`arange(stop)` 的产出是 `(stop,)`,而 `arange(start, stop[, step])`
-                # 的第 0 位是 **start**。消费方必须能区分,否则会把 `start` 当长度。
+                # **逐个位置实参都记**(2026-07-29):`arange(stop)` 的产出是 `(stop,)`,而
+                # `arange(start, stop[, step])` 的长度是 `ceil((stop-start)/step)` —— 只记
+                # 第 0 位就没法算(实测 `csa.py:439` `mint.arange(1, seqlen+1, dtype=int32)`
+                # 因此落 `constant_shape_unknown`,掐断整条 compress-topk 索引链)。
+                out["const_shape"] = [self._describe(a) for a in call.args]
+                # 位置实参个数:消费方按它区分 `arange(stop)` 与 `arange(start, stop)`。
                 out["const_argc"] = len(call.args)
             else:
                 elts = self._tuple_elts(call.args[0])

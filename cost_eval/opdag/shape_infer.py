@@ -31,10 +31,11 @@ from dataclasses import dataclass, field
 
 from .schema import OpDAG, OpNode
 from .sym_shape import (
-    Factors, NEG1, CONFIG2SYM,
+    Factors, NEG1, CONFIG2SYM, DivFacts, NO_DIV_FACTS,
     parse_shape, render_shape, parse_axis, product_of, render_term,
     mul, add, sub, floordiv, resolve_reshape,
     mark_numel_only, strip_numel_only,
+    normalize_axis, normalize_axes,
 )
 
 _QMARK = "?"
@@ -89,6 +90,10 @@ class _Ctx:
     # **调用方声明 / 源侧 docstring 派生**的形状台账(调用方传 `declared=[]` 才收):
     # 每条 `(名, 符号 shape, 出处, 理由)`。纪律:声明永远与"推断出来的"分开记。
     declared: list | None = None
+    # **已核验**的整除事实(`sym_shape.DivFacts`,2026-07-29):`ratio·(S//ratio) == S` 这类
+    # 身份只在 `ratio | S` 时成立,故必须由调用方按 `DimTable` 的**实际值**核验后传进来。
+    # 缺省空 —— 没有事实就不折叠,表达式保持保守形态(宁 `?` 勿错)。
+    div_facts: DivFacts = NO_DIV_FACTS
     # dtype 订正表(张量基名 -> 真 dtype):目前只装 `Compare` 的 bool 产出。
     # walker 的 `_emit` 按 ins 推产出 dtype,故比较类算子的产出被记成 compute dtype(bf16)= 2×;
     # 订正必须**连带下游 ins ref** 一起改,否则 `derive_saves` 读的是下游那份旧串。
@@ -105,6 +110,8 @@ UNRESOLVED_REASONS = {
                           " 元素数不可知(passthrough 会多算 n 倍)",
     "concat_axis_unknown": "`cat` 的轴 **未被 walker 记进 attrs**,且各输入 shape 不同 →"
                            " 猜轴会算错(实测 `cat([kv_nope, kv_pe], -1)` 两输入末轴不同)",
+    "concat_shape_mismatch": "`cat` 的**前置条件**不成立(各输入 rank 不同 / 非拼接轴不等)→"
+                             " 上游至少有一处 shape 解错了,拒绝在错的形状上继续算",
     "slice_bounds_unknown": "`slice` 的起止/步长解不出(`attrs['index']` 里的标量名无来源)",
     "constant_shape_unknown": "常量构造(arange/full/zeros/ones)的 shape 实参 **未被 walker 记进"
                               " attrs** → 无从得知形状",
@@ -649,12 +656,29 @@ def _constant(n: OpNode, ctx: _Ctx):
     #    才用 —— `arange(start, stop[, step])` 的第 0 位是 start,当成长度会算错
     #    (`attrs["const_argc"]` 就是为这个判据记的)。真源 `csa.py:452-453`
     #    `mint.arange(seqlen)` / `mint.arange(window_size)`(滑窗索引矩阵的两条轴)。
-    if prim == "arange" and int(n.attrs.get("const_argc") or 0) == 1:
-        elts = n.attrs.get("const_shape") or ()
-        stop = _resolve_token(str(elts[0]), ctx) if elts else None
-        if stop is None or stop is NEG1:
-            return None
-        return [stop], False
+    if prim == "arange":
+        # `arange(stop)` → `(stop,)`;`arange(start, stop)` → `(stop − start,)`
+        # (**算子定义**)。`arange(start, stop, step)` 的长度是 `ceil((stop−start)/step)`
+        # —— 取整就是猜 ⇒ 不支持,照旧记账保 `?`。
+        # 真源:`csa.py:452-453` `mint.arange(seqlen)` / `mint.arange(window_size)`;
+        #       `csa.py:439` `mint.arange(1, seqlen + 1, dtype=mstype.int32)`。
+        elts = list(n.attrs.get("const_shape") or ())
+        argc = int(n.attrs.get("const_argc") or 0)
+        if argc == 1 and elts:
+            stop = _resolve_token(str(elts[0]), ctx)
+            if stop is None or stop is NEG1:
+                return None
+            return [stop], False
+        if argc == 2 and len(elts) == 2:
+            start = _resolve_token(str(elts[0]), ctx)
+            stop = _resolve_token(str(elts[1]), ctx)
+            if start is None or start is NEG1 or stop is None or stop is NEG1:
+                return None
+            ln = sub(stop, start)
+            if ln is None:
+                return None
+            return [ln], False
+        return None
     # ④ `mint.zeros/ones/full/empty(<shape 元组>, …)`:目标各维由源表达式给出,全部解出才用。
     if prim in ("zeros", "ones", "full", "empty") and n.attrs.get("const_shape"):
         axes = []
@@ -759,6 +783,21 @@ def _concat(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
     if not in_axes_list or any(a is None for a in in_axes_list):
         _note(ctx, n, "no_input_shape")
         return None
+    # ── 算子**前置条件**校验(2026-07-29):`cat` 要求各输入 **rank 相同**、且**除拼接轴外
+    #    逐轴相等**。不满足 ⇒ 至少有一个上游 shape 是错的 ⇒ **整条拒绝**(连元素数之和都不给,
+    #    因为那个和是拿错 shape 算出来的)。
+    #    实测该守卫抓到的真错(`csa.py:818`):`cat([window_idxs, compress_topk_idxs], -1)` 的两个
+    #    操作数被解成 `S·128`(rank 2,`:460` `.broadcast_to((b,sq,W))` 是**方法形态的链式调用**、
+    #    walker 只把它别名成内层产物 → 批维丢了)与 `1·S·128`(按边桥接错位拿到的窗口分支)。
+    #    没有这条守卫时,按轴相加会给出 `S·(128+S)` —— 把 topk 轴从 512 放大成 4224,
+    #    再经 `csa.py:485` 的元素数守恒传导,整层 saves 从 ~22 GiB 涨到 **86 GiB**。
+    exact = [a for a, nm in zip(in_axes_list, in_numel_only) if not nm]
+    if len(exact) > 1:
+        ranks = {len(a) for a in exact}
+        if len(ranks) > 1:
+            _note(ctx, n, "concat_shape_mismatch",
+                  f"各输入 rank 不一致：{sorted(len(a) for a in in_axes_list)}")
+            return None
     axis = n.attrs.get("concat_axis")
     if axis is not None and not any(in_numel_only):
         base = [f.copy() for f in in_axes_list[0]]
@@ -770,6 +809,12 @@ def _concat(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
                 if ax >= len(other):
                     ok = False
                     break
+                # 非拼接轴逐轴必须相等 —— 不等即证明上游有一处解错了(宁 `?` 勿错)。
+                for i, (p, q) in enumerate(zip(base, other)):
+                    if i != ax and render_term(p) != render_term(q):
+                        _note(ctx, n, "concat_shape_mismatch",
+                              f"非拼接轴 {i} 不一致：{render_term(p)!r} vs {render_term(q)!r}")
+                        return None
                 acc = add(acc, other[ax])
             if ok:
                 base[ax] = acc
@@ -803,26 +848,136 @@ def _chunk(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
     return [floordiv(total, k)], True
 
 
+def _exact_floordiv(f: Factors, n: int, facts: DivFacts):
+    """`f // n`,**且整除性可证**时才给结果;证不出 → None(**不许取整**)。
+
+    为什么必须可证:带步长切片的长度是 `ceil(stop/step)`,只有 `step | stop` 时它才等于
+    `stop//step`。除不尽时 floor 与 ceil 差 1 —— 差的那一格会静默变成一个错的张量尺寸。
+
+    两档可证:① 系数整除(`n_compressed·4 // 4`,`compressor.py:230` 的 `total_seq_len`);
+             ② 已核验的整除事实(`4 | S`)。
+    """
+    n = int(n)
+    if n <= 0:
+        return None
+    if f.coeff % n == 0:
+        return Factors(f.coeff // n, dict(f.syms))
+    if not f.syms:
+        return None                              # 纯整数但除不尽 → 拒绝
+    if f.coeff == 1 and len(f.syms) == 1:
+        ((u, m),) = f.syms.items()
+        if m == 1 and facts.has(n, u):
+            return Factors(1, {f"{u}//{n}": 1})
+    return None
+
+
 def _slice(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
-    """`x[<index>]`:仅支持 `":<stop>"` 这一种能从 attrs 解出的形态(切轴 0)。其余记账。"""
+    """`x[<index>]`:支持 `":<stop>"` 与 `":<stop>:<step>"`(都切轴 0)。其余记账。
+
+    带步长那一档(2026-07-29)的真源是 `compressor.py:233`
+        freqs = freqs[:total_seq_len:self.compress_ratio][:n_compressed]
+    —— 它是 `compressor.py:233 ×3` 那条级联根(`slice_bounds_unknown`)。
+    `total_seq_len = n_compressed * self.compress_ratio`(`:230`)⇒ 步长**整除**终点 ⇒
+    长度 = `total_seq_len // ratio` 精确 = `n_compressed`。整除证不出就照旧记账保 `?`。
+    """
     a = in_axes_list[0] if in_axes_list else None
     if not a:
         _note(ctx, n, "no_input_shape")
         return None
     idx = str(n.attrs.get("index") or "")
-    if "," in idx or idx.count(":") != 1 or not idx.startswith(":"):
+    if "," in idx or not idx.startswith(":") or idx.count(":") not in (1, 2):
         _note(ctx, n, "slice_bounds_unknown", f"index={idx!r}")
         return None
-    stop = _resolve_token(idx[1:], ctx)
+    toks = idx[1:].split(":")
+    stop = _resolve_token(toks[0], ctx)
     if stop is None or stop is NEG1:
         _note(ctx, n, "slice_bounds_unknown", f"index={idx!r} 的 stop 解不出")
         return None
+    length = stop
+    step_tok = toks[1].strip() if len(toks) > 1 else ""
+    if step_tok:
+        step = _resolve_token(step_tok, ctx)
+        if step is None or step is NEG1 or step.syms or step.coeff <= 0:
+            _note(ctx, n, "slice_bounds_unknown",
+                  f"index={idx!r} 的步长不是可解的正整数常量")
+            return None
+        if step.coeff != 1:
+            length = _exact_floordiv(stop, step.coeff, ctx.div_facts)
+            if length is None:
+                _note(ctx, n, "slice_bounds_unknown",
+                      f"index={idx!r}:步长 {step.coeff} 整除 {render_term(stop)!r} 证不出 →"
+                      " 长度要向上取整,取整就是猜")
+                return None
     if in_numel_only and in_numel_only[0]:
         _note(ctx, n, "needs_axis_structure", "slice 要换轴 0")
         return None
     out = [f.copy() for f in a]
-    out[0] = stop
+    out[0] = length
     return out, False
+
+
+def _permute(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
+    """`mint.permute(x, dims)` / `ops.transpose(x, perm)` → `out.shape[i] = x.shape[dims[i]]`。
+
+    **这是算子定义,不是猜**:轴序在源里逐字写着(`csa.py:472` `(1,2,0,3)`、`:494` `(0,2,1,3)`…),
+    walker 早就抠进 attrs(`construct_walker.py:2295-2303` 的 `permute_dims`、
+    `:2254-2257` 的 `perm`)—— `shape_infer` 此前**没用它**,一律退 `numel_only`,
+    于是 `unfused_compressed_sparse_attn` 整个函数体(8 处 permute)拿不到轴结构。
+
+    守卫(缺一条就**退回既有的 `numel_only` 档** + 记账):输入有轴结构;`dims` 恰是
+    `range(rank)` 的一个置换。退回而不是整条放弃 —— permute **恒不改元素数**(算子定义),
+    元素数仍精确;丢的只是轴序,故 `~` 是准确的表述,`?` 反而**少给**了已知信息。
+    """
+    a = in_axes_list[0] if in_axes_list else None
+    if not a:
+        _note(ctx, n, "no_input_shape")
+        return None
+    if in_numel_only and in_numel_only[0]:
+        return [f.copy() for f in a], True                 # 输入本就无轴序 → 照旧 `~`
+    dims = n.attrs.get("permute_dims") or n.attrs.get("perm") or ()
+    rank = len(a)
+    try:
+        idx = [(int(d) if int(d) >= 0 else rank + int(d)) for d in dims]
+    except (TypeError, ValueError):
+        idx = []
+    if len(idx) != rank or sorted(idx) != list(range(rank)):
+        _note(ctx, n, "needs_axis_structure",
+              f"permute 轴 {list(dims)!r} 不是 rank={rank} 的一个置换 → 拒绝按假轴序改形")
+        return [f.copy() for f in a], True
+    return [a[k].copy() for k in idx], False
+
+
+def _squeeze(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
+    """`squeeze(x, dim)`:**只**去掉一条已证为 1 的轴。真源 `compressor.py:244`
+    `self.squeeze(out, -2)`(`:235` 刚 `unsqueeze(kv, -2)` 加上的那条)。
+
+    三档,全部是算子定义:
+      * 该轴已证 == 1 → 去掉(精确);
+      * 该轴已证 **≠ 1**(纯整数且不为 1)→ 源侧 squeeze 是 **no-op**,原样透传(精确);
+      * 判不出(符号轴,可能是 1 也可能不是)→ 元素数仍精确、轴结构不可信 → `numel_only`。
+        **不许**拿着"大概不是 1"的假设把轴留着往下算。
+    """
+    a = in_axes_list[0] if in_axes_list else None
+    if not a:
+        _note(ctx, n, "no_input_shape")
+        return None
+    if in_numel_only and in_numel_only[0]:
+        return [f.copy() for f in a], True
+    rank = len(a)
+    ax = int(n.attrs["squeeze_axis"])
+    ax = ax if ax >= 0 else rank + ax
+    if not (0 <= ax < rank):
+        _note(ctx, n, "needs_axis_structure",
+              f"squeeze 轴 {n.attrs['squeeze_axis']!r} 越界（rank={rank}）")
+        return [f.copy() for f in a], True
+    f = a[ax]
+    if not f.syms and f.coeff == 1:
+        return [g.copy() for i, g in enumerate(a) if i != ax], False
+    if not f.syms:                                   # 纯整数且 != 1 → squeeze 是 no-op
+        return [g.copy() for g in a], False
+    _note(ctx, n, "needs_axis_structure",
+          f"squeeze 的轴 {ax} 未证为 1（= {render_term(f)}）→ 去不去掉判不出")
+    return [g.copy() for g in a], True
 
 
 def _tile(n: OpNode, in_axes, tile_mult, ctx: _Ctx):
@@ -862,19 +1017,34 @@ def _reshape(n: OpNode, in_axes, reshape_dims, ctx: _Ctx):
     """
     target = []
     lost = None
+    lost_at = -1
     for tok in reshape_dims:
         r = _resolve_token(str(tok), ctx)
         if r is None:
+            # **恰好一个目标维解不出**时,它由元素数守恒**唯一确定** —— 与 `-1` 是同一条
+            # 算子定义(2026-07-29)。真源 `csa.py:482`
+            #     kv_flat = mint.reshape(kv_t, (b * sk, d))
+            # 里的 `sk = kv_full.shape[0]`(`:481`,下标取轴而非元组解包)walker 没导出,
+            # 于是整条 CSA 主链此前退 `~`。占位成 `NEG1` 后由 `resolve_reshape` 消元;
+            # **两个以上**解不出就还是退 `numel_only`(那时确实无解,不许猜)。
+            if lost is None:
+                lost, lost_at = tok, len(target)
+                target.append(NEG1)
+                continue
             lost = tok
             break
         target.append(r)
-    if lost is None:
+    if lost is None or (lost_at >= 0 and len(target) == len(list(reshape_dims))):
         # `allow_expr=True`:`-1` 消元约不干净时形成整除原子而不是整条退 numel_only
         # (见 `sym_shape.divide_expr` —— 压缩链 `S` vs `S//4` 就卡在这一步)。
         out = resolve_reshape(in_axes, target, allow_expr=True)
         if out is not None:
+            if lost_at >= 0:
+                _declare(ctx, n, render_shape(out), n.src or "",
+                         f"reshape 目标维 {lost!r} 未导出 → 由**元素数守恒**唯一确定"
+                         f"（与 `-1` 同一条算子定义；其余 {len(target) - 1} 维均已解出）")
             return out, False
-        lost = f"`-1` 消元不干净（目标 {list(reshape_dims)}）"
+        lost = lost if lost_at >= 0 else f"`-1` 消元不干净（目标 {list(reshape_dims)}）"
     _note(ctx, n, "reshape_unresolved",
           f"目标维 {lost!r} → 退 numel_only（reshape 恒不改元素数,故元素数仍精确）")
     return [product_of(in_axes)], True
@@ -886,7 +1056,8 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
                  param_shapes: dict | None = None,
                  declared_outs: dict | None = None,
                  declared: list | None = None,
-                 bridge_by_edge: bool = False) -> OpDAG:
+                 bridge_by_edge: bool = False,
+                 div_facts: DivFacts | None = None) -> OpDAG:
     """从 input_shapes 种子出发,逐节点符号传播 shape,回填 ins/out 的 shape 段,返回同一 dag。
 
     `report`(可选,2026-07-25):给一个 list → 每个**解不出**的节点追加一条
@@ -907,6 +1078,10 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
     (`producer.py:227` `real = [info for info in in_infos if info.sym and info.sym != "?"]`),
     多解出一个输入就会多注入一条 layout-redistribution AG —— 那是另一个子系统的口径,
     不该被本轮的覆盖度改造顺带改掉。故只有 `to_resolved`(显存记账)打开它。
+
+    `div_facts`(可选,2026-07-29):`sym_shape.DivFacts` —— **已按实际值核验**的整除事实
+    (`ratio | S`)。有了它,`ratio·(S//ratio)` 才允许折回 `S`;没有它就保持保守形态。
+    调用方**必须**用 `div_facts_from_values` 之类先核验;直接编一条事实等于编一个尺寸。
     """
     ctx = _Ctx(
         env=dict(input_shapes or {}),
@@ -917,6 +1092,7 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
         param_shapes=dict(param_shapes or {}),
         report=report,
         declared=declared,
+        div_facts=(div_facts if div_facts is not None else NO_DIV_FACTS),
     )
 
     # 入边:consumer id -> [producer id...](按 edge 顺序,供合成别名桥接)
@@ -987,7 +1163,11 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
 
         bare = [strip_numel_only(sh) if sh is not None else (None, False) for sh in shapes]
         in_numel_only = [b[1] for b in bare]
-        in_axes_list = [parse_shape(b[0]) if b[0] is not None else None for b in bare]
+        # **表达式规范化**(2026-07-29):在每条规则看到输入之前把轴化到规范形 ——
+        # `64+v_head_dim-64` 折成 `v_head_dim`、`4·(S//4)` 在事实成立时折成 `S`。
+        # 恒等变形(值不变),但它决定了下游 `divide`/`resolve_reshape` 的消元能不能约干净。
+        in_axes_list = [normalize_axes(parse_shape(b[0]), ctx.div_facts)
+                        if b[0] is not None else None for b in bare]
 
         # 3b) **权重派生节点**(`ins` 为空、操作数全是 `Parameter`)的伪输入轴(2026-07-28)。
         #     只在 `ins` 为空时启用 —— 有真激活操作数的节点照旧按 `ins` 推(否则
@@ -1095,7 +1275,7 @@ def infer_shapes(dag: OpDAG, input_shapes: dict, dims_ctx: dict | None = None,
             ctx.env.pop(_base(n.out), None)
         if got is not None:
             out_axes, numel_only = got
-            out_shape = render_shape(out_axes)
+            out_shape = render_shape(normalize_axes(out_axes, ctx.div_facts))
             if numel_only:
                 out_shape = mark_numel_only(out_shape)
             node_out_shape[n.id] = out_shape
@@ -1136,7 +1316,7 @@ def _apply_split(n: OpNode, in_axes_list, ctx: _Ctx):
             continue
         new_axes = [f.copy() for f in in_axes]
         new_axes[ax] = sz
-        shp = render_shape(new_axes)
+        shp = render_shape(normalize_axes(new_axes, ctx.div_facts))
         ctx.env[tgt] = shp
         if i == 0:
             first_shape = shp
@@ -1229,6 +1409,25 @@ def _dispatch(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
                 _note(ctx, n, "needs_axis_structure", "tile 按轴放大")
                 return None
             return _tile(n, a, n.attrs.get("tile_mult", []), ctx)
+        if view == "broadcast":
+            # `x.broadcast_to(shape)`:产出形**就是** `shape`(算子定义)。真源
+            # `csa.py:445/460` `mint.unsqueeze(matrix, 0).broadcast_to((b, seqlen, W))`
+            # —— 两处 topk 索引矩阵的批维扩展。此前没有这条规则,落"未列举的视图子类型"
+            # → 整条 topk_idxs 链保 `?`。目标维全部解出才用,任一解不出 → 记账保 `?`。
+            elts = n.attrs.get("broadcast_shape")
+            if not elts:
+                _note(ctx, n, "constant_shape_unknown",
+                      "broadcast_to 的目标 shape 未被 walker 记进 attrs")
+                return None
+            axes = []
+            for tok in elts:
+                f = _resolve_token(str(tok), ctx)
+                if f is None or f is NEG1:
+                    _note(ctx, n, "constant_shape_unknown",
+                          f"broadcast_to 目标维 {tok!r} 解不出")
+                    return None
+                axes.append(f)
+            return axes, False
         if view == "expand_dims":
             a = in_axes_list[0] if in_axes_list else None
             ax = n.attrs.get("expand_axis")
@@ -1263,6 +1462,12 @@ def _dispatch(n: OpNode, in_axes_list, in_numel_only, ctx: _Ctx):
             out = [f.copy() for f in a]
             out[d0], out[d1] = out[d1], out[d0]
             return out, False
+        if view in ("permute", "transpose") and (n.attrs.get("permute_dims")
+                                                 or n.attrs.get("perm")):
+            # 轴序**源里逐字写着**且 walker 记下了 → 精确重排(见 `_permute`)。
+            return _permute(n, in_axes_list, in_numel_only, ctx)
+        if view == "squeeze" and n.attrs.get("squeeze_axis") is not None:
+            return _squeeze(n, in_axes_list, in_numel_only, ctx)
         if view in _NUMEL_PRESERVING_VIEWS or view is None:
             # permute/transpose:轴的多重集与元素数不变;轴**序**未记 → `_passthrough` 标
             # numel_only,防下游按假轴序改形。

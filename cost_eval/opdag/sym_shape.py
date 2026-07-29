@@ -144,8 +144,13 @@ def _strip_outer_parens(s: str) -> str:
 
 
 def _is_atom_expr(unit: str) -> bool:
-    """该单元是否是**表达式原子**(和式或整除式)—— 出现在乘积里时要加括号以免读歧义。"""
-    return bool(_split_top(unit, "+")[1:]) or "//" in unit
+    """该单元是否是**表达式原子**(和式 / 差式 / 整除式)—— 出现在乘积里时要加括号以免读歧义。
+
+    **差式也算**(2026-07-29):`sub()` 产出的 `v_head_dim-64` 此前不加括号,进乘积后成为
+    `B·v_head_dim-64` —— `consumer._sym_value` 的差式档按**最后一个** `-` 左右切,会把它读成
+    `B·v_head_dim − 64`(真值是 `B·(v_head_dim−64)`)。加括号即消歧。
+    """
+    return bool(_split_signed(unit)[1:]) or "//" in unit
 
 
 def _canon_sum(unit: str) -> str:
@@ -154,6 +159,60 @@ def _canon_sum(unit: str) -> str:
     if len(terms) == 1:
         return terms[0]
     return "+".join(sorted(terms))
+
+
+def top_floordiv(sym: str) -> int:
+    """最外层(depth 0)**最后**一个 `//` 的下标;没有则 -1。右结合,与 `rpartition` 同向;
+    但**括号感知** —— `(a)//((b)//c)` 的最外层是第一个 `//`,`rpartition` 会切错。
+
+    (原实现在 `consumer._top_floordiv`,2026-07-29 上提到本模块,规范化与求值共用同一条切法。)
+    """
+    depth, last, i = 0, -1, 0
+    while i < len(sym):
+        c = sym[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "/" and depth == 0 and sym[i + 1:i + 2] == "/":
+            last = i
+            i += 1
+        i += 1
+    return last
+
+
+def _split_signed(s: str) -> list:
+    """把表达式串按**顶层** `+`/`-` 拆成 `[(符号, 项串), ...]`(括号内不拆)。
+
+    顶层出现 `//` 时**整串当一项**返回 —— 与 `consumer._sym_value` 的优先级一致
+    (`a-b//c` 读作 `(a-b)//c`),避免把整除式的被除数拆散。
+    """
+    if top_floordiv(s) >= 0:
+        return [(1, s.strip())]
+    out: list = []
+    depth, cur, sign = 0, [], 1
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")":
+            depth -= 1
+            cur.append(ch)
+        elif depth == 0 and ch in "+-":
+            head = "".join(cur).strip()
+            if head:
+                out.append((sign, head))
+                sign = 1 if ch == "+" else -1
+                cur = []
+            elif ch == "-":                     # 前导一元负号
+                sign = -sign
+            # 前导 `+` 无意义,忽略
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        out.append((sign, tail))
+    return out or [(1, s.strip())]
 
 
 # ── 解析 ──────────────────────────────────────────────────────────────────────
@@ -211,7 +270,11 @@ def _is_composite(f: Factors) -> bool:
     if f.coeff != 1 or num_units > 1:
         return True
     (unit,) = list(f.syms.keys())
-    return bool(_split_top(unit, "+")[1:])         # 单个和式单元 → 也要括号
+    # 单个和式/差式单元 → 要括号;**单个单元内部含顶层 `·` 也要**(2026-07-29 实测的一个静默错):
+    # `floordiv` 造的整除原子 `n_heads·v_head_dim//8` 是**一个**单元,但它内部有顶层 `·`,
+    # 裸着放进 shape 串 `8·1024·n_heads·v_head_dim//8` 后,`parse_shape` 按 `·` 切会得到
+    # **4 条轴**而不是 3 —— rank 凭空多一条,`permute`/`transpose` 的置换校验随之判错。
+    return bool(_split_signed(unit)[1:]) or bool(_split_top(unit, "·")[1:])
 
 
 def render_shape(axes: list[Factors]) -> str:
@@ -284,7 +347,7 @@ def _sum_term(f: Factors) -> str:
     concat 的"元素数 = 各输入元素数之和"要相加**乘积**,必须补括号才能往返。
     """
     t = render_term(f)
-    return f"({t})" if (_split_top(t, "·")[1:] or _split_top(t, "+")[1:]) else t
+    return f"({t})" if (_split_top(t, "·")[1:] or _split_signed(t)[1:]) else t
 
 
 def add(a: Factors, b: Factors) -> Factors:
@@ -339,6 +402,243 @@ def divide_expr(total: Factors, denom: Factors) -> Factors | None:
     if denom.coeff == 0:
         return None
     return Factors(1, {f"({render_term(total)})//({render_term(denom)})": 1})
+
+
+# ── 整除事实 + 表达式规范化(2026-07-29,「符号轴结构恢复」)──────────────────────
+#
+# 动机(`docs/next_fix_adversarial_review_2026-07-28.md` §3.5):四个级联根里三个归约到
+# 同一项能力缺口 —— 符号层**只会往前累积表达式,从不化简**,于是:
+#   * `csa.py:482` 的 `kv_flat` 末轴是 `64+v_head_dim-64`(源侧 split→cat 原样拼回),
+#     串上带着两个互相抵消的 64 → 下游的 advanced-index / BMM 认不出它就是 `v_head_dim`;
+#   * `compressor.py:203` 的 `-1` 位消元约不干净(`S` vs `4·(S//4)`)→ 整条压缩链退 `~`,
+#     `:216` 的按轴归约随之被拒。
+#
+# 两条纪律:
+#   ① **只做恒等变形**。折叠前后代入同一份 DimTable 求值必须逐字节相同(测试钉住)。
+#   ② **整除身份要先核验**。`n·(X//n) == X` 仅当 `n | X`;该前提由 `DimTable` 的**实际值**
+#      核验后才生成为一条 `DivFacts`,核验不过就**没有**这条事实 —— 表达式保持保守形态,
+#      下游按轴改形的算子照旧拒绝并记 `file:line`。**绝不**拿"大概能整除"往下算。
+
+@dataclass(frozen=True)
+class DivFacts:
+    """**已核验**的整除事实集合。每条 `(n, term)` 表示 `n | term`(term 是一个符号串)。
+
+    `rejected` 记下**核验不通过**的候选(`(n, term, 实际值)`),供调用方显式报告 ——
+    "这条身份不成立"必须是可见的,而不是静默退化。
+    """
+    facts: frozenset = frozenset()
+    rejected: tuple = ()
+
+    def has(self, n: int, term: str) -> bool:
+        return (int(n), str(term)) in self.facts
+
+
+#: 空事实集(缺省)。**没有事实时一律不折叠整除身份** —— 这是"宁 `?` 勿错"的默认档。
+NO_DIV_FACTS = DivFacts()
+
+
+def assert_divisible(n: int, term: str, values: dict) -> bool:
+    """显式断言 `n | term`;**不成立就 fail-loud**(ValueError,带实际值)。
+
+    给"我确信这条前提成立"的调用点用 —— 比如源侧逐字写着
+    `assert seq_length % compress_ratio == 0`。值查不到也 fail-loud(不许拿"查不到"当通过)。
+    """
+    v = values.get(str(term))
+    if v is None:
+        raise ValueError(
+            f"sym_shape.assert_divisible: 断言 {n} | {term} 但 {term!r} 没有已知值 —— "
+            "不许把'查不到'当成'成立'")
+    if int(n) <= 0 or int(v) % int(n) != 0:
+        raise ValueError(
+            f"sym_shape.assert_divisible: {n} | {term} **不成立**（{term}={int(v)}，"
+            f"{int(v)} % {n} = {int(v) % int(n) if int(n) else '除零'}）")
+    return True
+
+
+def div_facts_from_values(pairs, values: dict) -> DivFacts:
+    """按**实际值**核验一批候选 `(n, term)`,只把成立的那些收成事实。
+
+    * 值未知 → 既不成为事实、也不算被拒(无从判定,保守跳过);
+    * 值已知且不整除 → 进 `rejected`(可见),**不**成为事实。
+    """
+    ok, bad = set(), []
+    for n, term in pairs:
+        n = int(n)
+        v = values.get(str(term))
+        if v is None or n <= 0:
+            continue
+        if int(v) % n == 0:
+            ok.add((n, str(term)))
+        else:
+            bad.append((n, str(term), int(v)))
+    return DivFacts(frozenset(ok), tuple(bad))
+
+
+_NORM_MAX_DEPTH = 12          # 递归护栏(病态串不许把栈打穿)
+_NORM_MAX_ROUNDS = 8          # 整除身份重写的迭代上限
+
+
+def _lin_paren(t: str) -> str:
+    """和式里的一项:含顶层 `·` / `+` / `-` / `//` 就加括号(否则往返解析会读错分组)。"""
+    if _split_top(t, "·")[1:] or _split_signed(t)[1:] or top_floordiv(t) >= 0:
+        return f"({t})"
+    return t
+
+
+def _render_linear(items: list, const: int) -> str:
+    """`[(系数, syms), ...] + 常数` → 规范和式串:正项(升序)在前,负项(升序)在后。
+
+    再过一遍 `_canon_sum` ⇒ 与 `parse_axis` 的规范化**同一个不动点**(幂等)。
+    """
+    pos, neg = [], []
+    for c, syms in items:
+        t = _lin_paren(render_term(Factors(abs(c), dict(syms))))
+        (pos if c > 0 else neg).append(t)
+    if const > 0:
+        pos.append(str(const))
+    elif const < 0:
+        neg.append(str(-const))
+    pos.sort()
+    neg.sort()
+    return _canon_sum("+".join(pos) + "".join("-" + t for t in neg))
+
+
+def _expand_linear(ft: Factors, facts: DivFacts, depth: int):
+    """`Factors` → `(常数, [(系数, syms), ...])`,把**线性原子单元**递归摊平(乘法分配律)。
+
+    为什么必须摊平:`sub`/`add` 会把线性式包成一个**不可分的原子串**,嵌套一层就藏住了
+    可抵消的项 —— `(v_head_dim-64)+64` 若不摊平,外层只看见 `v_head_dim-64` 与 `64`
+    两个不同的 key,抵消不掉。摊平后按单项归并,`-64` 与 `+64` 才碰得上。
+    """
+    if depth > _NORM_MAX_DEPTH:
+        return (ft.coeff, []) if not ft.syms else (0, [(ft.coeff, dict(ft.syms))])
+    if not ft.syms:
+        return ft.coeff, []
+    if len(ft.syms) == 1:
+        ((unit, mult),) = ft.syms.items()
+        if mult == 1 and top_floordiv(unit) < 0:
+            parts = _split_signed(_strip_outer_parens(unit))
+            if len(parts) > 1 or parts[0][0] < 0:
+                const, mons = 0, []
+                for s, t in parts:
+                    c2, m2 = _expand_linear(_norm_unit(t, facts, depth + 1), facts, depth + 1)
+                    const += s * ft.coeff * c2
+                    mons.extend((s * ft.coeff * c, syms) for c, syms in m2)
+                return const, mons
+    return 0, [(ft.coeff, dict(ft.syms))]
+
+
+def _norm_linear(terms: list, facts: DivFacts, depth: int) -> Factors:
+    const = 0
+    groups: dict = {}
+    for sign, t in terms:
+        c0, mons = _expand_linear(_norm_unit(t, facts, depth + 1), facts, depth + 1)
+        const += sign * c0
+        for c, syms in mons:
+            key = render_term(Factors(1, dict(syms)))
+            g = groups.setdefault(key, [0, dict(syms)])
+            g[0] += sign * c
+    items = [(c, syms) for c, syms in groups.values() if c != 0]
+    if not items:
+        return Factors(coeff=const)
+    if len(items) == 1 and const == 0 and items[0][0] > 0:
+        c, syms = items[0]
+        return Factors(c, dict(syms))
+    return Factors(1, {_render_linear(items, const): 1})
+
+
+def _norm_floordiv(nb: Factors, nd: Factors, facts: DivFacts) -> Factors:
+    """规范化后的 `nb // nd`:能**精确消元**就消,否则原样重造整除原子。
+
+    重造的串形与 `floordiv`(整数分母)/ `divide_expr`(符号分母)**逐字一致** ——
+    什么都没折叠时,规范化必须是恒等映射(报表/台账不许无谓地抖)。
+    """
+    q = divide(nb, nd)
+    if q is not None:
+        return q
+    if not nd.syms:
+        n = nd.coeff
+        if n == 0:
+            return Factors(1, {f"{render_term(nb)}//0": 1})
+        if not nb.syms:
+            return Factors(coeff=nb.coeff // n)
+        return Factors(1, {f"{render_term(nb)}//{n}": 1})
+    return Factors(1, {f"({render_term(nb)})//({render_term(nd)})": 1})
+
+
+def _norm_unit(unit: str, facts: DivFacts, depth: int = 0) -> Factors:
+    """一个原子单元串 → 规范化后的 `Factors`(可能不再是原子:折叠掉了就散成乘积)。"""
+    u = _strip_outer_parens(str(unit).strip())
+    if u == "" or depth > _NORM_MAX_DEPTH:
+        return Factors(1, {u: 1}) if u else Factors()
+    cut = top_floordiv(u)
+    if cut >= 0:
+        nb = normalize_axis(parse_axis(u[:cut]), facts, depth + 1)
+        nd = normalize_axis(parse_axis(u[cut + 2:]), facts, depth + 1)
+        return _norm_floordiv(nb, nd, facts)
+    terms = _split_signed(u)
+    if len(terms) > 1 or terms[0][0] < 0:
+        return _norm_linear(terms, facts, depth)
+    if _split_top(u, "·")[1:]:
+        return normalize_axis(parse_axis(u), facts, depth + 1)
+    if u.lstrip("-").isdigit():
+        return Factors(coeff=int(u))
+    return Factors(1, {u: 1})
+
+
+def _apply_div_facts(f: Factors, facts: DivFacts, depth: int) -> Factors:
+    """在一个**乘积**里用已核验的整除身份消元:`coeff` 含 `n` 且 `n | X` ⇒ `n·(X//n) → X`。
+
+    真源:`compressor.py:196-203`
+        cutoff = (sq // ratio) * ratio ;  n_compressed = cutoff // ratio
+        kv = self.reshape(kv, (n_compressed, ratio, b, -1))
+    `-1` 位的分母是 `n_compressed·ratio·b` = `(S//ratio)·ratio·B`。`ratio | S` 成立时它
+    **恒等于** `B·S`,消元退化成精确的多重集差;不成立时源侧 `:197-199` 真的会截断,
+    身份不成立 —— 所以这一步**必须**由事实门控。
+    """
+    if not facts.facts:
+        return f
+    for _ in range(_NORM_MAX_ROUNDS):
+        hit = None
+        for unit, mult in f.syms.items():
+            if mult <= 0:
+                continue
+            cut = top_floordiv(unit)
+            if cut < 0:
+                continue
+            denom = unit[cut + 2:].strip()
+            if not denom.lstrip("-").isdigit():
+                continue
+            n = int(denom)
+            base = _strip_outer_parens(unit[:cut].strip())
+            if n > 0 and f.coeff % n == 0 and facts.has(n, base):
+                hit = (unit, n, base)
+                break
+        if hit is None:
+            return f
+        unit, n, base = hit
+        syms = dict(f.syms)
+        syms[unit] -= 1
+        if syms[unit] == 0:
+            del syms[unit]
+        f = mul(Factors(f.coeff // n, syms), _norm_unit(base, facts, depth + 1))
+    return f
+
+
+def normalize_axis(f: Factors, facts: DivFacts = NO_DIV_FACTS, depth: int = 0) -> Factors:
+    """一个轴的规范化:逐单元化简 + 整除身份消元。**恒等变形**,值不变。"""
+    if depth > _NORM_MAX_DEPTH:
+        return f.copy()
+    acc = Factors(coeff=f.coeff)
+    for unit, mult in f.syms.items():
+        nu = _norm_unit(unit, facts, depth + 1)
+        for _ in range(mult):
+            acc = mul(acc, nu)
+    return _apply_div_facts(acc, facts, depth)
+
+
+def normalize_axes(axes, facts: DivFacts = NO_DIV_FACTS) -> list:
+    return [normalize_axis(a, facts) for a in (axes or ())]
 
 
 def resolve_reshape(input_axes: list[Factors], target, *,

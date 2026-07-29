@@ -14,7 +14,8 @@ import re
 
 from .bprop_rules import derive_saves
 from .sym_shape import (parse_shape, parse_axis, render_term, strip_numel_only,
-                        _split_top, _strip_outer_parens)
+                        _split_top, _split_signed, _strip_outer_parens,
+                        top_floordiv as _sym_top_floordiv)
 
 
 # 符号 token → DimTable 属性名。token 集来自 sym_shape.CONFIG2SYM（提取器/推断产出的符号）。
@@ -74,31 +75,30 @@ def _cap_value(dims):
     return math.ceil(cf * tokens * topk / E)
 
 
-def _top_floordiv(sym: str) -> int:
-    """最外层（depth 0）**最后**一个 `//` 的下标；没有则 -1。右结合，与既有 `rpartition` 同向；
-    但**括号感知**——`(a)//((b)//c)` 的最外层是第一个 `//`，`rpartition` 会切错。"""
-    depth, last, i = 0, -1, 0
-    while i < len(sym):
-        c = sym[i]
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-        elif c == "/" and depth == 0 and sym[i + 1:i + 2] == "/":
-            last = i
-            i += 1
-        i += 1
-    return last
+#: 括号感知的最外层 `//` 定位（2026-07-29 上提到 `sym_shape`，规范化与求值共用同一条切法）。
+_top_floordiv = _sym_top_floordiv
 
 
 def _sym_value(sym, dims):
-    """一个原子 token → 整数值。token 可能是和式 'a+b'（concat 出来的）或整除式 'S//4'
-    （`sym_shape.floordiv` 第 3 档，压缩序列长度）。未知/0 → None。"""
-    sym = sym.strip()
-    parts = [p.strip() for p in _split_top(sym, "+")]
-    if len(parts) > 1:                       # 和式单元：逐项求和
-        vals = [_sym_value(p, dims) for p in parts]
-        return sum(vals) if all(v is not None for v in vals) else None
+    """一个原子 token → 整数值。token 可能是**线性式** 'a+b-c'（concat / split 的轴长）或
+    整除式 'S//4'（`sym_shape.floordiv` 第 3 档，压缩序列长度）。未知/0 → None。
+
+    **线性式按顶层带号项求和**（2026-07-29）：此前 `+` 用顶层切分、`-` 却用
+    `rpartition("-")`（不认括号）—— `S-(a-b)` 会被切成 `head="S-(a"` / `tail="b)"` 而读错。
+    改用 `sym_shape._split_signed`（括号感知、`//` 优先级一致）后两者同一条路子。
+    """
+    sym = _strip_outer_parens(str(sym).strip())
+    if sym == "":
+        return None
+    terms = _split_signed(sym)
+    if len(terms) > 1 or terms[0][0] < 0:    # 线性式：逐项带号求和
+        total = 0
+        for sign, t in terms:
+            v = _axis_value(parse_axis(t), dims)
+            if v is None:
+                return None
+            total += sign * v
+        return total if total > 0 else None  # 非正轴长 = 解错了，宁 None 勿错
     cut = _top_floordiv(sym)
     if cut >= 0:                             # 整除式单元：`<term>//<n>` 或 `(<term>)//(<term>)`
         base, denom = sym[:cut], sym[cut + 2:]
@@ -123,16 +123,10 @@ def _sym_value(sym, dims):
         # `64` 来自 `pos_dim = self.config.qk_pos_emb_head_dim` 的 host 值）。此前这一档缺失 →
         # 整个和式解不出 → 承载它的节点被跳过（实测 CSA 主链因此断掉）。
         return int(sym)
-    if "-" in sym:
-        # **差式单元** `a-b`（`sym_shape.sub`，2026-07-28）：左结合地剥最外层。真源
-        # `indexer.py:179` `self.index_head_dim - self.qk_pos_emb_head_dim`、
-        # `deepseek_v4_hybrid_attention.py:204` `self.config.v_head_dim - pos_dim`。
-        # 与 `//` 同一条路子：表达式保形，值仍完全由 DimTable 决定。
-        head, _, tail = sym.rpartition("-")
-        if head.strip():
-            h = _axis_value(parse_axis(head), dims)
-            t = _axis_value(parse_axis(tail), dims)
-            return (h - t) if (h is not None and t is not None and h - t > 0) else None
+    # ⚠ 此处**不再**有 `rpartition("-")` 的差式档（2026-07-29 删）：顶层带号项已在上面的
+    # 线性式档里按括号感知切完；剩下还含 `-` 的串一定是"`-` 在括号内 / 在乘积项里"
+    # （如 `(v_head_dim-64)·B`），对它做 `rpartition` 会切在错的位置 —— 交给下面的乘积档。
+    # 真源仍是 `indexer.py:179` / `deepseek_v4_hybrid_attention.py:204` 的两处差式。
     if sym == "cap":
         return _cap_value(dims)
     field = _SYM2FIELD.get(sym)

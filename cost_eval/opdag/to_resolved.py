@@ -58,7 +58,7 @@ from .init_dims import INIT_PARAM_SEEDS, eval_init_dims
 from .module_resolver import (PYNATIVE_SPEC_FILES, ResolvedSpec,
                               resolve_layer_spec)
 from .shape_infer import infer_shapes, merge_dims_ctx
-from .sym_shape import parse_axis
+from .sym_shape import NO_DIV_FACTS, div_facts_from_values, parse_axis
 
 __all__ = ["resolve_graph", "ExtractedGraph", "ExtractedLayer", "Coverage",
            "RTensor", "ROp", "mf_root", "SNAPSHOT_MD5", "SUPPORTED_LAYER_KINDS",
@@ -356,6 +356,9 @@ class Coverage:
     name_disambiguations: list = field(default_factory=list)
     #: `dag.detached` 名册里有、但节点级 `attrs["detached"]` 上匹配不到的名字（形状未解析等）。
     detach_unmatched: list = field(default_factory=list)
+    #: **核验不通过**的整除事实候选：`[(n, term, 实际值)]`（2026-07-29）。`ratio·(S//ratio)==S`
+    #: 这条身份只在 `ratio | S` 时成立；不成立时它必须**显式可见**，而不是静默退化。
+    div_facts_rejected: list = field(default_factory=list)
     #: `workspace_bytes` / `bwd_scratch_bytes` 恒 0 的说明（契约 §不要求）。
     absent_calibration_note: str = (
         "workspace_bytes / bwd_scratch_bytes 恒 0：契约 §不要求 明确排除（kernel 实现细节，"
@@ -382,7 +385,8 @@ class Coverage:
                "param_in_graph_bytes": self.param_in_graph_bytes,
                "declared_shapes": len(self.declared_shapes),
                "name_disambiguations": len(self.name_disambiguations),
-               "detach_unmatched": len(self.detach_unmatched)}
+               "detach_unmatched": len(self.detach_unmatched),
+               "div_facts_rejected": len(self.div_facts_rejected)}
         for c in self.children:
             for k, v in c.totals().items():
                 acc[k] = acc.get(k, 0) + v
@@ -1004,8 +1008,9 @@ class _Folder:
     """把一个 segment 的 `OpDAG` 折成 `[ROp]`，并把每一处"解不出"记进 `Coverage`。"""
 
     def __init__(self, dag, dims, pm, *, book: _InitBook, tag: str,
-                 dims_for_file: dict = None):
+                 dims_for_file: dict = None, ratio: int = 0):
         self.dag, self.dims, self.pm, self.book = dag, dims, pm, book
+        self.ratio = int(ratio or 0)
         self.cov = Coverage(tag=tag, n_nodes=len(dag.nodes))
         #: 某些文件里的符号要按**另一张** DimTable 求值（`shared_experts.py:52` 把
         #: `config.ffn_hidden_size` 改写成 shared 尺寸 → MoE 层里 `mlp.py` 链的 `ffn_hidden`
@@ -1240,13 +1245,36 @@ class _Folder:
         """
         return {k: "·".join(axes) for k, (axes, _dt, _cls) in self.book.param.items() if axes}
 
+    def _div_facts(self):
+        """本层可用的**已核验**整除事实（2026-07-29）。今天只有一条候选：`ratio | S`。
+
+        出处（逐字）：`compressor.py:196-201`
+            cutoff = (sq // ratio) * ratio ;  n_compressed = cutoff // ratio
+        `ratio·(S//ratio) == S` **当且仅当** `ratio | S` —— 除不尽时 `:197-199`
+        (`if cutoff < sq: kv = kv[:cutoff]`) 真的会把序列截断，身份不成立。
+
+        纪律：事实由 `DimTable.S` 与**本层自己**的 `compress_ratio` 逐字核验后才生成
+        （`sym_shape.div_facts_from_values`）。核验不过 → 没有这条事实 → 表达式保持
+        保守形态 → 按轴改形的算子照旧拒绝并把 `file:line` 记进 `Coverage`。
+        **绝不**因为"配置一般都是 2 的幂"就假定它成立。被拒的候选进 `Coverage.div_facts_rejected`，
+        显式可见。
+        """
+        if self.ratio <= 1:
+            return NO_DIV_FACTS
+        facts = div_facts_from_values([(int(self.ratio), "S")], {"S": int(self.dims.S)})
+        for rec in facts.rejected:
+            if rec not in self.cov.div_facts_rejected:
+                self.cov.div_facts_rejected.append(rec)
+        return facts
+
     def fold(self, seed_shapes: dict) -> tuple:
         dag = self.dag
         infer_shapes(dag, seed_shapes, dims_ctx=self.book.dims_ctx, report=self.report,
                      param_shapes=self._param_shapes(),
                      declared_outs=_DECLARED_OPAQUE_OUTS,
                      declared=self.cov.declared_shapes,
-                     bridge_by_edge=True)
+                     bridge_by_edge=True,
+                     div_facts=self._div_facts())
         for r in self.report:
             k = r.get("reason", "?")
             self.cov.node_gap_reasons[k] = self.cov.node_gap_reasons.get(k, 0) + 1
@@ -1349,7 +1377,7 @@ def _build_layer(root: str, dims, pm, *, layer_id: int, layer_type: str, site: _
     for seg_tag, dag in segs:
         folder = _Folder(dag, dims, pm, book=book,
                          tag=f"L{layer_id}:{layer_type}/{seg_tag}",
-                         dims_for_file=dims_for_file)
+                         dims_for_file=dims_for_file, ratio=int(site.ratio))
         seeds = dict(_SEED_SHAPES.get(seg_tag, ()))
         seeds.update(_declared_seeds(seg_tag, dag, folder.cov))
         seg_ops, seg_cov = folder.fold(seeds)

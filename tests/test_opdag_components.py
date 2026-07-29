@@ -1103,8 +1103,17 @@ def test_all_four_dsv4_cells_still_clean_after_axis_capture(mf_pkg):
         (True,  "CompressedSparseAttention"): (90, 103),
         (True,  "DSv4HybridSelfAttention"): (123, 145),
         (False, "Compressor"): (29, 31),  (False, "CSAIndexer"): (14, 13),
-        (False, "CompressedSparseAttention"): (207, 240),
-        (False, "DSv4HybridSelfAttention"): (240, 281),
+        # **期望变更台账**(2026-07-29,`docs/opdag_symbolic_axes_2026-07-29.md` §2):
+        # 207→**209** 节点 / 240→**242** 边。多出来的**恰好两个**是 `csa.py:445` 与
+        # `csa.py:460` 的 `.broadcast_to((batch_size, seqlen, …))`:此前
+        # `_handle_chained_call` 把**任何**链式"视图"方法都只做别名(不建节点),而
+        # `broadcast_to` **会改变元素数** —— 别名掉它 = 静默丢批维(实测 `flat_indices`
+        # 因此解成 `128·S` 而非 `B·S·128`;B=1 时数值恰好相同、B>1 就整层少读 B 倍)。
+        # 不变量("节点数逐个在册,动一个就要说清为什么")逐字保留,只换例子。
+        (False, "CompressedSparseAttention"): (209, 242),
+        # 同上,+2/+2:`DSv4HybridSelfAttention` 的 unfused 支内联了 `csa.py` 那两处
+        # `broadcast_to`(fused 支走融合 kernel、不经 `get_*_topk_idxs`,故 123/145 不变)。
+        (False, "DSv4HybridSelfAttention"): (242, 283),
     }
     files = {"Compressor": "compressor.py", "CSAIndexer": "indexer.py",
              "CompressedSparseAttention": "csa.py",

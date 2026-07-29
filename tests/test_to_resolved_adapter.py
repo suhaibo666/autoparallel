@@ -345,20 +345,39 @@ def test_norm_fp32_prelift_is_undone(mf_pkg):
 #:   `linear.py:132`           → `init_dims` 支持 `weight_shape = (output_size, input_size)`
 #:                               这种局部元组 + `Linear.__init__` 位置形参种子；
 #:   `loss.py:197`             → `_LogSoftmax` 的产出形声明（`loss.py:134-143` 逐字）。
+#: **台账更新（2026-07-29，`docs/opdag_symbolic_axes_2026-07-29.md`）**：「符号轴结构恢复」
+#: 落地后，2026-07-28 记的 5 处里**修掉 3 处**、剩 1 处、新暴露 3 处。逐条对应关系：
+#:   `compressor.py:233` → `_slice` 支持 `":<stop>:<step>"`，且步长整除终点**可证**
+#:                         （`total_seq_len = n_compressed·ratio` @ `:230` ⇒ 系数整除）；
+#:   `deepseek_v4_hybrid_attention.py:205` → `permute` 用 walker 早就记下的 `permute_dims`
+#:                         精确重排（不再退 `~`）⇒ `core_out` 有轴结构 ⇒ split 可解；
+#:   `csa.py:485`        → ① `permute` 精确化让 `kv_t` 拿到 `B·1·S·v_head_dim`；
+#:                         ② `csa.py:482` 的 reshape 目标里**恰好一个**维（`sk`）没导出，
+#:                            由**元素数守恒**唯一确定（与 `-1` 同一条算子定义）。
+#: **不变量逐字保留**：级联根必须逐条在册、每条带一句"为什么还挡着"；修好一处就更新台账。
 LEDGER_BLOCKERS = {
+    # ── 仍在册（未修）───────────────────────────────────────────────────────
     # `pooled = (out.astype(fp32) * weights).sum(dim=1)` —— 上游 `:203`
-    # `reshape(kv, (n_compressed, ratio, b, -1))` 的 `-1` 消元约不干净：已知积里是
-    # `n_compressed = S//4`（差式/整除原子），总积里是 `S` —— `sym_shape` 不知道
-    # `S = 4·(S//4)`，故只解出**元素数**（`~`），归约要按轴去掉一条轴 → 拒绝。
+    # `reshape(kv, (n_compressed, ratio, b, -1))` 退 `numel_only`：`n_compressed` / `ratio`
+    # 两个 construct 局部标量**都**没导出（不是一个）→ 元素数守恒那条只解得了"恰好一个"。
+    # 整除事实 `ratio | S` 已经生效（表达式从
+    # `~((2·((2·B·S·v)//(4·B·(S//4)))·B·(S//4))+…)` 折成了 `~(2·B·S·v_head_dim)`），
+    # 但归约仍要按轴去掉一条轴 → 拒绝。
     "compressor.py:216",
-    # `kv[:cutoff]`（`compressor.py:233`）：切片上界 `cutoff = (sq // ratio) * ratio` 是
-    # construct 局部标量，`_slice` 只支持 `":<stop>"` 且要求 stop 解得出 —— 这里 stop 走的是
-    # 表达式档、但 `_slice` 拿到的是 `attrs["index"]` 原文里那个**未导出**的名字。
+    # ── 新暴露（都是**上游本来就错、此前被 `~` 盖住**的，现在显式拒绝）─────────
+    # `topk_idxs = cat([window_idxs, compress_topk_idxs], -1)`：两个操作数一个 rank 2、
+    # 一个 rank 3 —— `cat` 的前置条件不成立 ⇒ 至少一处上游 shape 是错的 ⇒ 整条拒绝
+    # （`concat_shape_mismatch`）。没有这条守卫时按轴相加会把 topk 轴从 512 放大成 4224，
+    # 再经 `csa.py:485` 的元素数守恒传导，整层 saves 从 ~22 GiB 变成 **86 GiB**。
+    "csa.py:747",
+    # `sink = cast(reshape(attn_sink, (1, n, 1, 1)), fp32)`：`attn_sink` 是 `Parameter`，
+    # 按契约 W2/W4 不进 `ins`；该 reshape 节点 `ins` 为空且不是"操作数全是权重"的形态。
+    "csa.py:506",
+    # `router.py:393` 的 `topk`：`k` 未被 walker 记进 attrs（`reduce_axis_unknown`）。
+    "router.py:393",
+    # ── 保留在册备查（历史上出现过、现已解开）──────────────────────────────
     "compressor.py:233",
-    # `_apply_forward_rope` 的 `split(t, [nope_dim, pos_dim], -1)`：`t` 只解出元素数。
     "deepseek_v4_hybrid_attention.py:205",
-    # unfused 支：`kv_flat[flat_indices]` 的 advanced indexing —— 规则有了（`_advanced_index`），
-    # 但 `kv_flat` 的形状来自上面那条压缩链，仍是 `~`。
     "csa.py:485",
     # `language_model_embedding.py:134` 的 transpose 已随「过期种子」修复解开，保留在册备查。
     "language_model_embedding.py:134",
