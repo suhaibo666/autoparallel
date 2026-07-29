@@ -147,7 +147,16 @@ _STD_ON_REAL = {32: {0: 11131.6, 1: 15370.0}, 8: {0: 10747.6, 1: 14986.0}}
 # 2026-07-29 重钉：`FusedRMSNorm` 不 cast（layer_norm.py:151-155）→ std MHA/GQA 的 ln1/ln2/
 #   final_norm 保留输入不再抬 fp32。MHA s0 8074.8→8042.8 / s1 14802.8→14786.8；
 #   GQA s0 7594.8→7562.8 / s1 14490.8→14474.8。四点仍全部 sim < 真机（不变量不动）。
-_STD_ON_THEO = {32: {0: 8042.8, 1: 14786.8}, 8: {0: 7562.8, 1: 14474.8}}
+# 2026-07-30 重钉（**word-embedding 反向 kernel workspace 实测入账**，
+#   `docs/head_workspace_2026-07-30.md`）：`GatherDGradV2` 的 workspace
+#   （= 4·vocab·H + 16 MiB + 12·H·B·S + 3072 B；此 config H=2048/S=4096/B=1 → **1122.003 MiB**）
+#   挂到 `embedding` op 上后，**s0 的峰值事件易主到 `bwd@0`**：
+#     MHA s0 8042.8→**8310.7**（+267.9） / GQA s0 7562.8→**8046.7**（+483.9）。
+#   净上移小于 1122.003，正因为峰值事件换了（原峰在别的 bwd 事件上，两者之差才是净额）。
+#   **s1 逐 MiB 不变**——尾 stage 没有 embedding 层（`parallel_model.py:122`：embedding→stage0）。
+#   四点仍全部 sim < 真机（框架缺口不变量不动），方向：MHA s0 0.723→0.747、GQA s0 0.704→0.749，
+#   缺口**收窄**。
+_STD_ON_THEO = {32: {0: 8310.7, 1: 14786.8}, 8: {0: 8046.7, 1: 14474.8}}
 
 
 @pytest.mark.parametrize("kv,stage", [(32, 0), (32, 1), (8, 0), (8, 1)])

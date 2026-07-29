@@ -111,13 +111,25 @@ def test_unfused_branch_stays_zero():
 
 
 def test_default_is_zero_and_byte_neutral_for_untagged_specs():
-    """未标注该字段的 op / 旧构造 → 0（尾部追加 + getattr 兜底，全库其余模型逐字节不变）。"""
+    """未标注该字段的 op / 旧构造 → 0（尾部追加 + getattr 兜底，全库其余模型逐字节不变）。
+
+    **2026-07-30 样例移动**（不变量原样保留，见 `docs/opdag_walker_core_2026-07-25.md` §6.6
+    的精神）：原来拿 `embedding` 段当「未标注」样例，而本轮把实测到的 `GatherDGradV2`
+    反向 workspace **挂到了 embedding op 上**（`docs/head_workspace_2026-07-30.md`）→ 它不再
+    未标注。样例改用 **`lm_head` 段**。
+
+    这个新样例本身就是一条**如实记账**：`lm_head`/loss 段（final_norm / lm_head MatMul /
+    logsoftmax / nll）自己的反向 kernel workspace **至今没有测过** → 留 0，是**已知欠读**，
+    不是「已确认为 0」。而 13 个 OOM-不安全锚点的峰值事件恰在 `bwd@<lm_head>`
+    （见该文 §2.4）——所以这一格是当前最要紧的待测项，钉住它防止有人拿别处的实测值来顶。"""
     from cost_eval.model_spec import OpSpec, OpType, TensorRef
     t = TensorRef("x", ("S", "B", "H"))
     op = OpSpec("plain", OpType.MATMUL, [t], t)
     assert op.bwd_workspace is None and op.bwd_workspace_ref is None
-    lay = _layer(_resolve(_FUSED_TAG), "embedding")
-    assert estimate_structure_memory(lay.ops).bwd_workspace == 0
+    lay = _layer(_resolve(_FUSED_TAG), "lm_head")
+    assert estimate_structure_memory(lay.ops).bwd_workspace == 0, (
+        "lm_head/loss 段的反向 kernel workspace 未经测量 → 必须留 0。"
+        "若有人在此填数，须先有真机测量（见 docs/head_workspace_2026-07-30.md §6①）。")
 
 
 def test_bwd_workspace_is_additive_not_a_partition_of_the_working_set():

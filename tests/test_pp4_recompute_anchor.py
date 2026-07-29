@@ -225,7 +225,16 @@ REAL_MTP = {0: 24153.0, 1: 14641.0, 2: 14100.0, 3: 39898.0}
 #   s3 29605.0 → **28291.7**（−1313.3）。与无 MTP 的 s3 不同，MTP 尾 stage 的峰值事件落在
 #   **MTP decoder 层的 bwd** 上（那是解码层、带 mHC 包装），故吃满分支差而非只吃 +3.0。
 #   四 stage 仍全部 sim < real（s3 0.742→0.709）。
-THEO_MTP = {0: 16143.8, 1: 10924.6, 2: 11133.6, 3: 28291.7}
+# 2026-07-30 六次重钉（**word-embedding 反向 kernel workspace 实测入账**，
+#   `docs/head_workspace_2026-07-30.md`）：s0-s2 **逐 MiB 不变**（其峰值事件是解码层的 bwd，
+#   而 `bwd@0` 距峰 2780.4 MiB > 本项 2228.003 MiB → 够不着）；
+#   s3 28291.7 → **29789.8**（+1498.0）。原因：MTP 尾 stage 的峰值事件落在 **MTP decoder 层的
+#   bwd** 上，而 MTP 层内部**含一个共享 word-embedding op**（`multi_token_prediction.py` 对
+#   roll 后的 input_ids 走同一个 embedding cell，见 `cost_eval/layers/head.py:build_mtp_ops`）
+#   → 该层的 `bwd_workspace = max(730.0 的融合稀疏 flash-MLA, 2228.003 的 GatherDGradV2)`
+#   = 2228.003，净增 1498.003。取 max 不是保守假设，是实测判据（块寿命恒 1 tick）。
+#   四 stage 仍全部 sim < real（s3 0.709→0.747，缺口收窄）。
+THEO_MTP = {0: 16143.8, 1: 10924.6, 2: 11133.6, 3: 29789.8}
 
 
 @pytest.fixture(scope="module")

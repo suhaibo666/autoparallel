@@ -141,11 +141,19 @@ def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
     # 2026-07-29 二次重钉：11162.1/45991.4 → 10458.1/45611.4（RMSNorm 不 cast）。
     #   ⚠ s0 对真机 10246 的比值 1.089 → **1.021**（仍 OOM-安全，但余量大幅收窄）；
     #   s1 1.007 → 0.999（**刚跌破 1.0，转 OOM-不安全侧** —— 如实记，见下方守卫的注释）。
-    assert abs(s0.peak_bytes / MiB - 10458.1) < 0.1
+    # 2026-07-30 三次重钉（**word-embedding 反向 kernel workspace 实测入账**，
+    #   `docs/head_workspace_2026-07-30.md`）：s0 10458.1 → **10573.0**，且**峰值事件由
+    #   `bwd@4` 易主为 `bwd@0`（embedding 反向）**。比值 1.021 → **1.032**。
+    #   ⚠ 这是全库**唯一**被本项抬动的记分卡锚点，因为只有它的 `bwd@0` 本来就贴着峰
+    #   （差 952.9 MiB < 本项 1067.753 MiB）。**这一笔正是本 config 自己的真机 profiler
+    #   量到的**：`analysis/realmachine/pp2_norecomp/op_816362.csv` 里 `GatherDGradV2` 的
+    #   瞬态块 `Size(KB)=1093379.0` = 1119620096 B = 1067.753 MiB，逐字节对上（该文件正是
+    #   这条锚点 real=10246.0 的同一次采集）。s1 逐 MiB 不变（末 stage 无 embedding 层）。
+    assert abs(s0.peak_bytes / MiB - 10573.0) < 0.1
     assert abs(s1.peak_bytes / MiB - 45611.4) < 0.1
     assert s0.peak_event.startswith("bwd") and s1.peak_event.startswith("bwd")
     # ── 方向门（2026-07-29 二次重钉后**分两档**，如实记录 s1 的翻转）────────────────────
-    # s0 仍 OOM-安全（预测 ≥ 真机 10246.0，比值 1.021；原 1.089，余量收窄但方向不变）。
+    # s0 仍 OOM-安全（预测 ≥ 真机 10246.0，比值 1.032；原 1.021，本轮因实测 workspace 入账回升）。
     assert s0.peak_bytes / MiB >= 10246.0
     # s1 **已翻成 OOM-不安全**：45611.4 vs 真机 45655.0 = 0.9990，欠 43.6 MiB（0.10%）。
     #   成因：`FusedRMSNorm` 不 cast（`layer_norm.py:151-155`）修掉了一处**真实的过读**，

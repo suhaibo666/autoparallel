@@ -11,6 +11,65 @@ from __future__ import annotations
 from ..llm_config import LLMConfig
 from ..model_spec import OpSpec, OpType, TensorRef, norm_kind_of
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# word-embedding **反向** kernel workspace（`GatherDGradV2`）—— **两轮独立真机实测**驱动，
+#   源码快照里读不出来（契约 §不要求：aclnn kernel 内部 scratch）。
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# **实测律**（4 个点、2 个站点、2 次独立采集，**逐字节**吻合）：
+#
+#     bwd_ws(GatherDGradV2) = 4·vocab·H  +  16 MiB  +  12·H·(B·S)  +  3072 B
+#     ├─ 4·vocab·H  = 该 op 自己要累加进去的 [vocab,H] **fp32 梯度表的一份影子拷贝**
+#     ├─ 16 MiB     = H 无关常数（两个 H 值上都恰为 16.000 MiB）
+#     ├─ 12·H/token = 每 token 3 个 fp32 的 hidden 宽副本（H=4096 → 49152 B/token；
+#     │               H=1792 → 21504 B/token，两点各自逐字节成立）
+#     └─ 3072 B     = 分配器尾（在 167 的 3 位小数显示上就是那个恒定的 "+0.003 MiB"）
+#
+# ── 采集 ①：167 / MindSpore 2.10 memory-tracker（`docs/kernel_workspace_2026-07-29.md` §4.4/§8④）──
+#   DSv4-hybrid 站点：vocab=129280、**H=4096**、**B=1**、tp=1、cp=1、fused/无重算/L8/m4、pp4·dp2·ep2。
+#   BWD 相位单 kernel 极大值，**stage 0**（= 持有 embedding 的那个 stage）：
+#       S=1024 → 2084.003 MiB ／ S=2048 → 2132.003 MiB ／ S=4096 → **2228.003 MiB**
+#   本式在这三点上给 2084.00293 / 2132.00293 / 2228.00293 MiB —— 三位小数逐位相同。
+#   同名 kernel 在 rank2（stage 1，无 embedding）只有 16.03 MiB。
+#
+# ── 采集 ②：`analysis/realmachine/pp2_norecomp/op_816362.csv`（**仓内既有** profiler，DSv3 pp2 无重算）──
+#   完全独立的另一次采集、另一个模型、另一组维度：vocab=129280、**H=1792**、**B=2**、S=4096、
+#   pp2/dp1、tp=1、cp=1。该文件里 `Name == GatherDGradV2` 共 24 行，按尺寸/寿命分三类：
+#     · `Size(KB)=1093379.0` = **1119620096 B**，`Duration(us)≈22.9`（**瞬态** → workspace 类）× 3
+#     · `Size(KB)=904960.5`  = 926679552 B，`Duration≈5.59e6 us`（**长寿** → 就是 4·vocab·H
+#        = 926679040 B 的 fp32 梯度表本体 + 512 B 分配器尾）× 3
+#     · `Size(KB)=16513.5` / `256.5`（小件，另有其主）
+#   本式给 4·129280·1792 + 16 MiB + 12·1792·(2·4096) + 3072 = **1119620096 B** —— **delta = 0 B**。
+#   对照 rank 文件 `op_816365.csv`（stage 1，无 embedding）：**没有**任何 ≥1 MiB 的
+#   `GatherDGradV2` 块（只剩 16513.5 KB / 256.5 KB 小件）—— 与采集 ① 的 rank2 现象同构。
+#
+# **归属**（这是本项的关键判据，见 `docs/head_workspace_2026-07-30.md` §2）：
+#   该 workspace **属于 word-embedding 的反向**（gather 对 [vocab,H] 权重表求导），
+#   **不是** lm_head/loss 段的反向。三条独立证据：
+#     ① `4·vocab·H` 那一项**与 S 无关**（167 的三点 S 扫描直接证明）。若它是 loss 侧
+#        CE-gather 的 [S·B, vocab] fp32 梯度，就必须 ∝S（S=1024 时只剩 1/4）——实测不然。
+#        （在 167 站点 S·B = 4096 == H，两种假设的 4096 点数值**恰好相同**；正是 S 扫描把它们分开。）
+#     ② 只出现在**持有 embedding 的那个 rank/stage** 上（两次采集一致，pp4 的 stage0 与
+#        pp2 的 stage0；lm_head 在 pp 的**末** stage）。
+#     ③ `GatherDGradV2` 是 Gather 的 dgrad；本库 [vocab,H] 形状的 Gather 只有 word embedding
+#        （lm_head 前向是 MatMul，其 wgrad 由 MatMul 产出，不走 GatherDGrad）。
+#
+# **缩放的适用边界（超出即未测，不外推）**：
+#   · H：**两点验证**（1792 / 4096），常数项与每-token 项各自逐字节成立 ✓
+#   · B：**两点验证**（1 / 2，经 B·S 的 token 数）✓
+#   · S：3 点验证线性 ✓（1024/2048/4096）
+#   · vocab：**未扫**（两次采集都是 129280）。写成 `4·vocab·H` 是**归因推断**——依据是它
+#     逐字节等于该 op 自己输出的那张 fp32 梯度表（采集 ② 里那张表**被同一个 CSV 单独看见**）。
+#   · tp：`4·vocab·H` 走**字符串**通道 → **不** ÷tp。真机上 `emb_w` 是 Shard(0)（head.py 见下），
+#     故 tp>1 时真值应 ÷tp → 本式**过读 = OOM 安全侧**，未实测，如实记。
+#   · cp：每-token 项走 TensorRef → 首个 S 维 ÷cp（结构正确）；常数项不缩放。cp>1 **未实测**。
+_EMB_GATHER_DGRAD_BWD_WS = {
+    # S 无关部分：影子梯度表 4·vocab·H + 16 MiB + 3072 B 分配器尾。
+    # 走字符串通道 → 不吃 cp 整除（shape_eval 刻意不对 bwd_workspace 施加「含 S 就 ÷cp」）。
+    "bwd_workspace": "4*vocab*H + 16777216 + 3072",
+    # 每-token 部分：3 个 fp32 的 hidden 宽副本。走 TensorRef → 首个 S 维按 cp 切。
+    "bwd_workspace_ref": TensorRef("emb_gather_dgrad_ws", ("B", "S", "3*H"), dtype_bytes=4),
+}
+
 
 def _cfg_norm_kind(cfg: LLMConfig) -> str:
     """`LLMConfig` → norm 种类（head 段无 DimTable 在手，直接走 `to_dimtable` 的同一条派生）。"""
@@ -31,7 +90,13 @@ def build_embedding_ops(cfg: LLMConfig) -> list:
     w = TensorRef("emb_w", ("vocab", "H"), shard={0: "tp"}, is_weight=True,
                   dtype_bytes=cfg.embedding_params_dtype_bytes)
     out = TensorRef("emb_out", ("S", "B", "H"), shard={0: "sp"})
-    return [OpSpec("embedding", OpType.ELEMENTWISE, [], out, params=[w], saves=[])]
+    # `bwd_workspace{,_ref}`（2026-07-30）：`GatherDGradV2` 的反向 kernel workspace，
+    # 两轮独立真机实测逐字节吻合——出处/律/适用边界逐条见本文件顶部 `_EMB_GATHER_DGRAD_BWD_WS`。
+    # 它**叠在**反向工作集之上（用完即还，寿命 1 tick），与 `grad_buf` 里那张 4·vocab·H 的
+    # 梯度表**是两块**（采集 ② 的 CSV 里二者分别可见：瞬态 1119620096 B / 长寿 926679552 B）
+    # → 不双计。
+    return [OpSpec("embedding", OpType.ELEMENTWISE, [], out, params=[w], saves=[],
+                   **_EMB_GATHER_DGRAD_BWD_WS)]
 
 
 _LOSS_TYPES = ("logsoftmax_nll", "chunked", "vocab_parallel_ce")
