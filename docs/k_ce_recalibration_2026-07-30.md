@@ -379,10 +379,11 @@ K_CE_LEAN = 4     # 不动    —— ce_pynative_lean（无逐块台账）
 |---|---:|---|
 | `cross_entropy_fused=True` → `loss_lids` 空 | 26（pp4 ON/OFF/MTP 各 4、pp8 8、185 P3-P/F0/U1/U2 4、DSv4-fused、DSv4 mHC+MTP） | `mem_timeline.py:324` —— 门恒不进 |
 | stage 内有重算 → `_stage_no_recompute` False | 12（DSv3 4L/8L full、ep2、cp2 colossal/ulysses、select ×3、185 std ON ×4） | `mem_timeline.py:329-331` |
-| `ce_pynative_lean=True` → 走**未动**的 `K_CE_LEAN` | 6（116 std mha/gqa × {pp2-s0, pp2-s1, pp1-s0}） | `tests/test_std_attn_anchor.py:120` 的 `_BUILD_FACTS` |
-| 无 loss 层（非末 stage） | 1（pp2-stage0） | `parallel_model.py:122`：head 恒在末 stage |
+| `ce_pynative_lean=True` → 走**未动**的 `K_CE_LEAN` | 4（116 std mha/gqa × {pp2-s1, pp1-s0}） | `tests/test_std_attn_anchor.py:120` 的 `_BUILD_FACTS` |
+| 无 loss 层（非末 stage，`K_CE` 无从生效） | 3（pp2-stage0、116 std mha pp2-s0、116 std gqa pp2-s0） | `parallel_model.py:122`：head 恒在末 stage |
 
-（26 + 12 + 6 + 1 = 45 ✓）
+（26 + 12 + 4 + 3 = 45 ✓。注：185 std ON 的 s0 两格既「有重算」又「无 loss 层」，
+上表按前者归类；两条理由都独立地推出零位移，故归类不影响结论。）
 
 ### 8.1 OOM-不安全数：**23 → 26**
 
