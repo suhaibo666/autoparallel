@@ -118,7 +118,7 @@ class StagePeak:
 #   ⇒ `K_CE = 实测 fp32-等效总数 − 0.5`
 #
 # ── `K_CE_PP1`（`pp == 1` 且非 lean）= 3 ────────────────────────────────────────────
-#   台账：**7 份**仓内 CSV 的 high-water 在世平面**全部** = 3 张 fp32 + 1 张 bf16 = **3.5**
+#   台账：**7 份**仓内 profiler 明细的 high-water 在世平面**全部** = 3 张 fp32 + 1 张 bf16 = **3.5**
 #     · `analysis/realmachine/pp2_norecomp/..` 之外的全部 pp=1 采集：
 #       `cp2_none/`、`select_ffn/`（实为 8L-none 那条锚点）、`select_attn/`、`select_mlp/`、
 #       `operator_memory_rank0.csv`（实为 4L-full 那条）、`cp2_colossal/`、`dsv4_fused/`
@@ -133,7 +133,7 @@ class StagePeak:
 #
 # ── `K_CE_PP`（`pp > 1` 且非 lean）= 7 ──────────────────────────────────────────────
 #   台账：该分支**唯一**的锚点 `pp2-stage1` 自己那次采集
-#     `analysis/realmachine/pp2_norecomp/op_816365.csv`（其 pool high-water = 45655.46 MiB，
+#     `analysis/realmachine/pp2_norecomp/op_816365.csv`（其 pool high-water = 45655.46 MiB,
 #     逐 MiB 命中 `scorecard_anchors.py` 的 `real=45655.0`）→ 在世 **5 张 fp32 + 5 张 bf16
 #     = 7.5** ⇒ `7.5 − 0.5 = 7`。
 #   **仍然是混合常数，但混的两件事已定位并量化**（报告 §5.1）：那 6 张瞬态里
@@ -147,7 +147,7 @@ class StagePeak:
 # ── `K_CE_LEAN`（`ce_pynative_lean`）= 4，**本轮不动** ──────────────────────────────
 #   它的出处是 116/MS2.9 的**整机峰值差分反解**（`tests/test_std_attn_anchor.py:27-29` 逐字
 #   「实测 ~3.3-4 份…与 pp 无关」），那批探针只记 `max_memory_allocated`，**仓内没有 116 的
-#   逐块 CSV**，故该值吸收了该 config 其它全部误差，**不能当平面份数用**（「~3.3-4」本身就
+#   逐块明细**，故该值吸收了该 config 其它全部误差，**不能当平面份数用**（「~3.3-4」本身就
 #   横跨 3.5，分辨不到 0.5 张）。而把 DSv3-era 的逐块份数外推到该 build 已被证伪：
 #   167/MS2.10 同一族 op 链是 **1 saved + 3 瞬态 = 4 张 fp32**
 #   （`docs/head_loss_bwd_workspace_2026-07-30.md` §5.1 的逐块 dump），比 MS2.9 多一张。
@@ -161,7 +161,7 @@ class StagePeak:
 #   · `loss_type="vocab_parallel_ce"` 的 `bwd_scratch` 只有 1 张（`head.py:249-251` 走
 #     `bwd_scratch_ref`）→ 下面 `// 2` 的「2 张里去掉一张」前提不成立。这是**本轮之前就
 #     存在**的不一致，且无锚点触及（只在 `tests/test_mtp_loss.py` 结构门里）→ 如实单列，未动。
-K_CE_PP1 = 3      # was 4（= 3 观测 + 1 保守）；台账 7 份 CSV 逐块 → 拿掉那 1 张保守
+K_CE_PP1 = 3      # was 4（= 3 观测 + 1 保守）；7 份仓内 profiler 明细逐块 → 拿掉那 1 张保守
 K_CE_PP = 7       # was 8（DSv3-era 冻结口径的混合常数）；台账 pp2-s1 逐块 5+5=7.5 → 7
 K_CE_LEAN = 4     # 未动：无逐块台账（见上），保持 2026-07-23 的 116 std 差分标定值
 
@@ -738,8 +738,11 @@ class MemTimeline:
                         #   （None→全 stage 无重算→fat ✓;full/select→loss stage 含被重算 transformer→lean ✓）;
                         #   per-stage select（如 s0:both;s1:none）时未重算的 loss stage 恢复 fat
                         #   （修前被全局 mode=='select' 误关,低估 45%）。
-                        #   ⚠ 2026-07-30 起 `K_CE_PP1 == 3` ⇒ **pp==1 非 lean 下这条改写是恒等的**
-                        #     （`sm.bwd_scratch // 2 * 2 == sm.bwd_scratch`，因 8·S·B·vocab 必偶）。
+                        #   ⚠ 2026-07-30 起 `K_CE_PP1 == 3` ⇒ **pp==1 非 lean 下这条改写在默认
+                        #     `logsoftmax_nll` 口径上是恒等的**：那里 `sm.bwd_scratch = 8·S·B·vocab`
+                        #     必被 8 整除 ⇒ `// 2 * 2 == 原值`。（`chunked` 的 `8·S·B·vocab//k` 与
+                        #     `vocab_parallel_ce` 的 `bwd_scratch_ref` 可能是奇数 ⇒ 那两条路上 `//2*2`
+                        #     会掉 1 B；量级可忽略、无锚点触及，但不写成「恒等」以免过度声明。）
                         #     这不是把门关掉了，而是台账证明该 regime 本来就该等于门关值；分支保留，
                         #     因为 `pp>1`（7）与 `lean`（4）两条仍非恒等，且 P0.1 的 per-stage 判据仍要守。
                         if _stage_no_recompute and lid in loss_lids and sm.bwd_scratch > 0:

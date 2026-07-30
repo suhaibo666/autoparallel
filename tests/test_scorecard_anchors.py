@@ -81,7 +81,7 @@ def test_d1_margin_is_present_and_effective():
         #    `docs/k_ce_recalibration_2026-07-30.md`）又把它们**翻回 OOM-不安全侧**
         #    （**0.9330 / 0.9429**）。不变量仍是「不得靠调大标定 margin 凑」——margin 一个
         #    字节没动（仍 0.6，由 ① 的 on>off 断言守住）；两次翻转都来自**台账级证据**
-        #    （前者是 kernel workspace 逐字节实测，后者是 9 份仓内 profiler CSV 逐块清点）。
+        #    （前者是 kernel workspace 逐字节实测，后者是 9 份仓内 profiler 明细逐块清点）。
         #    举例因此第二次搬家：从「过读带 (1.02,1.05)」换成「欠读带 (0.92,0.95)」，两侧都守。
         #    **这一侧不放宽方向**：下界防欠读继续恶化，上界防有人把 K_CE 或 margin 调回去凑。
         assert 0.92 <= on <= 0.95, (

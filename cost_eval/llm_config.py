@@ -107,7 +107,7 @@ class LLMConfig:
     # CE fat 取 `K_CE_LEAN=4`（116 std pp1 与 pp2-s1 峰值差分反解「~3.3-4 份」,与 pp 无关；
     # **无逐块台账**,2026-07-30 重标定刻意未动它——见 mem_timeline 顶部 `K_CE_LEAN` 注释）；
     # False = 按 pp 分档的 `K_CE_PP / K_CE_PP1`（2026-07-30 由 8/4 重标定为 **7/3**,
-    # 依据是 9 份仓内 profiler CSV 逐块清点,`docs/k_ce_recalibration_2026-07-30.md`）。
+    # 依据是 9 份仓内 profiler 明细的逐块清点,`docs/k_ce_recalibration_2026-07-30.md`）。
     # 仅 cross_entropy_fused=False 且无重算 loss stage 有差异。
     ce_pynative_lean: bool = False
 

@@ -96,7 +96,7 @@ def anchors() -> list:
         #   **这两个数不在同一条代码路径上**：那 3 张是 167/DSv4-hybrid 站点量的，而该站点
         #   `cross_entropy_fused=True` → `loss_lids` 空（`cost_eval/mem_timeline.py:324`）→
         #   `K_CE` 那一行**根本不执行**（实测该站点 `bwd_scratch` = 2.00 张平面）。
-        #   把两侧放到同一条路径上重数（9 份仓内 profiler CSV 逐块，每份 high-water 都逐 MiB
+        #   把两侧放到同一条路径上重数（9 份仓内 profiler 明细逐块，每份 high-water 都逐 MiB
         #   命中它自己这条锚点的 `real`）后：真正的过读是**恰好 1 张**，两个 fat 分支都是
         #   —— `K_CE` 由 `4/8` 改为 **`3/7`**（`lean` 无逐块台账，仍 4）。
         #   **只有 3 条锚点因此位移**（其余逐 MiB 不变）：`pp2-stage1` 1.045→0.9565、
@@ -141,12 +141,12 @@ def anchors() -> list:
         Anchor("cp2-none (loss,k_ce=3)", "cp+norecomp",
                lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (0.94, 0.95),
                note="2026-07-29 起 0.991（OOM-不安全）→ 2026-07-30 `lm_head` 反向 workspace 入账 1.043（安全侧）→ 同日 `K_CE` 重标定 4→3 后 **0.9429**（OOM-不安全，欠 1148.3 MiB）。"
-                    "3 由**它自己那份 CSV**（`cp2_none/operator_memory.csv`，high-water 20119.37 MiB 在世 3 张 fp32 + 1 张 bf16 = 3.5 fp32-等效）与另外 6 份 pp=1 采集共同数出；D1 margin 一个字节没动（仍 0.6，OFF 时 0.8694 → 机制门仍绿）"),
+                    "3 由**它自己那份 profiler 明细**（`cp2_none/operator_memory.csv`，high-water 20119.37 MiB 在世 3 张 fp32 + 1 张 bf16 = 3.5 fp32-等效）与另外 6 份 pp=1 采集共同数出；D1 margin 一个字节没动（仍 0.6，OFF 时 0.8694 → 机制门仍绿）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.003 → **0.981**。同上，D1 两点标定之一，margin 未重标。
         Anchor("DSv3 8L none (dp2)", "norecomp",
                lambda: dsv3(8, NONE), 19967.3, (0.93, 0.94),
                note="2026-07-29 起 0.981（OOM-不安全）→ 2026-07-30 `lm_head` 反向 workspace 入账 1.034（安全侧）→ 同日 `K_CE` 重标定 4→3 后 **0.9330**（OOM-不安全，欠 1337.8 MiB）。"
-                    "3 由**它自己那份 CSV**（`select_ffn/operator_memory.csv`，high-water 19967.28 MiB 逐 MiB 命中本 real；目录名误导，实为本锚点的采集）与另外 6 份 pp=1 采集共同数出；D1 margin 一个字节没动（仍 0.6，OFF 时 0.8648）"),
+                    "3 由**它自己那份 profiler 明细**（`select_ffn/operator_memory.csv`，high-water 19967.28 MiB 逐 MiB 命中本锚点真机值；目录名误导，实为本锚点的采集）与另外 6 份 pp=1 采集共同数出；D1 margin 一个字节没动（仍 0.6，OFF 时 0.8648）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.001 → **0.970**（保留层的 ln1/ln2/q_a_norm/kv_a_norm 不再抬 fp32）。
         Anchor("select self_attn (keep-FFN)", "select",
                lambda: dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2, (1.02, 1.03),
