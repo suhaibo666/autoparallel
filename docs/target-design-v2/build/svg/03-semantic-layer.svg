@@ -9,13 +9,13 @@
 <text class="dg-bsub dg-mono t-sem" x="210.0" y="126.5" font-size="12">随版本发布，只读</text>
 <rect class="dg-box b-sem" x="80" y="152" width="260" height="44" rx="8"/>
 <text class="dg-blabel dg-mono t-sem" x="210.0" y="171.5" font-size="15">UserOpRegistry</text>
-<text class="dg-bsub dg-mono t-sem" x="210.0" y="186.5" font-size="12">只能新增 native 未覆盖</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="186.5" font-size="12">仅补充 Native 未覆盖项</text>
 <rect class="dg-box b-sem" x="80" y="212" width="260" height="44" rx="8"/>
 <text class="dg-blabel dg-mono t-sem" x="210.0" y="231.5" font-size="15">NativePatchRegistry</text>
-<text class="dg-bsub dg-mono t-sem" x="210.0" y="246.5" font-size="12">整条替换 + hash 门禁</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="246.5" font-size="12">完整替换 + hash 门禁</text>
 <rect class="dg-box b-sem" x="440" y="92" width="260" height="44" rx="8"/>
 <text class="dg-blabel t-sem" x="570.0" y="111.5" font-size="15">RegistryLoader</text>
-<text class="dg-bsub dg-mono t-sem" x="570.0" y="126.5" font-size="12">冲突 / 版本 / 完整性</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="126.5" font-size="12">校验冲突、版本与完整性</text>
 <rect class="dg-box b-sem" x="440" y="168" width="260" height="44" rx="8"/>
 <text class="dg-blabel t-sem" x="570.0" y="187.5" font-size="15">DSL 编译</text>
 <text class="dg-bsub dg-mono t-sem" x="570.0" y="202.5" font-size="12">parse → typecheck → 模板展开</text>

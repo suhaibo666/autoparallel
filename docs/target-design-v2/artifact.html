@@ -78,21 +78,32 @@ body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.75 var(--sans
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 .wrap{display:grid;grid-template-columns:270px minmax(0,1fr);max-width:1520px;margin:0 auto}
 
-/* ── 目录：等宽栏 ────────────────────────────────────────────────────── */
+/* ── 目录：等宽栏。13 章 + 45 小节全量收录，故按扫读优化：单行省略号 + 当前项高亮 ── */
 nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
-  padding:34px 18px 60px;border-right:1px solid var(--rule);
-  font:12.5px/1.5 var(--mono);background:var(--panel)}
-nav .navtitle{margin:0 0 16px;padding:0 8px;font-size:10.5px;letter-spacing:.18em;
+  overscroll-behavior:contain;scrollbar-width:thin;
+  padding:30px 14px 70px;border-right:1px solid var(--rule);
+  font:12.5px/1.45 var(--mono);background:var(--panel)}
+nav .navtitle{margin:0 0 14px;padding:0 8px;font-size:10.5px;letter-spacing:.18em;
   color:var(--ink4);text-transform:uppercase}
-nav ol{display:flex;flex-direction:column;gap:1px;list-style:none;margin:0;padding:0}
-nav a{display:grid;grid-template-columns:2.4em 1fr;gap:2px;padding:5px 8px;
-  color:var(--ink2);text-decoration:none;border-left:2px solid transparent}
-nav a:hover{background:var(--accent-soft);color:var(--accent);border-left-color:var(--accent)}
-nav .num{color:var(--ink4);font-variant-numeric:tabular-nums}
-nav .sub a{grid-template-columns:1fr;padding-left:38px;color:var(--ink3);font-size:11.8px}
-nav .grp{margin:16px 0 4px;padding:0 8px;font-size:10px;letter-spacing:.16em;
+nav ol{display:flex;flex-direction:column;list-style:none;margin:0;padding:0}
+nav a{display:grid;grid-template-columns:2.3em minmax(0,1fr);gap:6px;
+  padding:4px 8px;color:var(--ink2);text-decoration:none;
+  border-left:2px solid transparent}
+nav .ttl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+nav .num{color:var(--ink4);font-variant-numeric:tabular-nums;text-align:right}
+nav a:hover{background:var(--accent-soft);color:var(--accent)}
+nav a.active{color:var(--accent);border-left-color:var(--accent);
+  background:var(--accent-soft);font-weight:600}
+nav a.active .num{color:var(--accent)}
+/* 小节：更轻、缩进、字号收一档 */
+nav .sub a{padding:2.5px 8px 2.5px 6px;grid-template-columns:3.2em minmax(0,1fr);
+  color:var(--ink3);font-size:11.8px}
+nav .sub a:not(.active) .num{color:var(--ink4);opacity:.75}
+nav .grp{margin:15px 0 5px;padding:0 8px;font-size:10px;letter-spacing:.16em;
   color:var(--ink4);text-transform:uppercase}
-main{padding:36px 46px 150px;min-width:0}
+nav .grp:first-child{margin-top:0}
+main{padding:36px 46px 150px;min-width:0;scroll-behavior:smooth}
+:target{scroll-margin-top:24px}
 
 /* ── 排版 ────────────────────────────────────────────────────────────── */
 h1{margin:6px 0 12px;font:600 33px/1.22 var(--sans);letter-spacing:-.022em;
@@ -234,91 +245,118 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 </style>
 
 <div class="wrap">
-<nav>
+<nav aria-label="目录">
   <p class="navtitle">目录</p>
   <ol>
-    <li><a href="#c0"><span class="num">0</span>导读与基线</a></li>
+    <li><a href="#c0"><span class="num">0</span><span class="ttl">导读与基线</span></a></li>
     <li class="grp">第一部分 · 总体</li>
-    <li><a href="#c1"><span class="num">1</span>总体设计与分层</a></li>
-    <li class="sub"><a href="#c1-2">1.2 关节为什么切在这里</a></li>
-    <li class="sub"><a href="#c1-4">1.4 全局不变量</a></li>
-    <li><a href="#c2"><span class="num">2</span>横切契约：知识分级</a></li>
+    <li><a href="#c1"><span class="num">1</span><span class="ttl">总体设计与分层</span></a></li>
+    <li class="sub"><a href="#c1-1" title="1.1 主线"><span class="num">1.1</span><span class="ttl">主线</span></a></li>
+    <li class="sub"><a href="#c1-2" title="1.2 为什么在这里划分层级边界"><span class="num">1.2</span><span class="ttl">为什么在这里划分层级边界</span></a></li>
+    <li class="sub"><a href="#c1-3" title="1.3 层的职责边界"><span class="num">1.3</span><span class="ttl">层的职责边界</span></a></li>
+    <li class="sub"><a href="#c1-4" title="1.4 全局不变量"><span class="num">1.4</span><span class="ttl">全局不变量</span></a></li>
+    <li><a href="#c2"><span class="num">2</span><span class="ttl">横切契约：知识分级</span></a></li>
+    <li class="sub"><a href="#s2-1" title="2.1 是什么"><span class="num">2.1</span><span class="ttl">是什么</span></a></li>
+    <li class="sub"><a href="#s2-2" title="2.2 为什么分界线在这里"><span class="num">2.2</span><span class="ttl">为什么分界线在这里</span></a></li>
+    <li class="sub"><a href="#s2-3" title="2.3 数据结构"><span class="num">2.3</span><span class="ttl">数据结构</span></a></li>
+    <li class="sub"><a href="#s2-4" title="2.4 数据流"><span class="num">2.4</span><span class="ttl">数据流</span></a></li>
     <li class="grp">第二部分 · 逐层</li>
-    <li><a href="#c3"><span class="num">3</span>S1 语义层</a></li>
-    <li><a href="#c4"><span class="num">4</span>S2 结构层</a></li>
-    <li><a href="#c5"><span class="num">5</span>S3 反向层</a></li>
-    <li><a href="#c6"><span class="num">6</span>身份体系</a></li>
-    <li><a href="#c7"><span class="num">7</span>S4 布局层</a></li>
-    <li><a href="#c8"><span class="num">8</span>S5 执行层</a></li>
-    <li><a href="#c9"><span class="num">9</span>S6 后端与 S7 报告</a></li>
+    <li><a href="#c3"><span class="num">3</span><span class="ttl">S1 语义层</span></a></li>
+    <li class="sub"><a href="#s3-1" title="3.1 是什么"><span class="num">3.1</span><span class="ttl">是什么</span></a></li>
+    <li class="sub"><a href="#s3-2" title="3.2 为什么是三个物理隔离的注册域"><span class="num">3.2</span><span class="ttl">为什么是三个物理隔离的注册域</span></a></li>
+    <li class="sub"><a href="#s3-3" title="3.3 原子 Op：一种类型对应一条形状关系"><span class="num">3.3</span><span class="ttl">原子 Op：一种类型对应一条形状关系</span></a></li>
+    <li class="sub"><a href="#s3-4" title="3.4 数据结构：Op 描述的七个面"><span class="num">3.4</span><span class="ttl">数据结构：Op 描述的七个面</span></a></li>
+    <li class="sub"><a href="#s3-5" title="3.5 数据流与逻辑流程"><span class="num">3.5</span><span class="ttl">数据流与逻辑流程</span></a></li>
+    <li><a href="#c4"><span class="num">4</span><span class="ttl">S2 结构层</span></a></li>
+    <li class="sub"><a href="#s4-1" title="4.1 是什么"><span class="num">4.1</span><span class="ttl">是什么</span></a></li>
+    <li class="sub"><a href="#s4-2" title="4.2 为什么源码只给结构"><span class="num">4.2</span><span class="ttl">为什么源码只给结构</span></a></li>
+    <li class="sub"><a href="#s4-3" title="4.3 数据结构"><span class="num">4.3</span><span class="ttl">数据结构</span></a></li>
+    <li class="sub"><a href="#s4-4" title="4.4 数据流与逻辑流程"><span class="num">4.4</span><span class="ttl">数据流与逻辑流程</span></a></li>
+    <li><a href="#c5"><span class="num">5</span><span class="ttl">S3 反向层</span></a></li>
+    <li class="sub"><a href="#s5-1" title="5.1 是什么"><span class="num">5.1</span><span class="ttl">是什么</span></a></li>
+    <li class="sub"><a href="#s5-2" title="5.2 为什么采用显式反向图，而不是将反向信息挂在前向算子上"><span class="num">5.2</span><span class="ttl">为什么采用显式反向图，而不是将反向信息挂在前向算子上</span></a></li>
+    <li class="sub"><a href="#s5-3" title="5.3 数据结构"><span class="num">5.3</span><span class="ttl">数据结构</span></a></li>
+    <li class="sub"><a href="#s5-4" title="5.4 数据流与逻辑流程"><span class="num">5.4</span><span class="ttl">数据流与逻辑流程</span></a></li>
+    <li><a href="#c6"><span class="num">6</span><span class="ttl">身份体系</span></a></li>
+    <li class="sub"><a href="#s6-1" title="6.1 是什么与为什么"><span class="num">6.1</span><span class="ttl">是什么与为什么</span></a></li>
+    <li><a href="#c7"><span class="num">7</span><span class="ttl">S4 布局层</span></a></li>
+    <li class="sub"><a href="#s7-1" title="7.1 是什么"><span class="num">7.1</span><span class="ttl">是什么</span></a></li>
+    <li class="sub"><a href="#s7-2" title="7.2 为什么它必须独立成层，并提供声明通道"><span class="num">7.2</span><span class="ttl">为什么它必须独立成层，并提供声明通道</span></a></li>
+    <li class="sub"><a href="#s7-3" title="7.3 数据结构"><span class="num">7.3</span><span class="ttl">数据结构</span></a></li>
+    <li class="sub"><a href="#s7-4" title="7.4 数据流与逻辑流程"><span class="num">7.4</span><span class="ttl">数据流与逻辑流程</span></a></li>
+    <li><a href="#c8"><span class="num">8</span><span class="ttl">S5 执行层</span></a></li>
+    <li class="sub"><a href="#s8-1" title="8.1 是什么"><span class="num">8.1</span><span class="ttl">是什么</span></a></li>
+    <li class="sub"><a href="#s8-2" title="8.2 为什么两个视图都必须自包含"><span class="num">8.2</span><span class="ttl">为什么两个视图都必须自包含</span></a></li>
+    <li class="sub"><a href="#s8-3" title="8.3 数据结构"><span class="num">8.3</span><span class="ttl">数据结构</span></a></li>
+    <li class="sub"><a href="#s8-4" title="8.4 数据流与逻辑流程"><span class="num">8.4</span><span class="ttl">数据流与逻辑流程</span></a></li>
+    <li><a href="#c9"><span class="num">9</span><span class="ttl">S6 后端与 S7 报告</span></a></li>
+    <li class="sub"><a href="#s9-1" title="9.1 显存后端"><span class="num">9.1</span><span class="ttl">显存后端</span></a></li>
+    <li class="sub"><a href="#s9-2" title="9.2 时间后端"><span class="num">9.2</span><span class="ttl">时间后端</span></a></li>
+    <li class="sub"><a href="#s9-3" title="9.3 报告"><span class="num">9.3</span><span class="ttl">报告</span></a></li>
     <li class="grp">第三部分 · 闭环</li>
-    <li><a href="#c10"><span class="num">10</span>阻断与用户闭环</a></li>
-    <li><a href="#c11"><span class="num">11</span>验收与迁移</a></li>
-    <li><a href="#c12"><span class="num">12</span>决策记录与边界</a></li>
+    <li><a href="#c10"><span class="num">10</span><span class="ttl">阻断与用户闭环</span></a></li>
+    <li class="sub"><a href="#s10-1" title="10.1 阻断范围（相较 v1 进一步明确）"><span class="num">10.1</span><span class="ttl">阻断范围（相较 v1 进一步明确）</span></a></li>
+    <li class="sub"><a href="#s10-2" title="10.2 闭环流程"><span class="num">10.2</span><span class="ttl">闭环流程</span></a></li>
+    <li><a href="#c11"><span class="num">11</span><span class="ttl">验收与迁移</span></a></li>
+    <li class="sub"><a href="#s11-1" title="11.1 验收基准必须来自真机"><span class="num">11.1</span><span class="ttl">验收基准必须来自真机</span></a></li>
+    <li class="sub"><a href="#s11-2" title="11.2 迁移策略"><span class="num">11.2</span><span class="ttl">迁移策略</span></a></li>
+    <li class="sub"><a href="#s11-3" title="11.3 实施前必须量化起点差距"><span class="num">11.3</span><span class="ttl">实施前必须量化起点差距</span></a></li>
+    <li><a href="#c12"><span class="num">12</span><span class="ttl">决策记录与边界</span></a></li>
+    <li class="sub"><a href="#s12-1" title="12.1 决策记录"><span class="num">12.1</span><span class="ttl">决策记录</span></a></li>
+    <li class="sub"><a href="#s12-2" title="12.2 非目标"><span class="num">12.2</span><span class="ttl">非目标</span></a></li>
+    <li class="sub"><a href="#s12-3" title="12.3 诚实边界"><span class="num">12.3</span><span class="ttl">诚实边界</span></a></li>
   </ol>
 </nav>
 
 <main>
 
 <h1>统一源码级 Model IR — 目标方案设计 v2</h1>
-<p class="lede">把显存与时间两条独立的模型构造链合成一条：结构从源码抽取、语义由纯配置描述、
-布局与执行作为派生计划层，两个后端只读消费。</p>
+<p class="lede">将显存与时间两条独立的模型构造链统一起来：结构从源码抽取，语义由纯配置描述，布局与执行作为派生计划层，两个后端只读使用计划结果。</p>
 
 <div class="meta">
   <div><b>文档类型</b>　目标方案（To-Be）总体设计与分层设计</div>
   <div><b>代码基线</b>　<code>feat/unified-llm-modelspec</code> @ <code>6b72d8d</code></div>
   <div><b>方案版本</b>　v2 · 2026-07-30 · 状态：设计（待过审）</div>
-  <div><b>前作</b>　<code>specs/2026-07-30-unified-code-grounded-ir-design.md</code>（分层与缺陷清单）、
-       <code>docs/pynative-cost-evaluator-target-solution-design-2026-07-30.md</code>（v1 全量规范）</div>
-  <div><b>本版相对 v1 的实质改动</b>　新增 BackwardIR 派生层（重算入图）、
-       用「量的 provenance」取代「层的退化档」、placement 增加声明通道、
-       验收对照物从 legacy 改为真机</div>
-  <div><b>图</b>　可编辑源在 <code>docs/target-design-v2/diagrams/*.excalidraw</code>；
-       页面内 SVG 与其同源生成（<code>tools/gen_diagrams.py</code>）</div>
+  <div><b>前作</b>　<code>specs/2026-07-30-unified-code-grounded-ir-design.md</code>（分层与缺陷清单）、<code>docs/pynative-cost-evaluator-target-solution-design-2026-07-30.md</code>（v1 全量规范）</div>
+  <div><b>本版相对 v1 的实质改动</b>　新增 BackwardIR 派生层（重算入图）、用「逐量 provenance」取代「按层设置回退档」、placement 增加声明通道、验收对照物从 legacy 改为真机</div>
+  <div><b>图</b>　可编辑源在 <code>docs/target-design-v2/diagrams/*.excalidraw</code>；页面内 SVG 与其同源生成（<code>tools/gen_diagrams.py</code>）</div>
 </div>
 
 <h2 id="c0"><span class="cn">Chapter 0</span>导读与基线</h2>
 
-<p>这份文档回答一个问题：<b>如果从原理出发重新设计这个仿真器的模型表示，应该长什么样。</b>
-它不是对现有代码的改造清单，而是目标形态的分层规范——每一层讲四件事：<b>是什么</b>、
-<b>为什么这样切</b>、<b>主要数据结构</b>、<b>数据流与逻辑流程</b>。</p>
+<p>这份文档回答一个问题：<b>如果从原理出发重新设计这个仿真器的模型表示，其目标形态应当如何。</b>它不是现有代码的改造清单，而是目标形态的分层规范——每一层说明四项内容：<b>是什么</b>、<b>为什么这样切</b>、<b>主要数据结构</b>、<b>数据流与逻辑流程</b>。</p>
 
 <h4>要解决的四个问题</h4>
 <div class="tw"><table>
-<tr><th>问题</th><th>今天的形态</th><th>本方案</th></tr>
+<tr><th>问题</th><th>当前形态</th><th>本方案</th></tr>
 <tr><td class="nw">模型演进速度</td>
-  <td>op 图与 <code>saves=[...]</code> 手写在 Python 里，框架代码一改就烂且<b>静默</b>失效</td>
+  <td>Op 图与 <code>saves=[...]</code> 手写在 Python 中，框架代码变更后容易<b>静默</b>失效</td>
   <td>结构从源码抽取，重跑编译即更新</td></tr>
 <tr><td class="nw">未知算子</td>
   <td>三种不一致结果：抛错 / 只进 <code>opaque_calls</code> / 透传首输入 shape</td>
   <td>统一阻断 + 生成待填骨架</td></tr>
-<tr><td class="nw">两条链各自为政</td>
-  <td>显存吃手写图、时间吃抽取图；轴代入、反向语义各实现一遍</td>
-  <td>共享 Structure + Backward + Placement，后端只剩口径壳</td></tr>
-<tr><td class="nw">不确定性无处安放</td>
-  <td>时间侧有退化阶梯与 confidence；形状/内存侧只有「精确或阻断」</td>
+<tr><td class="nw">两条建模链彼此独立</td>
+  <td>显存侧使用手写图，时间侧使用抽取图；轴代入与反向语义分别实现</td>
+  <td>共享 Structure、Backward 与 Placement，后端只保留各自的计算口径</td></tr>
+<tr><td class="nw">不确定量缺少统一表达</td>
+  <td>时间侧设有分级回退与 confidence；形状/内存侧只有「精确或阻断」</td>
   <td>provenance 作为全 IR 横切契约（<a href="#c2">第 2 章</a>）</td></tr>
 </table></div>
 
-<div class="cal why"><span class="lbl">为什么值得重做而不是继续打补丁</span>
-<p>手写图的失效模式是<b>静默的</b>：框架结构变了，数字还在，没有任何机制会发现。
-可证伪性是这里唯一重要的性质——一条追不到出处的断言，和一个猜测没有区别。</p></div>
+<div class="cal why"><span class="lbl">为什么需要重构，而不是继续局部修补</span>
+<p>手写图的失效模式是<b>静默的</b>：框架结构已经变化，旧结果仍可继续输出，却没有机制能够发现。因此，可证伪性是这里最关键的性质——无法追溯来源的结论，与猜测没有区别。</p></div>
 
-<h2 id="c1"><span class="cn">Chapter 1</span>总体设计与分层</h2>
+<h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体设计与分层</h2>
 
 <h3 id="c1-1">1.1 主线</h3>
-<div class="thesis">
-以<b>框架源码</b>为模型结构的唯一入口；以<b>纯配置描述的原子 op 语义</b>补齐源码无法证明的算子契约；
-编译成不可变的 <code>CoreIR</code>；由 <code>BackwardIR</code> → <code>PlacementPlan</code> →
-<code>ExecutionPlan</code> 三个<b>派生</b>计划层逐步加信息；最后由显存与时间两个<b>只读</b>后端消费。
-</div>
+<div class="thesis">以<b>框架源码</b>为模型结构的唯一入口；以<b>纯配置描述的原子 Op 语义</b>补齐源码无法证明的算子契约；编译成不可变的 <code>CoreIR</code>；由 <code>BackwardIR</code> → <code>PlacementPlan</code> →
+<code>ExecutionPlan</code> 三个<b>派生</b>计划层逐步加信息；最后由显存与时间两个<b>只读</b>后端消费。</div>
 
 <p>四类角色必须分清，这是全篇的骨架：</p>
 <dl class="kv">
-  <dt>事实源</dt><dd>源码（结构）、配置（语义）、标定（实测量）——只有这三处产生新事实</dd>
+  <dt>事实源</dt><dd>源码（结构）、配置（语义）、标定（实测量）——只有这三类输入产生新事实</dd>
   <dt>不可变核</dt><dd><code>CoreIR</code>：与设备、并行、时序全部无关的逻辑事实</dd>
-  <dt>派生层</dt><dd><code>BackwardIR</code> / <code>PlacementPlan</code> / <code>ExecutionPlan</code>：
-      各自吃一份策略输入，只读上游、从不回写</dd>
+  <dt>派生层</dt><dd><code>BackwardIR</code> / <code>PlacementPlan</code> / <code>ExecutionPlan</code>：各自接收一类策略输入，只读上游、从不回写</dd>
   <dt>只读后端</dt><dd>显存、时间：只消费计划，互不 import，不改 IR</dd>
 </dl>
 
@@ -332,12 +370,12 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <text class="dg-ftitle t-sem" x="82" y="32">S1 语义层</text>
 <rect class="dg-box b-sem" x="430" y="58" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-sem" x="590.0" y="83.5" font-size="15">TypedRegistrySnapshot</text>
-<text class="dg-bsub dg-mono t-sem" x="590.0" y="98.5" font-size="12">op 语义词典（冻结、带 digest）</text>
+<text class="dg-bsub dg-mono t-sem" x="590.0" y="98.5" font-size="12">Op 语义词典（冻结、带 digest）</text>
 <rect class="dg-frame" x="70" y="170" width="1040" height="92" rx="10"/>
 <text class="dg-ftitle t-ir" x="82" y="162">S2 结构层</text>
 <rect class="dg-box b-ir" x="430" y="188" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-ir" x="590.0" y="213.5" font-size="15">CoreIR</text>
-<text class="dg-bsub dg-mono t-ir" x="590.0" y="228.5" font-size="12">逻辑事实：op / 值 / 存储关系</text>
+<text class="dg-bsub dg-mono t-ir" x="590.0" y="228.5" font-size="12">逻辑事实：Op / 值 / 存储关系</text>
 <rect class="dg-frame" x="70" y="300" width="1040" height="92" rx="10"/>
 <text class="dg-ftitle t-derived" x="82" y="292">S3 反向层</text>
 <rect class="dg-box b-derived" x="430" y="318" width="320" height="56" rx="8"/>
@@ -347,12 +385,12 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <text class="dg-ftitle t-plan" x="82" y="422">S4 布局层</text>
 <rect class="dg-box b-plan" x="430" y="448" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="590.0" y="473.5" font-size="15">PlacementPlan</text>
-<text class="dg-bsub dg-mono t-plan" x="590.0" y="488.5" font-size="12">在哪：mesh / shard / local shape</text>
+<text class="dg-bsub dg-mono t-plan" x="590.0" y="488.5" font-size="12">位置：mesh / shard / local shape</text>
 <rect class="dg-frame" x="70" y="560" width="1040" height="92" rx="10"/>
 <text class="dg-ftitle t-plan" x="82" y="552">S5 执行层</text>
 <rect class="dg-box b-plan" x="430" y="578" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="590.0" y="603.5" font-size="15">ExecutionPlan</text>
-<text class="dg-bsub dg-mono t-plan" x="590.0" y="618.5" font-size="12">何时：event / lifetime / alloc-free</text>
+<text class="dg-bsub dg-mono t-plan" x="590.0" y="618.5" font-size="12">时序：event / lifetime / alloc-free</text>
 <rect class="dg-box b-input" x="90" y="58" width="250" height="40" rx="8"/>
 <text class="dg-blabel t-input" x="215.0" y="75.5" font-size="15">Native / User / Patch</text>
 <text class="dg-bsub dg-mono t-input" x="215.0" y="90.5" font-size="12">三个物理隔离注册域</text>
@@ -370,7 +408,7 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <text class="dg-bsub dg-mono t-input" x="945.0" y="480.5" font-size="12">tp / pp / ep / cp / dp</text>
 <rect class="dg-box b-input" x="820" y="578" width="250" height="40" rx="8"/>
 <text class="dg-blabel t-input" x="945.0" y="595.5" font-size="15">BufferCalibration</text>
-<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">measured 量的载体</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">measured 量载体</text>
 <polyline class="dg-arrow a-note" points="590.0,114 590.0,158" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590.0,244 590.0,288" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590.0,374 590.0,418" marker-end="url(#ah)"/>
@@ -392,7 +430,7 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <text class="dg-bsub dg-mono t-backend" x="865.0" y="764.5" font-size="12">cost / contention / pipeline DES</text>
 <polyline class="dg-arrow a-note" points="470,634 315,700 315,712" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="710,634 865,700 865,712" marker-end="url(#ah)"/>
-<text class="dg-note t-block" x="590" y="754" text-anchor="middle" font-size="13">互不 import</text>
+<text class="dg-note t-block" x="590" y="754" text-anchor="middle" font-size="13">互不依赖</text>
 <text class="dg-note t-block" x="590" y="771" text-anchor="middle" font-size="13">不回写上游</text>
 <rect class="dg-frame" x="70" y="838" width="1040" height="96" rx="10"/>
 <text class="dg-ftitle t-note" x="82" y="830">S7 报告</text>
@@ -401,43 +439,40 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <text class="dg-bsub dg-mono t-note" x="590.0" y="900.5" font-size="12">结果 + provenance + confidence</text>
 <polyline class="dg-arrow a-note" points="315,788 430,880" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="865,788 750,880" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="90" y="966" text-anchor="start" font-size="14">不变量：每层只增加一类信息；下游只读上游，从不回写。改并行配置只失效 S4/S5，CoreIR 不动（what-if 的交互性由此保证）。</text>
+<text class="dg-note t-note" x="90" y="966" text-anchor="start" font-size="14">不变量：每层只增加一类信息；下游只读上游，从不回写。修改并行配置只使 S4/S5 失效，CoreIR 保持不变（由此支持交互式 what-if）。</text>
 </svg>
 </div>
 <figcaption><span><b>图 1</b>　总体分层与数据流</span><span class="src">diagrams/01-layering.excalidraw</span></figcaption>
 </figure>
 
-<h3 id="c1-2">1.2 关节为什么切在这里</h3>
-<p>分层的判据只有一条：<b>每层只增加一类信息</b>。层数不是越多越好，但关节切错会在某个具体
-场景上暴露——所以下面用三个压力测试验它。</p>
+<h3 id="c1-2">1.2 为什么在这里划分层级边界</h3>
+<p>分层的判据只有一条：<b>每层只增加一类信息</b>。层数并非越多越好，但边界设置不当会在具体场景中暴露问题。下面通过三个压力场景验证这一划分。</p>
 
 <div class="tw"><table>
-<tr><th>压力测试</th><th>如果关节切错会怎样</th><th>本分层的表现</th></tr>
+<tr><th>压力测试</th><th>如果层级边界设置不当</th><th>本分层的表现</th></tr>
 <tr><td class="nw"><b>重算</b></td>
-  <td>同一逻辑算子执行两次、生命周期不同。若把它当结构事实，就要 fork CoreIR</td>
+  <td>同一逻辑算子执行两次且生命周期不同。若将其视为结构事实，就必须生成 CoreIR 分支</td>
   <td>落 <code>BackwardIR</code>：重算节点 = 被复制进反向图的前向节点。CoreIR 不动 ✓</td></tr>
 <tr><td class="nw"><b>算子融合</b></td>
   <td>融合与否取决于框架版本，看似是环境事实而非模型事实</td>
-  <td>源码字面调用融合 kernel，且框架版本快照参与语义绑定 ⇒ 确实是编译期可定的源码事实 ✓</td></tr>
+  <td>源码中直接调用融合 kernel，且框架版本快照参与语义绑定，因此它属于编译期可确定的源码事实 ✓</td></tr>
 <tr><td class="nw"><b>交互式 what-if</b></td>
-  <td>改一次 <code>tp</code> 若失效整条链，探索器就没法用</td>
-  <td>改并行只失效 S4/S5；改重算只失效 S3 及其下游；CoreIR（最贵的一层）不动 ✓</td></tr>
+  <td>如果修改一次 <code>tp</code> 就使整条链失效，系统将无法支持交互式探索</td>
+  <td>修改并行配置只使 S4/S5 失效；修改重算配置只使 S3 及其下游失效；CoreIR（编译成本最高的一层）保持不变 ✓</td></tr>
 </table></div>
 
-<div class="cal why"><span class="lbl">为什么源码和配置的分工是这样</span>
-<p>源码只提供<b>三样</b>：符号、数据流、attrs 字面值。配置提供<b>全部</b>语义
-（<code>(输入 shape, attrs) → 输出</code>）。两者不重叠，所以结构上不可能出现
-「这个 shape 该信源码还是信声明」的仲裁问题——<b>「两个真相源」在这个切法下无法复发</b>。</p></div>
+<div class="cal why"><span class="lbl">为什么这样划分源码与配置的职责</span>
+<p>源码只提供<b>三类信息</b>：符号、数据流、attrs 字面值。配置提供<b>完整</b>语义（<code>(输入 shape, attrs) → 输出</code>）。两者不重叠，所以结构上不可能出现「这个 shape 应采用源码还是声明」的仲裁问题——<b>这种划分从结构上消除了「两个真相源」</b>。</p></div>
 
 <h3 id="c1-3">1.3 层的职责边界</h3>
 <div class="tw"><table>
 <tr><th>层</th><th>只负责</th><th>不负责</th><th class="nw">策略输入</th></tr>
-<tr><td class="nw">S1 语义</td><td>注册域加载、DSL 校验、冻结成快照</td><td>看任何一个具体模型</td><td>—</td></tr>
-<tr><td class="nw">S2 结构</td><td>解析源码、绑定语义、产出逻辑事实</td><td>并行、时序、字节</td><td>—</td></tr>
-<tr><td class="nw">S3 反向</td><td>反向图、重算节点、fan-in 累加</td><td>在哪、多大</td><td class="nw"><code>RecomputeSpec</code></td></tr>
+<tr><td class="nw">S1 语义</td><td>注册域加载、DSL 校验、冻结成快照</td><td>解析具体模型实例</td><td>—</td></tr>
+<tr><td class="nw">S2 结构</td><td>解析源码、绑定语义、产出逻辑事实</td><td>并行策略、执行时序和物理字节</td><td>—</td></tr>
+<tr><td class="nw">S3 反向</td><td>反向图、重算节点、fan-in 累加</td><td>放置位置和本地规模</td><td class="nw"><code>RecomputeSpec</code></td></tr>
 <tr><td class="nw">S4 布局</td><td>mesh / shard / local shape / 集合通信</td><td>生命周期、定价</td><td class="nw"><code>ParallelConfig</code></td></tr>
 <tr><td class="nw">S5 执行</td><td>事件、依赖、流、生命周期、分配释放</td><td>改逻辑模型</td><td class="nw">调度 + 标定</td></tr>
-<tr><td class="nw">S6 后端</td><td>显存：liveness/allocator/OOM；时间：定价/竞争/流水</td><td>推导上游任何事实</td><td class="nw">硬件 + profile</td></tr>
+<tr><td class="nw">S6 后端</td><td>显存：liveness/allocator/OOM；时间：定价/竞争/流水</td><td>重新推导任何上游事实</td><td class="nw">硬件 + profile</td></tr>
 <tr><td class="nw">S7 报告</td><td>汇总 + 覆盖率 + provenance + confidence</td><td>隐藏未覆盖项</td><td>—</td></tr>
 </table></div>
 
@@ -446,20 +481,18 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <ol>
 <li><b>单向</b>：派生层只读上游，任何层都不回写上游。</li>
 <li><b>policy-free 核</b>：<code>CoreIR</code> 不含任何策略痕迹（并行度、重算、调度）。</li>
-<li><b>唯一绑定</b>：一个原子源码调用在一次编译中只能解析到一条 op 语义。</li>
+<li><b>唯一绑定</b>：一个原子源码调用在一次编译中只能解析到一条 Op 语义。</li>
 <li><b>无 opaque</b>：可执行 IR 中不存在未知算子或不透明节点。</li>
 <li><b>缺失 ≠ 空</b>：字段缺失（未描述）与显式空值（描述为无）严格区分。</li>
 <li><b>全或无</b>：预检不过就不产生任何可供后端执行的部分计划。</li>
 <li><b>身份不靠名字</b>：逻辑值、逻辑存储、放置、物理实例是四个独立 ID（<a href="#c6">第 6 章</a>）。</li>
-<li><b>provenance 必填</b>：每个进入报告的量都带 provenance；<code>measured</code> 必带标定 key、
-    <code>assumed</code> 必带依据（<a href="#c2">第 2 章</a>）。</li>
+<li><b>provenance 必填</b>：每个进入报告的量都带 provenance；<code>measured</code> 必带标定 key、<code>assumed</code> 必带依据（<a href="#c2">第 2 章</a>）。</li>
 </ol></div>
 
 <h2 id="c2"><span class="cn">Chapter 2</span>横切契约：知识分级</h2>
 
-<h3>2.1 是什么</h3>
-<p>仿真建模里的量不是同一种知识。本方案给<b>每个量</b>标一个 <code>provenance</code>，
-而不是给<b>每一层</b>配一套退化档。三类，闭集：</p>
+<h3 id="s2-1">2.1 是什么</h3>
+<p>仿真建模中的量具有不同的知识来源。本方案为<b>每个量</b>标注 <code>provenance</code>，而不是为<b>每一层</b>设置统一的回退等级。类型限定为以下三种，构成闭集：</p>
 
 <div class="tw"><table>
 <tr><th class="nw">provenance</th><th>含义</th><th>典型量</th><th>必带</th><th>缺失时</th></tr>
@@ -468,7 +501,7 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
   <td>shape、dtype、alias/inplace、saved 结构、数据流</td><td>—</td>
   <td><b>阻断</b></td></tr>
 <tr><td class="nw"><span class="pill p-me">measured</span></td>
-  <td>源码里根本不存在，只能实测标定</td>
+  <td>源码中不包含，只能通过实测标定</td>
   <td><code>workspace_bytes</code>、<code>bwd_scratch</code>、kernel duration、allocator 参数</td>
   <td>标定 key + <b>适用边界</b></td>
   <td>缺 key <b>阻断</b>；命中则带 confidence</td></tr>
@@ -481,7 +514,7 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 
 <figure id="fig-02-provenance">
 <div class="fw">
-<svg class="dg" viewBox="0 0 1160 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="知识分级：量的 provenance 而非层的退化档">
+<svg class="dg" viewBox="0 0 1160 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="知识分级：逐量 provenance，而非按层设置回退档">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
@@ -503,7 +536,7 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <rect class="dg-frame" x="450" y="60" width="280" height="470" rx="10"/>
 <text class="dg-ftitle t-me" x="462" y="52">measured</text>
 <text class="dg-note t-me" x="466" y="88" text-anchor="start" font-size="13">只能实测标定</text>
-<text class="dg-note t-me" x="466" y="105" text-anchor="start" font-size="13">源码里不存在</text>
+<text class="dg-note t-me" x="466" y="105" text-anchor="start" font-size="13">源码中不存在</text>
 <rect class="dg-box b-me" x="470" y="132" width="240" height="40" rx="8"/>
 <text class="dg-blabel dg-mono t-me" x="590.0" y="156.5" font-size="15">workspace_bytes</text>
 <rect class="dg-box b-me" x="470" y="184" width="240" height="40" rx="8"/>
@@ -530,42 +563,39 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <text class="dg-blabel t-block" x="980.0" y="374.5" font-size="15">判据</text>
 <text class="dg-bsub dg-mono t-block" x="980.0" y="389.5" font-size="12">必须显式声明</text>
 <text class="dg-bsub dg-mono t-block" x="980.0" y="403.5" font-size="12">缺声明 ⇒ 阻断</text>
-<text class="dg-note t-note" x="60" y="32" text-anchor="start" font-size="15">同一条契约字段 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。</text>
+<text class="dg-note t-note" x="60" y="32" text-anchor="start" font-size="15">同一契约字段的 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。</text>
 <rect class="dg-box b-note" x="390" y="578" width="380" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-note" x="580.0" y="603.5" font-size="15">UnifiedReport</text>
 <text class="dg-bsub dg-mono t-note" x="580.0" y="618.5" font-size="12">按 provenance 分别统计覆盖率与 confidence</text>
 <polyline class="dg-arrow a-note" points="200,530 200,560 580,560 580,574" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590,530 590,560 580,560 580,574" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="980,530 980,560 580,560 580,574" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="60" y="674" text-anchor="start" font-size="14">关键：assumed 不是 fallback。未声明仍然阻断；声明了才放行，且 basis 与方向（上界/下界/标称）进报告。</text>
+<text class="dg-note t-note" x="60" y="674" text-anchor="start" font-size="14">关键：assumed 不是 fallback。未声明时仍然阻断；只有显式声明后才允许执行，且 basis 与方向（上界/下界/标称）必须进入报告。</text>
 </svg>
 </div>
-<figcaption><span><b>图 2</b>　知识分级：量的 provenance 而非层的退化档</span><span class="src">diagrams/02-provenance.excalidraw</span></figcaption>
+<figcaption><span><b>图 2</b>　知识分级：逐量 provenance，而非按层设置回退档</span><span class="src">diagrams/02-provenance.excalidraw</span></figcaption>
 </figure>
 
-<h3>2.2 为什么分界线在这里</h3>
-<p>一个直觉的分法是「内存侧要精确、时间侧允许估」。<b>这个分法是错的</b>，两个反例就能推翻：</p>
+<h3 id="s2-2">2.2 为什么分界线在这里</h3>
+<p>一种直观的划分是「内存侧要求精确、时间侧允许估算」。<b>这种划分并不成立</b>，两个反例即可说明：</p>
 <ul>
 <li><code>workspace_bytes</code> 在<b>内存</b>侧，却是 kernel 实现属性——源码里没有，只能上机测；</li>
 <li>MoE 每专家负载在<b>形状</b>侧，却只能假设——它是 router 输出<b>值</b>的函数，不是输入 shape 的函数。</li>
 </ul>
 <p>所以真正的分界线是<b>「源码可判定 / 不可判定」</b>，它横穿内存与时间两侧。</p>
 
-<div class="cal why"><span class="lbl">为什么必须有 assumed 这一档</span>
-<p>被仿真的对象是<b>稀疏模型</b>。topk 之后的实际长度、每专家实际 token 数、动态稀疏注意力的选中数
+<div class="cal why"><span class="lbl">为什么必须引入 assumed 类型</span>
+<p>被仿真的对象是<b>稀疏模型</b>。top-k 操作后的实际长度、每个专家处理的实际 token 数、动态稀疏注意力的选中数
 ——这些在原理上<b>不是</b><code>(输入 shape, attrs)</code> 的函数，任何静态语义都证明不了。</p>
-<p>只有「精确或阻断」两态时，剩下两条路都坏：要么永远阻断（工具对稀疏模型不可用），
-要么偷偷用容量因子顶上（正是本方案禁止的「用缺省值替代未声明」）。
-<b>第三态不是妥协，是把已经在做的假设变得可见。</b></p></div>
+<p>如果系统只有「精确或阻断」两种状态，则两种处理方式都不可取：要么始终阻断（工具无法用于稀疏模型），要么隐式使用容量因子代替真实值（正是本方案禁止的「用缺省值替代未声明」）。<b>第三种状态不是妥协，而是将原本隐含的假设显式化。</b></p></div>
 
 <div class="cal bad"><span class="lbl">这一档要挡住的失效模式</span>
-<p>如果只有阻断，用户为了让工具跑起来，会在骨架里填一个看起来合理的数。
-而这个数一旦进了系统就<b>与真值不可区分</b>——它有完整 schema、通过类型检查、
-provenance 说它来自用户注册域。结果恰好摧毁了本方案最想要的那条性质。</p>
+<p>如果只有阻断，用户为了让仿真继续执行，可能会在骨架中填写一个表面合理的数值。该数值一旦进入系统，就会<b>与真值不可区分</b>——它具有完整 schema、通过类型检查，
+provenance 也表明它来自用户注册域。这会破坏本方案最重视的可追溯性。</p>
 <p>所以 <code>assumed</code> 必须带 <code>basis</code>，且在报告里<b>独立统计</b>。</p></div>
 
-<h3>2.3 数据结构</h3>
-<pre><code># 每个可进报告的量都是这个形状（闭集 tagged union）
+<h3 id="s2-3">2.3 数据结构</h3>
+<pre><code># 每个可进入报告的量都采用这一结构（闭集 tagged union）
 Quantity:
   provenance: source_derived | measured | assumed
   value:      &lt;Expr&gt;                 # 受控表达式，见 3.4
@@ -576,18 +606,15 @@ Quantity:
   basis:     &lt;str&gt;                   # 为什么这样假设
   direction: upper | lower | nominal # 偏差方向，报告必须点明</code></pre>
 
-<h3>2.4 数据流</h3>
-<p><code>provenance</code> 在 S1 声明、随量流经 S2–S5、在 S6 参与 confidence 计算、
-在 S7 分类统计。<b>它从不被消掉</b>——任何一层把 <code>assumed</code> 洗成普通数值都是契约违规。</p>
+<h3 id="s2-4">2.4 数据流</h3>
+<p><code>provenance</code> 在 S1 声明，随量流经 S2–S5，在 S6 参与 confidence 计算，并在 S7 分类统计。<b>它不得丢失</b>——任何一层将 <code>assumed</code> 转换成普通数值都属于契约违规。</p>
 <div class="cal inv"><span class="lbl">不变量</span>
-<p>报告必须能回答：这个峰值里有多少字节来自 <code>measured</code>、多少来自 <code>assumed</code>，
-以及每一条的依据是什么。做不到就不是这个方案。</p></div>
+<p>报告必须能回答：这个峰值里有多少字节来自 <code>measured</code>、多少来自 <code>assumed</code>，以及每一项的依据是什么。若无法回答，说明实现不符合本方案。</p></div>
 
-<h2 id="c3"><span class="cn">Chapter 3</span>S1 语义层</h2>
+<h2 id="c3" data-part="第二部分 · 逐层"><span class="cn">Chapter 3</span>S1 语义层</h2>
 
-<h3>3.1 是什么</h3>
-<p>op 语义的<b>唯一</b>词典，以配置文件描述，编译成不可变快照。它不认识任何具体模型——
-它只回答「这个算子是什么」。</p>
+<h3 id="s3-1">3.1 是什么</h3>
+<p>这是 Op 语义的<b>唯一</b>词典：语义通过配置文件描述，并编译成不可变快照。它不依赖任何具体模型，只回答「这个算子是什么」。</p>
 
 <figure id="fig-03-semantic-layer">
 <div class="fw">
@@ -602,13 +629,13 @@ Quantity:
 <text class="dg-bsub dg-mono t-sem" x="210.0" y="126.5" font-size="12">随版本发布，只读</text>
 <rect class="dg-box b-sem" x="80" y="152" width="260" height="44" rx="8"/>
 <text class="dg-blabel dg-mono t-sem" x="210.0" y="171.5" font-size="15">UserOpRegistry</text>
-<text class="dg-bsub dg-mono t-sem" x="210.0" y="186.5" font-size="12">只能新增 native 未覆盖</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="186.5" font-size="12">仅补充 Native 未覆盖项</text>
 <rect class="dg-box b-sem" x="80" y="212" width="260" height="44" rx="8"/>
 <text class="dg-blabel dg-mono t-sem" x="210.0" y="231.5" font-size="15">NativePatchRegistry</text>
-<text class="dg-bsub dg-mono t-sem" x="210.0" y="246.5" font-size="12">整条替换 + hash 门禁</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="246.5" font-size="12">完整替换 + hash 门禁</text>
 <rect class="dg-box b-sem" x="440" y="92" width="260" height="44" rx="8"/>
 <text class="dg-blabel t-sem" x="570.0" y="111.5" font-size="15">RegistryLoader</text>
-<text class="dg-bsub dg-mono t-sem" x="570.0" y="126.5" font-size="12">冲突 / 版本 / 完整性</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="126.5" font-size="12">校验冲突、版本与完整性</text>
 <rect class="dg-box b-sem" x="440" y="168" width="260" height="44" rx="8"/>
 <text class="dg-blabel t-sem" x="570.0" y="187.5" font-size="15">DSL 编译</text>
 <text class="dg-bsub dg-mono t-sem" x="570.0" y="202.5" font-size="12">parse → typecheck → 模板展开</text>
@@ -660,30 +687,25 @@ Quantity:
 <figcaption><span><b>图 3</b>　语义层：注册域、DSL 编译与调用绑定</span><span class="src">diagrams/03-semantic-layer.excalidraw</span></figcaption>
 </figure>
 
-<h3>3.2 为什么是三个物理隔离的注册域</h3>
+<h3 id="s3-2">3.2 为什么是三个物理隔离的注册域</h3>
 <div class="tw"><table>
 <tr><th class="nw">注册域</th><th>用途</th><th>能否改 native</th><th>加载</th></tr>
 <tr><td class="nw">Native</td><td>随仿真器版本发布的内置语义</td><td>否</td><td>只读</td></tr>
 <tr><td class="nw">User</td><td>补 native 未覆盖的算子</td><td>否（只能新增）</td><td>用户目录</td></tr>
 <tr><td class="nw">NativePatch</td><td>显式修正一条 native</td><td><b>整条替换</b></td><td>独立目录 + 开关</td></tr>
 </table></div>
-<div class="cal why"><span class="lbl">为什么不是一张表加优先级</span>
-<p><b>加载顺序决定胜者 = 结果不可复现。</b> User 声明了 native 已占用的 selector，
-必须在加载期直接报冲突，而不是「后者覆盖前者」。</p>
-<p><b>Patch 为什么必须整条替换</b>：字段级 merge 会造出「native 的 shape + user 的 autograd
-+ 默认的 cost」这种没人设计过的混合语义，且没有任何人能对它负责。</p></div>
+<div class="cal why"><span class="lbl">为什么不采用单表加优先级</span>
+<p><b>如果由加载顺序决定最终生效项，结果将不可复现。</b> User 声明了 native 已占用的 selector，必须在加载期直接报冲突，而不是「后者覆盖前者」。</p>
+<p><b>Patch 为什么必须整条替换</b>：字段级 merge 会产生「native 的 shape + user 的 autograd
++ 默认的 cost」这类未经整体设计和验证的混合语义，无法明确其责任归属。</p></div>
 
-<h3>3.3 原子 op：一个类型 = 一条形状关系</h3>
-<p>op 类型必须拆到<b>原子级</b>。反面教材是把 14 种视图语义
-（reshape / permute / transpose / squeeze / unsqueeze / concat / stack / split / chunk /
-slice / tile / roll / broadcast / contiguous）塞进一个 <code>View</code> 类型，
-再在代码里用判别字段二次分派——那等于把配置里已有的信息重新读一遍，
-而且逼着不同语义共用一条反向规则。</p>
+<h3 id="s3-3">3.3 原子 Op：一种类型对应一条形状关系</h3>
+<p>Op 类型必须拆到<b>原子级</b>。不推荐的做法是将 14 种视图语义（reshape / permute / transpose / squeeze / unsqueeze / concat / stack / split / chunk /
+slice / tile / roll / broadcast / contiguous）合并为一个 <code>View</code> 类型，再在代码中通过判别字段进行二次分派。这相当于重新解析配置中已有的信息，并迫使不同语义共用一条反向规则。</p>
 <div class="cal inv"><span class="lbl">不变量</span>
-<p>一个 op 类型只有一条形状关系、一条反向规则、一条布局规则。分派只发生在 selector 绑定，
-不发生在语义求值。</p></div>
+<p>一个 Op 类型只对应一条形状关系、一条反向规则和一条布局规则。分派只发生在 selector 绑定阶段，不发生在语义求值。</p></div>
 
-<h3>3.4 数据结构：op 描述的七个面</h3>
+<h3 id="s3-4">3.4 数据结构：Op 描述的七个面</h3>
 <p>描述是<b>纯配置</b>，不含任何代码引用。字段值是受控表达式，由固定函数集求值。</p>
 <div class="tw"><table>
 <tr><th class="nw">面</th><th>回答</th><th class="nw">消费者</th></tr>
@@ -703,7 +725,7 @@ ops:
     shape:
       rel:   reshape                      # 固定组合子
       args:  { input: in0, target: attrs.reshape_dims }
-      on_unresolved: numel_only           # reshape 恒不改元素数（算子定义）⇒ 退元素数档
+      on_unresolved: numel_only           # reshape 恒不改变元素数（算子定义）⇒ 降级为仅保留元素数约束
       why:   "单缺维由元素数守恒唯一确定"
     dtype:     { outputs: [same_as(in0)] }
     storage:   [{ kind: alias, of: in0 }] # 视图：零 Allocate
@@ -724,18 +746,15 @@ ops:
       why:    "out.shape[i] = x.shape[dims[i]]（算子定义）"
     # …余下六面同上</code></pre>
 
-<div class="cal why"><span class="lbl">为什么组合子在引擎里不算「op 关联了代码」</span>
-<p><code>rel: reshape</code> 里的 <code>reshape</code> 是<b>表达式求值器的原语</b>，与任何具体 op 无关
-——就像配置里写 <code>2*x</code> 不会让人说它关联了代码。判据很清楚：
-<b>组合子跨 op 复用</b>（九个原子 op 共用 <code>same_as</code>），
-而 op 独有的知识只有「关系名 + 参数来源 + 守卫 + 退化档」，全是数据。</p>
-<p>组合子是闭集，不到 20 个：<code>same_as</code> · <code>broadcast</code> ·
+<div class="cal why"><span class="lbl">为什么引擎中的组合子不等于「Op 关联了代码」</span>
+<p><code>rel: reshape</code> 里的 <code>reshape</code> 是<b>表达式求值器的原语</b>，与任何具体 Op 无关
+——正如在配置中写 <code>2*x</code> 并不意味着配置关联了代码。判据很明确：<b>组合子可以跨 Op 复用</b>（九个原子 Op 共用 <code>same_as</code>），而 Op 独有的知识只有「关系名 + 参数来源 + 守卫 + 回退策略」，这些内容全部以数据表示。</p>
+<p>组合子构成闭集，当前共 20 个：<code>same_as</code> · <code>broadcast</code> ·
 <code>replace_last</code> · <code>bmm</code> · <code>halve_last</code> · <code>reshape</code> ·
 <code>permute</code> · <code>swap_axes</code> · <code>squeeze</code> · <code>expand_dims</code> ·
 <code>concat</code> · <code>stack</code> · <code>split</code> · <code>chunk</code> ·
 <code>slice</code> · <code>tile</code> · <code>literal</code> · <code>range_len</code> ·
-<code>index_compose</code> · <code>declared</code>。引用不存在的组合子 → 加载即阻断，
-并要求说明其算子定义。这是显式、可数、要写理由的扩展点，不是后门。</p></div>
+<code>index_compose</code> · <code>declared</code>。引用不存在的组合子 → 加载即阻断，并要求说明其算子定义。这是显式、数量可控且必须说明理由的扩展点，不是隐式代码扩展入口。</p></div>
 
 <h4>固定类型系统</h4>
 <div class="tw"><table>
@@ -748,24 +767,22 @@ ops:
 <tr><td class="nw"><code>ValueRefExpr</code></td><td>primal / 梯度 / 内部值引用</td><td><code>grad_output(0)</code></td></tr>
 <tr><td class="nw"><code>PlacementExpr</code></td><td>分片规则</td><td><code>shard(x,axis=-1,mesh="tp")</code></td></tr>
 </table></div>
-<p><b>禁止</b>：循环、递归、赋值、可变状态、文件/网络/环境访问、import、用户自定义函数、
-运行期改注册表、用缺省值替代未声明项。</p>
+<p><b>禁止</b>：循环、递归、赋值、可变状态、文件/网络/环境访问、import、用户自定义函数、运行期改注册表、用缺省值替代未声明项。</p>
 
-<h3>3.5 数据流与逻辑流程</h3>
+<h3 id="s3-5">3.5 数据流与逻辑流程</h3>
 <ol class="flow">
-<li>加载三域原始文件 + 框架/运行时版本快照。</li>
-<li>schema 解析（closed schema：未知字段、拼错、未知枚举、未知版本全部拒绝）。</li>
+<li>加载三个注册域的原始文件及框架/运行时版本快照。</li>
+<li>解析 schema（closed schema：未知字段、字段拼写错误、未知枚举和未知版本全部拒绝）。</li>
 <li>模板展开 → 静态类型检查 → 语义完整性检查（七个面按需齐备）。</li>
-<li>冲突检测：selector 重复、user 侵占 native、patch 目标不存在或 hash 不匹配 → 阻断。</li>
+<li>冲突检测：selector 重复、User selector 与 Native 冲突、patch 目标不存在或 hash 不匹配 → 阻断。</li>
 <li>冻结成不可变快照 + digest（框架版本参与 digest：同一份文件在不同框架版本下不得复用旧快照）。</li>
 <li>此后<b>只做绑定</b>：解析器不再读配置文件、不再展开模板。</li>
 </ol>
 
 <h2 id="c4"><span class="cn">Chapter 4</span>S2 结构层</h2>
 
-<h3>4.1 是什么</h3>
-<p>读框架源码，产出 <code>CoreIR</code>——一张只含<b>逻辑事实</b>的图：有哪些算子、
-它们怎么连、每个值的形状/类型/存储关系是什么。与设备、并行、时序<b>全部无关</b>。</p>
+<h3 id="s4-1">4.1 是什么</h3>
+<p>读取框架源码并产出 <code>CoreIR</code>——一张只包含<b>逻辑事实</b>的图：有哪些算子、算子之间如何连接，以及每个值的形状、类型和存储关系。它与设备、并行和时序<b>全部无关</b>。</p>
 
 <figure id="fig-04-structure-backward">
 <div class="fw">
@@ -793,7 +810,7 @@ ops:
 <polyline class="dg-arrow a-note" points="330,196 426,170" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-ir" points="550,108 550,132" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="670,160 776,160" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="90" y="246" text-anchor="start" font-size="13">源码只给三样：符号、数据流、attrs 字面值。注册表给全部语义。两者不重叠 ⇒ 结构上不可能出现「两个真相源」。</text>
+<text class="dg-note t-note" x="90" y="246" text-anchor="start" font-size="13">源码仅提供三类信息：符号、数据流、attrs 字面值。注册表提供完整语义。两者不重叠，因此结构上不会出现「两个真相源」。</text>
 <rect class="dg-frame" x="60" y="300" width="1030" height="300" rx="10"/>
 <text class="dg-ftitle t-derived" x="72" y="292">S3 反向层：BackwardIR（派生，CoreIR 保持 policy-free）</text>
 <rect class="dg-box b-ir" x="100" y="352" width="120" height="42" rx="8"/>
@@ -822,27 +839,26 @@ ops:
 <text class="dg-alabel t-plan" x="415.5" y="432.5">复制</text>
 <rect class="dg-box b-ir" x="790" y="396" width="280" height="128" rx="8"/>
 <text class="dg-blabel t-ir" x="930.0" y="450.5" font-size="15">统一节点类型</text>
-<text class="dg-bsub dg-mono t-ir" x="930.0" y="465.5" font-size="12">前向 / 反向 / 重算 三类节点同构，</text>
-<text class="dg-bsub dg-mono t-ir" x="930.0" y="479.5" font-size="12">共用同一套形状·类型·布局·资源机器</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="465.5" font-size="12">前向 / 反向 / 重算三类节点同构，</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="479.5" font-size="12">共用同一套形状·类型·布局·资源计算机制</text>
 <text class="dg-note t-plan" x="610" y="552" text-anchor="start" font-size="13">重算节点 = 前向 op2 的副本：同 SemanticId、新 NodeId、origin 回指。插在该区</text>
 <text class="dg-note t-plan" x="610" y="569" text-anchor="start" font-size="13">域反向节点之前。</text>
-<text class="dg-note t-note" x="60" y="654" text-anchor="start" font-size="14">为什么 BackwardIR 是派生层而不是写进 CoreIR：CoreIR 必须 policy-free。否则改一次重算配置就失效 CoreIR 缓存 —— 而它是最贵的一层。</text>
-<text class="dg-note t-note" x="60" y="700" text-anchor="start" font-size="14">净效果是删类：AutogradContract / GradientValueSpec / GradientAccumulationSpec（fan-in 累加本来就是个 add 节点）全部退化为图里的普通节点与边。</text>
-<text class="dg-note t-note" x="60" y="746" text-anchor="start" font-size="14">不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，digest 独立。</text>
+<text class="dg-note t-note" x="60" y="654" text-anchor="start" font-size="14">BackwardIR 必须作为派生层，而不能写入 CoreIR：CoreIR 必须保持 policy-free。否则每次修改重算配置都会使 CoreIR 缓存失效，而它是编译成本最高的一层。</text>
+<text class="dg-note t-note" x="60" y="700" text-anchor="start" font-size="14">结果是简化类型体系：AutogradContract / GradientValueSpec / GradientAccumulationSpec（fan-in 累加可表示为普通 add 节点）均可统一表示为图中的普通节</text>
+<text class="dg-note t-note" x="60" y="718" text-anchor="start" font-size="14">点与边。</text>
+<text class="dg-note t-note" x="60" y="746" text-anchor="start" font-size="14">不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，使用独立 digest。</text>
 </svg>
 </div>
 <figcaption><span><b>图 4</b>　结构层与反向层</span><span class="src">diagrams/04-structure-backward.excalidraw</span></figcaption>
 </figure>
 
-<h3>4.2 为什么源码只给结构</h3>
-<p>前端只做三件事：解析、内联可展开调用、识别原子调用与数据依赖。它<b>不猜</b>任何算子语义——
-一个未绑定的调用进 <code>UnresolvedCall</code>，由 S1 的绑定决定生死。</p>
-<div class="cal why"><span class="lbl">为什么这个二分是干净的</span>
-<p>源码天然知道的是「调用了谁、拿了什么、传了什么常量」；它<b>不</b>知道「这个算子的反向要读什么」。
-把前者交给源码、后者交给配置，正好沿着知识的天然边界切。今天那种「形状推断是代码、
-部分参数来自源码 attrs」的混合形态，是这条边界没切干净的结果。</p></div>
+<h3 id="s4-2">4.2 为什么源码只给结构</h3>
+<p>前端只做三件事：解析源码、内联可展开调用、识别原子调用与数据依赖。它<b>不推断</b>任何算子语义——
+未绑定的调用进入 <code>UnresolvedCall</code>，由 S1 的绑定结果决定该调用能否进入可执行 IR。</p>
+<div class="cal why"><span class="lbl">为什么这种职责划分清晰</span>
+<p>源码天然知道的是「调用了谁、拿了什么、传了什么常量」；它<b>不</b>知道「这个算子的反向要读什么」。将前者交给源码、后者交给配置，正好沿着知识的天然边界划分职责。当前「形状推断由代码实现、部分参数来自源码 attrs」的混合形态，正是这条边界划分不清的结果。</p></div>
 
-<h3>4.3 数据结构</h3>
+<h3 id="s4-3">4.3 数据结构</h3>
 <pre><code>CoreIR:
   ops:        [OpInstance]
   values:     [TensorValue]
@@ -852,9 +868,9 @@ ops:
 
 OpInstance:
   id:          OpId
-  semantic_id: SemanticId              # 指向 S1 快照里的那条 op 描述
+  semantic_id: SemanticId              # 指向 S1 快照中的对应 Op 描述
   inputs:      [TensorId]
-  outputs:     [TensorId]              # 可为空（side-effect 算子不许被跳过）
+  outputs:     [TensorId]              # 可为空（side-effect 算子不得被跳过）
   attrs:       {...}                   # 源码字面值
   dtype:       { compute, accum }
 
@@ -868,51 +884,43 @@ TensorValue:
 
 Storage:
   id: StorageId; size: BytesExpr; kind; persistence; alignment</code></pre>
-<p><b>不进 CoreIR</b>：源码文件、行号、调用原文。它们走可剥离的 SourceMap 旁路，
-不参与语义 hash——否则换一个注释就会失效整条缓存。</p>
+<p><b>CoreIR 不包含</b>源码文件、行号和调用原文。它们通过可剥离的 SourceMap 旁路传递，不参与语义 hash——否则换一个注释就会失效整条缓存。</p>
 
 <div class="cal honest"><span class="lbl">需要澄清的一点</span>
-<p>「不承载源码信息」不等于「op 没有可读名字」。算子在模型里的<b>限定名</b>
-（形如 <code>attn.indexer.linear_wq_b</code>，由内联帧路径 + 调用点属性名拼成）
-是<b>逻辑身份</b>而非源码定位：标定表按它挂载、重算 selector 按它匹配、报告按它可读。
-它应当在 <code>OpId</code> 内可解析，而不是只能查旁路。</p></div>
+<p>「不承载源码信息」不等于「Op 没有可读名称」。算子在模型中的<b>限定名</b>（形如 <code>attn.indexer.linear_wq_b</code>，由内联帧路径 + 调用点属性名拼成）是<b>逻辑身份</b>而非源码定位：标定表以它为索引挂载，重算 selector 按它匹配，报告也用它提供可读名称。它应当能够从 <code>OpId</code> 中解析，而不是只能通过旁路查询。</p></div>
 
-<h3>4.4 数据流与逻辑流程</h3>
+<h3 id="s4-4">4.4 数据流与逻辑流程</h3>
 <ol class="flow">
 <li>从模型配置定位入口，按框架的模块规格解析出<b>本次实际实例化的模块树</b>。</li>
-<li>逐个可展开函数内联，按配置剪掉未命中的条件分支；<b>不可判定的条件即阻断</b>，绝不双走。</li>
-<li>逐语句发射原子调用，用单赋值表记录「哪个变量当前由哪个节点产出」，据此补数据流边。</li>
-<li>每个调用向 S1 快照请求绑定 → 得到 <code>SemanticId</code>；未绑定 → 阻断（<a href="#c10">第 10 章</a>）。</li>
+<li>逐个内联可展开函数，并按配置剪除未命中的条件分支；<b>条件不可判定时立即阻断</b>，禁止同时保留两条分支。</li>
+<li>按语句生成原子调用节点，用单赋值表记录「当前变量由哪个节点产出」，据此补全数据流边。</li>
+<li>每个调用都与 S1 快照执行语义绑定 → 得到 <code>SemanticId</code>；未绑定 → 阻断（<a href="#c10">第 10 章</a>）。</li>
 <li>按 <code>shape</code> / <code>dtype</code> / <code>storage</code> 三面求值，得到 <code>TensorValue</code> 与 <code>Storage</code>。</li>
 <li>校验 CoreIR 不变量：无 opaque、每输出恰一条存储规则、alias 链无环无悬空、side-effect 算子未被跳过。</li>
 </ol>
 
 <h2 id="c5"><span class="cn">Chapter 5</span>S3 反向层</h2>
 
-<h3>5.1 是什么</h3>
-<p>把反向图<b>显式化</b>为一层派生 IR。前向节点、反向节点、重算节点<b>是同一种节点类型</b>，
-共用同一套形状/类型/布局/资源机器。</p>
+<h3 id="s5-1">5.1 是什么</h3>
+<p>将反向图<b>显式化</b>为一层派生 IR。前向节点、反向节点和重算节点<b>使用同一种节点类型</b>，共用同一套形状、类型、布局与资源计算机制。</p>
 
-<h3>5.2 为什么显式化，而不是挂在前向算子上</h3>
-<p>另一种做法是把反向信息编码成前向算子的「契约字段」（保存哪些输入、产哪些梯度值……），
-再用一个 lowering pass 展开。那样做的代价是：反向值得不到与前向值同等的待遇——
-它们的形状、类型、放置要靠一族专用字段和特殊分支，而不是走同一条路。</p>
-<p>显式化之后，一整族契约类<b>退化成图里的普通节点与边</b>：</p>
+<h3 id="s5-2">5.2 为什么采用显式反向图，而不是将反向信息挂在前向算子上</h3>
+<p>另一种做法是把反向信息编码成前向算子的「契约字段」（保存哪些输入、产哪些梯度值……），再通过 lowering pass 展开。这样做的代价是：反向值无法与前向值采用同一套表示——
+它们的形状、类型和放置需要依赖一组专用字段与特殊分支，而不能复用同一条处理链。</p>
+<p>显式化之后，这一组契约类可以<b>统一表示为图中的普通节点与边</b>：</p>
 <div class="tw"><table>
 <tr><th>挂字段的做法</th><th>显式反向图之后</th></tr>
 <tr><td>autograd 契约（保存输入/输出/内部值三个列表）</td><td>就是图的边</td></tr>
 <tr><td>梯度值规格 + phase 存储规则 + phase 值 ID</td><td>就是 <code>TensorValue</code> + <code>StorageRelation</code></td></tr>
-<tr><td>梯度 fan-in 累加规格</td><td><b>就是一个 add 节点</b>——累加本来就是个算子</td></tr>
-<tr><td>重算的独立 lowering 路径</td><td>删除：重算就是被复制进图的前向节点</td></tr>
-<tr><td>每个事件/资源对象逐个携带 phase 字段</td><td>phase 成为图属性</td></tr>
+<tr><td>梯度 fan-in 累加规格</td><td>表现为一个 <b>add 节点</b>——累加本身就是算子计算</td></tr>
+<tr><td>重算的独立 lowering 路径</td><td>无需保留：重算就是被复制进图的前向节点</td></tr>
+<tr><td>每个事件/资源对象分别携带 phase 字段</td><td>phase 成为图属性</td></tr>
 </table></div>
 
-<div class="cal inv"><span class="lbl">必须守住的性质</span>
-<p><code>BackwardIR</code> 是<b>派生层</b>，<code>RecomputeSpec</code> 是它的<b>输入</b>，digest 独立。
-不能把它写进 <code>CoreIR</code>——否则改一次重算配置就失效 CoreIR 缓存，而那是最贵的一层，
-交互式 what-if 会因此不可用。</p></div>
+<div class="cal inv"><span class="lbl">必须保持的性质</span>
+<p><code>BackwardIR</code> 是<b>派生层</b>，<code>RecomputeSpec</code> 是它的<b>输入</b>，digest 独立。不能将它写入 <code>CoreIR</code>——否则每次修改重算配置都会使 CoreIR 缓存失效，而 CoreIR 是编译成本最高的一层，系统也将无法支持交互式 what-if。</p></div>
 
-<h3>5.3 数据结构</h3>
+<h3 id="s5-3">5.3 数据结构</h3>
 <pre><code>BackwardIR:                            # = f(CoreIR, RecomputeSpec)
   nodes: [Node]                        # 与 CoreIR 同构：phase ∈ {forward,backward,recompute}
   edges: [(NodeId, NodeId)]
@@ -920,38 +928,36 @@ Storage:
 
 Node:                                  # 三类节点唯一的区别是 phase 与来源
   id:          NodeId
-  semantic_id: SemanticId              # 重算节点与其前向节点**同一个** SemanticId
+  semantic_id: SemanticId              # 重算节点与其前向节点「同一个」SemanticId
   phase:       forward | backward | recompute
   origin:      NodeId?                 # 重算/反向节点回指其前向节点
   inputs/outputs/attrs                 # 同 CoreIR</code></pre>
 
-<h3>5.4 数据流与逻辑流程</h3>
+<h3 id="s5-4">5.4 数据流与逻辑流程</h3>
 <ol class="flow">
 <li>按 CoreIR 拓扑逆序，为每个可微算子生成反向节点；不可微算子（比较、常量、detach）不生成。</li>
 <li>反向节点的输入按 <code>autograd</code> 面解析：需要保存的前向值在图上连出<b>跨相边</b>——
     这条边同时就是它的生命周期依据。</li>
-<li>一个前向值收到多个下游梯度贡献时，插入 <b>add 节点</b>；上游只绑定累加结果这一个值。</li>
-<li>按 <code>RecomputeSpec</code> 选中的区域，把该区域的前向节点<b>复制</b>进反向图
-    （同 <code>SemanticId</code>、新 <code>NodeId</code>、<code>phase=recompute</code>、
-    <code>origin</code> 回指），插在该区域反向节点之前。</li>
+<li>一个前向值收到多个下游梯度贡献时，插入 <b>add 节点</b>；上游只绑定唯一的累加结果。</li>
+<li>按 <code>RecomputeSpec</code> 选中的区域，把该区域的前向节点<b>复制</b>进反向图（同 <code>SemanticId</code>、新 <code>NodeId</code>、<code>phase=recompute</code>、<code>origin</code> 回指），插在该区域反向节点之前。</li>
 <li>校验：每个梯度边恰一个 producer；重算节点的输入在其插入点可达；释放点在偏序上晚于所有 reader。</li>
 </ol>
 
 <h2 id="c6"><span class="cn">Chapter 6</span>身份体系</h2>
 
-<h3>6.1 是什么与为什么</h3>
-<p>四个独立 ID。存在的理由是一句反命题：<b>用名字推断物理复用一定同时犯两个方向的错。</b></p>
+<h3 id="s6-1">6.1 是什么与为什么</h3>
+<p>系统需要四类独立 ID，原因是：<b>使用名称推断物理复用，必然会在两个方向上同时出错。</b></p>
 
 <figure id="fig-05-identities">
 <div class="fw">
-<svg class="dg" viewBox="0 0 1160 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="四层身份：为什么名称去重必须废掉">
+<svg class="dg" viewBox="0 0 1160 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="四层身份：为什么必须禁止按名称去重">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
 <rect class="dg-box b-ir" x="70" y="70" width="300" height="60" rx="8"/>
 <text class="dg-blabel dg-mono t-ir" x="220.0" y="97.5" font-size="15">TensorId</text>
 <text class="dg-bsub dg-mono t-ir" x="220.0" y="112.5" font-size="12">逻辑值身份（一次赋值 = 一个 ID）</text>
-<text class="dg-note t-ir" x="400" y="96" text-anchor="start" font-size="14">同名重绑 ⇒ 新 ID。名称不能推断物理复用</text>
+<text class="dg-note t-ir" x="400" y="96" text-anchor="start" font-size="14">同名重新赋值 ⇒ 新 ID。名称不能推断物理复用</text>
 <polyline class="dg-arrow a-note" points="220,130 220,178" marker-end="url(#ah)"/>
 <rect class="dg-box b-ir" x="70" y="190" width="300" height="60" rx="8"/>
 <text class="dg-blabel dg-mono t-ir" x="220.0" y="217.5" font-size="15">StorageId</text>
@@ -972,10 +978,10 @@ Node:                                  # 三类节点唯一的区别是 phase �
 <text class="dg-note dg-mono t-note" x="90" y="550" text-anchor="start" font-size="13">x = f(a)            → TensorId t1, StorageId s1</text>
 <text class="dg-note dg-mono t-note" x="90" y="567" text-anchor="start" font-size="13">y = x.view(...)     → TensorId t2, StorageId s1（alias，零 Allocate）</text>
 <text class="dg-note dg-mono t-note" x="90" y="584" text-anchor="start" font-size="13">x = g(y)            → TensorId t3, StorageId s2（同名，但是新逻辑值）</text>
-<text class="dg-note t-note" x="70" y="634" text-anchor="start" font-size="14">今天按 tensor name 首见定型：t1/t3 会被当成同一个（少算），t1/t2 会被当成两次分配（多算）。四层身份把这两类错误一起消掉。</text>
+<text class="dg-note t-note" x="70" y="634" text-anchor="start" font-size="14">若按 tensor name 采用首次出现时的定义，t1/t3 会被视为同一个值（少算），t1/t2 会被视为两次分配（多算）。四层身份可以同时消除这两类错误。</text>
 </svg>
 </div>
-<figcaption><span><b>图 5</b>　四层身份：为什么名称去重必须废掉</span><span class="src">diagrams/05-identities.excalidraw</span></figcaption>
+<figcaption><span><b>图 5</b>　四层身份：为什么必须禁止按名称去重</span><span class="src">diagrams/05-identities.excalidraw</span></figcaption>
 </figure>
 
 <div class="tw"><table>
@@ -983,20 +989,19 @@ Node:                                  # 三类节点唯一的区别是 phase �
 <tr><td class="nw"><code>TensorId</code></td><td>逻辑值身份（一次赋值 = 一个）</td><td>这是同一个值，还是同名的新值？</td></tr>
 <tr><td class="nw"><code>StorageId</code></td><td>逻辑存储 / alias 等价类</td><td>这两个值共享同一块存储吗？</td></tr>
 <tr><td class="nw"><code>StoragePlacementId</code></td><td>rank / stage 上的放置模板</td><td>它在哪张卡上、切成多大？</td></tr>
-<tr><td class="nw"><code>StorageInstanceId</code></td><td>某次执行 lifetime 的物理分配</td><td>这次分配占多少字节、什么时候还？</td></tr>
+<tr><td class="nw"><code>StorageInstanceId</code></td><td>某次执行 lifetime 的物理分配</td><td>这次分配占多少字节、何时释放？</td></tr>
 </table></div>
 
-<div class="cal bad"><span class="lbl">按名字去重会同时错两个方向</span>
+<div class="cal bad"><span class="lbl">按名称去重会在两个方向上同时出错</span>
 <pre><code>x = f(a)          # 逻辑值 1，存储 1
 y = x.view(...)    # 逻辑值 2，存储 1   ← 别名，零分配
 x = g(y)          # 逻辑值 3，存储 2   ← 同名，但是新值</code></pre>
-<p>按名字首见定型：值 1 与值 3 被当成同一个（<b>少算</b>），值 1 与值 2 被当成两次分配（<b>多算</b>）。
-四层身份把这两类错误一起消掉，而且让「零字节别名」<b>可表达</b>——这是桶式记账做不到的。</p></div>
+<p>如果按名称采用首次出现时的定义，值 1 与值 3 会被视为同一个值（<b>少算</b>），值 1 与值 2 会被视为两次分配（<b>多算</b>）。四层身份能够同时消除这两类错误，并使「零字节别名」<b>可表达</b>——这是基于分桶的记账方式无法做到的。</p></div>
 
 <h2 id="c7"><span class="cn">Chapter 7</span>S4 布局层</h2>
 
-<h3>7.1 是什么</h3>
-<p>吃并行配置，为每个值算出：每根轴被谁切了、本地形状是多少、哪里需要插集合通信。</p>
+<h3 id="s7-1">7.1 是什么</h3>
+<p>布局层接收并行配置，并为每个值计算：各维度由哪个 mesh 轴切分、本地形状是多少，以及需要在哪些位置插入集合通信。</p>
 
 <figure id="fig-06-placement-execution">
 <div class="fw">
@@ -1005,7 +1010,7 @@ x = g(y)          # 逻辑值 3，存储 2   ← 同名，但是新值</code></p
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
 <rect class="dg-frame" x="60" y="60" width="1030" height="228" rx="10"/>
-<text class="dg-ftitle t-plan" x="72" y="52">S4 布局：沿数据流传播 per-value 分片状态</text>
+<text class="dg-ftitle t-plan" x="72" y="52">S4 布局：沿数据流传播逐值分片状态</text>
 <rect class="dg-box b-plan" x="90" y="120" width="150" height="44" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="165.0" y="146.5" font-size="15">段入口 x</text>
 <rect class="dg-box b-plan" x="300" y="120" width="150" height="44" rx="8"/>
@@ -1027,13 +1032,13 @@ x = g(y)          # 逻辑值 3，存储 2   ← 同名，但是新值</code></p
 <text class="dg-note dg-mono t-note" x="945" y="190" text-anchor="middle" font-size="12">{}</text>
 <rect class="dg-box b-block" x="300" y="232" width="150" height="44" rx="8"/>
 <text class="dg-blabel t-block" x="375.0" y="251.5" font-size="15">注入 AG</text>
-<text class="dg-bsub dg-mono t-block" x="375.0" y="266.5" font-size="12">入携 S</text>
+<text class="dg-bsub dg-mono t-block" x="375.0" y="266.5" font-size="12">输入携带 S</text>
 <rect class="dg-box b-block" x="660" y="232" width="150" height="44" rx="8"/>
 <text class="dg-blabel t-block" x="735.0" y="251.5" font-size="15">注入 RS / AR</text>
 <text class="dg-bsub dg-mono t-block" x="735.0" y="266.5" font-size="12">sp / 非 sp</text>
 <polyline class="dg-arrow a-block" points="375,164 375,228" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-block" points="735,164 735,228" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="60" y="310" text-anchor="start" font-size="13">规则来自模块语义（在 Registry 的 placement 面），不是猜。carrier 歧义、Column∘Column、Row 前无 Column ⇒ 阻断。</text>
+<text class="dg-note t-note" x="60" y="310" text-anchor="start" font-size="13">规则来自模块语义（Registry 的 placement 面），而非推测。carrier 歧义、Column∘Column、Row 前缺少 Column ⇒ 阻断。</text>
 <rect class="dg-frame" x="60" y="360" width="1030" height="268" rx="10"/>
 <text class="dg-ftitle t-plan" x="72" y="352">S5 执行：生命周期 → 显式事件</text>
 <polyline class="dg-arrow a-note" points="110,540 1050,540" marker-end="url(#ah)"/>
@@ -1055,30 +1060,27 @@ x = g(y)          # 逻辑值 3，存储 2   ← 同名，但是新值</code></p
 <rect class="dg-box b-plan" x="850" y="460" width="130" height="40" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="915.0" y="484.5" font-size="15">Free</text>
 <polyline class="dg-arrow a-plan" points="915,500 915,534" marker-end="url(#ah)"/>
-<text class="dg-note t-plan" x="130" y="426" text-anchor="start" font-size="13">每个 StorageInstanceId 的事件序；非 persistent 恰好一次 Allocate / Free，结束前 FinalAudit。</text>
+<text class="dg-note t-plan" x="130" y="426" text-anchor="start" font-size="13">每个 StorageInstanceId 均有明确事件序；非 persistent 实例恰好执行一次 Allocate / Free，并在结束前执行 FinalAudit。</text>
 <rect class="dg-box b-backend" x="130" y="570" width="400" height="40" rx="8"/>
 <text class="dg-blabel dg-mono t-backend" x="330.0" y="587.5" font-size="15">MemoryEventView</text>
 <text class="dg-bsub dg-mono t-backend" x="330.0" y="602.5" font-size="12">自包含 dependency / stream 偏序</text>
 <rect class="dg-box b-backend" x="620" y="570" width="400" height="40" rx="8"/>
 <text class="dg-blabel dg-mono t-backend" x="820.0" y="587.5" font-size="15">ResourceRequest</text>
 <text class="dg-bsub dg-mono t-backend" x="820.0" y="602.5" font-size="12">自包含 PricingDescriptor</text>
-<text class="dg-note t-note" x="60" y="678" text-anchor="start" font-size="14">为什么两个视图都必须自包含：后端一旦回读上游，profile / cache key 就随上游结构变化而失效，实测复用会静默失灵。</text>
+<text class="dg-note t-note" x="60" y="678" text-anchor="start" font-size="14">两个视图都必须自包含：后端一旦回读上游，profile / cache key 就会随上游结构变化而失效，实测画像复用也会静默失效。</text>
 </svg>
 </div>
 <figcaption><span><b>图 6</b>　布局传播与执行事件</span><span class="src">diagrams/06-placement-execution.excalidraw</span></figcaption>
 </figure>
 
-<h3>7.2 为什么它必须是独立一层，且必须有声明通道</h3>
-<p>独立的理由是变化率：并行策略是 what-if 的主要变量，把它隔离出来，
-改 <code>tp</code> 只需重算这一层及其下游。</p>
+<h3 id="s7-2">7.2 为什么它必须独立成层，并提供声明通道</h3>
+<p>独立成层的依据是变化频率：并行策略是 what-if 的主要变量。将其隔离后，修改 <code>tp</code> 只需重新计算这一层及其下游。</p>
 <div class="cal honest"><span class="lbl">可推导性的边界（本方案相对 v1 的修正）</span>
-<p>「placement 可由模块语义推导」只在<b>框架的切分本身是规则化、且我们复刻了那套规则</b>时成立。
-半自动/自动并行的策略传播是一个<b>求解器</b>，不是一组规则。</p>
-<p>把策略搜索器列为非目标是对的；但排除求解器之后，<b>必须允许 placement 作为声明输入</b>
-——从源码的布局标注读出（<code>source_derived</code>），或由用户声明（<code>assumed</code>）。
-只有「推导」一种模式的设计，对那类框架在原理上无解。</p></div>
+<p>「placement 可由模块语义推导」只在<b>框架的切分本身是规则化、且我们复刻了那套规则</b>时成立。半自动/自动并行的策略传播是一个<b>求解器</b>，不是一组规则。</p>
+<p>将策略搜索器列为非目标是合理的；但排除求解器之后，<b>必须允许 placement 作为声明输入</b>
+——可以从源码布局标注中读取（<code>source_derived</code>），也可以由用户声明（<code>assumed</code>）。如果设计只支持「推导」这一种模式，就无法覆盖此类框架。</p></div>
 
-<h3>7.3 数据结构</h3>
+<h3 id="s7-3">7.3 数据结构</h3>
 <pre><code>PlacementPlan:                         # = f(BackwardIR, ParallelConfig)
   values:      [ValuePlacement]
   storages:    [StoragePlacement]
@@ -1093,33 +1095,29 @@ ValuePlacement:
   source:      derived | declared      # ← 7.2 的声明通道
   provenance:  source_derived | assumed</code></pre>
 
-<h3>7.4 数据流与逻辑流程</h3>
+<h3 id="s7-4">7.4 数据流与逻辑流程</h3>
 <ol class="flow">
-<li>段入口播种：外部输入若含序列轴且启用序列并行，标记为序列驻留。</li>
-<li>沿数据流传播每个值的分片状态；规则来自 S1 的 <code>placement</code> 面（列并行产出特征载体、
-    行并行消耗载体、序列并行权重不切）。</li>
-<li>汇合点取并集；序列驻留状态分歧 → 在驻留侧注入布局重分布通信。</li>
+<li>在段入口初始化分片状态：外部输入若包含序列轴且启用序列并行，则标记为序列驻留。</li>
+<li>沿数据流传播每个值的分片状态；规则来自 S1 的 <code>placement</code> 面（列并行产出特征载体、行并行消耗载体、序列并行权重不切）。</li>
+<li>在汇合点合并状态；如果序列驻留状态存在分歧，则在驻留侧注入布局重分布通信。</li>
 <li>模块语义要求的通信按规则注入（列并行入口聚合、行并行出口归约/散播）。</li>
 <li>无法推导的值：走声明通道；既无推导也无声明 → 阻断，逐条记录。</li>
-<li>校验：载体歧义、列∘列、行前无列、不整除 → 全部阻断（不许悄悄取整）。</li>
+<li>校验：载体歧义、列∘列、行并行前缺少列并行、不整除 → 全部阻断（禁止隐式取整）。</li>
 </ol>
 <div class="cal inv"><span class="lbl">不变量</span>
-<p>轴代入规则<b>只有一份实现</b>。两个后端各自实现一遍的必然结果是分道——而分道<b>不会</b>
-被任何现有测试发现，因为没有断言把两者放在一起看。</p></div>
+<p>轴代入规则<b>只能有一份实现</b>。如果两个后端分别实现，结果必然产生分歧；而现有测试<b>无法</b>发现这种分歧，因为没有断言对两者进行统一比较。</p></div>
 
 <h2 id="c8"><span class="cn">Chapter 8</span>S5 执行层</h2>
 
-<h3>8.1 是什么</h3>
-<p>把「逻辑上活多久」变成「事件序上什么时候申请、什么时候释放」，并为每个算子实例生成
-自包含的定价请求。</p>
+<h3 id="s8-1">8.1 是什么</h3>
+<p>执行层将「逻辑生命周期」转换为明确的申请与释放事件顺序，并为每个算子实例生成自包含的定价请求。</p>
 
-<h3>8.2 为什么两个视图都必须自包含</h3>
-<div class="cal why"><span class="lbl">为什么后端不许回读上游</span>
-<p>后端一旦回读 IR/计划去补信息，它的 profile / cache key 就随上游<b>结构</b>变化而失效——
-换一次上游重构，实测复用会静默失灵，而失灵的表现是「命中率下降」，不是报错。
-代价是执行计划变大（信息被复制进去），这是有意的空间换解耦。</p></div>
+<h3 id="s8-2">8.2 为什么两个视图都必须自包含</h3>
+<div class="cal why"><span class="lbl">为什么后端不得回读上游</span>
+<p>后端一旦回读 IR 或计划来补充信息，其 profile / cache key 就会随上游<b>结构</b>变化而失效——
+上游每次重构都可能使实测画像复用静默失效，而外在表现只是「命中率下降」，并不会报错。代价是执行计划体积增大（信息需要复制到计划中），这是有意以空间开销换取解耦。</p></div>
 
-<h3>8.3 数据结构</h3>
+<h3 id="s8-3">8.3 数据结构</h3>
 <pre><code>ExecutionPlan:                         # = f(BackwardIR, PlacementPlan, 调度配置, 标定)
   targets:   [ExecutionTarget]         # rank / device / stage / 资源域
   events:    [ExecEvent]               # kind / target / stream / deps
@@ -1131,49 +1129,44 @@ MemoryEventView:                       # 自包含：不依赖时间后端的内
   events:      [Allocate|Bind|Use|Pin|Retire|Free]
   descriptors: [AllocationDescriptor]  # 每个 Allocate 可唯一解析出字节/域/池/对齐
   order:       dependency + stream 偏序
-  policy:      MemorySchedulePolicy?   # 可选；缺省用偏序的确定性拓扑
+  policy:      MemorySchedulePolicy?   # 可选；未指定时采用偏序的确定性拓扑序
 
 ResourceRequest:                       # 自包含：时间后端不回读 CoreIR/PlacementPlan
   target: ExecutionTargetId
   work:   { flops, special_ops, reduction_ops }   # 分 model / executed 两套
   traffic:{ memory, transport }
-  pricing:PricingDescriptor            # 含 compute/accum dtype、cost family、签名基
+  pricing:PricingDescriptor            # 含 compute/accum dtype、cost family、基础签名
   provenance: 逐量携带（见第 2 章）</code></pre>
 
-<h3>8.4 数据流与逻辑流程</h3>
+<h3 id="s8-4">8.4 数据流与逻辑流程</h3>
 <ol class="flow">
 <li>按调度（1F1B / 交错虚拟流水）展开 <code>(stage × microbatch × 节点)</code>；重算节点已在 S3 入图，此处无特例。</li>
-<li>为每个值实例分配 <code>StorageInstanceId</code>：alias 归并到 root（零分配），
-    inplace 在变更点终结旧值，重算再物化用新 epoch。</li>
-<li>由 S3 的释放点偏序推出 <code>Retire</code>/<code>Free</code>；被保存的值以 <code>Pin</code> 延寿，
-    <b>不改变其字节</b>（需要独立字节的一律建成内部保存值）。</li>
-<li>为每个 <code>BufferContract</code> 按放置结果解析本地字节，落成半开区间的申请/释放对。</li>
-<li>生成资源请求：逐量带 provenance，<code>measured</code> 项在此绑定标定 key。</li>
-<li>联合预检：所选后端需要的能力是否齐备、事件是否不重不漏、偏序是否无环。<b>不过则不产出任何部分计划。</b></li>
+<li>为每个值实例分配 <code>StorageInstanceId</code>：alias 映射到根存储（零分配），
+    inplace 在变更点结束旧值的生命周期，重算再物化使用新的 epoch。</li>
+<li>根据 S3 的释放点偏序生成 <code>Retire</code>/<code>Free</code>；被保存的值通过 <code>Pin</code> 延长生命周期，<b>不改变其字节</b>（需要独立字节的一律建成内部保存值）。</li>
+<li>为每个 <code>BufferContract</code> 按放置结果解析本地字节，并物化为半开区间的申请/释放对。</li>
+<li>生成资源请求：每个量均携带 provenance，<code>measured</code> 项在此绑定标定 key。</li>
+<li>联合预检：所选后端需要的能力是否完整、事件是否不重不漏、偏序是否无环。<b>未通过时不产出任何部分计划。</b></li>
 </ol>
 
 <h2 id="c9"><span class="cn">Chapter 9</span>S6 后端与 S7 报告</h2>
 
-<h3>9.1 显存后端</h3>
-<p>只消费 <code>MemoryEventView</code>。核心状态是「当前在世的物理实例集合」，
-按事件推进、按池与对齐规则模拟申请释放，给出已分配/已保留峰值与 OOM 判定及首次失败证据。
-结束前做终审：没有残留未释放的非持久实例、没有未 lower 的高层事件。</p>
+<h3 id="s9-1">9.1 显存后端</h3>
+<p>显存后端只消费 <code>MemoryEventView</code>。核心状态是「当前存活的物理实例集合」。它按事件推进，并依据内存池与对齐规则模拟申请和释放，给出已分配/已保留峰值、OOM 判定及首次失败证据。结束前执行终审：不得残留未释放的非持久实例，也不得存在尚未完成 lowering 的高层事件。</p>
 
-<h3>9.2 时间后端</h3>
-<p>只消费 <code>ResourceRequest</code> + 硬件/profile 快照。两级离散事件仿真保持不变
-（段内多流 → 全局调度）。定价按退化链：命中兼容实测 → 形状/类型插值 → 已标定族模型 →
-理论 roofline；每档记 provenance 与 confidence，参数不全则阻断，<b>绝不静默变成零成本或纯带宽</b>。</p>
+<h3 id="s9-2">9.2 时间后端</h3>
+<p>时间后端只消费 <code>ResourceRequest</code> 与硬件/profile 快照。两级离散事件仿真保持不变（段内多流 → 全局调度）。定价采用分级回退链：命中兼容实测 → 形状/类型插值 → 已标定族模型 →
+理论 roofline；每一级都记录 provenance 与 confidence，参数不完整时阻断，<b>绝不静默降级为零成本或纯带宽模型</b>。</p>
 
-<h3>9.3 报告</h3>
+<h3 id="s9-3">9.3 报告</h3>
 <div class="cal inv"><span class="lbl">不变量</span>
-<p>两个后端<b>不共同构造</b>报告，由汇总器聚合。报告必须分别统计三类 provenance 的覆盖率，
-并把 <code>assumed</code> 项的依据与偏差方向逐条列出。<b>不允许把未覆盖项藏起来。</b></p></div>
+<p>两个后端<b>不共同构造</b>报告，由汇总器聚合。报告必须分别统计三类 provenance 的覆盖率，并把 <code>assumed</code> 项的依据与偏差方向逐条列出。<b>不允许把未覆盖项藏起来。</b></p></div>
 
-<h2 id="c10"><span class="cn">Chapter 10</span>阻断与用户闭环</h2>
+<h2 id="c10" data-part="第三部分 · 闭环"><span class="cn">Chapter 10</span>阻断与用户闭环</h2>
 
 <figure id="fig-07-unknown-op-loop">
 <div class="fw">
-<svg class="dg" viewBox="0 0 1100 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="未知 op 的阻断与用户闭环">
+<svg class="dg" viewBox="0 0 1100 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="未知 Op 的阻断与用户闭环">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
@@ -1184,13 +1177,16 @@ ResourceRequest:                       # 自包含：时间后端不回读 CoreI
 <text class="dg-blabel dg-mono t-block" x="253.0" y="150.5" font-size="15">UNREGISTERED</text>
 <polyline class="dg-arrow a-note" points="318,146 336,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-sem" x="336" y="120" width="130" height="52" rx="8"/>
-<text class="dg-blabel dg-mono t-sem" x="401.0" y="150.5" font-size="15">USER_DESCRIBED</text>
+<text class="dg-blabel dg-mono t-sem" x="401.0" y="143.0" font-size="15">USER_</text>
+<text class="dg-blabel dg-mono t-sem" x="401.0" y="158.0" font-size="15">DESCRIBED</text>
 <polyline class="dg-arrow a-note" points="466,146 484,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-sem" x="484" y="120" width="130" height="52" rx="8"/>
-<text class="dg-blabel dg-mono t-sem" x="549.0" y="150.5" font-size="15">SCHEMA_VALIDATED</text>
+<text class="dg-blabel dg-mono t-sem" x="549.0" y="143.0" font-size="15">SCHEMA_</text>
+<text class="dg-blabel dg-mono t-sem" x="549.0" y="158.0" font-size="15">VALIDATED</text>
 <polyline class="dg-arrow a-note" points="614,146 632,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-sem" x="632" y="120" width="130" height="52" rx="8"/>
-<text class="dg-blabel dg-mono t-sem" x="697.0" y="150.5" font-size="15">SEMANTIC_VALIDATED</text>
+<text class="dg-blabel dg-mono t-sem" x="697.0" y="143.0" font-size="15">SEMANTIC_</text>
+<text class="dg-blabel dg-mono t-sem" x="697.0" y="158.0" font-size="15">VALIDATED</text>
 <polyline class="dg-arrow a-note" points="762,146 780,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-ir" x="780" y="120" width="130" height="52" rx="8"/>
 <text class="dg-blabel dg-mono t-ir" x="845.0" y="150.5" font-size="15">COMPILED</text>
@@ -1200,110 +1196,103 @@ ResourceRequest:                       # 自包含：时间后端不回读 CoreI
 <text class="dg-note t-note" x="40" y="90" text-anchor="start" font-size="14">任一步失败都不进入下一状态；不产生部分计划。</text>
 <rect class="dg-box b-note" x="188" y="230" width="400" height="60" rx="8"/>
 <text class="dg-blabel t-note" x="388.0" y="250.5" font-size="15">scaffold 生成骨架</text>
-<text class="dg-bsub dg-mono t-note" x="388.0" y="265.5" font-size="12">只填可从调用证明的 selector / inputs / attrs，其余 REQUIRED</text>
-<text class="dg-bsub dg-mono t-note" x="388.0" y="279.5" font-size="12">占位</text>
+<text class="dg-bsub dg-mono t-note" x="388.0" y="265.5" font-size="12">只填写可从调用证明的 selector / inputs / attrs，其余字段保留</text>
+<text class="dg-bsub dg-mono t-note" x="388.0" y="279.5" font-size="12">REQUIRED 占位</text>
 <polyline class="dg-arrow a-block" points="253,172 253,226" marker-end="url(#ah)"/>
 <rect class="dg-box b-note" x="640" y="230" width="420" height="60" rx="8"/>
 <text class="dg-blabel dg-mono t-note" x="850.0" y="257.5" font-size="15">cost-eval semantics validate / explain</text>
-<text class="dg-bsub dg-mono t-note" x="850.0" y="272.5" font-size="12">用户补完 → digest 更新 → 缓存失效 → 重新编译</text>
+<text class="dg-bsub dg-mono t-note" x="850.0" y="272.5" font-size="12">用户补充完整 → digest 更新 → 缓存失效 → 重新编译</text>
 <polyline class="dg-arrow a-note" points="588,260 636,260" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-sem dg-dash" points="850,230 850,200 484,200 484,176" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="40" y="364" text-anchor="start" font-size="14">阻断只针对「未注册 op」。已注册但含 measured / assumed 量的 ⇒ 放行，并在报告里逐项标注 —— 这两件事必须分开，</text>
-<text class="dg-note t-note" x="40" y="394" text-anchor="start" font-size="14">否则 assumed 通道无处落脚。</text>
-<text class="dg-note t-block" x="40" y="438" text-anchor="start" font-size="14">已知失效模式：用户为跑通而在骨架里填一个看似合理的数，该数与真值不可区分。故 assumed 必须带 basis 且独立统计。</text>
+<text class="dg-note t-note" x="40" y="364" text-anchor="start" font-size="14">阻断只针对「未注册 Op」。已注册但含 measured / assumed 量的 Op 可以继续执行，并在报告中逐项标注。两类情况必须区分，</text>
+<text class="dg-note t-note" x="40" y="394" text-anchor="start" font-size="14">否则 assumed 将缺少合法的表达通道。</text>
+<text class="dg-note t-block" x="40" y="438" text-anchor="start" font-size="14">已知失效模式：用户为使仿真继续执行而在骨架中填写一个表面合理的数值，该数与真值不可区分。故 assumed 必须带 basis 且独立统计。</text>
 </svg>
 </div>
-<figcaption><span><b>图 7</b>　未知 op 的阻断与用户闭环</span><span class="src">diagrams/07-unknown-op-loop.excalidraw</span></figcaption>
+<figcaption><span><b>图 7</b>　未知 Op 的阻断与用户闭环</span><span class="src">diagrams/07-unknown-op-loop.excalidraw</span></figcaption>
 </figure>
 
-<h3>10.1 阻断的范围（相对 v1 收紧了定义）</h3>
+<h3 id="s10-1">10.1 阻断范围（相较 v1 进一步明确）</h3>
 <div class="tw"><table>
 <tr><th>情形</th><th>处理</th><th>为什么</th></tr>
-<tr><td class="nw"><b>未注册 op</b></td><td>阻断 + 生成骨架</td>
-  <td>语义未知时任何数都是编的；且这种情况罕见（新 kernel 才会遇到）</td></tr>
-<tr><td class="nw"><b>已注册，含 measured 量</b></td><td>放行 + 报告标注</td>
-  <td>标定值是<b>已声明的实测事实</b>，不是猜测</td></tr>
-<tr><td class="nw"><b>已注册，含 assumed 量</b></td><td>放行 + 报告标注依据与方向</td>
-  <td>否则第 2 章的第三态无处落脚，稀疏模型永远跑不起来</td></tr>
-<tr><td class="nw">形状/类型解不出</td><td>阻断</td>
+<tr><td class="nw"><b>未注册 Op</b></td><td>阻断 + 生成骨架</td>
+  <td>语义未知时，任何估算都缺乏可验证依据；这种情况通常只在新增 kernel 时出现</td></tr>
+<tr><td class="nw"><b>已注册，含 measured 量</b></td><td>允许执行 + 报告标注</td>
+  <td>标定值是<b>已声明的实测事实</b>，而非猜测</td></tr>
+<tr><td class="nw"><b>已注册，含 assumed 量</b></td><td>允许执行 + 报告标注依据与方向</td>
+  <td>否则第 2 章定义的第三种状态无法得到表达，稀疏模型也无法执行</td></tr>
+<tr><td class="nw">形状/类型无法求解</td><td>阻断</td>
   <td><code>source_derived</code> 缺失即不可判定</td></tr>
 </table></div>
-<div class="cal why"><span class="lbl">为什么这两件事必须分开</span>
-<p>把它们混在同一条不变量里（「不完整就阻断」）会导致：要么 <code>assumed</code> 无处安放，
-要么为了让工具能跑而把 <code>assumed</code> 伪装成 <code>source_derived</code>。后者是最坏的结果。</p></div>
+<div class="cal why"><span class="lbl">为什么必须区分未注册与已注册的不确定量</span>
+<p>如果将两者统一归入「不完整就阻断」，会产生两种结果：要么 <code>assumed</code> 无法表达，要么为了让仿真继续执行而将 <code>assumed</code> 伪装成 <code>source_derived</code>。后一种结果不可接受。</p></div>
 
-<h3>10.2 闭环流程</h3>
+<h3 id="s10-2">10.2 闭环流程</h3>
 <ol class="flow">
 <li>发现未绑定调用 → 阻断，并输出：符号、各输入的形状与类型、赋值目标、两个注册域的查找结果。</li>
-<li>生成骨架：<b>只填能从调用证明的</b>（selector、输入、attrs），其余全部 <code>REQUIRED</code> 占位。</li>
-<li>用户补完 → 校验 → 解释（打印该 op 展开后的完整七面语义，供人复核）。</li>
-<li>快照 digest 更新 → 上游产物缓存失效 → 重新编译 → 联合预检 → 开始仿真。</li>
+<li>生成骨架：<b>只填写可从调用证明的信息</b>（selector、输入、attrs），其余字段全部保留 <code>REQUIRED</code> 占位。</li>
+<li>用户补充完整 → 校验 → 解释（打印该 Op 展开后七个方面的完整语义，供人工复核）。</li>
+<li>快照 digest 更新 → 相关缓存失效 → 重新编译 → 联合预检 → 开始仿真。</li>
 </ol>
 <p>骨架里<b>不含</b>源码文件与行号——那些只出现在诊断输出，避免用户配置与源码位置耦合。</p>
 
 <h2 id="c11"><span class="cn">Chapter 11</span>验收与迁移</h2>
 
-<h3>11.1 对照物只能是真机</h3>
-<div class="cal bad"><span class="lbl">一条方法论错误必须避免</span>
-<p>迁移期做新旧双跑是必要的，但<b>不能用旧路径判对错</b>。以旧路径为准绳，等于把旧路径的已知偏差
-编码成新系统的验收标准。</p>
-<p><b>一个仿真器的正确性定义只能来自被仿真的对象，不能来自它的前一版。</b>
-双跑的正确用途是<b>变更归因</b>（哪些数变了、为什么），判对错必须对真机实测。</p></div>
+<h3 id="s11-1">11.1 验收基准必须来自真机</h3>
+<div class="cal bad"><span class="lbl">必须避免的方法论错误</span>
+<p>迁移期间进行新旧双跑是必要的，但<b>不能用旧路径判断正确性</b>。将旧路径作为验收基准，等于把旧路径的已知偏差编码成新系统的验收标准。</p>
+<p><b>一个仿真器的正确性定义只能来自被仿真的对象，不能来自它的前一版。</b>双跑的正确用途是<b>变更归因</b>（哪些数值发生变化、为什么变化），正确性判定必须以真机实测为准。</p></div>
 
 <div class="tw"><table>
 <tr><th class="nw">门</th><th>断言</th><th class="nw">性质</th></tr>
-<tr><td class="nw">真机对照</td><td>逐 stage 峰值、逐层驻留、step time 与实测比值；实测数据带指纹校验，不得编辑</td><td><b>唯一对错判据</b></td></tr>
-<tr><td class="nw">结构不变量</td><td>×1 于层数、×1 于微批数这类结构性关系必须由模型<b>导出</b>而非被公式告知</td><td>正确性</td></tr>
-<tr><td class="nw">轴代入一致</td><td>两个后端路径对同一符号形状 × 同一并行度，本地元素数必须逐字节相等</td><td>防分道</td></tr>
+<tr><td class="nw">真机对照</td><td>逐 stage 峰值、逐层驻留、step time 与实测比值；实测数据带指纹校验，不得编辑</td><td><b>唯一正确性判据</b></td></tr>
+<tr><td class="nw">结构不变量</td><td>随层数、微批数按既定倍数变化的结构关系，必须由模型<b>导出</b>，而不是直接写入公式</td><td>正确性</td></tr>
+<tr><td class="nw">轴代入一致</td><td>两个后端对同一符号形状和同一并行度求得的本地元素数与字节数必须一致</td><td>防分歧</td></tr>
 <tr><td class="nw">provenance 闭合</td><td>报告里每个字节可归到三类之一；<code>assumed</code> 项均有依据</td><td>诚实性</td></tr>
 <tr><td class="nw">阻断有效性</td><td>参数化删除任一必填字段 → 必须阻断；显式空值 ≠ 缺失</td><td>安全性</td></tr>
 <tr><td class="nw">后端隔离</td><td>两后端双向 import 禁令；后端不读源码/配置/注册表</td><td>解耦</td></tr>
-<tr><td class="nw">新旧双跑</td><td>逐项差异归因，已知设计修正列入 accepted delta</td><td><b>归因，非判据</b></td></tr>
+<tr><td class="nw">新旧双跑</td><td>逐项分析差异原因，已知设计修正列入可接受差异（accepted delta）</td><td><b>归因，非判据</b></td></tr>
 </table></div>
 
-<h3>11.2 迁移策略</h3>
-<p>不做全量重写（数值变化无法归因），不做长期双轨（两个真相源必然漂移）。
-采用<b>适配层 + 按算子族收编 + 双跑归因</b>，每收编一族就删掉对应旧分支。</p>
+<h3 id="s11-2">11.2 迁移策略</h3>
+<p>不采用全量重写（数值变化无法归因），也不保留长期双轨（两套事实源必然产生漂移）。方案采用<b>适配层 + 按算子族收编 + 双跑归因</b>；每完成一个算子族的迁移，即删除对应的旧分支。</p>
 <div class="tw"><table>
 <tr><th class="nw">阶段</th><th>内容</th><th>该阶段的门</th></tr>
-<tr><td class="nw">1</td><td>语义基础设施：类型系统、组合子库、DSL 编译器、三注册域</td><td>加载期阻断用例全绿</td></tr>
-<tr><td class="nw">2</td><td>适配层：把现有语义表接进新描述，可证明部分数值不变；<b>由缺字段/默认零产生的值一律标 legacy 假设</b>，未经显式收编不得通过完整性门</td><td>真机对照不劣化</td></tr>
+<tr><td class="nw">1</td><td>语义基础设施：类型系统、组合子库、DSL 编译器、三个注册域</td><td>加载期阻断用例全部通过</td></tr>
+<tr><td class="nw">2</td><td>适配层：将现有语义表转换为新的描述格式，并验证可保持不变的数值；<b>由缺失字段或默认零值产生的结果一律标记为 legacy 假设</b>，未经显式收编不得通过完整性门禁</td><td>真机对照结果不劣化</td></tr>
 <tr><td class="nw">3</td><td>按族收编：视图/类型转换/比较 → 逐元素/归一化 → 矩乘 → 注意力 → MoE → 集合通信 → 融合</td><td>每族收编后真机对照 + 双跑归因</td></tr>
 <tr><td class="nw">4</td><td>CoreIR + BackwardIR + 两个计划层</td><td>不变量校验 + 轴代入一致门</td></tr>
-<tr><td class="nw">5</td><td>后端切换：显存改吃事件视图，时间经适配复用现有两级仿真</td><td>真机对照成为权威判据</td></tr>
-<tr><td class="nw">6</td><td>开放用户通道：注册、校验、解释、骨架生成</td><td>闭环用例全绿</td></tr>
-<tr><td class="nw">7</td><td>收口：删除旧分支，只留兼容 API</td><td>全门绿</td></tr>
+<tr><td class="nw">5</td><td>后端切换：显存后端改为使用事件视图，时间后端通过适配层复用现有两级仿真</td><td>真机对照成为权威判据</td></tr>
+<tr><td class="nw">6</td><td>开放用户通道：注册、校验、解释、骨架生成</td><td>闭环用例全部通过</td></tr>
+<tr><td class="nw">7</td><td>收口：删除旧分支，只保留兼容 API</td><td>所有门禁均通过</td></tr>
 </table></div>
 
-<h3>11.3 起点距离必须先量化</h3>
+<h3 id="s11-3">11.3 实施前必须量化起点差距</h3>
 <div class="cal honest"><span class="lbl">诚实边界</span>
-<p>「可执行 IR 中不存在 opaque 节点」是目标态的不变量，不是今天的状态。启动阶段 2 之前
-必须先量化并公布起点距离：当前抽取链上有多少调用还绑不上语义、级联根在哪几处、
-哪些量在原理上读不出（融合 kernel 自身输出的形状在编译产物里，不在源码里）。
-<b>不量化就开工，等于把「什么时候算做完」变成一个没人能回答的问题。</b></p></div>
+<p>「可执行 IR 中不存在 opaque 节点」是目标态的不变量，并非当前状态。启动阶段 2 之前，必须先量化并公布起点差距：当前抽取链上有多少调用仍无法绑定语义、级联失败的根因集中在哪些位置，以及哪些量在原理上无法从源码获得（例如，融合 kernel 自身输出的形状位于编译产物中，而不在源码中）。<b>如果不先量化，何时达到完成标准将无法判断。</b></p></div>
 
 <h2 id="c12"><span class="cn">Chapter 12</span>决策记录与边界</h2>
 
-<h3>12.1 决策记录</h3>
+<h3 id="s12-1">12.1 决策记录</h3>
 <div class="tw"><table>
 <tr><th class="nw">#</th><th>决策</th><th>关键理由</th></tr>
 <tr><td class="nw">D1</td><td>结构从框架源码抽取，是唯一结构源</td><td>手写图的失效是静默的；可证伪性优先</td></tr>
-<tr><td class="nw">D2</td><td>op 语义用纯配置描述，不开放代码插件</td><td>可静态校验、可版本化、用户可扩展</td></tr>
-<tr><td class="nw">D3</td><td>op 类型拆到原子级（一类型 = 一条形状关系）</td><td>消灭代码里的二次分派；避免不同语义共用一条反向规则</td></tr>
-<tr><td class="nw">D4</td><td>三注册域物理隔离；patch 整条替换 + 版本/hash 门禁</td><td>加载顺序决定胜者 = 不可复现</td></tr>
-<tr><td class="nw">D5</td><td>未注册 op 硬阻断 + 生成骨架</td><td>语义未知时任何数都是编的</td></tr>
+<tr><td class="nw">D2</td><td>Op 语义用纯配置描述，不开放代码插件</td><td>可静态校验、可版本化、用户可扩展</td></tr>
+<tr><td class="nw">D3</td><td>Op 类型拆到原子级（一种类型对应一条形状关系）</td><td>消除代码中的二次分派；避免不同语义共用一条反向规则</td></tr>
+<tr><td class="nw">D4</td><td>三个注册域物理隔离；patch 整条替换 + 版本/hash 门禁</td><td>若由加载顺序决定最终生效项，结果将不可复现</td></tr>
+<tr><td class="nw">D5</td><td>未注册 Op 硬阻断 + 生成骨架</td><td>语义未知时，任何数值都缺乏可验证依据</td></tr>
 <tr><td class="nw">D6</td><td><b>provenance 三分（source_derived / measured / assumed）作为全 IR 横切契约</b></td><td>分界线是「源码可判定与否」，横穿内存与时间；稀疏模型必须有第三态</td></tr>
-<tr><td class="nw">D7</td><td><b>BackwardIR 为独立派生层，重算节点入图</b></td><td>三类节点同构；删掉一族契约类与一条 lowering 路径；CoreIR 保持 policy-free</td></tr>
-<tr><td class="nw">D8</td><td>四层身份，禁止按名字推断复用</td><td>名称去重必然同时少算与多算</td></tr>
-<tr><td class="nw">D9</td><td>dtype 分 storage / compute / accum，编译期求值，无退化档</td><td>它是 <code>source_derived</code>；缺依据即阻断，不默认继承首输入</td></tr>
+<tr><td class="nw">D7</td><td><b>BackwardIR 为独立派生层，重算节点入图</b></td><td>三类节点同构；减少一组契约类并取消一条 lowering 路径；CoreIR 保持 policy-free</td></tr>
+<tr><td class="nw">D8</td><td>四层身份，禁止按名字推断复用</td><td>按名称去重会同时造成少算与多算</td></tr>
+<tr><td class="nw">D9</td><td>dtype 分 storage / compute / accum，编译期求值，不设置回退档</td><td>它是 <code>source_derived</code>；缺依据即阻断，不默认继承首输入</td></tr>
 <tr><td class="nw">D10</td><td><b>placement 有推导与声明两种输入模式</b></td><td>非规则化切分的框架在原理上推不出来</td></tr>
-<tr><td class="nw">D11</td><td>轴代入只有一份实现</td><td>两份实现必然分道，且不会被任何现有测试发现</td></tr>
-<tr><td class="nw">D12</td><td>两后端只读、互不 import、自包含视图</td><td>后端回读上游会让 profile 复用静默失灵</td></tr>
+<tr><td class="nw">D11</td><td>轴代入只有一份实现</td><td>两份实现必然产生分歧，且现有测试无法发现</td></tr>
+<tr><td class="nw">D12</td><td>两后端只读、互不 import、自包含视图</td><td>后端回读上游会使 profile 复用机制静默失效</td></tr>
 <tr><td class="nw">D13</td><td><b>验收对照物是真机；新旧双跑只做归因</b></td><td>正确性定义只能来自被仿真对象</td></tr>
 </table></div>
-<p>其中 <b>D6 / D7 / D10 / D13</b> 是本版相对 v1 的实质改动，其余为承接。</p>
+<p>其中 <b>D6 / D7 / D10 / D13</b> 是本版相对 v1 的实质改动，其余决策沿用 v1。</p>
 
-<h3>12.2 非目标</h3>
+<h3 id="s12-2">12.2 非目标</h3>
 <ul>
 <li>不把自动并行策略搜索器纳入核心（但因此必须有 placement 声明通道，见 D10）。</li>
 <li>配置不执行任意代码，不开放语法扩展或解释器插件。</li>
@@ -1311,23 +1300,59 @@ ResourceRequest:                       # 自包含：时间后端不回读 CoreI
 <li>不追求一次性删除全部旧路径。</li>
 </ul>
 
-<h3>12.3 诚实边界</h3>
-<div class="cal honest"><span class="lbl">这套设计做不到的事</span>
+<h3 id="s12-3">12.3 诚实边界</h3>
+<div class="cal honest"><span class="lbl">本设计的能力边界</span>
 <ul>
-<li><b>融合 kernel 自身输出的保存集</b>：末轴在编译产物里、不在源码里。声明通道能承载它，
-    但没人声明时就是 <code>Unknown</code>——<b>照样不给数</b>，不猜。</li>
-<li><b>数据依赖量的精确值</b>：MoE 实际负载只能是 <code>assumed</code>。报告能说清方向与依据，
-    但不能把它变成精确值。</li>
-<li><b>反馈回路长度</b>：干净分层的固有代价是第一个可与现实比对的数字要等整条链。
-    适配层 + 按族收编是缓解，不是消除——所以阶段 2 的门必须是真机而非旧路径。</li>
-<li><b>覆盖面</b>：目标态不承诺一次覆盖所有模型族；未覆盖的层型必须显式阻断，不产空层。</li>
+<li><b>融合 kernel 自身输出的保存集</b>：末轴位于编译产物中，而不在源码中。声明通道可以承载该信息；若未提供声明，则标记为 <code>Unknown</code>，并<b>停止给出数值</b>，禁止猜测。</li>
+<li><b>数据依赖量的精确值</b>：MoE 实际负载只能通过 <code>assumed</code> 描述。报告可以说明偏差方向与依据，但不能把它变成精确值。</li>
+<li><b>验证反馈周期</b>：清晰分层的固有代价是，必须等待整条链完成后，才能得到第一个可与现实对照的数值。适配层与按族收编只能缩短这一周期，无法彻底消除——因此阶段 2 的门禁必须使用真机，而非旧路径。</li>
+<li><b>覆盖面</b>：目标态不承诺一次覆盖所有模型族；未覆盖的层类型必须显式阻断，不生成空层结果。</li>
 </ul></div>
 
 <div class="foot">
-<p>图的可编辑源：<code>docs/target-design-v2/diagrams/*.excalidraw</code>（直接拖进 excalidraw 打开）。
-本页 SVG 由 <code>docs/target-design-v2/tools/gen_diagrams.py</code> 与其同源生成，
-改图后重跑 <code>tools/build_doc.py</code> 即同步。</p>
+<p>图的可编辑源：<code>docs/target-design-v2/diagrams/*.excalidraw</code>（可直接导入 Excalidraw 编辑）。本页 SVG 由 <code>docs/target-design-v2/tools/gen_diagrams.py</code> 与其同源生成，修改图后重新运行 <code>tools/build_doc.py</code> 即可同步。</p>
 </div>
 
 </main>
+
+<script>
+/* 导航当前位置高亮：58 条目录需要它才好用。无外部依赖，尊重 reduced-motion。 */
+(function(){
+  var links = [].slice.call(document.querySelectorAll('nav a[href^="#"]'));
+  if(!links.length || !('IntersectionObserver' in window)) return;
+  var byId = {}, targets = [];
+  links.forEach(function(a){
+    var el = document.getElementById(a.getAttribute('href').slice(1));
+    if(el){ byId[el.id] = a; targets.push(el); }
+  });
+  var seen = new Set();
+  function paint(){
+    var best = null;
+    for(var i=targets.length-1;i>=0;i--){
+      var t = targets[i];
+      if(t.getBoundingClientRect().top <= 120){ best = t; break; }
+    }
+    if(!best) best = targets[0];
+    links.forEach(function(a){ a.classList.remove('active'); });
+    var a = byId[best.id];
+    if(a){
+      a.classList.add('active');
+      if(!seen.has(best.id)){
+        seen.add(best.id);
+        var nav = a.closest('nav'), r = a.getBoundingClientRect(),
+            nr = nav.getBoundingClientRect();
+        if(r.top < nr.top + 40 || r.bottom > nr.bottom - 40)
+          a.scrollIntoView({block:'nearest'});
+      }
+    }
+  }
+  var raf = 0;
+  addEventListener('scroll', function(){
+    if(raf) return;
+    raf = requestAnimationFrame(function(){ raf = 0; paint(); });
+  }, {passive:true});
+  addEventListener('resize', paint, {passive:true});
+  paint();
+})();
+</script>
 </div>

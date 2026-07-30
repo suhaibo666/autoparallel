@@ -6,12 +6,12 @@
 <text class="dg-ftitle t-sem" x="82" y="32">S1 语义层</text>
 <rect class="dg-box b-sem" x="430" y="58" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-sem" x="590.0" y="83.5" font-size="15">TypedRegistrySnapshot</text>
-<text class="dg-bsub dg-mono t-sem" x="590.0" y="98.5" font-size="12">op 语义词典（冻结、带 digest）</text>
+<text class="dg-bsub dg-mono t-sem" x="590.0" y="98.5" font-size="12">Op 语义词典（冻结、带 digest）</text>
 <rect class="dg-frame" x="70" y="170" width="1040" height="92" rx="10"/>
 <text class="dg-ftitle t-ir" x="82" y="162">S2 结构层</text>
 <rect class="dg-box b-ir" x="430" y="188" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-ir" x="590.0" y="213.5" font-size="15">CoreIR</text>
-<text class="dg-bsub dg-mono t-ir" x="590.0" y="228.5" font-size="12">逻辑事实：op / 值 / 存储关系</text>
+<text class="dg-bsub dg-mono t-ir" x="590.0" y="228.5" font-size="12">逻辑事实：Op / 值 / 存储关系</text>
 <rect class="dg-frame" x="70" y="300" width="1040" height="92" rx="10"/>
 <text class="dg-ftitle t-derived" x="82" y="292">S3 反向层</text>
 <rect class="dg-box b-derived" x="430" y="318" width="320" height="56" rx="8"/>
@@ -21,12 +21,12 @@
 <text class="dg-ftitle t-plan" x="82" y="422">S4 布局层</text>
 <rect class="dg-box b-plan" x="430" y="448" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="590.0" y="473.5" font-size="15">PlacementPlan</text>
-<text class="dg-bsub dg-mono t-plan" x="590.0" y="488.5" font-size="12">在哪：mesh / shard / local shape</text>
+<text class="dg-bsub dg-mono t-plan" x="590.0" y="488.5" font-size="12">位置：mesh / shard / local shape</text>
 <rect class="dg-frame" x="70" y="560" width="1040" height="92" rx="10"/>
 <text class="dg-ftitle t-plan" x="82" y="552">S5 执行层</text>
 <rect class="dg-box b-plan" x="430" y="578" width="320" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="590.0" y="603.5" font-size="15">ExecutionPlan</text>
-<text class="dg-bsub dg-mono t-plan" x="590.0" y="618.5" font-size="12">何时：event / lifetime / alloc-free</text>
+<text class="dg-bsub dg-mono t-plan" x="590.0" y="618.5" font-size="12">时序：event / lifetime / alloc-free</text>
 <rect class="dg-box b-input" x="90" y="58" width="250" height="40" rx="8"/>
 <text class="dg-blabel t-input" x="215.0" y="75.5" font-size="15">Native / User / Patch</text>
 <text class="dg-bsub dg-mono t-input" x="215.0" y="90.5" font-size="12">三个物理隔离注册域</text>
@@ -44,7 +44,7 @@
 <text class="dg-bsub dg-mono t-input" x="945.0" y="480.5" font-size="12">tp / pp / ep / cp / dp</text>
 <rect class="dg-box b-input" x="820" y="578" width="250" height="40" rx="8"/>
 <text class="dg-blabel t-input" x="945.0" y="595.5" font-size="15">BufferCalibration</text>
-<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">measured 量的载体</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">measured 量载体</text>
 <polyline class="dg-arrow a-note" points="590.0,114 590.0,158" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590.0,244 590.0,288" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590.0,374 590.0,418" marker-end="url(#ah)"/>
@@ -66,7 +66,7 @@
 <text class="dg-bsub dg-mono t-backend" x="865.0" y="764.5" font-size="12">cost / contention / pipeline DES</text>
 <polyline class="dg-arrow a-note" points="470,634 315,700 315,712" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="710,634 865,700 865,712" marker-end="url(#ah)"/>
-<text class="dg-note t-block" x="590" y="754" text-anchor="middle" font-size="13">互不 import</text>
+<text class="dg-note t-block" x="590" y="754" text-anchor="middle" font-size="13">互不依赖</text>
 <text class="dg-note t-block" x="590" y="771" text-anchor="middle" font-size="13">不回写上游</text>
 <rect class="dg-frame" x="70" y="838" width="1040" height="96" rx="10"/>
 <text class="dg-ftitle t-note" x="82" y="830">S7 报告</text>
@@ -75,5 +75,5 @@
 <text class="dg-bsub dg-mono t-note" x="590.0" y="900.5" font-size="12">结果 + provenance + confidence</text>
 <polyline class="dg-arrow a-note" points="315,788 430,880" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="865,788 750,880" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="90" y="966" text-anchor="start" font-size="14">不变量：每层只增加一类信息；下游只读上游，从不回写。改并行配置只失效 S4/S5，CoreIR 不动（what-if 的交互性由此保证）。</text>
+<text class="dg-note t-note" x="90" y="966" text-anchor="start" font-size="14">不变量：每层只增加一类信息；下游只读上游，从不回写。修改并行配置只使 S4/S5 失效，CoreIR 保持不变（由此支持交互式 what-if）。</text>
 </svg>

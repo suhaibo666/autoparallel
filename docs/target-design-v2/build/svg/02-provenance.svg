@@ -1,4 +1,4 @@
-<svg class="dg" viewBox="0 0 1160 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="知识分级：量的 provenance 而非层的退化档">
+<svg class="dg" viewBox="0 0 1160 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="知识分级：逐量 provenance，而非按层设置回退档">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
@@ -20,7 +20,7 @@
 <rect class="dg-frame" x="450" y="60" width="280" height="470" rx="10"/>
 <text class="dg-ftitle t-me" x="462" y="52">measured</text>
 <text class="dg-note t-me" x="466" y="88" text-anchor="start" font-size="13">只能实测标定</text>
-<text class="dg-note t-me" x="466" y="105" text-anchor="start" font-size="13">源码里不存在</text>
+<text class="dg-note t-me" x="466" y="105" text-anchor="start" font-size="13">源码中不存在</text>
 <rect class="dg-box b-me" x="470" y="132" width="240" height="40" rx="8"/>
 <text class="dg-blabel dg-mono t-me" x="590.0" y="156.5" font-size="15">workspace_bytes</text>
 <rect class="dg-box b-me" x="470" y="184" width="240" height="40" rx="8"/>
@@ -47,12 +47,12 @@
 <text class="dg-blabel t-block" x="980.0" y="374.5" font-size="15">判据</text>
 <text class="dg-bsub dg-mono t-block" x="980.0" y="389.5" font-size="12">必须显式声明</text>
 <text class="dg-bsub dg-mono t-block" x="980.0" y="403.5" font-size="12">缺声明 ⇒ 阻断</text>
-<text class="dg-note t-note" x="60" y="32" text-anchor="start" font-size="15">同一条契约字段 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。</text>
+<text class="dg-note t-note" x="60" y="32" text-anchor="start" font-size="15">同一契约字段的 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。</text>
 <rect class="dg-box b-note" x="390" y="578" width="380" height="56" rx="8"/>
 <text class="dg-blabel dg-mono t-note" x="580.0" y="603.5" font-size="15">UnifiedReport</text>
 <text class="dg-bsub dg-mono t-note" x="580.0" y="618.5" font-size="12">按 provenance 分别统计覆盖率与 confidence</text>
 <polyline class="dg-arrow a-note" points="200,530 200,560 580,560 580,574" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590,530 590,560 580,560 580,574" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="980,530 980,560 580,560 580,574" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="60" y="674" text-anchor="start" font-size="14">关键：assumed 不是 fallback。未声明仍然阻断；声明了才放行，且 basis 与方向（上界/下界/标称）进报告。</text>
+<text class="dg-note t-note" x="60" y="674" text-anchor="start" font-size="14">关键：assumed 不是 fallback。未声明时仍然阻断；只有显式声明后才允许执行，且 basis 与方向（上界/下界/标称）必须进入报告。</text>
 </svg>

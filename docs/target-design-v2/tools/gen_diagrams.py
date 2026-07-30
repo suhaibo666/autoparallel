@@ -283,11 +283,11 @@ def d1():
     ]
     # 逐层：(y, 层名, tone, 主产物, 副标)
     layers = [
-        (40,  "S1 语义层", "sem",     "TypedRegistrySnapshot", "op 语义词典（冻结、带 digest）"),
-        (170, "S2 结构层", "ir",      "CoreIR",                "逻辑事实：op / 值 / 存储关系"),
+        (40,  "S1 语义层", "sem",     "TypedRegistrySnapshot", "Op 语义词典（冻结、带 digest）"),
+        (170, "S2 结构层", "ir",      "CoreIR",                "逻辑事实：Op / 值 / 存储关系"),
         (300, "S3 反向层", "derived", "BackwardIR",            "前向+反向+重算，同一节点类型"),
-        (430, "S4 布局层", "plan",    "PlacementPlan",         "在哪：mesh / shard / local shape"),
-        (560, "S5 执行层", "plan",    "ExecutionPlan",         "何时：event / lifetime / alloc-free"),
+        (430, "S4 布局层", "plan",    "PlacementPlan",         "位置：mesh / shard / local shape"),
+        (560, "S5 执行层", "plan",    "ExecutionPlan",         "时序：event / lifetime / alloc-free"),
     ]
     for y, name, tone, art, sub in layers:
         g.frame(70, y, 1040, 92, name, tone)
@@ -300,7 +300,7 @@ def d1():
     g.box(90, 188, 250, 40, "源码 → DraftGraph", "input", sub="符号 / 数据流 / attrs 字面值")
     g.box(820, 318, 250, 40, "RecomputeSpec", "input", sub="重算策略（派生输入）")
     g.box(820, 448, 250, 40, "ParallelConfig", "input", sub="tp / pp / ep / cp / dp")
-    g.box(820, 578, 250, 40, "BufferCalibration", "input", sub="measured 量的载体")
+    g.box(820, 578, 250, 40, "BufferCalibration", "input", sub="measured 量载体")
 
     # 主干箭头
     for y0, y1 in ((114, 158), (244, 288), (374, 418), (504, 548), (634, 690)):
@@ -321,7 +321,7 @@ def d1():
           sub="cost / contention / pipeline DES")
     g.arrow([(CX + 40, 634), (315, 700), (315, 712)])
     g.arrow([(CX + BW - 40, 634), (865, 700), (865, 712)])
-    g.label(590, 740, "互不 import\n不回写上游", 13, "middle", "block")
+    g.label(590, 740, "互不依赖\n不回写上游", 13, "middle", "block")
 
     # S7 报告
     g.frame(70, 838, 1040, 96, "S7 报告", "note")
@@ -331,7 +331,7 @@ def d1():
     g.arrow([(865, 788), (CX + BW, 880)])
 
     g.label(90, 952, "不变量：每层只增加一类信息；下游只读上游，从不回写。"
-                     "改并行配置只失效 S4/S5，CoreIR 不动（what-if 的交互性由此保证）。", 14)
+                     "修改并行配置只使 S4/S5 失效，CoreIR 保持不变（由此支持交互式 what-if）。", 14)
     return g
 
 
@@ -339,14 +339,14 @@ def d1():
 # D2 — 知识分级（provenance）
 # ══════════════════════════════════════════════════════════════════════════════
 def d2():
-    g = D("d2", "知识分级：量的 provenance 而非层的退化档", 1160, 700)
+    g = D("d2", "知识分级：逐量 provenance，而非按层设置回退档", 1160, 700)
     cols = [
         (60,  "source_derived", "sd",
          ["shape / dtype", "alias / inplace", "saved 结构", "数据流与依赖"],
          "源码 + 算子定义\n可判定", "缺失 ⇒ 阻断"),
         (450, "measured", "me",
          ["workspace_bytes", "bwd_scratch", "kernel duration", "allocator 参数"],
-         "只能实测标定\n源码里不存在", "缺 key ⇒ 阻断\n命中 ⇒ 带 confidence"),
+         "只能实测标定\n源码中不存在", "缺 key ⇒ 阻断\n命中 ⇒ 带 confidence"),
         (840, "assumed", "as",
          ["MoE 每专家负载", "专家 capacity", "非规则化 placement"],
          "需要建模假设\n值依赖运行期数据", "必须显式声明\n缺声明 ⇒ 阻断"),
@@ -358,14 +358,14 @@ def d2():
             g.box(x + 20, 132 + i * 52, 240, 40, s, tone, mono=True)
         g.box(x + 20, 132 + 4 * 52 + 14, 240, 60, "判据", "block", sub=rule)
 
-    g.label(60, 18, "同一条契约字段 provenance 贯穿 S1→S7；分界线是"
+    g.label(60, 18, "同一契约字段的 provenance 贯穿 S1→S7；分界线是"
                     "「源码可判定 / 不可判定」，横穿内存与时间两侧。", 15)
     g.box(390, 578, 380, 56, "UnifiedReport", "note",
           sub="按 provenance 分别统计覆盖率与 confidence", mono=True)
     for x in (200, 590, 980):
         g.arrow([(x, 530), (x, 560), (580, 560), (580, 574)])
-    g.label(60, 660, "关键：assumed 不是 fallback。未声明仍然阻断；"
-                     "声明了才放行，且 basis 与方向（上界/下界/标称）进报告。", 14)
+    g.label(60, 660, "关键：assumed 不是 fallback。未声明时仍然阻断；"
+                     "只有显式声明后才允许执行，且 basis 与方向（上界/下界/标称）必须进入报告。", 14)
     return g
 
 
@@ -376,11 +376,11 @@ def d3():
     g = D("d3", "语义层：注册域、DSL 编译与调用绑定", 1160, 620)
     g.frame(60, 60, 300, 250, "三个物理隔离注册域", "sem")
     g.box(80, 92,  260, 44, "NativeOpRegistry", "sem", sub="随版本发布，只读", mono=True)
-    g.box(80, 152, 260, 44, "UserOpRegistry", "sem", sub="只能新增 native 未覆盖", mono=True)
+    g.box(80, 152, 260, 44, "UserOpRegistry", "sem", sub="仅补充 Native 未覆盖项", mono=True)
     g.box(80, 212, 260, 44, "NativePatchRegistry", "sem",
-          sub="整条替换 + hash 门禁", mono=True)
+          sub="完整替换 + hash 门禁", mono=True)
 
-    g.box(440, 92, 260, 44, "RegistryLoader", "sem", sub="冲突 / 版本 / 完整性")
+    g.box(440, 92, 260, 44, "RegistryLoader", "sem", sub="校验冲突、版本与完整性")
     g.box(440, 168, 260, 44, "DSL 编译", "sem", sub="parse → typecheck → 模板展开")
     g.box(440, 244, 260, 60, "TypedRegistrySnapshot", "ir",
           sub="不可变 + digest", mono=True)
@@ -434,8 +434,8 @@ def d4():
     g.arrow([(330, 196), (426, 170)])
     g.arrow([(550, 108), (550, 132)], tone="ir")
     g.arrow([(670, 160), (776, 160)])
-    g.label(90, 232, "源码只给三样：符号、数据流、attrs 字面值。"
-                     "注册表给全部语义。两者不重叠 ⇒ 结构上不可能出现「两个真相源」。", 13)
+    g.label(90, 232, "源码仅提供三类信息：符号、数据流、attrs 字面值。"
+                     "注册表提供完整语义。两者不重叠，因此结构上不会出现「两个真相源」。", 13)
 
     g.frame(60, 300, 1030, 300, "S3 反向层：BackwardIR（派生，CoreIR 保持 policy-free）", "derived")
     # 前向链（CoreIR）
@@ -461,17 +461,17 @@ def d4():
             dashed=True, tone="plan", label="复制")
 
     g.box(790, 396, 280, 128, "统一节点类型", "ir",
-          sub="前向 / 反向 / 重算 三类节点同构，\n共用同一套形状·类型·布局·资源机器")
+          sub="前向 / 反向 / 重算三类节点同构，\n共用同一套形状·类型·布局·资源计算机制")
     g.label(610, by + 58, "重算节点 = 前向 op2 的副本：同 SemanticId、新 NodeId、"
                           "origin 回指。插在该区域反向节点之前。", 13, "start", "plan")
 
-    g.label(60, 640, "为什么 BackwardIR 是派生层而不是写进 CoreIR：CoreIR 必须 policy-free。"
-                     "否则改一次重算配置就失效 CoreIR 缓存 —— 而它是最贵的一层。", 14)
-    g.label(60, 686, "净效果是删类：AutogradContract / GradientValueSpec / "
-                     "GradientAccumulationSpec（fan-in 累加本来就是个 add 节点）"
-                     "全部退化为图里的普通节点与边。", 14)
+    g.label(60, 640, "BackwardIR 必须作为派生层，而不能写入 CoreIR：CoreIR 必须保持 policy-free。"
+                     "否则每次修改重算配置都会使 CoreIR 缓存失效，而它是编译成本最高的一层。", 14)
+    g.label(60, 686, "结果是简化类型体系：AutogradContract / GradientValueSpec / "
+                     "GradientAccumulationSpec（fan-in 累加可表示为普通 add 节点）"
+                     "均可统一表示为图中的普通节点与边。", 14)
     g.label(60, 732, "不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，"
-                     "digest 独立。", 14)
+                     "使用独立 digest。", 14)
     return g
 
 
@@ -479,10 +479,10 @@ def d4():
 # D5 — 四层身份
 # ══════════════════════════════════════════════════════════════════════════════
 def d5():
-    g = D("d5", "四层身份：为什么名称去重必须废掉", 1160, 640)
+    g = D("d5", "四层身份：为什么必须禁止按名称去重", 1160, 640)
     rows = [
         (70,  "TensorId", "ir", "逻辑值身份（一次赋值 = 一个 ID）",
-         "同名重绑 ⇒ 新 ID。名称不能推断物理复用"),
+         "同名重新赋值 ⇒ 新 ID。名称不能推断物理复用"),
         (190, "StorageId", "ir", "逻辑存储 / alias 等价类",
          "alias / view / inplace 归并到同一 root"),
         (310, "StoragePlacementId", "plan", "rank / stage 上的放置模板",
@@ -502,8 +502,8 @@ def d5():
             "y = x.view(...)     → TensorId t2, StorageId s1（alias，零 Allocate）\n"
             "x = g(y)            → TensorId t3, StorageId s2（同名，但是新逻辑值）",
             13, "start", "note", mono=True)
-    g.label(70, 620, "今天按 tensor name 首见定型：t1/t3 会被当成同一个（少算），"
-                     "t1/t2 会被当成两次分配（多算）。四层身份把这两类错误一起消掉。", 14)
+    g.label(70, 620, "若按 tensor name 采用首次出现时的定义，t1/t3 会被视为同一个值（少算），"
+                     "t1/t2 会被视为两次分配（多算）。四层身份可以同时消除这两类错误。", 14)
     return g
 
 
@@ -512,7 +512,7 @@ def d5():
 # ══════════════════════════════════════════════════════════════════════════════
 def d6():
     g = D("d6", "布局传播与执行事件", 1160, 720)
-    g.frame(60, 60, 1030, 228, "S4 布局：沿数据流传播 per-value 分片状态", "plan")
+    g.frame(60, 60, 1030, 228, "S4 布局：沿数据流传播逐值分片状态", "plan")
     chain = (("段入口 x", 90), ("Column", 300), ("act", 500), ("Row", 660), ("out", 870))
     for nm, x in chain:
         g.box(x, 120, 150, 44, nm, "plan", mono=True)
@@ -522,12 +522,12 @@ def d6():
               ('{} + RS/AR', 660), ('{}', 870))
     for s, x in states:
         g.label(x + 75, 176, s, 12, "middle", "note", mono=True)
-    g.box(300, 232, 150, 44, "注入 AG", "block", sub="入携 S")
+    g.box(300, 232, 150, 44, "注入 AG", "block", sub="输入携带 S")
     g.box(660, 232, 150, 44, "注入 RS / AR", "block", sub="sp / 非 sp")
     g.arrow([(375, 164), (375, 228)], tone="block")
     g.arrow([(735, 164), (735, 228)], tone="block")
-    g.label(60, 296, "规则来自模块语义（在 Registry 的 placement 面），不是猜。"
-                     "carrier 歧义、Column∘Column、Row 前无 Column ⇒ 阻断。", 13)
+    g.label(60, 296, "规则来自模块语义（Registry 的 placement 面），而非推测。"
+                     "carrier 歧义、Column∘Column、Row 前缺少 Column ⇒ 阻断。", 13)
 
     g.frame(60, 360, 1030, 268, "S5 执行：生命周期 → 显式事件", "plan")
     tl = 420
@@ -537,14 +537,14 @@ def d6():
     for nm, x in ev:
         g.box(x, tl + 40, 130, 40, nm, "plan", mono=True)
         g.arrow([(x + 65, tl + 80), (x + 65, tl + 114)], tone="plan")
-    g.label(130, tl - 8, "每个 StorageInstanceId 的事件序；非 persistent 恰好一次 "
-                         "Allocate / Free，结束前 FinalAudit。", 13, "start", "plan")
+    g.label(130, tl - 8, "每个 StorageInstanceId 均有明确事件序；非 persistent 实例恰好执行一次 "
+                         "Allocate / Free，并在结束前执行 FinalAudit。", 13, "start", "plan")
     g.box(130, tl + 150, 400, 40, "MemoryEventView", "backend",
           sub="自包含 dependency / stream 偏序", mono=True)
     g.box(620, tl + 150, 400, 40, "ResourceRequest", "backend",
           sub="自包含 PricingDescriptor", mono=True)
-    g.label(60, 664, "为什么两个视图都必须自包含：后端一旦回读上游，"
-                     "profile / cache key 就随上游结构变化而失效，实测复用会静默失灵。", 14)
+    g.label(60, 664, "两个视图都必须自包含：后端一旦回读上游，"
+                     "profile / cache key 就会随上游结构变化而失效，实测画像复用也会静默失效。", 14)
     return g
 
 
@@ -552,9 +552,9 @@ def d6():
 # D7 — 未知 op 阻断闭环
 # ══════════════════════════════════════════════════════════════════════════════
 def d7():
-    g = D("d7", "未知 op 的阻断与用户闭环", 1100, 470)
-    st = ("DISCOVERED", "UNREGISTERED", "USER_DESCRIBED", "SCHEMA_VALIDATED",
-          "SEMANTIC_VALIDATED", "COMPILED", "SIMULATED")
+    g = D("d7", "未知 Op 的阻断与用户闭环", 1100, 470)
+    st = ("DISCOVERED", "UNREGISTERED", "USER_\nDESCRIBED", "SCHEMA_\nVALIDATED",
+          "SEMANTIC_\nVALIDATED", "COMPILED", "SIMULATED")
     x = 40
     for i, s in enumerate(st):
         tone = "block" if i == 1 else ("ir" if i >= 5 else "sem")
@@ -565,17 +565,17 @@ def d7():
     g.label(40, 76, "任一步失败都不进入下一状态；不产生部分计划。", 14)
 
     g.box(188, 230, 400, 60, "scaffold 生成骨架", "note",
-          sub="只填可从调用证明的 selector / inputs / attrs，其余 REQUIRED 占位")
+          sub="只填写可从调用证明的 selector / inputs / attrs，其余字段保留 REQUIRED 占位")
     g.arrow([(253, 172), (253, 226)], tone="block")
     g.box(640, 230, 420, 60, "cost-eval semantics validate / explain", "note",
-          sub="用户补完 → digest 更新 → 缓存失效 → 重新编译", mono=True)
+          sub="用户补充完整 → digest 更新 → 缓存失效 → 重新编译", mono=True)
     g.arrow([(588, 260), (636, 260)])
     g.arrow([(850, 230), (850, 200), (484, 200), (484, 176)], dashed=True, tone="sem")
 
-    g.label(40, 350, "阻断只针对「未注册 op」。已注册但含 measured / assumed 量的 ⇒ "
-                     "放行，并在报告里逐项标注 —— 这两件事必须分开，", 14)
-    g.label(40, 380, "否则 assumed 通道无处落脚。", 14)
-    g.label(40, 424, "已知失效模式：用户为跑通而在骨架里填一个看似合理的数，"
+    g.label(40, 350, "阻断只针对「未注册 Op」。已注册但含 measured / assumed 量的 Op 可以继续执行，"
+                     "并在报告中逐项标注。两类情况必须区分，", 14)
+    g.label(40, 380, "否则 assumed 将缺少合法的表达通道。", 14)
+    g.label(40, 424, "已知失效模式：用户为使仿真继续执行而在骨架中填写一个表面合理的数值，"
                      "该数与真值不可区分。故 assumed 必须带 basis 且独立统计。", 14, "start", "block")
     return g
 

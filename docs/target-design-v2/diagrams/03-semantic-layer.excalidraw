@@ -196,13 +196,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "UserOpRegistry\n只能新增 native 未覆盖",
+   "text": "UserOpRegistry\n仅补充 Native 未覆盖项",
    "fontSize": 15,
    "fontFamily": 3,
    "textAlign": "center",
    "verticalAlign": "middle",
    "containerId": "d3-b3",
-   "originalText": "UserOpRegistry\n只能新增 native 未覆盖",
+   "originalText": "UserOpRegistry\n仅补充 Native 未覆盖项",
    "lineHeight": 1.25
   },
   {
@@ -265,13 +265,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "NativePatchRegistry\n整条替换 + hash 门禁",
+   "text": "NativePatchRegistry\n完整替换 + hash 门禁",
    "fontSize": 15,
    "fontFamily": 3,
    "textAlign": "center",
    "verticalAlign": "middle",
    "containerId": "d3-b4",
-   "originalText": "NativePatchRegistry\n整条替换 + hash 门禁",
+   "originalText": "NativePatchRegistry\n完整替换 + hash 门禁",
    "lineHeight": 1.25
   },
   {
@@ -334,13 +334,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "RegistryLoader\n冲突 / 版本 / 完整性",
+   "text": "RegistryLoader\n校验冲突、版本与完整性",
    "fontSize": 15,
    "fontFamily": 2,
    "textAlign": "center",
    "verticalAlign": "middle",
    "containerId": "d3-b5",
-   "originalText": "RegistryLoader\n冲突 / 版本 / 完整性",
+   "originalText": "RegistryLoader\n校验冲突、版本与完整性",
    "lineHeight": 1.25
   },
   {

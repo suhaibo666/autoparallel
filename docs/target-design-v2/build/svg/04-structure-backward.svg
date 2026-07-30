@@ -22,7 +22,7 @@
 <polyline class="dg-arrow a-note" points="330,196 426,170" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-ir" points="550,108 550,132" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="670,160 776,160" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="90" y="246" text-anchor="start" font-size="13">源码只给三样：符号、数据流、attrs 字面值。注册表给全部语义。两者不重叠 ⇒ 结构上不可能出现「两个真相源」。</text>
+<text class="dg-note t-note" x="90" y="246" text-anchor="start" font-size="13">源码仅提供三类信息：符号、数据流、attrs 字面值。注册表提供完整语义。两者不重叠，因此结构上不会出现「两个真相源」。</text>
 <rect class="dg-frame" x="60" y="300" width="1030" height="300" rx="10"/>
 <text class="dg-ftitle t-derived" x="72" y="292">S3 反向层：BackwardIR（派生，CoreIR 保持 policy-free）</text>
 <rect class="dg-box b-ir" x="100" y="352" width="120" height="42" rx="8"/>
@@ -51,11 +51,12 @@
 <text class="dg-alabel t-plan" x="415.5" y="432.5">复制</text>
 <rect class="dg-box b-ir" x="790" y="396" width="280" height="128" rx="8"/>
 <text class="dg-blabel t-ir" x="930.0" y="450.5" font-size="15">统一节点类型</text>
-<text class="dg-bsub dg-mono t-ir" x="930.0" y="465.5" font-size="12">前向 / 反向 / 重算 三类节点同构，</text>
-<text class="dg-bsub dg-mono t-ir" x="930.0" y="479.5" font-size="12">共用同一套形状·类型·布局·资源机器</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="465.5" font-size="12">前向 / 反向 / 重算三类节点同构，</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="479.5" font-size="12">共用同一套形状·类型·布局·资源计算机制</text>
 <text class="dg-note t-plan" x="610" y="552" text-anchor="start" font-size="13">重算节点 = 前向 op2 的副本：同 SemanticId、新 NodeId、origin 回指。插在该区</text>
 <text class="dg-note t-plan" x="610" y="569" text-anchor="start" font-size="13">域反向节点之前。</text>
-<text class="dg-note t-note" x="60" y="654" text-anchor="start" font-size="14">为什么 BackwardIR 是派生层而不是写进 CoreIR：CoreIR 必须 policy-free。否则改一次重算配置就失效 CoreIR 缓存 —— 而它是最贵的一层。</text>
-<text class="dg-note t-note" x="60" y="700" text-anchor="start" font-size="14">净效果是删类：AutogradContract / GradientValueSpec / GradientAccumulationSpec（fan-in 累加本来就是个 add 节点）全部退化为图里的普通节点与边。</text>
-<text class="dg-note t-note" x="60" y="746" text-anchor="start" font-size="14">不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，digest 独立。</text>
+<text class="dg-note t-note" x="60" y="654" text-anchor="start" font-size="14">BackwardIR 必须作为派生层，而不能写入 CoreIR：CoreIR 必须保持 policy-free。否则每次修改重算配置都会使 CoreIR 缓存失效，而它是编译成本最高的一层。</text>
+<text class="dg-note t-note" x="60" y="700" text-anchor="start" font-size="14">结果是简化类型体系：AutogradContract / GradientValueSpec / GradientAccumulationSpec（fan-in 累加可表示为普通 add 节点）均可统一表示为图中的普通节</text>
+<text class="dg-note t-note" x="60" y="718" text-anchor="start" font-size="14">点与边。</text>
+<text class="dg-note t-note" x="60" y="746" text-anchor="start" font-size="14">不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，使用独立 digest。</text>
 </svg>

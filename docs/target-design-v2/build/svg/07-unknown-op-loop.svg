@@ -1,4 +1,4 @@
-<svg class="dg" viewBox="0 0 1100 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="未知 op 的阻断与用户闭环">
+<svg class="dg" viewBox="0 0 1100 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="未知 Op 的阻断与用户闭环">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
@@ -9,13 +9,16 @@
 <text class="dg-blabel dg-mono t-block" x="253.0" y="150.5" font-size="15">UNREGISTERED</text>
 <polyline class="dg-arrow a-note" points="318,146 336,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-sem" x="336" y="120" width="130" height="52" rx="8"/>
-<text class="dg-blabel dg-mono t-sem" x="401.0" y="150.5" font-size="15">USER_DESCRIBED</text>
+<text class="dg-blabel dg-mono t-sem" x="401.0" y="143.0" font-size="15">USER_</text>
+<text class="dg-blabel dg-mono t-sem" x="401.0" y="158.0" font-size="15">DESCRIBED</text>
 <polyline class="dg-arrow a-note" points="466,146 484,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-sem" x="484" y="120" width="130" height="52" rx="8"/>
-<text class="dg-blabel dg-mono t-sem" x="549.0" y="150.5" font-size="15">SCHEMA_VALIDATED</text>
+<text class="dg-blabel dg-mono t-sem" x="549.0" y="143.0" font-size="15">SCHEMA_</text>
+<text class="dg-blabel dg-mono t-sem" x="549.0" y="158.0" font-size="15">VALIDATED</text>
 <polyline class="dg-arrow a-note" points="614,146 632,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-sem" x="632" y="120" width="130" height="52" rx="8"/>
-<text class="dg-blabel dg-mono t-sem" x="697.0" y="150.5" font-size="15">SEMANTIC_VALIDATED</text>
+<text class="dg-blabel dg-mono t-sem" x="697.0" y="143.0" font-size="15">SEMANTIC_</text>
+<text class="dg-blabel dg-mono t-sem" x="697.0" y="158.0" font-size="15">VALIDATED</text>
 <polyline class="dg-arrow a-note" points="762,146 780,146" marker-end="url(#ah)"/>
 <rect class="dg-box b-ir" x="780" y="120" width="130" height="52" rx="8"/>
 <text class="dg-blabel dg-mono t-ir" x="845.0" y="150.5" font-size="15">COMPILED</text>
@@ -25,15 +28,15 @@
 <text class="dg-note t-note" x="40" y="90" text-anchor="start" font-size="14">任一步失败都不进入下一状态；不产生部分计划。</text>
 <rect class="dg-box b-note" x="188" y="230" width="400" height="60" rx="8"/>
 <text class="dg-blabel t-note" x="388.0" y="250.5" font-size="15">scaffold 生成骨架</text>
-<text class="dg-bsub dg-mono t-note" x="388.0" y="265.5" font-size="12">只填可从调用证明的 selector / inputs / attrs，其余 REQUIRED</text>
-<text class="dg-bsub dg-mono t-note" x="388.0" y="279.5" font-size="12">占位</text>
+<text class="dg-bsub dg-mono t-note" x="388.0" y="265.5" font-size="12">只填写可从调用证明的 selector / inputs / attrs，其余字段保留</text>
+<text class="dg-bsub dg-mono t-note" x="388.0" y="279.5" font-size="12">REQUIRED 占位</text>
 <polyline class="dg-arrow a-block" points="253,172 253,226" marker-end="url(#ah)"/>
 <rect class="dg-box b-note" x="640" y="230" width="420" height="60" rx="8"/>
 <text class="dg-blabel dg-mono t-note" x="850.0" y="257.5" font-size="15">cost-eval semantics validate / explain</text>
-<text class="dg-bsub dg-mono t-note" x="850.0" y="272.5" font-size="12">用户补完 → digest 更新 → 缓存失效 → 重新编译</text>
+<text class="dg-bsub dg-mono t-note" x="850.0" y="272.5" font-size="12">用户补充完整 → digest 更新 → 缓存失效 → 重新编译</text>
 <polyline class="dg-arrow a-note" points="588,260 636,260" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-sem dg-dash" points="850,230 850,200 484,200 484,176" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="40" y="364" text-anchor="start" font-size="14">阻断只针对「未注册 op」。已注册但含 measured / assumed 量的 ⇒ 放行，并在报告里逐项标注 —— 这两件事必须分开，</text>
-<text class="dg-note t-note" x="40" y="394" text-anchor="start" font-size="14">否则 assumed 通道无处落脚。</text>
-<text class="dg-note t-block" x="40" y="438" text-anchor="start" font-size="14">已知失效模式：用户为跑通而在骨架里填一个看似合理的数，该数与真值不可区分。故 assumed 必须带 basis 且独立统计。</text>
+<text class="dg-note t-note" x="40" y="364" text-anchor="start" font-size="14">阻断只针对「未注册 Op」。已注册但含 measured / assumed 量的 Op 可以继续执行，并在报告中逐项标注。两类情况必须区分，</text>
+<text class="dg-note t-note" x="40" y="394" text-anchor="start" font-size="14">否则 assumed 将缺少合法的表达通道。</text>
+<text class="dg-note t-block" x="40" y="438" text-anchor="start" font-size="14">已知失效模式：用户为使仿真继续执行而在骨架中填写一个表面合理的数值，该数与真值不可区分。故 assumed 必须带 basis 且独立统计。</text>
 </svg>

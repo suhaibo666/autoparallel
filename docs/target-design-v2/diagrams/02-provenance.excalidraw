@@ -537,13 +537,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "只能实测标定\n源码里不存在",
+   "text": "只能实测标定\n源码中不存在",
    "fontSize": 13,
    "fontFamily": 2,
    "textAlign": "start",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "只能实测标定\n源码里不存在",
+   "originalText": "只能实测标定\n源码中不存在",
    "lineHeight": 1.3
   },
   {
@@ -1292,13 +1292,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "同一条契约字段 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。",
+   "text": "同一契约字段的 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。",
    "fontSize": 15,
    "fontFamily": 2,
    "textAlign": "start",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "同一条契约字段 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。",
+   "originalText": "同一契约字段的 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。",
    "lineHeight": 1.3
   },
   {
@@ -1552,13 +1552,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "关键：assumed 不是 fallback。未声明仍然阻断；声明了才放行，且 basis 与方向（上界/下界/标称）进报告。",
+   "text": "关键：assumed 不是 fallback。未声明时仍然阻断；只有显式声明后才允许执行，且 basis 与方向（上界/下界/标称）必须进入报告。",
    "fontSize": 14,
    "fontFamily": 2,
    "textAlign": "start",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "关键：assumed 不是 fallback。未声明仍然阻断；声明了才放行，且 basis 与方向（上界/下界/标称）进报告。",
+   "originalText": "关键：assumed 不是 fallback。未声明时仍然阻断；只有显式声明后才允许执行，且 basis 与方向（上界/下界/标称）必须进入报告。",
    "lineHeight": 1.3
   }
  ],
