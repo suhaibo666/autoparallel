@@ -200,7 +200,7 @@ time：`timesim/producer` 剥掉 placement 后只剩"发 TimedOp"→ `op_cost` �
 
 ## 5. op 描述配置（U4/U5 的落地）
 
-### 5.1 六个面
+### 5.1 七个面
 
 | 面 | 消费者 | 形态 |
 |---|---|---|
@@ -208,8 +208,38 @@ time：`timesim/producer` 剥掉 placement 后只剩"发 TimedOp"→ `op_cost` �
 | 词表 op→`OpType` | mem | `ops.<op>.optype` |
 | 反向 pin 哪些张量 | mem | `ops.<op>.bprop` |
 | 形状 out shape 关系 | 两侧 | `ops.<op>.shape` |
+| **dtype 产出 dtype 关系** | 两侧 | `ops.<op>.dtype` |
 | 布局 placement 传播 | 两侧 | `ops.<op>.placement` |
 | 展开+定价 | time | `ops.<op>.bwd` / `.cost` |
+
+#### 5.1.1 dtype 面（缺陷 ⑥ 的归口）
+
+**今天 dtype 推断散在至少 9 处**，且推错过一次真实的 2× 字节错误：
+
+| 位置 | 干什么 |
+|---|---|
+| `construct_walker.py:1840, 1990` | 显式 cast 取目标 dtype（`_resolve_cast_dtype`） |
+| `:1618` `_promote_dtype` + `_emit:3163-3172` | 按输入提升序推——**两份 rank 表** |
+| `:1701, 1714, 1992` | `attrs.get("compute_dtype") or "bf16"` 兜底——**三处重复** |
+| `:1470, 1506, 1829` | `"bool" if op == "Compare" else None`——**三处重复** |
+| `shape_infer.py:1272-1281` | **第二道**把 Compare 改 bool。注释写明动因：「walker 的 `_emit` 按 ins 推产出 dtype → 这批节点被记成 bf16 = **2×**」（`csa.py:779` / `:810` 两个 O(S²) mask，被 `Where` 的 `PIN{"inputs":[0]}` 当 cond 保留 ⇒ dtype 必须对） |
+| `bprop_rules.py:127-130` → `to_resolved._undo_norm_prelift` → `structure_mem._dt` | Norm 输入**预抬 fp32 → 适配器撤销 → 消费侧再抬**，一个三段往返，只因 dtype 语义没有单一归属 |
+
+**归口规则**（声明式，优先级自上而下）：
+
+```yaml
+Cast:        {dtype: attrs.to_dtype}
+Compare:     {dtype: fixed(bool)}
+Norm:        {dtype: config.layernorm_compute_dtype}    # 单点归属，取消预抬-撤销-再抬
+TopK:        {dtype: {out0: same_as(in0), out1: fixed(int32)}}
+Elementwise: {dtype: promote(in*)}                      # 唯一一份提升序表（引擎侧）
+Constant:    {dtype: config.compute_dtype}
+MatMul:      {dtype: same_as(in0)}
+```
+
+dtype 组合子（引擎侧，与形状组合子同性质）：`same_as(inK)` · `promote(in*)` · `fixed(<dtype>)` ·
+`attrs.<key>` · `config.<key>`。**取消 `"bf16"` 硬兜底**——缺 dtype 依据的节点走完备性门阻断，
+不默认成 bf16（那正是 2× 错误的形态）。
 
 ### 5.2 形状面：纯声明的边界
 
@@ -356,6 +386,7 @@ ops:
 | ③ | `timesim/bwd_rules.py:86-88` 对**任何**未知 op 类型静默产 `<op_type>Grad` | 代码核实 | §6 完备性门 |
 | ④ | `Coverage.totals()`（`to_resolved.py:382-400`）递归加子 Coverage，而 `_build_layer:1395-1396` 已把 segment 计数累加进层级 cov → `n_nodes`/`n_ops` **双计**。报 `2568→2056`，真值 `1284→1028`。不影响字节，但让跳过率看起来好一倍（真值 256/1284≈20%） | 实跑核实 | 随 S1 修 |
 | ⑤ | 手写 op 名是真源属性名的**截断近似**（`linear_q_down` vs `self.linear_q_down_proj` @ `deepseek_v4_hybrid_attention.py:92,237`），无人检查 | 源码核实 | S1-a（U6） |
+| ⑥ | **dtype 推断散在至少 9 处**（walker 6 + `shape_infer` 1 + `bprop_rules` 1 + 适配器 1 处撤销），含两份提升序表、三处 `"bf16"` 硬兜底、三处 Compare→bool 重复；且 `shape_infer.py:1272-1281` 的注释记载它推错过一次真实的 **2×** 字节错误（O(S²) mask 被记成 bf16）。Norm 的 fp32 更是「预抬→撤销→再抬」三段往返 | 代码核实 | §5.1.1 dtype 面归口 |
 
 ## 8. 测试与验收门
 
@@ -364,6 +395,7 @@ ops:
 | `test_optype_vocab` | Registry 的 op 类型键集合 == `bprop` 面键集合 == `bwd` 面键集合（三面同表后退化为 schema 校验，仍保留防回归） |
 | `test_localizer_parity` | 一组代表性符号 shape（含 `S·B·S`、`E·cap·H`、`n_heads·v_head_dim`、含 `-1` 消元的）× 一组并行度：mem 路径 numel ≡ time 路径逐轴之积 |
 | `test_registry_completeness` | 全模型抽图后 `assert_registry_complete` 通过；人为删一条 op 描述 → 阻断且 stub 含正确 `src` |
+| `test_dtype_single_source` | 全图无任何张量 dtype 来自硬兜底（取消 `"bf16"` 默认后，缺依据即阻断）；`csa.py:779` / `:810` 两个 O(S²) mask 恒为 `bool`（缺陷 ⑥ 的 2× 防回归）；Norm 输入 fp32 **只被抬一次** |
 | `test_registry_load` | schema 校验 / 缺 `src` 拒绝 / 未知组合子拒绝 / 无 `override` 的重复定义拒绝 |
 | `test_timesim_decoupling` | **更新**：白名单加 `opdefs`；其余四条契约不变（§2） |
 | `tools/liveness_ab_validate.py` | 167 A/B 八跑，`REAL_SHA256` 钉真机；每步迁移的主门 |
@@ -375,7 +407,7 @@ ops:
 |---|---|---|
 | 0 | S1-a/c/d（`qname`、删 `_OPTYPE`、识别面迁 YAML）+ 缺陷 ④ | 八跑**逐字节不变**（纯改名/改表） |
 | 1 | S3 唯一 localizer + parity 门 | 显存八跑**逐字节不变**（A1 采 mem 语义 ⇒ mem 侧零变化）；**time 侧会变**——缺陷 ① 的修正使多 S 轴张量的 local shape 改变，须逐条列出受影响算子并记进变更说明，不得混在"纯重构"里过门 |
-| 2 | S1-b 原子 op 拆分 + Registry 全面接管六个面 | 479 opdag 测试不破 |
+| 2 | S1-b 原子 op 拆分 + Registry 全面接管**七个面**（含 §5.1.1 dtype 归口：取消三处 `"bf16"` 硬兜底、合并两份提升序表、拆掉 Norm 的预抬-撤销-再抬往返） | 479 opdag 测试不破；八跑逐字节不变（dtype 归口若改变任何张量的 dtype，须逐条列出并单独记账，不得混在"纯重构"里过门） |
 | 3 | §6 完备性门开启（先 warn 一轮观察缺口，再切 raise） | 缺口清单进 `Coverage` |
 | 4 | S2 placement 落地，mem 侧补传 `shard` | `tp=cp=1` 八跑逐字节不变；新增 `tp=2` 用例从 fail-loud 变出数 |
 | 5 | Registry `kernels:` 段建表，标定量从 `layers/*.py` 迁入 | `extracted` 的 workspace/bwd_scratch 从恒 0 变有值，与 `hand_spec` 逐桶对照 |
