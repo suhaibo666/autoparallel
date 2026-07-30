@@ -1,0 +1,58 @@
+<svg class="dg" viewBox="0 0 1160 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="知识分级：量的 provenance 而非层的退化档">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="280" height="470" rx="10"/>
+<text class="dg-ftitle t-ir" x="72" y="52">source_derived</text>
+<text class="dg-note t-ir" x="76" y="88" text-anchor="start" font-size="13">源码 + 算子定义</text>
+<text class="dg-note t-ir" x="76" y="105" text-anchor="start" font-size="13">可判定</text>
+<rect class="dg-box b-ir" x="80" y="132" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="156.5" font-size="15">shape / dtype</text>
+<rect class="dg-box b-ir" x="80" y="184" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="208.5" font-size="15">alias / inplace</text>
+<rect class="dg-box b-ir" x="80" y="236" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="260.5" font-size="15">saved 结构</text>
+<rect class="dg-box b-ir" x="80" y="288" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="312.5" font-size="15">数据流与依赖</text>
+<rect class="dg-box b-block" x="80" y="354" width="240" height="60" rx="8"/>
+<text class="dg-blabel t-block" x="200.0" y="381.5" font-size="15">判据</text>
+<text class="dg-bsub dg-mono t-block" x="200.0" y="396.5" font-size="12">缺失 ⇒ 阻断</text>
+<rect class="dg-frame" x="450" y="60" width="280" height="470" rx="10"/>
+<text class="dg-ftitle t-plan" x="462" y="52">measured</text>
+<text class="dg-note t-plan" x="466" y="88" text-anchor="start" font-size="13">只能实测标定</text>
+<text class="dg-note t-plan" x="466" y="105" text-anchor="start" font-size="13">源码里不存在</text>
+<rect class="dg-box b-plan" x="470" y="132" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="156.5" font-size="15">workspace_bytes</text>
+<rect class="dg-box b-plan" x="470" y="184" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="208.5" font-size="15">bwd_scratch</text>
+<rect class="dg-box b-plan" x="470" y="236" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="260.5" font-size="15">kernel duration</text>
+<rect class="dg-box b-plan" x="470" y="288" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="312.5" font-size="15">allocator 参数</text>
+<rect class="dg-box b-block" x="470" y="354" width="240" height="60" rx="8"/>
+<text class="dg-blabel t-block" x="590.0" y="374.5" font-size="15">判据</text>
+<text class="dg-bsub dg-mono t-block" x="590.0" y="389.5" font-size="12">缺 key ⇒ 阻断</text>
+<text class="dg-bsub dg-mono t-block" x="590.0" y="403.5" font-size="12">命中 ⇒ 带 confidence</text>
+<rect class="dg-frame" x="840" y="60" width="280" height="470" rx="10"/>
+<text class="dg-ftitle t-backend" x="852" y="52">assumed</text>
+<text class="dg-note t-backend" x="856" y="88" text-anchor="start" font-size="13">需要建模假设</text>
+<text class="dg-note t-backend" x="856" y="105" text-anchor="start" font-size="13">值依赖运行期数据</text>
+<rect class="dg-box b-backend" x="860" y="132" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="980.0" y="156.5" font-size="15">MoE 每专家负载</text>
+<rect class="dg-box b-backend" x="860" y="184" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="980.0" y="208.5" font-size="15">专家 capacity</text>
+<rect class="dg-box b-backend" x="860" y="236" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="980.0" y="260.5" font-size="15">非规则化 placement</text>
+<rect class="dg-box b-block" x="860" y="354" width="240" height="60" rx="8"/>
+<text class="dg-blabel t-block" x="980.0" y="374.5" font-size="15">判据</text>
+<text class="dg-bsub dg-mono t-block" x="980.0" y="389.5" font-size="12">必须显式声明</text>
+<text class="dg-bsub dg-mono t-block" x="980.0" y="403.5" font-size="12">缺声明 ⇒ 阻断</text>
+<text class="dg-note t-note" x="60" y="32" text-anchor="start" font-size="15">同一条契约字段 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。</text>
+<rect class="dg-box b-note" x="390" y="578" width="380" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-note" x="580.0" y="603.5" font-size="15">UnifiedReport</text>
+<text class="dg-bsub dg-mono t-note" x="580.0" y="618.5" font-size="12">按 provenance 分别统计覆盖率与 confidence</text>
+<polyline class="dg-arrow a-note" points="200,530 200,560 580,560 580,574" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="590,530 590,560 580,560 580,574" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="980,530 980,560 580,560 580,574" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="60" y="674" text-anchor="start" font-size="14">关键：assumed 不是 fallback。未声明仍然阻断；声明了才放行，且 basis 与方向（上界/下界/标称）进报告。</text>
+</svg>

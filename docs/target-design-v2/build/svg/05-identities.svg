@@ -1,0 +1,30 @@
+<svg class="dg" viewBox="0 0 1160 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="四层身份：为什么名称去重必须废掉">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-box b-ir" x="70" y="70" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="220.0" y="97.5" font-size="15">TensorId</text>
+<text class="dg-bsub dg-mono t-ir" x="220.0" y="112.5" font-size="12">逻辑值身份（一次赋值 = 一个 ID）</text>
+<text class="dg-note t-ir" x="400" y="96" text-anchor="start" font-size="14">同名重绑 ⇒ 新 ID。名称不能推断物理复用</text>
+<polyline class="dg-arrow a-note" points="220,130 220,178" marker-end="url(#ah)"/>
+<rect class="dg-box b-ir" x="70" y="190" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="220.0" y="217.5" font-size="15">StorageId</text>
+<text class="dg-bsub dg-mono t-ir" x="220.0" y="232.5" font-size="12">逻辑存储 / alias 等价类</text>
+<text class="dg-note t-ir" x="400" y="216" text-anchor="start" font-size="14">alias / view / inplace 归并到同一 root</text>
+<polyline class="dg-arrow a-note" points="220,250 220,298" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="70" y="310" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="220.0" y="337.5" font-size="15">StoragePlacementId</text>
+<text class="dg-bsub dg-mono t-plan" x="220.0" y="352.5" font-size="12">rank / stage 上的放置模板</text>
+<text class="dg-note t-plan" x="400" y="336" text-anchor="start" font-size="14">同一逻辑存储在不同 rank 是不同放置</text>
+<polyline class="dg-arrow a-note" points="220,370 220,418" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="70" y="430" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="220.0" y="457.5" font-size="15">StorageInstanceId</text>
+<text class="dg-bsub dg-mono t-plan" x="220.0" y="472.5" font-size="12">某次执行 lifetime 的物理分配</text>
+<text class="dg-note t-plan" x="400" y="456" text-anchor="start" font-size="14">唯一进入内存计数的身份；epoch 区分重算再物化</text>
+<rect class="dg-frame" x="70" y="520" width="1020" height="84" rx="10"/>
+<text class="dg-ftitle t-note" x="82" y="512">一个具体例子</text>
+<text class="dg-note dg-mono t-note" x="90" y="550" text-anchor="start" font-size="13">x = f(a)            → TensorId t1, StorageId s1</text>
+<text class="dg-note dg-mono t-note" x="90" y="567" text-anchor="start" font-size="13">y = x.view(...)     → TensorId t2, StorageId s1（alias，零 Allocate）</text>
+<text class="dg-note dg-mono t-note" x="90" y="584" text-anchor="start" font-size="13">x = g(y)            → TensorId t3, StorageId s2（同名，但是新逻辑值）</text>
+<text class="dg-note t-note" x="70" y="634" text-anchor="start" font-size="14">今天按 tensor name 首见定型：t1/t3 会被当成同一个（少算），t1/t2 会被当成两次分配（多算）。四层身份把这两类错误一起消掉。</text>
+</svg>

@@ -1,0 +1,1315 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>统一源码级 Model IR — 目标方案设计 v2</title>
+<style>
+:root{
+  --bg:#fbfbfd; --panel:#fff; --ink:#16181d; --ink2:#4a5160; --ink3:#767e8f;
+  --line:#e3e6ec; --line2:#eef0f4; --accent:#2f6fed; --accent2:#7048e8;
+  --code-bg:#f5f6f9; --code-ink:#22252c;
+  --ok:#2f9e44; --warn:#e8590c; --bad:#c92a2a; --meas:#e8590c; --assum:#9c36b5;
+  --dg-frame:#b8bfcc; --dg-ink:#16181d;
+  --b-input:#eceef2; --s-input:#5b6472;
+  --b-sem:#e4efff;   --s-sem:#1f66d0;
+  --b-ir:#dcf6e2;    --s-ir:#2b8f3e;
+  --b-plan:#fff2cf;  --s-plan:#d1600a;
+  --b-backend:#f4dcfb;--s-backend:#8e33a8;
+  --b-block:#ffe0e0; --s-block:#c02a2a;
+  --b-note:#f4f5f8;  --s-note:#6b7280;
+  --b-derived:#e6ddff;--s-derived:#6338cf;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0f1116; --panel:#15181f; --ink:#e6e9ef; --ink2:#aab2c0; --ink3:#7d8595;
+    --line:#262b35; --line2:#1d222b; --accent:#6f9dff; --accent2:#a98bff;
+    --code-bg:#171b23; --code-ink:#dde2ea;
+    --ok:#51cf66; --warn:#ff922b; --bad:#ff6b6b; --meas:#ff922b; --assum:#cc5de8;
+    --dg-frame:#3a424f; --dg-ink:#e6e9ef;
+    --b-input:#242a34; --s-input:#9aa4b4;
+    --b-sem:#16304f;   --s-sem:#7cb0ff;
+    --b-ir:#153524;    --s-ir:#69db7c;
+    --b-plan:#3b2a0c;  --s-plan:#ffb057;
+    --b-backend:#331838;--s-backend:#e099f5;
+    --b-block:#3a1b1b; --s-block:#ff8787;
+    --b-note:#1c212a;  --s-note:#8f98a8;
+    --b-derived:#241a4a;--s-derived:#b197fc;
+  }
+}
+:root[data-theme=light]{
+  --bg:#fbfbfd; --panel:#fff; --ink:#16181d; --ink2:#4a5160; --ink3:#767e8f;
+  --line:#e3e6ec; --line2:#eef0f4; --accent:#2f6fed; --code-bg:#f5f6f9; --code-ink:#22252c;
+  --dg-frame:#b8bfcc; --dg-ink:#16181d;
+  --b-input:#eceef2;--s-input:#5b6472; --b-sem:#e4efff;--s-sem:#1f66d0;
+  --b-ir:#dcf6e2;--s-ir:#2b8f3e; --b-plan:#fff2cf;--s-plan:#d1600a;
+  --b-backend:#f4dcfb;--s-backend:#8e33a8; --b-block:#ffe0e0;--s-block:#c02a2a;
+  --b-note:#f4f5f8;--s-note:#6b7280; --b-derived:#e6ddff;--s-derived:#6338cf;
+  --ok:#2f9e44; --warn:#e8590c; --bad:#c92a2a; --meas:#e8590c; --assum:#9c36b5;
+}
+:root[data-theme=dark]{
+  --bg:#0f1116; --panel:#15181f; --ink:#e6e9ef; --ink2:#aab2c0; --ink3:#7d8595;
+  --line:#262b35; --line2:#1d222b; --accent:#6f9dff; --code-bg:#171b23; --code-ink:#dde2ea;
+  --dg-frame:#3a424f; --dg-ink:#e6e9ef;
+  --b-input:#242a34;--s-input:#9aa4b4; --b-sem:#16304f;--s-sem:#7cb0ff;
+  --b-ir:#153524;--s-ir:#69db7c; --b-plan:#3b2a0c;--s-plan:#ffb057;
+  --b-backend:#331838;--s-backend:#e099f5; --b-block:#3a1b1b;--s-block:#ff8787;
+  --b-note:#1c212a;--s-note:#8f98a8; --b-derived:#241a4a;--s-derived:#b197fc;
+  --ok:#51cf66; --warn:#ff922b; --bad:#ff6b6b; --meas:#ff922b; --assum:#cc5de8;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:16px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",
+  "PingFang SC","Hiragino Sans GB","Source Han Sans SC",sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{display:grid;grid-template-columns:266px minmax(0,1fr);gap:0;
+  max-width:1500px;margin:0 auto}
+/* ── TOC ─────────────────────────────────────────────── */
+nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:30px 20px 60px;border-right:1px solid var(--line);font-size:13.5px}
+nav .navtitle{font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink3);margin:0 0 14px;font-weight:700}
+nav ol{list-style:none;margin:0;padding:0}
+nav ol li{margin:1px 0}
+nav a{display:block;padding:5px 9px;border-radius:6px;color:var(--ink2);
+  text-decoration:none;line-height:1.45}
+nav a:hover{background:var(--line2);color:var(--ink)}
+nav a .num{display:inline-block;min-width:2.1em;color:var(--ink3);
+  font-variant-numeric:tabular-nums}
+nav .sub a{padding-left:34px;font-size:12.8px;color:var(--ink3)}
+nav .grp{margin-top:14px;padding:0 9px;font-size:11.5px;font-weight:700;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+main{padding:30px 42px 140px;min-width:0}
+/* ── typography ──────────────────────────────────────── */
+h1{font-size:31px;line-height:1.25;letter-spacing:-.02em;margin:8px 0 10px}
+h2{font-size:23px;letter-spacing:-.01em;margin:56px 0 4px;padding-top:22px;
+  border-top:1px solid var(--line)}
+h2 .cn{display:block;font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--accent);font-weight:700;margin-bottom:6px}
+h3{font-size:17px;margin:30px 0 8px}
+h4{font-size:14.5px;margin:22px 0 6px;color:var(--ink2);
+  letter-spacing:.02em;text-transform:uppercase;font-weight:700}
+p{margin:11px 0}
+ul,ol{margin:11px 0;padding-left:24px}
+li{margin:5px 0}
+code{font:13.2px/1.5 ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace;
+  background:var(--code-bg);color:var(--code-ink);padding:1.5px 5px;border-radius:4px;
+  border:1px solid var(--line)}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:9px;
+  padding:15px 17px;overflow-x:auto;margin:14px 0}
+pre code{background:none;border:0;padding:0;font-size:12.9px;line-height:1.62}
+.lede{font-size:17.5px;color:var(--ink2);margin:14px 0 22px}
+.meta{font-size:13px;color:var(--ink3);border-left:3px solid var(--line);
+  padding:2px 0 2px 14px;margin:18px 0 26px}
+.meta div{margin:3px 0}
+.meta b{color:var(--ink2);font-weight:600}
+.thesis{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);
+  border-radius:10px;padding:18px 22px;margin:22px 0;font-size:17px;line-height:1.7}
+/* ── callouts ────────────────────────────────────────── */
+.cal{border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:16px 0;
+  background:var(--panel);font-size:14.6px}
+.cal .lbl{font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  font-weight:800;display:block;margin-bottom:5px}
+.cal.why{border-left:4px solid var(--accent)} .cal.why .lbl{color:var(--accent)}
+.cal.inv{border-left:4px solid var(--ok)} .cal.inv .lbl{color:var(--ok)}
+.cal.honest{border-left:4px solid var(--warn)} .cal.honest .lbl{color:var(--warn)}
+.cal.bad{border-left:4px solid var(--bad)} .cal.bad .lbl{color:var(--bad)}
+.cal p:first-of-type{margin-top:0} .cal p:last-child{margin-bottom:0}
+/* ── tables ──────────────────────────────────────────── */
+.tw{overflow-x:auto;margin:16px 0;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:14px;background:var(--panel)}
+th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line2);
+  vertical-align:top}
+th{background:var(--code-bg);font-size:12.4px;letter-spacing:.03em;font-weight:700;
+  color:var(--ink2);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td code{font-size:12.4px}
+.nw{white-space:nowrap}
+/* ── figures ─────────────────────────────────────────── */
+figure{margin:26px 0;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:18px 18px 12px}
+figure .fw{overflow-x:auto}
+figure svg{display:block;min-width:640px;width:100%;height:auto}
+figcaption{font-size:13px;color:var(--ink3);margin-top:12px;padding-top:10px;
+  border-top:1px solid var(--line2);display:flex;gap:12px;flex-wrap:wrap;
+  align-items:baseline;justify-content:space-between}
+figcaption b{color:var(--ink2);font-weight:600}
+figcaption .src{font:12px ui-monospace,monospace;color:var(--ink3);white-space:nowrap}
+/* ── SVG diagram theming ─────────────────────────────── */
+svg.dg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",
+  "PingFang SC",sans-serif}
+svg.dg .dg-mono{font-family:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace}
+svg.dg .dg-frame{fill:none;stroke:var(--dg-frame);stroke-dasharray:7 5;stroke-width:1.4}
+svg.dg .dg-box{stroke-width:1.8}
+svg.dg .dg-blabel{text-anchor:middle;font-weight:650;font-size:15px}
+svg.dg .dg-bsub{text-anchor:middle;font-size:12px;opacity:.9}
+svg.dg .dg-ftitle{font-size:14.5px;font-weight:750;letter-spacing:.02em}
+svg.dg .dg-arrow{fill:none;stroke-width:1.9;stroke-linejoin:round}
+svg.dg .dg-dash{stroke-dasharray:6 4}
+svg.dg .dg-alabel{font-size:12.5px}
+svg.dg .dg-note{font-size:13px;fill:var(--ink2)}
+svg.dg .dg-ah{fill:var(--dg-ink)}
+svg.dg .b-input{fill:var(--b-input);stroke:var(--s-input)}
+svg.dg .b-sem{fill:var(--b-sem);stroke:var(--s-sem)}
+svg.dg .b-ir{fill:var(--b-ir);stroke:var(--s-ir)}
+svg.dg .b-plan{fill:var(--b-plan);stroke:var(--s-plan)}
+svg.dg .b-backend{fill:var(--b-backend);stroke:var(--s-backend)}
+svg.dg .b-block{fill:var(--b-block);stroke:var(--s-block)}
+svg.dg .b-note{fill:var(--b-note);stroke:var(--s-note)}
+svg.dg .b-derived{fill:var(--b-derived);stroke:var(--s-derived)}
+svg.dg .t-input{fill:var(--s-input)} svg.dg .t-sem{fill:var(--s-sem)}
+svg.dg .t-ir{fill:var(--s-ir)} svg.dg .t-plan{fill:var(--s-plan)}
+svg.dg .t-backend{fill:var(--s-backend)} svg.dg .t-block{fill:var(--s-block)}
+svg.dg .t-note{fill:var(--ink2)} svg.dg .t-derived{fill:var(--s-derived)}
+svg.dg .a-note{stroke:var(--ink3)} svg.dg .a-input{stroke:var(--s-input)}
+svg.dg .a-sem{stroke:var(--s-sem)} svg.dg .a-ir{stroke:var(--s-ir)}
+svg.dg .a-plan{stroke:var(--s-plan)} svg.dg .a-block{stroke:var(--s-block)}
+svg.dg .a-backend{stroke:var(--s-backend)} svg.dg .a-derived{stroke:var(--s-derived)}
+/* ── misc ────────────────────────────────────────────── */
+.pill{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.04em;
+  padding:2px 8px;border-radius:20px;border:1px solid;vertical-align:1px}
+.p-sd{color:var(--ok);border-color:var(--ok)}
+.p-me{color:var(--meas);border-color:var(--meas)}
+.p-as{color:var(--assum);border-color:var(--assum)}
+.flow{counter-reset:st;list-style:none;padding:0;margin:14px 0}
+.flow li{counter-increment:st;position:relative;padding:9px 0 9px 44px;
+  border-bottom:1px solid var(--line2)}
+.flow li:last-child{border-bottom:0}
+.flow li::before{content:counter(st);position:absolute;left:0;top:9px;width:26px;
+  height:26px;border-radius:50%;background:var(--code-bg);border:1px solid var(--line);
+  color:var(--ink2);font:600 12.5px/25px ui-monospace,monospace;text-align:center}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;font-size:14.2px;
+  margin:12px 0}
+.kv dt{font:600 13px ui-monospace,monospace;color:var(--accent2);white-space:nowrap}
+.kv dd{margin:0;color:var(--ink2)}
+hr{border:0;border-top:1px solid var(--line);margin:40px 0}
+.foot{margin-top:70px;padding-top:20px;border-top:1px solid var(--line);
+  font-size:13px;color:var(--ink3)}
+@media (max-width:1040px){
+  .wrap{grid-template-columns:1fr}
+  nav{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}
+  main{padding:24px 20px 100px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <p class="navtitle">目录</p>
+  <ol>
+    <li><a href="#c0"><span class="num">0</span>导读与基线</a></li>
+    <li class="grp">第一部分 · 总体</li>
+    <li><a href="#c1"><span class="num">1</span>总体设计与分层</a></li>
+    <li class="sub"><a href="#c1-2">1.2 关节为什么切在这里</a></li>
+    <li class="sub"><a href="#c1-4">1.4 全局不变量</a></li>
+    <li><a href="#c2"><span class="num">2</span>横切契约：知识分级</a></li>
+    <li class="grp">第二部分 · 逐层</li>
+    <li><a href="#c3"><span class="num">3</span>S1 语义层</a></li>
+    <li><a href="#c4"><span class="num">4</span>S2 结构层</a></li>
+    <li><a href="#c5"><span class="num">5</span>S3 反向层</a></li>
+    <li><a href="#c6"><span class="num">6</span>身份体系</a></li>
+    <li><a href="#c7"><span class="num">7</span>S4 布局层</a></li>
+    <li><a href="#c8"><span class="num">8</span>S5 执行层</a></li>
+    <li><a href="#c9"><span class="num">9</span>S6 后端与 S7 报告</a></li>
+    <li class="grp">第三部分 · 闭环</li>
+    <li><a href="#c10"><span class="num">10</span>阻断与用户闭环</a></li>
+    <li><a href="#c11"><span class="num">11</span>验收与迁移</a></li>
+    <li><a href="#c12"><span class="num">12</span>决策记录与边界</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<h1>统一源码级 Model IR — 目标方案设计 v2</h1>
+<p class="lede">把显存与时间两条独立的模型构造链合成一条：结构从源码抽取、语义由纯配置描述、
+布局与执行作为派生计划层，两个后端只读消费。</p>
+
+<div class="meta">
+  <div><b>文档类型</b>　目标方案（To-Be）总体设计与分层设计</div>
+  <div><b>代码基线</b>　<code>feat/unified-llm-modelspec</code> @ <code>6b72d8d</code></div>
+  <div><b>方案版本</b>　v2 · 2026-07-30 · 状态：设计（待过审）</div>
+  <div><b>前作</b>　<code>specs/2026-07-30-unified-code-grounded-ir-design.md</code>（分层与缺陷清单）、
+       <code>docs/pynative-cost-evaluator-target-solution-design-2026-07-30.md</code>（v1 全量规范）</div>
+  <div><b>本版相对 v1 的实质改动</b>　新增 BackwardIR 派生层（重算入图）、
+       用「量的 provenance」取代「层的退化档」、placement 增加声明通道、
+       验收对照物从 legacy 改为真机</div>
+  <div><b>图</b>　可编辑源在 <code>docs/target-design-v2/diagrams/*.excalidraw</code>；
+       页面内 SVG 与其同源生成（<code>tools/gen_diagrams.py</code>）</div>
+</div>
+
+<h2 id="c0"><span class="cn">Chapter 0</span>导读与基线</h2>
+
+<p>这份文档回答一个问题：<b>如果从原理出发重新设计这个仿真器的模型表示，应该长什么样。</b>
+它不是对现有代码的改造清单，而是目标形态的分层规范——每一层讲四件事：<b>是什么</b>、
+<b>为什么这样切</b>、<b>主要数据结构</b>、<b>数据流与逻辑流程</b>。</p>
+
+<h4>要解决的四个问题</h4>
+<div class="tw"><table>
+<tr><th>问题</th><th>今天的形态</th><th>本方案</th></tr>
+<tr><td class="nw">模型演进速度</td>
+  <td>op 图与 <code>saves=[...]</code> 手写在 Python 里，框架代码一改就烂且<b>静默</b>失效</td>
+  <td>结构从源码抽取，重跑编译即更新</td></tr>
+<tr><td class="nw">未知算子</td>
+  <td>三种不一致结果：抛错 / 只进 <code>opaque_calls</code> / 透传首输入 shape</td>
+  <td>统一阻断 + 生成待填骨架</td></tr>
+<tr><td class="nw">两条链各自为政</td>
+  <td>显存吃手写图、时间吃抽取图；轴代入、反向语义各实现一遍</td>
+  <td>共享 Structure + Backward + Placement，后端只剩口径壳</td></tr>
+<tr><td class="nw">不确定性无处安放</td>
+  <td>时间侧有退化阶梯与 confidence；形状/内存侧只有「精确或阻断」</td>
+  <td>provenance 作为全 IR 横切契约（<a href="#c2">第 2 章</a>）</td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">为什么值得重做而不是继续打补丁</span>
+<p>手写图的失效模式是<b>静默的</b>：框架结构变了，数字还在，没有任何机制会发现。
+可证伪性是这里唯一重要的性质——一条追不到出处的断言，和一个猜测没有区别。</p></div>
+
+<h2 id="c1"><span class="cn">Chapter 1</span>总体设计与分层</h2>
+
+<h3 id="c1-1">1.1 主线</h3>
+<div class="thesis">
+以<b>框架源码</b>为模型结构的唯一入口；以<b>纯配置描述的原子 op 语义</b>补齐源码无法证明的算子契约；
+编译成不可变的 <code>CoreIR</code>；由 <code>BackwardIR</code> → <code>PlacementPlan</code> →
+<code>ExecutionPlan</code> 三个<b>派生</b>计划层逐步加信息；最后由显存与时间两个<b>只读</b>后端消费。
+</div>
+
+<p>四类角色必须分清，这是全篇的骨架：</p>
+<dl class="kv">
+  <dt>事实源</dt><dd>源码（结构）、配置（语义）、标定（实测量）——只有这三处产生新事实</dd>
+  <dt>不可变核</dt><dd><code>CoreIR</code>：与设备、并行、时序全部无关的逻辑事实</dd>
+  <dt>派生层</dt><dd><code>BackwardIR</code> / <code>PlacementPlan</code> / <code>ExecutionPlan</code>：
+      各自吃一份策略输入，只读上游、从不回写</dd>
+  <dt>只读后端</dt><dd>显存、时间：只消费计划，互不 import，不改 IR</dd>
+</dl>
+
+<figure id="fig-01-layering">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1180 1010" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="总体分层与数据流">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="70" y="40" width="1040" height="92" rx="10"/>
+<text class="dg-ftitle t-sem" x="82" y="32">S1 语义层</text>
+<rect class="dg-box b-sem" x="430" y="58" width="320" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="590.0" y="83.5" font-size="15">TypedRegistrySnapshot</text>
+<text class="dg-bsub dg-mono t-sem" x="590.0" y="98.5" font-size="12">op 语义词典（冻结、带 digest）</text>
+<rect class="dg-frame" x="70" y="170" width="1040" height="92" rx="10"/>
+<text class="dg-ftitle t-ir" x="82" y="162">S2 结构层</text>
+<rect class="dg-box b-ir" x="430" y="188" width="320" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="590.0" y="213.5" font-size="15">CoreIR</text>
+<text class="dg-bsub dg-mono t-ir" x="590.0" y="228.5" font-size="12">逻辑事实：op / 值 / 存储关系</text>
+<rect class="dg-frame" x="70" y="300" width="1040" height="92" rx="10"/>
+<text class="dg-ftitle t-derived" x="82" y="292">S3 反向层</text>
+<rect class="dg-box b-derived" x="430" y="318" width="320" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="590.0" y="343.5" font-size="15">BackwardIR</text>
+<text class="dg-bsub dg-mono t-derived" x="590.0" y="358.5" font-size="12">前向+反向+重算，同一节点类型</text>
+<rect class="dg-frame" x="70" y="430" width="1040" height="92" rx="10"/>
+<text class="dg-ftitle t-plan" x="82" y="422">S4 布局层</text>
+<rect class="dg-box b-plan" x="430" y="448" width="320" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="473.5" font-size="15">PlacementPlan</text>
+<text class="dg-bsub dg-mono t-plan" x="590.0" y="488.5" font-size="12">在哪：mesh / shard / local shape</text>
+<rect class="dg-frame" x="70" y="560" width="1040" height="92" rx="10"/>
+<text class="dg-ftitle t-plan" x="82" y="552">S5 执行层</text>
+<rect class="dg-box b-plan" x="430" y="578" width="320" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="603.5" font-size="15">ExecutionPlan</text>
+<text class="dg-bsub dg-mono t-plan" x="590.0" y="618.5" font-size="12">何时：event / lifetime / alloc-free</text>
+<rect class="dg-box b-input" x="90" y="58" width="250" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="215.0" y="75.5" font-size="15">Native / User / Patch</text>
+<text class="dg-bsub dg-mono t-input" x="215.0" y="90.5" font-size="12">三个物理隔离注册域</text>
+<rect class="dg-box b-input" x="820" y="58" width="250" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="945.0" y="75.5" font-size="15">FrameworkRuntimeSnapshot</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="90.5" font-size="12">版本参与 digest</text>
+<rect class="dg-box b-input" x="90" y="188" width="250" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="215.0" y="205.5" font-size="15">源码 → DraftGraph</text>
+<text class="dg-bsub dg-mono t-input" x="215.0" y="220.5" font-size="12">符号 / 数据流 / attrs 字面值</text>
+<rect class="dg-box b-input" x="820" y="318" width="250" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="945.0" y="335.5" font-size="15">RecomputeSpec</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="350.5" font-size="12">重算策略（派生输入）</text>
+<rect class="dg-box b-input" x="820" y="448" width="250" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="945.0" y="465.5" font-size="15">ParallelConfig</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="480.5" font-size="12">tp / pp / ep / cp / dp</text>
+<rect class="dg-box b-input" x="820" y="578" width="250" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="945.0" y="595.5" font-size="15">BufferCalibration</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">measured 量的载体</text>
+<polyline class="dg-arrow a-note" points="590.0,114 590.0,158" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="590.0,244 590.0,288" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="590.0,374 590.0,418" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="590.0,504 590.0,548" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="590.0,634 590.0,690" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="340,78 430,78" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="820,78 750,78" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="340,208 430,208" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="820,338 750,338" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="820,468 750,468" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="820,598 750,598" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="70" y="690" width="1040" height="120" rx="10"/>
+<text class="dg-ftitle t-backend" x="82" y="682">S6 只读后端</text>
+<rect class="dg-box b-backend" x="150" y="716" width="330" height="72" rx="8"/>
+<text class="dg-blabel t-backend" x="315.0" y="749.5" font-size="15">MemorySimulator</text>
+<text class="dg-bsub dg-mono t-backend" x="315.0" y="764.5" font-size="12">allocator / liveness / OOM</text>
+<rect class="dg-box b-backend" x="700" y="716" width="330" height="72" rx="8"/>
+<text class="dg-blabel t-backend" x="865.0" y="749.5" font-size="15">TimeSimulator</text>
+<text class="dg-bsub dg-mono t-backend" x="865.0" y="764.5" font-size="12">cost / contention / pipeline DES</text>
+<polyline class="dg-arrow a-note" points="470,634 315,700 315,712" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="710,634 865,700 865,712" marker-end="url(#ah)"/>
+<text class="dg-note t-block" x="590" y="754" text-anchor="middle" font-size="13">互不 import</text>
+<text class="dg-note t-block" x="590" y="771" text-anchor="middle" font-size="13">不回写上游</text>
+<rect class="dg-frame" x="70" y="838" width="1040" height="96" rx="10"/>
+<text class="dg-ftitle t-note" x="82" y="830">S7 报告</text>
+<rect class="dg-box b-note" x="430" y="862" width="320" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-note" x="590.0" y="885.5" font-size="15">UnifiedReport</text>
+<text class="dg-bsub dg-mono t-note" x="590.0" y="900.5" font-size="12">结果 + provenance + confidence</text>
+<polyline class="dg-arrow a-note" points="315,788 430,880" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="865,788 750,880" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="90" y="966" text-anchor="start" font-size="14">不变量：每层只增加一类信息；下游只读上游，从不回写。改并行配置只失效 S4/S5，CoreIR 不动（what-if 的交互性由此保证）。</text>
+</svg>
+</div>
+<figcaption><span><b>图 1</b>　总体分层与数据流</span><span class="src">diagrams/01-layering.excalidraw</span></figcaption>
+</figure>
+
+<h3 id="c1-2">1.2 关节为什么切在这里</h3>
+<p>分层的判据只有一条：<b>每层只增加一类信息</b>。层数不是越多越好，但关节切错会在某个具体
+场景上暴露——所以下面用三个压力测试验它。</p>
+
+<div class="tw"><table>
+<tr><th>压力测试</th><th>如果关节切错会怎样</th><th>本分层的表现</th></tr>
+<tr><td class="nw"><b>重算</b></td>
+  <td>同一逻辑算子执行两次、生命周期不同。若把它当结构事实，就要 fork CoreIR</td>
+  <td>落 <code>BackwardIR</code>：重算节点 = 被复制进反向图的前向节点。CoreIR 不动 ✓</td></tr>
+<tr><td class="nw"><b>算子融合</b></td>
+  <td>融合与否取决于框架版本，看似是环境事实而非模型事实</td>
+  <td>源码字面调用融合 kernel，且框架版本快照参与语义绑定 ⇒ 确实是编译期可定的源码事实 ✓</td></tr>
+<tr><td class="nw"><b>交互式 what-if</b></td>
+  <td>改一次 <code>tp</code> 若失效整条链，探索器就没法用</td>
+  <td>改并行只失效 S4/S5；改重算只失效 S3 及其下游；CoreIR（最贵的一层）不动 ✓</td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">为什么源码和配置的分工是这样</span>
+<p>源码只提供<b>三样</b>：符号、数据流、attrs 字面值。配置提供<b>全部</b>语义
+（<code>(输入 shape, attrs) → 输出</code>）。两者不重叠，所以结构上不可能出现
+「这个 shape 该信源码还是信声明」的仲裁问题——<b>「两个真相源」在这个切法下无法复发</b>。</p></div>
+
+<h3 id="c1-3">1.3 层的职责边界</h3>
+<div class="tw"><table>
+<tr><th>层</th><th>只负责</th><th>不负责</th><th class="nw">策略输入</th></tr>
+<tr><td class="nw">S1 语义</td><td>注册域加载、DSL 校验、冻结成快照</td><td>看任何一个具体模型</td><td>—</td></tr>
+<tr><td class="nw">S2 结构</td><td>解析源码、绑定语义、产出逻辑事实</td><td>并行、时序、字节</td><td>—</td></tr>
+<tr><td class="nw">S3 反向</td><td>反向图、重算节点、fan-in 累加</td><td>在哪、多大</td><td class="nw"><code>RecomputeSpec</code></td></tr>
+<tr><td class="nw">S4 布局</td><td>mesh / shard / local shape / 集合通信</td><td>生命周期、定价</td><td class="nw"><code>ParallelConfig</code></td></tr>
+<tr><td class="nw">S5 执行</td><td>事件、依赖、流、生命周期、分配释放</td><td>改逻辑模型</td><td class="nw">调度 + 标定</td></tr>
+<tr><td class="nw">S6 后端</td><td>显存：liveness/allocator/OOM；时间：定价/竞争/流水</td><td>推导上游任何事实</td><td class="nw">硬件 + profile</td></tr>
+<tr><td class="nw">S7 报告</td><td>汇总 + 覆盖率 + provenance + confidence</td><td>隐藏未覆盖项</td><td>—</td></tr>
+</table></div>
+
+<h3 id="c1-4">1.4 全局不变量</h3>
+<div class="cal inv"><span class="lbl">不变量</span>
+<ol>
+<li><b>单向</b>：派生层只读上游，任何层都不回写上游。</li>
+<li><b>policy-free 核</b>：<code>CoreIR</code> 不含任何策略痕迹（并行度、重算、调度）。</li>
+<li><b>唯一绑定</b>：一个原子源码调用在一次编译中只能解析到一条 op 语义。</li>
+<li><b>无 opaque</b>：可执行 IR 中不存在未知算子或不透明节点。</li>
+<li><b>缺失 ≠ 空</b>：字段缺失（未描述）与显式空值（描述为无）严格区分。</li>
+<li><b>全或无</b>：预检不过就不产生任何可供后端执行的部分计划。</li>
+<li><b>身份不靠名字</b>：逻辑值、逻辑存储、放置、物理实例是四个独立 ID（<a href="#c6">第 6 章</a>）。</li>
+<li><b>provenance 必填</b>：每个进入报告的量都带 provenance；<code>measured</code> 必带标定 key、
+    <code>assumed</code> 必带依据（<a href="#c2">第 2 章</a>）。</li>
+</ol></div>
+
+<h2 id="c2"><span class="cn">Chapter 2</span>横切契约：知识分级</h2>
+
+<h3>2.1 是什么</h3>
+<p>仿真建模里的量不是同一种知识。本方案给<b>每个量</b>标一个 <code>provenance</code>，
+而不是给<b>每一层</b>配一套退化档。三类，闭集：</p>
+
+<div class="tw"><table>
+<tr><th class="nw">provenance</th><th>含义</th><th>典型量</th><th>必带</th><th>缺失时</th></tr>
+<tr><td class="nw"><span class="pill p-sd">source_derived</span></td>
+  <td>源码 + 算子定义可判定</td>
+  <td>shape、dtype、alias/inplace、saved 结构、数据流</td><td>—</td>
+  <td><b>阻断</b></td></tr>
+<tr><td class="nw"><span class="pill p-me">measured</span></td>
+  <td>源码里根本不存在，只能实测标定</td>
+  <td><code>workspace_bytes</code>、<code>bwd_scratch</code>、kernel duration、allocator 参数</td>
+  <td>标定 key + <b>适用边界</b></td>
+  <td>缺 key <b>阻断</b>；命中则带 confidence</td></tr>
+<tr><td class="nw"><span class="pill p-as">assumed</span></td>
+  <td>值依赖运行期数据，静态不可判定</td>
+  <td>MoE 每专家实际负载、专家 capacity、非规则化 placement</td>
+  <td><code>basis</code> + 方向（上界/下界/标称）</td>
+  <td>未<b>显式声明</b>即阻断</td></tr>
+</table></div>
+
+<figure id="fig-02-provenance">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1160 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="知识分级：量的 provenance 而非层的退化档">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="280" height="470" rx="10"/>
+<text class="dg-ftitle t-ir" x="72" y="52">source_derived</text>
+<text class="dg-note t-ir" x="76" y="88" text-anchor="start" font-size="13">源码 + 算子定义</text>
+<text class="dg-note t-ir" x="76" y="105" text-anchor="start" font-size="13">可判定</text>
+<rect class="dg-box b-ir" x="80" y="132" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="156.5" font-size="15">shape / dtype</text>
+<rect class="dg-box b-ir" x="80" y="184" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="208.5" font-size="15">alias / inplace</text>
+<rect class="dg-box b-ir" x="80" y="236" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="260.5" font-size="15">saved 结构</text>
+<rect class="dg-box b-ir" x="80" y="288" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="200.0" y="312.5" font-size="15">数据流与依赖</text>
+<rect class="dg-box b-block" x="80" y="354" width="240" height="60" rx="8"/>
+<text class="dg-blabel t-block" x="200.0" y="381.5" font-size="15">判据</text>
+<text class="dg-bsub dg-mono t-block" x="200.0" y="396.5" font-size="12">缺失 ⇒ 阻断</text>
+<rect class="dg-frame" x="450" y="60" width="280" height="470" rx="10"/>
+<text class="dg-ftitle t-plan" x="462" y="52">measured</text>
+<text class="dg-note t-plan" x="466" y="88" text-anchor="start" font-size="13">只能实测标定</text>
+<text class="dg-note t-plan" x="466" y="105" text-anchor="start" font-size="13">源码里不存在</text>
+<rect class="dg-box b-plan" x="470" y="132" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="156.5" font-size="15">workspace_bytes</text>
+<rect class="dg-box b-plan" x="470" y="184" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="208.5" font-size="15">bwd_scratch</text>
+<rect class="dg-box b-plan" x="470" y="236" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="260.5" font-size="15">kernel duration</text>
+<rect class="dg-box b-plan" x="470" y="288" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="590.0" y="312.5" font-size="15">allocator 参数</text>
+<rect class="dg-box b-block" x="470" y="354" width="240" height="60" rx="8"/>
+<text class="dg-blabel t-block" x="590.0" y="374.5" font-size="15">判据</text>
+<text class="dg-bsub dg-mono t-block" x="590.0" y="389.5" font-size="12">缺 key ⇒ 阻断</text>
+<text class="dg-bsub dg-mono t-block" x="590.0" y="403.5" font-size="12">命中 ⇒ 带 confidence</text>
+<rect class="dg-frame" x="840" y="60" width="280" height="470" rx="10"/>
+<text class="dg-ftitle t-backend" x="852" y="52">assumed</text>
+<text class="dg-note t-backend" x="856" y="88" text-anchor="start" font-size="13">需要建模假设</text>
+<text class="dg-note t-backend" x="856" y="105" text-anchor="start" font-size="13">值依赖运行期数据</text>
+<rect class="dg-box b-backend" x="860" y="132" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="980.0" y="156.5" font-size="15">MoE 每专家负载</text>
+<rect class="dg-box b-backend" x="860" y="184" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="980.0" y="208.5" font-size="15">专家 capacity</text>
+<rect class="dg-box b-backend" x="860" y="236" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="980.0" y="260.5" font-size="15">非规则化 placement</text>
+<rect class="dg-box b-block" x="860" y="354" width="240" height="60" rx="8"/>
+<text class="dg-blabel t-block" x="980.0" y="374.5" font-size="15">判据</text>
+<text class="dg-bsub dg-mono t-block" x="980.0" y="389.5" font-size="12">必须显式声明</text>
+<text class="dg-bsub dg-mono t-block" x="980.0" y="403.5" font-size="12">缺声明 ⇒ 阻断</text>
+<text class="dg-note t-note" x="60" y="32" text-anchor="start" font-size="15">同一条契约字段 provenance 贯穿 S1→S7；分界线是「源码可判定 / 不可判定」，横穿内存与时间两侧。</text>
+<rect class="dg-box b-note" x="390" y="578" width="380" height="56" rx="8"/>
+<text class="dg-blabel dg-mono t-note" x="580.0" y="603.5" font-size="15">UnifiedReport</text>
+<text class="dg-bsub dg-mono t-note" x="580.0" y="618.5" font-size="12">按 provenance 分别统计覆盖率与 confidence</text>
+<polyline class="dg-arrow a-note" points="200,530 200,560 580,560 580,574" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="590,530 590,560 580,560 580,574" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="980,530 980,560 580,560 580,574" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="60" y="674" text-anchor="start" font-size="14">关键：assumed 不是 fallback。未声明仍然阻断；声明了才放行，且 basis 与方向（上界/下界/标称）进报告。</text>
+</svg>
+</div>
+<figcaption><span><b>图 2</b>　知识分级：量的 provenance 而非层的退化档</span><span class="src">diagrams/02-provenance.excalidraw</span></figcaption>
+</figure>
+
+<h3>2.2 为什么分界线在这里</h3>
+<p>一个直觉的分法是「内存侧要精确、时间侧允许估」。<b>这个分法是错的</b>，两个反例就能推翻：</p>
+<ul>
+<li><code>workspace_bytes</code> 在<b>内存</b>侧，却是 kernel 实现属性——源码里没有，只能上机测；</li>
+<li>MoE 每专家负载在<b>形状</b>侧，却只能假设——它是 router 输出<b>值</b>的函数，不是输入 shape 的函数。</li>
+</ul>
+<p>所以真正的分界线是<b>「源码可判定 / 不可判定」</b>，它横穿内存与时间两侧。</p>
+
+<div class="cal why"><span class="lbl">为什么必须有 assumed 这一档</span>
+<p>被仿真的对象是<b>稀疏模型</b>。topk 之后的实际长度、每专家实际 token 数、动态稀疏注意力的选中数
+——这些在原理上<b>不是</b><code>(输入 shape, attrs)</code> 的函数，任何静态语义都证明不了。</p>
+<p>只有「精确或阻断」两态时，剩下两条路都坏：要么永远阻断（工具对稀疏模型不可用），
+要么偷偷用容量因子顶上（正是本方案禁止的「用缺省值替代未声明」）。
+<b>第三态不是妥协，是把已经在做的假设变得可见。</b></p></div>
+
+<div class="cal bad"><span class="lbl">这一档要挡住的失效模式</span>
+<p>如果只有阻断，用户为了让工具跑起来，会在骨架里填一个看起来合理的数。
+而这个数一旦进了系统就<b>与真值不可区分</b>——它有完整 schema、通过类型检查、
+provenance 说它来自用户注册域。结果恰好摧毁了本方案最想要的那条性质。</p>
+<p>所以 <code>assumed</code> 必须带 <code>basis</code>，且在报告里<b>独立统计</b>。</p></div>
+
+<h3>2.3 数据结构</h3>
+<pre><code># 每个可进报告的量都是这个形状（闭集 tagged union）
+Quantity:
+  provenance: source_derived | measured | assumed
+  value:      &lt;Expr&gt;                 # 受控表达式，见 3.4
+  # provenance == measured
+  calibration_key: &lt;str&gt;             # 指向标定快照里的条目
+  bounds:          &lt;str&gt;             # 适用边界：测过哪些点、哪些维没扫过
+  # provenance == assumed
+  basis:     &lt;str&gt;                   # 为什么这样假设
+  direction: upper | lower | nominal # 偏差方向，报告必须点明</code></pre>
+
+<h3>2.4 数据流</h3>
+<p><code>provenance</code> 在 S1 声明、随量流经 S2–S5、在 S6 参与 confidence 计算、
+在 S7 分类统计。<b>它从不被消掉</b>——任何一层把 <code>assumed</code> 洗成普通数值都是契约违规。</p>
+<div class="cal inv"><span class="lbl">不变量</span>
+<p>报告必须能回答：这个峰值里有多少字节来自 <code>measured</code>、多少来自 <code>assumed</code>，
+以及每一条的依据是什么。做不到就不是这个方案。</p></div>
+
+<h2 id="c3"><span class="cn">Chapter 3</span>S1 语义层</h2>
+
+<h3>3.1 是什么</h3>
+<p>op 语义的<b>唯一</b>词典，以配置文件描述，编译成不可变快照。它不认识任何具体模型——
+它只回答「这个算子是什么」。</p>
+
+<figure id="fig-03-semantic-layer">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1160 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="语义层：注册域、DSL 编译与调用绑定">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="300" height="250" rx="10"/>
+<text class="dg-ftitle t-sem" x="72" y="52">三个物理隔离注册域</text>
+<rect class="dg-box b-sem" x="80" y="92" width="260" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="210.0" y="111.5" font-size="15">NativeOpRegistry</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="126.5" font-size="12">随版本发布，只读</text>
+<rect class="dg-box b-sem" x="80" y="152" width="260" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="210.0" y="171.5" font-size="15">UserOpRegistry</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="186.5" font-size="12">只能新增 native 未覆盖</text>
+<rect class="dg-box b-sem" x="80" y="212" width="260" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="210.0" y="231.5" font-size="15">NativePatchRegistry</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="246.5" font-size="12">整条替换 + hash 门禁</text>
+<rect class="dg-box b-sem" x="440" y="92" width="260" height="44" rx="8"/>
+<text class="dg-blabel t-sem" x="570.0" y="111.5" font-size="15">RegistryLoader</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="126.5" font-size="12">冲突 / 版本 / 完整性</text>
+<rect class="dg-box b-sem" x="440" y="168" width="260" height="44" rx="8"/>
+<text class="dg-blabel t-sem" x="570.0" y="187.5" font-size="15">DSL 编译</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="202.5" font-size="12">parse → typecheck → 模板展开</text>
+<rect class="dg-box b-ir" x="440" y="244" width="260" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="570.0" y="271.5" font-size="15">TypedRegistrySnapshot</text>
+<text class="dg-bsub dg-mono t-ir" x="570.0" y="286.5" font-size="12">不可变 + digest</text>
+<rect class="dg-box b-input" x="790" y="92" width="300" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="940.0" y="111.5" font-size="15">FrameworkRuntimeSnapshot</text>
+<text class="dg-bsub dg-mono t-input" x="940.0" y="126.5" font-size="12">framework / runtime 版本</text>
+<rect class="dg-box b-input" x="790" y="168" width="300" height="44" rx="8"/>
+<text class="dg-blabel t-input" x="940.0" y="187.5" font-size="15">TemplateLibrary</text>
+<text class="dg-bsub dg-mono t-input" x="940.0" y="202.5" font-size="12">固定模板，非第二执行路径</text>
+<polyline class="dg-arrow a-note" points="340,114 436,114" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570,140 570,164" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570,216 570,240" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="790,114 704,114" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="790,190 704,190" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="60" y="360" width="1030" height="230" rx="10"/>
+<text class="dg-ftitle t-ir" x="72" y="352">调用绑定（快照冻结后，不再解析 YAML、不再展开模板）</text>
+<rect class="dg-box b-input" x="90" y="402" width="210" height="48" rx="8"/>
+<text class="dg-blabel t-input" x="195.0" y="423.5" font-size="15">原子源码调用</text>
+<text class="dg-bsub dg-mono t-input" x="195.0" y="438.5" font-size="12">symbol + inputs + attrs</text>
+<rect class="dg-box b-sem" x="350" y="402" width="190" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="445.0" y="430.5" font-size="15">native 命中？</text>
+<rect class="dg-box b-sem" x="350" y="500" width="190" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="445.0" y="528.5" font-size="15">user 命中？</text>
+<rect class="dg-box b-sem" x="610" y="402" width="190" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="705.0" y="430.5" font-size="15">有有效 patch？</text>
+<rect class="dg-box b-ir" x="860" y="402" width="190" height="48" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="955.0" y="416.5" font-size="15">ResolvedCall</text>
+<text class="dg-bsub dg-mono t-ir" x="955.0" y="431.5" font-size="12">definition + attrs +</text>
+<text class="dg-bsub dg-mono t-ir" x="955.0" y="445.5" font-size="12">provenance</text>
+<rect class="dg-box b-block" x="610" y="500" width="190" height="48" rx="8"/>
+<text class="dg-blabel dg-mono t-block" x="705.0" y="521.5" font-size="15">E_OP_UNREGISTERED</text>
+<text class="dg-bsub dg-mono t-block" x="705.0" y="536.5" font-size="12">阻断 + 生成骨架</text>
+<polyline class="dg-arrow a-note" points="300,426 346,426" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="540,426 606,426" marker-end="url(#ah)"/>
+<text class="dg-alabel t-note" x="581.0" y="420.0">是</text>
+<polyline class="dg-arrow a-note" points="800,426 856,426" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="445,450 445,496" marker-end="url(#ah)"/>
+<text class="dg-alabel t-note" x="453.0" y="467.0">否</text>
+<polyline class="dg-arrow a-note" points="540,524 606,524" marker-end="url(#ah)"/>
+<text class="dg-alabel t-note" x="581.0" y="518.0">否</text>
+<polyline class="dg-arrow a-sem" points="445,548 445,570 960,570 960,454" marker-end="url(#ah)"/>
+<text class="dg-alabel t-sem" x="668" y="584">是（user 绑定）</text>
+<text class="dg-note t-sem" x="806" y="410" text-anchor="middle" font-size="12">patch 命中则优先</text>
+</svg>
+</div>
+<figcaption><span><b>图 3</b>　语义层：注册域、DSL 编译与调用绑定</span><span class="src">diagrams/03-semantic-layer.excalidraw</span></figcaption>
+</figure>
+
+<h3>3.2 为什么是三个物理隔离的注册域</h3>
+<div class="tw"><table>
+<tr><th class="nw">注册域</th><th>用途</th><th>能否改 native</th><th>加载</th></tr>
+<tr><td class="nw">Native</td><td>随仿真器版本发布的内置语义</td><td>否</td><td>只读</td></tr>
+<tr><td class="nw">User</td><td>补 native 未覆盖的算子</td><td>否（只能新增）</td><td>用户目录</td></tr>
+<tr><td class="nw">NativePatch</td><td>显式修正一条 native</td><td><b>整条替换</b></td><td>独立目录 + 开关</td></tr>
+</table></div>
+<div class="cal why"><span class="lbl">为什么不是一张表加优先级</span>
+<p><b>加载顺序决定胜者 = 结果不可复现。</b> User 声明了 native 已占用的 selector，
+必须在加载期直接报冲突，而不是「后者覆盖前者」。</p>
+<p><b>Patch 为什么必须整条替换</b>：字段级 merge 会造出「native 的 shape + user 的 autograd
++ 默认的 cost」这种没人设计过的混合语义，且没有任何人能对它负责。</p></div>
+
+<h3>3.3 原子 op：一个类型 = 一条形状关系</h3>
+<p>op 类型必须拆到<b>原子级</b>。反面教材是把 14 种视图语义
+（reshape / permute / transpose / squeeze / unsqueeze / concat / stack / split / chunk /
+slice / tile / roll / broadcast / contiguous）塞进一个 <code>View</code> 类型，
+再在代码里用判别字段二次分派——那等于把配置里已有的信息重新读一遍，
+而且逼着不同语义共用一条反向规则。</p>
+<div class="cal inv"><span class="lbl">不变量</span>
+<p>一个 op 类型只有一条形状关系、一条反向规则、一条布局规则。分派只发生在 selector 绑定，
+不发生在语义求值。</p></div>
+
+<h3>3.4 数据结构：op 描述的七个面</h3>
+<p>描述是<b>纯配置</b>，不含任何代码引用。字段值是受控表达式，由固定函数集求值。</p>
+<div class="tw"><table>
+<tr><th class="nw">面</th><th>回答</th><th class="nw">消费者</th></tr>
+<tr><td class="nw">selector</td><td>哪个源码符号绑定到本条</td><td>S2</td></tr>
+<tr><td class="nw">shape</td><td>输出形状与输入/attrs 的关系</td><td>S2–S5</td></tr>
+<tr><td class="nw">dtype</td><td>storage / compute / accum 三类分别是什么</td><td>S2 / 两后端</td></tr>
+<tr><td class="nw">storage</td><td>每个输出是 new / alias / inplace</td><td>S2</td></tr>
+<tr><td class="nw">autograd</td><td>反向读什么、保存什么、产哪些梯度值</td><td>S3</td></tr>
+<tr><td class="nw">placement</td><td>分片如何沿本算子传播</td><td>S4</td></tr>
+<tr><td class="nw">resource</td><td>逐 phase 的 flops / 访存 / buffer</td><td>S5 / 时间</td></tr>
+</table></div>
+
+<pre><code>dsl_version: 1
+ops:
+  Reshape:
+    selector:  { symbols: [mint.reshape, mint.view, ops.reshape, mint.flatten] }
+    shape:
+      rel:   reshape                      # 固定组合子
+      args:  { input: in0, target: attrs.reshape_dims }
+      on_unresolved: numel_only           # reshape 恒不改元素数（算子定义）⇒ 退元素数档
+      why:   "单缺维由元素数守恒唯一确定"
+    dtype:     { outputs: [same_as(in0)] }
+    storage:   [{ kind: alias, of: in0 }] # 视图：零 Allocate
+    autograd:  { saved_inputs: [], saved_outputs: [], saved_internal: [] }
+    placement: passthrough
+    resource:
+      forward:  { cost_mode: analytic, components: [{ name: view, stream: host_only,
+                  flops: 0, bytes_read: 0, bytes_written: 0, cost_family: host }] }
+      backward: { reuse_inverse_of: forward }
+
+  Permute:
+    selector: { symbols: [mint.permute] }
+    shape:
+      rel:    permute
+      args:   { input: in0, dims: attrs.permute_dims }
+      guards: [dims_is_permutation]       # 谓词库里的具名断言
+      on_guard_fail: numel_only
+      why:    "out.shape[i] = x.shape[dims[i]]（算子定义）"
+    # …余下六面同上</code></pre>
+
+<div class="cal why"><span class="lbl">为什么组合子在引擎里不算「op 关联了代码」</span>
+<p><code>rel: reshape</code> 里的 <code>reshape</code> 是<b>表达式求值器的原语</b>，与任何具体 op 无关
+——就像配置里写 <code>2*x</code> 不会让人说它关联了代码。判据很清楚：
+<b>组合子跨 op 复用</b>（九个原子 op 共用 <code>same_as</code>），
+而 op 独有的知识只有「关系名 + 参数来源 + 守卫 + 退化档」，全是数据。</p>
+<p>组合子是闭集，不到 20 个：<code>same_as</code> · <code>broadcast</code> ·
+<code>replace_last</code> · <code>bmm</code> · <code>halve_last</code> · <code>reshape</code> ·
+<code>permute</code> · <code>swap_axes</code> · <code>squeeze</code> · <code>expand_dims</code> ·
+<code>concat</code> · <code>stack</code> · <code>split</code> · <code>chunk</code> ·
+<code>slice</code> · <code>tile</code> · <code>literal</code> · <code>range_len</code> ·
+<code>index_compose</code> · <code>declared</code>。引用不存在的组合子 → 加载即阻断，
+并要求说明其算子定义。这是显式、可数、要写理由的扩展点，不是后门。</p></div>
+
+<h4>固定类型系统</h4>
+<div class="tw"><table>
+<tr><th class="nw">类型</th><th>用途</th><th>例</th></tr>
+<tr><td class="nw"><code>IntExpr</code></td><td>轴长、元素数、整数属性</td><td><code>dim(x,-1)</code></td></tr>
+<tr><td class="nw"><code>BoolExpr</code></td><td>有限条件分支（必须带 else）</td><td><code>attr("causal")</code></td></tr>
+<tr><td class="nw"><code>ShapeExpr</code></td><td>输出形状</td><td><code>broadcast(shape(x),shape(y))</code></td></tr>
+<tr><td class="nw"><code>DTypeExpr</code></td><td>三类 dtype</td><td><code>promote(dtype(x),dtype(y))</code></td></tr>
+<tr><td class="nw"><code>BytesExpr</code></td><td>buffer 与通信字节</td><td><code>numel(x)*sizeof(dtype(x))</code></td></tr>
+<tr><td class="nw"><code>ValueRefExpr</code></td><td>primal / 梯度 / 内部值引用</td><td><code>grad_output(0)</code></td></tr>
+<tr><td class="nw"><code>PlacementExpr</code></td><td>分片规则</td><td><code>shard(x,axis=-1,mesh="tp")</code></td></tr>
+</table></div>
+<p><b>禁止</b>：循环、递归、赋值、可变状态、文件/网络/环境访问、import、用户自定义函数、
+运行期改注册表、用缺省值替代未声明项。</p>
+
+<h3>3.5 数据流与逻辑流程</h3>
+<ol class="flow">
+<li>加载三域原始文件 + 框架/运行时版本快照。</li>
+<li>schema 解析（closed schema：未知字段、拼错、未知枚举、未知版本全部拒绝）。</li>
+<li>模板展开 → 静态类型检查 → 语义完整性检查（七个面按需齐备）。</li>
+<li>冲突检测：selector 重复、user 侵占 native、patch 目标不存在或 hash 不匹配 → 阻断。</li>
+<li>冻结成不可变快照 + digest（框架版本参与 digest：同一份文件在不同框架版本下不得复用旧快照）。</li>
+<li>此后<b>只做绑定</b>：解析器不再读配置文件、不再展开模板。</li>
+</ol>
+
+<h2 id="c4"><span class="cn">Chapter 4</span>S2 结构层</h2>
+
+<h3>4.1 是什么</h3>
+<p>读框架源码，产出 <code>CoreIR</code>——一张只含<b>逻辑事实</b>的图：有哪些算子、
+它们怎么连、每个值的形状/类型/存储关系是什么。与设备、并行、时序<b>全部无关</b>。</p>
+
+<figure id="fig-04-structure-backward">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1160 780" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="结构层与反向层">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="1030" height="190" rx="10"/>
+<text class="dg-ftitle t-ir" x="72" y="52">S2 结构层：二分法</text>
+<rect class="dg-box b-input" x="90" y="100" width="240" height="48" rx="8"/>
+<text class="dg-blabel t-input" x="210.0" y="121.5" font-size="15">SourceFrontend</text>
+<text class="dg-bsub dg-mono t-input" x="210.0" y="136.5" font-size="12">AST 内联可展开调用</text>
+<rect class="dg-box b-input" x="90" y="172" width="240" height="48" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="210.0" y="193.5" font-size="15">DraftGraph</text>
+<text class="dg-bsub dg-mono t-input" x="210.0" y="208.5" font-size="12">symbol / 数据流 / attrs 字面值</text>
+<rect class="dg-box b-sem" x="430" y="136" width="240" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="550.0" y="164.5" font-size="15">SemanticResolver</text>
+<rect class="dg-box b-ir" x="430" y="68" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="550.0" y="85.5" font-size="15">TypedRegistrySnapshot</text>
+<text class="dg-bsub dg-mono t-ir" x="550.0" y="100.5" font-size="12">(输入shape, attrs) → 语义</text>
+<rect class="dg-box b-ir" x="780" y="136" width="280" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="920.0" y="163.5" font-size="15">CoreIR</text>
+<text class="dg-bsub dg-mono t-ir" x="920.0" y="178.5" font-size="12">OpInstance / TensorValue / Storage</text>
+<polyline class="dg-arrow a-note" points="210,148 210,168" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="330,196 426,170" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-ir" points="550,108 550,132" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="670,160 776,160" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="90" y="246" text-anchor="start" font-size="13">源码只给三样：符号、数据流、attrs 字面值。注册表给全部语义。两者不重叠 ⇒ 结构上不可能出现「两个真相源」。</text>
+<rect class="dg-frame" x="60" y="300" width="1030" height="300" rx="10"/>
+<text class="dg-ftitle t-derived" x="72" y="292">S3 反向层：BackwardIR（派生，CoreIR 保持 policy-free）</text>
+<rect class="dg-box b-ir" x="100" y="352" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="160.0" y="377.5" font-size="15">op1</text>
+<rect class="dg-box b-ir" x="260" y="352" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="320.0" y="377.5" font-size="15">op2</text>
+<rect class="dg-box b-ir" x="420" y="352" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="480.0" y="377.5" font-size="15">op3</text>
+<polyline class="dg-arrow a-ir" points="220,373 256,373" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-ir" points="380,373 416,373" marker-end="url(#ah)"/>
+<text class="dg-note t-ir" x="100" y="334" text-anchor="start" font-size="13">CoreIR 前向</text>
+<rect class="dg-box b-derived" x="100" y="480" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="160.0" y="505.5" font-size="15">op1′</text>
+<rect class="dg-box b-derived" x="260" y="480" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="320.0" y="505.5" font-size="15">op2′</text>
+<rect class="dg-box b-plan" x="420" y="480" width="150" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="495.0" y="498.5" font-size="15">op2ʳ</text>
+<text class="dg-bsub dg-mono t-plan" x="495.0" y="513.5" font-size="12">phase=recompute</text>
+<rect class="dg-box b-derived" x="610" y="480" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="670.0" y="505.5" font-size="15">op3′</text>
+<polyline class="dg-arrow a-derived" points="610,501 574,501" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-derived" points="420,501 384,501" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-derived" points="260,501 224,501" marker-end="url(#ah)"/>
+<text class="dg-note t-derived" x="100" y="552" text-anchor="start" font-size="13">BackwardIR 反向（右→左）</text>
+<polyline class="dg-arrow a-plan dg-dash" points="320,394 320,442 495,442 495,476" marker-end="url(#ah)"/>
+<text class="dg-alabel t-plan" x="415.5" y="432.5">复制</text>
+<rect class="dg-box b-ir" x="790" y="396" width="280" height="128" rx="8"/>
+<text class="dg-blabel t-ir" x="930.0" y="450.5" font-size="15">统一节点类型</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="465.5" font-size="12">前向 / 反向 / 重算 三类节点同构，</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="479.5" font-size="12">共用同一套形状·类型·布局·资源机器</text>
+<text class="dg-note t-plan" x="610" y="552" text-anchor="start" font-size="13">重算节点 = 前向 op2 的副本：同 SemanticId、新 NodeId、origin 回指。插在该区</text>
+<text class="dg-note t-plan" x="610" y="569" text-anchor="start" font-size="13">域反向节点之前。</text>
+<text class="dg-note t-note" x="60" y="654" text-anchor="start" font-size="14">为什么 BackwardIR 是派生层而不是写进 CoreIR：CoreIR 必须 policy-free。否则改一次重算配置就失效 CoreIR 缓存 —— 而它是最贵的一层。</text>
+<text class="dg-note t-note" x="60" y="700" text-anchor="start" font-size="14">净效果是删类：AutogradContract / GradientValueSpec / GradientAccumulationSpec（fan-in 累加本来就是个 add 节点）全部退化为图里的普通节点与边。</text>
+<text class="dg-note t-note" x="60" y="746" text-anchor="start" font-size="14">不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，digest 独立。</text>
+</svg>
+</div>
+<figcaption><span><b>图 4</b>　结构层与反向层</span><span class="src">diagrams/04-structure-backward.excalidraw</span></figcaption>
+</figure>
+
+<h3>4.2 为什么源码只给结构</h3>
+<p>前端只做三件事：解析、内联可展开调用、识别原子调用与数据依赖。它<b>不猜</b>任何算子语义——
+一个未绑定的调用进 <code>UnresolvedCall</code>，由 S1 的绑定决定生死。</p>
+<div class="cal why"><span class="lbl">为什么这个二分是干净的</span>
+<p>源码天然知道的是「调用了谁、拿了什么、传了什么常量」；它<b>不</b>知道「这个算子的反向要读什么」。
+把前者交给源码、后者交给配置，正好沿着知识的天然边界切。今天那种「形状推断是代码、
+部分参数来自源码 attrs」的混合形态，是这条边界没切干净的结果。</p></div>
+
+<h3>4.3 数据结构</h3>
+<pre><code>CoreIR:
+  ops:        [OpInstance]
+  values:     [TensorValue]
+  storages:   [Storage]
+  params:     [ParameterBinding]
+  buffers:    [BufferContract]         # 声明式，尚未放置
+
+OpInstance:
+  id:          OpId
+  semantic_id: SemanticId              # 指向 S1 快照里的那条 op 描述
+  inputs:      [TensorId]
+  outputs:     [TensorId]              # 可为空（side-effect 算子不许被跳过）
+  attrs:       {...}                   # 源码字面值
+  dtype:       { compute, accum }
+
+TensorValue:
+  id:            TensorId              # 逻辑值身份（见第 6 章）
+  shape:         ShapeExpr
+  storage_dtype: DType
+  storage_id:    StorageId
+  layout:        LayoutExpr
+  relation:      StorageRelation       # new | alias(base,offset,stride) | inplace(base)
+
+Storage:
+  id: StorageId; size: BytesExpr; kind; persistence; alignment</code></pre>
+<p><b>不进 CoreIR</b>：源码文件、行号、调用原文。它们走可剥离的 SourceMap 旁路，
+不参与语义 hash——否则换一个注释就会失效整条缓存。</p>
+
+<div class="cal honest"><span class="lbl">需要澄清的一点</span>
+<p>「不承载源码信息」不等于「op 没有可读名字」。算子在模型里的<b>限定名</b>
+（形如 <code>attn.indexer.linear_wq_b</code>，由内联帧路径 + 调用点属性名拼成）
+是<b>逻辑身份</b>而非源码定位：标定表按它挂载、重算 selector 按它匹配、报告按它可读。
+它应当在 <code>OpId</code> 内可解析，而不是只能查旁路。</p></div>
+
+<h3>4.4 数据流与逻辑流程</h3>
+<ol class="flow">
+<li>从模型配置定位入口，按框架的模块规格解析出<b>本次实际实例化的模块树</b>。</li>
+<li>逐个可展开函数内联，按配置剪掉未命中的条件分支；<b>不可判定的条件即阻断</b>，绝不双走。</li>
+<li>逐语句发射原子调用，用单赋值表记录「哪个变量当前由哪个节点产出」，据此补数据流边。</li>
+<li>每个调用向 S1 快照请求绑定 → 得到 <code>SemanticId</code>；未绑定 → 阻断（<a href="#c10">第 10 章</a>）。</li>
+<li>按 <code>shape</code> / <code>dtype</code> / <code>storage</code> 三面求值，得到 <code>TensorValue</code> 与 <code>Storage</code>。</li>
+<li>校验 CoreIR 不变量：无 opaque、每输出恰一条存储规则、alias 链无环无悬空、side-effect 算子未被跳过。</li>
+</ol>
+
+<h2 id="c5"><span class="cn">Chapter 5</span>S3 反向层</h2>
+
+<h3>5.1 是什么</h3>
+<p>把反向图<b>显式化</b>为一层派生 IR。前向节点、反向节点、重算节点<b>是同一种节点类型</b>，
+共用同一套形状/类型/布局/资源机器。</p>
+
+<h3>5.2 为什么显式化，而不是挂在前向算子上</h3>
+<p>另一种做法是把反向信息编码成前向算子的「契约字段」（保存哪些输入、产哪些梯度值……），
+再用一个 lowering pass 展开。那样做的代价是：反向值得不到与前向值同等的待遇——
+它们的形状、类型、放置要靠一族专用字段和特殊分支，而不是走同一条路。</p>
+<p>显式化之后，一整族契约类<b>退化成图里的普通节点与边</b>：</p>
+<div class="tw"><table>
+<tr><th>挂字段的做法</th><th>显式反向图之后</th></tr>
+<tr><td>autograd 契约（保存输入/输出/内部值三个列表）</td><td>就是图的边</td></tr>
+<tr><td>梯度值规格 + phase 存储规则 + phase 值 ID</td><td>就是 <code>TensorValue</code> + <code>StorageRelation</code></td></tr>
+<tr><td>梯度 fan-in 累加规格</td><td><b>就是一个 add 节点</b>——累加本来就是个算子</td></tr>
+<tr><td>重算的独立 lowering 路径</td><td>删除：重算就是被复制进图的前向节点</td></tr>
+<tr><td>每个事件/资源对象逐个携带 phase 字段</td><td>phase 成为图属性</td></tr>
+</table></div>
+
+<div class="cal inv"><span class="lbl">必须守住的性质</span>
+<p><code>BackwardIR</code> 是<b>派生层</b>，<code>RecomputeSpec</code> 是它的<b>输入</b>，digest 独立。
+不能把它写进 <code>CoreIR</code>——否则改一次重算配置就失效 CoreIR 缓存，而那是最贵的一层，
+交互式 what-if 会因此不可用。</p></div>
+
+<h3>5.3 数据结构</h3>
+<pre><code>BackwardIR:                            # = f(CoreIR, RecomputeSpec)
+  nodes: [Node]                        # 与 CoreIR 同构：phase ∈ {forward,backward,recompute}
+  edges: [(NodeId, NodeId)]
+  release: [ReleaseJoin]               # 由「最后一个 reader」的边直接推出，不再手写
+
+Node:                                  # 三类节点唯一的区别是 phase 与来源
+  id:          NodeId
+  semantic_id: SemanticId              # 重算节点与其前向节点**同一个** SemanticId
+  phase:       forward | backward | recompute
+  origin:      NodeId?                 # 重算/反向节点回指其前向节点
+  inputs/outputs/attrs                 # 同 CoreIR</code></pre>
+
+<h3>5.4 数据流与逻辑流程</h3>
+<ol class="flow">
+<li>按 CoreIR 拓扑逆序，为每个可微算子生成反向节点；不可微算子（比较、常量、detach）不生成。</li>
+<li>反向节点的输入按 <code>autograd</code> 面解析：需要保存的前向值在图上连出<b>跨相边</b>——
+    这条边同时就是它的生命周期依据。</li>
+<li>一个前向值收到多个下游梯度贡献时，插入 <b>add 节点</b>；上游只绑定累加结果这一个值。</li>
+<li>按 <code>RecomputeSpec</code> 选中的区域，把该区域的前向节点<b>复制</b>进反向图
+    （同 <code>SemanticId</code>、新 <code>NodeId</code>、<code>phase=recompute</code>、
+    <code>origin</code> 回指），插在该区域反向节点之前。</li>
+<li>校验：每个梯度边恰一个 producer；重算节点的输入在其插入点可达；释放点在偏序上晚于所有 reader。</li>
+</ol>
+
+<h2 id="c6"><span class="cn">Chapter 6</span>身份体系</h2>
+
+<h3>6.1 是什么与为什么</h3>
+<p>四个独立 ID。存在的理由是一句反命题：<b>用名字推断物理复用一定同时犯两个方向的错。</b></p>
+
+<figure id="fig-05-identities">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1160 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="四层身份：为什么名称去重必须废掉">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-box b-ir" x="70" y="70" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="220.0" y="97.5" font-size="15">TensorId</text>
+<text class="dg-bsub dg-mono t-ir" x="220.0" y="112.5" font-size="12">逻辑值身份（一次赋值 = 一个 ID）</text>
+<text class="dg-note t-ir" x="400" y="96" text-anchor="start" font-size="14">同名重绑 ⇒ 新 ID。名称不能推断物理复用</text>
+<polyline class="dg-arrow a-note" points="220,130 220,178" marker-end="url(#ah)"/>
+<rect class="dg-box b-ir" x="70" y="190" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="220.0" y="217.5" font-size="15">StorageId</text>
+<text class="dg-bsub dg-mono t-ir" x="220.0" y="232.5" font-size="12">逻辑存储 / alias 等价类</text>
+<text class="dg-note t-ir" x="400" y="216" text-anchor="start" font-size="14">alias / view / inplace 归并到同一 root</text>
+<polyline class="dg-arrow a-note" points="220,250 220,298" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="70" y="310" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="220.0" y="337.5" font-size="15">StoragePlacementId</text>
+<text class="dg-bsub dg-mono t-plan" x="220.0" y="352.5" font-size="12">rank / stage 上的放置模板</text>
+<text class="dg-note t-plan" x="400" y="336" text-anchor="start" font-size="14">同一逻辑存储在不同 rank 是不同放置</text>
+<polyline class="dg-arrow a-note" points="220,370 220,418" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="70" y="430" width="300" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="220.0" y="457.5" font-size="15">StorageInstanceId</text>
+<text class="dg-bsub dg-mono t-plan" x="220.0" y="472.5" font-size="12">某次执行 lifetime 的物理分配</text>
+<text class="dg-note t-plan" x="400" y="456" text-anchor="start" font-size="14">唯一进入内存计数的身份；epoch 区分重算再物化</text>
+<rect class="dg-frame" x="70" y="520" width="1020" height="84" rx="10"/>
+<text class="dg-ftitle t-note" x="82" y="512">一个具体例子</text>
+<text class="dg-note dg-mono t-note" x="90" y="550" text-anchor="start" font-size="13">x = f(a)            → TensorId t1, StorageId s1</text>
+<text class="dg-note dg-mono t-note" x="90" y="567" text-anchor="start" font-size="13">y = x.view(...)     → TensorId t2, StorageId s1（alias，零 Allocate）</text>
+<text class="dg-note dg-mono t-note" x="90" y="584" text-anchor="start" font-size="13">x = g(y)            → TensorId t3, StorageId s2（同名，但是新逻辑值）</text>
+<text class="dg-note t-note" x="70" y="634" text-anchor="start" font-size="14">今天按 tensor name 首见定型：t1/t3 会被当成同一个（少算），t1/t2 会被当成两次分配（多算）。四层身份把这两类错误一起消掉。</text>
+</svg>
+</div>
+<figcaption><span><b>图 5</b>　四层身份：为什么名称去重必须废掉</span><span class="src">diagrams/05-identities.excalidraw</span></figcaption>
+</figure>
+
+<div class="tw"><table>
+<tr><th class="nw">ID</th><th>是什么</th><th>回答的问题</th></tr>
+<tr><td class="nw"><code>TensorId</code></td><td>逻辑值身份（一次赋值 = 一个）</td><td>这是同一个值，还是同名的新值？</td></tr>
+<tr><td class="nw"><code>StorageId</code></td><td>逻辑存储 / alias 等价类</td><td>这两个值共享同一块存储吗？</td></tr>
+<tr><td class="nw"><code>StoragePlacementId</code></td><td>rank / stage 上的放置模板</td><td>它在哪张卡上、切成多大？</td></tr>
+<tr><td class="nw"><code>StorageInstanceId</code></td><td>某次执行 lifetime 的物理分配</td><td>这次分配占多少字节、什么时候还？</td></tr>
+</table></div>
+
+<div class="cal bad"><span class="lbl">按名字去重会同时错两个方向</span>
+<pre><code>x = f(a)          # 逻辑值 1，存储 1
+y = x.view(...)    # 逻辑值 2，存储 1   ← 别名，零分配
+x = g(y)          # 逻辑值 3，存储 2   ← 同名，但是新值</code></pre>
+<p>按名字首见定型：值 1 与值 3 被当成同一个（<b>少算</b>），值 1 与值 2 被当成两次分配（<b>多算</b>）。
+四层身份把这两类错误一起消掉，而且让「零字节别名」<b>可表达</b>——这是桶式记账做不到的。</p></div>
+
+<h2 id="c7"><span class="cn">Chapter 7</span>S4 布局层</h2>
+
+<h3>7.1 是什么</h3>
+<p>吃并行配置，为每个值算出：每根轴被谁切了、本地形状是多少、哪里需要插集合通信。</p>
+
+<figure id="fig-06-placement-execution">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1160 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="布局传播与执行事件">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="1030" height="228" rx="10"/>
+<text class="dg-ftitle t-plan" x="72" y="52">S4 布局：沿数据流传播 per-value 分片状态</text>
+<rect class="dg-box b-plan" x="90" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="165.0" y="146.5" font-size="15">段入口 x</text>
+<rect class="dg-box b-plan" x="300" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="375.0" y="146.5" font-size="15">Column</text>
+<rect class="dg-box b-plan" x="500" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="575.0" y="146.5" font-size="15">act</text>
+<rect class="dg-box b-plan" x="660" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="735.0" y="146.5" font-size="15">Row</text>
+<rect class="dg-box b-plan" x="870" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="945.0" y="146.5" font-size="15">out</text>
+<polyline class="dg-arrow a-plan" points="240,142 296,142" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-plan" points="450,142 496,142" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-plan" points="650,142 656,142" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-plan" points="810,142 866,142" marker-end="url(#ah)"/>
+<text class="dg-note dg-mono t-note" x="165" y="190" text-anchor="middle" font-size="12">{"S": tp}</text>
+<text class="dg-note dg-mono t-note" x="375" y="190" text-anchor="middle" font-size="12">{carrier: tp}</text>
+<text class="dg-note dg-mono t-note" x="575" y="190" text-anchor="middle" font-size="12">{carrier: tp}</text>
+<text class="dg-note dg-mono t-note" x="735" y="190" text-anchor="middle" font-size="12">{} + RS/AR</text>
+<text class="dg-note dg-mono t-note" x="945" y="190" text-anchor="middle" font-size="12">{}</text>
+<rect class="dg-box b-block" x="300" y="232" width="150" height="44" rx="8"/>
+<text class="dg-blabel t-block" x="375.0" y="251.5" font-size="15">注入 AG</text>
+<text class="dg-bsub dg-mono t-block" x="375.0" y="266.5" font-size="12">入携 S</text>
+<rect class="dg-box b-block" x="660" y="232" width="150" height="44" rx="8"/>
+<text class="dg-blabel t-block" x="735.0" y="251.5" font-size="15">注入 RS / AR</text>
+<text class="dg-bsub dg-mono t-block" x="735.0" y="266.5" font-size="12">sp / 非 sp</text>
+<polyline class="dg-arrow a-block" points="375,164 375,228" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-block" points="735,164 735,228" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="60" y="310" text-anchor="start" font-size="13">规则来自模块语义（在 Registry 的 placement 面），不是猜。carrier 歧义、Column∘Column、Row 前无 Column ⇒ 阻断。</text>
+<rect class="dg-frame" x="60" y="360" width="1030" height="268" rx="10"/>
+<text class="dg-ftitle t-plan" x="72" y="352">S5 执行：生命周期 → 显式事件</text>
+<polyline class="dg-arrow a-note" points="110,540 1050,540" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="130" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="195.0" y="484.5" font-size="15">Allocate</text>
+<polyline class="dg-arrow a-plan" points="195,500 195,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="270" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="335.0" y="484.5" font-size="15">Bind</text>
+<polyline class="dg-arrow a-plan" points="335,500 335,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="400" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="465.0" y="484.5" font-size="15">Use</text>
+<polyline class="dg-arrow a-plan" points="465,500 465,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="530" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="595.0" y="484.5" font-size="15">Pin</text>
+<polyline class="dg-arrow a-plan" points="595,500 595,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="700" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="765.0" y="484.5" font-size="15">Retire</text>
+<polyline class="dg-arrow a-plan" points="765,500 765,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="850" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="915.0" y="484.5" font-size="15">Free</text>
+<polyline class="dg-arrow a-plan" points="915,500 915,534" marker-end="url(#ah)"/>
+<text class="dg-note t-plan" x="130" y="426" text-anchor="start" font-size="13">每个 StorageInstanceId 的事件序；非 persistent 恰好一次 Allocate / Free，结束前 FinalAudit。</text>
+<rect class="dg-box b-backend" x="130" y="570" width="400" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="330.0" y="587.5" font-size="15">MemoryEventView</text>
+<text class="dg-bsub dg-mono t-backend" x="330.0" y="602.5" font-size="12">自包含 dependency / stream 偏序</text>
+<rect class="dg-box b-backend" x="620" y="570" width="400" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="820.0" y="587.5" font-size="15">ResourceRequest</text>
+<text class="dg-bsub dg-mono t-backend" x="820.0" y="602.5" font-size="12">自包含 PricingDescriptor</text>
+<text class="dg-note t-note" x="60" y="678" text-anchor="start" font-size="14">为什么两个视图都必须自包含：后端一旦回读上游，profile / cache key 就随上游结构变化而失效，实测复用会静默失灵。</text>
+</svg>
+</div>
+<figcaption><span><b>图 6</b>　布局传播与执行事件</span><span class="src">diagrams/06-placement-execution.excalidraw</span></figcaption>
+</figure>
+
+<h3>7.2 为什么它必须是独立一层，且必须有声明通道</h3>
+<p>独立的理由是变化率：并行策略是 what-if 的主要变量，把它隔离出来，
+改 <code>tp</code> 只需重算这一层及其下游。</p>
+<div class="cal honest"><span class="lbl">可推导性的边界（本方案相对 v1 的修正）</span>
+<p>「placement 可由模块语义推导」只在<b>框架的切分本身是规则化、且我们复刻了那套规则</b>时成立。
+半自动/自动并行的策略传播是一个<b>求解器</b>，不是一组规则。</p>
+<p>把策略搜索器列为非目标是对的；但排除求解器之后，<b>必须允许 placement 作为声明输入</b>
+——从源码的布局标注读出（<code>source_derived</code>），或由用户声明（<code>assumed</code>）。
+只有「推导」一种模式的设计，对那类框架在原理上无解。</p></div>
+
+<h3>7.3 数据结构</h3>
+<pre><code>PlacementPlan:                         # = f(BackwardIR, ParallelConfig)
+  values:      [ValuePlacement]
+  storages:    [StoragePlacement]
+  buffers:     [BufferPlacement]
+  collectives: [CollectivePlan]
+
+ValuePlacement:
+  value:       ValueRef                # 覆盖 primal 与梯度，统一引用
+  shard:       { axis_key: mesh_axis }  # tp / ep / cp / sp
+  local_shape: Shape
+  layout:      LayoutSignature         # 含 stride/offset/对齐（进 profile 签名）
+  source:      derived | declared      # ← 7.2 的声明通道
+  provenance:  source_derived | assumed</code></pre>
+
+<h3>7.4 数据流与逻辑流程</h3>
+<ol class="flow">
+<li>段入口播种：外部输入若含序列轴且启用序列并行，标记为序列驻留。</li>
+<li>沿数据流传播每个值的分片状态；规则来自 S1 的 <code>placement</code> 面（列并行产出特征载体、
+    行并行消耗载体、序列并行权重不切）。</li>
+<li>汇合点取并集；序列驻留状态分歧 → 在驻留侧注入布局重分布通信。</li>
+<li>模块语义要求的通信按规则注入（列并行入口聚合、行并行出口归约/散播）。</li>
+<li>无法推导的值：走声明通道；既无推导也无声明 → 阻断，逐条记录。</li>
+<li>校验：载体歧义、列∘列、行前无列、不整除 → 全部阻断（不许悄悄取整）。</li>
+</ol>
+<div class="cal inv"><span class="lbl">不变量</span>
+<p>轴代入规则<b>只有一份实现</b>。两个后端各自实现一遍的必然结果是分道——而分道<b>不会</b>
+被任何现有测试发现，因为没有断言把两者放在一起看。</p></div>
+
+<h2 id="c8"><span class="cn">Chapter 8</span>S5 执行层</h2>
+
+<h3>8.1 是什么</h3>
+<p>把「逻辑上活多久」变成「事件序上什么时候申请、什么时候释放」，并为每个算子实例生成
+自包含的定价请求。</p>
+
+<h3>8.2 为什么两个视图都必须自包含</h3>
+<div class="cal why"><span class="lbl">为什么后端不许回读上游</span>
+<p>后端一旦回读 IR/计划去补信息，它的 profile / cache key 就随上游<b>结构</b>变化而失效——
+换一次上游重构，实测复用会静默失灵，而失灵的表现是「命中率下降」，不是报错。
+代价是执行计划变大（信息被复制进去），这是有意的空间换解耦。</p></div>
+
+<h3>8.3 数据结构</h3>
+<pre><code>ExecutionPlan:                         # = f(BackwardIR, PlacementPlan, 调度配置, 标定)
+  targets:   [ExecutionTarget]         # rank / device / stage / 资源域
+  events:    [ExecEvent]               # kind / target / stream / deps
+  memory:    MemoryEventView           # 给显存后端的自包含视图
+  requests:  [ResourceRequest]         # 给时间后端的自包含定价请求
+  instances: [StorageInstance]         # StorageInstanceId + epoch
+
+MemoryEventView:                       # 自包含：不依赖时间后端的内部状态
+  events:      [Allocate|Bind|Use|Pin|Retire|Free]
+  descriptors: [AllocationDescriptor]  # 每个 Allocate 可唯一解析出字节/域/池/对齐
+  order:       dependency + stream 偏序
+  policy:      MemorySchedulePolicy?   # 可选；缺省用偏序的确定性拓扑
+
+ResourceRequest:                       # 自包含：时间后端不回读 CoreIR/PlacementPlan
+  target: ExecutionTargetId
+  work:   { flops, special_ops, reduction_ops }   # 分 model / executed 两套
+  traffic:{ memory, transport }
+  pricing:PricingDescriptor            # 含 compute/accum dtype、cost family、签名基
+  provenance: 逐量携带（见第 2 章）</code></pre>
+
+<h3>8.4 数据流与逻辑流程</h3>
+<ol class="flow">
+<li>按调度（1F1B / 交错虚拟流水）展开 <code>(stage × microbatch × 节点)</code>；重算节点已在 S3 入图，此处无特例。</li>
+<li>为每个值实例分配 <code>StorageInstanceId</code>：alias 归并到 root（零分配），
+    inplace 在变更点终结旧值，重算再物化用新 epoch。</li>
+<li>由 S3 的释放点偏序推出 <code>Retire</code>/<code>Free</code>；被保存的值以 <code>Pin</code> 延寿，
+    <b>不改变其字节</b>（需要独立字节的一律建成内部保存值）。</li>
+<li>为每个 <code>BufferContract</code> 按放置结果解析本地字节，落成半开区间的申请/释放对。</li>
+<li>生成资源请求：逐量带 provenance，<code>measured</code> 项在此绑定标定 key。</li>
+<li>联合预检：所选后端需要的能力是否齐备、事件是否不重不漏、偏序是否无环。<b>不过则不产出任何部分计划。</b></li>
+</ol>
+
+<h2 id="c9"><span class="cn">Chapter 9</span>S6 后端与 S7 报告</h2>
+
+<h3>9.1 显存后端</h3>
+<p>只消费 <code>MemoryEventView</code>。核心状态是「当前在世的物理实例集合」，
+按事件推进、按池与对齐规则模拟申请释放，给出已分配/已保留峰值与 OOM 判定及首次失败证据。
+结束前做终审：没有残留未释放的非持久实例、没有未 lower 的高层事件。</p>
+
+<h3>9.2 时间后端</h3>
+<p>只消费 <code>ResourceRequest</code> + 硬件/profile 快照。两级离散事件仿真保持不变
+（段内多流 → 全局调度）。定价按退化链：命中兼容实测 → 形状/类型插值 → 已标定族模型 →
+理论 roofline；每档记 provenance 与 confidence，参数不全则阻断，<b>绝不静默变成零成本或纯带宽</b>。</p>
+
+<h3>9.3 报告</h3>
+<div class="cal inv"><span class="lbl">不变量</span>
+<p>两个后端<b>不共同构造</b>报告，由汇总器聚合。报告必须分别统计三类 provenance 的覆盖率，
+并把 <code>assumed</code> 项的依据与偏差方向逐条列出。<b>不允许把未覆盖项藏起来。</b></p></div>
+
+<h2 id="c10"><span class="cn">Chapter 10</span>阻断与用户闭环</h2>
+
+<figure id="fig-07-unknown-op-loop">
+<div class="fw">
+<svg class="dg" viewBox="0 0 1100 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="未知 op 的阻断与用户闭环">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-box b-sem" x="40" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="105.0" y="150.5" font-size="15">DISCOVERED</text>
+<polyline class="dg-arrow a-note" points="170,146 188,146" marker-end="url(#ah)"/>
+<rect class="dg-box b-block" x="188" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-block" x="253.0" y="150.5" font-size="15">UNREGISTERED</text>
+<polyline class="dg-arrow a-note" points="318,146 336,146" marker-end="url(#ah)"/>
+<rect class="dg-box b-sem" x="336" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="401.0" y="150.5" font-size="15">USER_DESCRIBED</text>
+<polyline class="dg-arrow a-note" points="466,146 484,146" marker-end="url(#ah)"/>
+<rect class="dg-box b-sem" x="484" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="549.0" y="150.5" font-size="15">SCHEMA_VALIDATED</text>
+<polyline class="dg-arrow a-note" points="614,146 632,146" marker-end="url(#ah)"/>
+<rect class="dg-box b-sem" x="632" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="697.0" y="150.5" font-size="15">SEMANTIC_VALIDATED</text>
+<polyline class="dg-arrow a-note" points="762,146 780,146" marker-end="url(#ah)"/>
+<rect class="dg-box b-ir" x="780" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="845.0" y="150.5" font-size="15">COMPILED</text>
+<polyline class="dg-arrow a-note" points="910,146 928,146" marker-end="url(#ah)"/>
+<rect class="dg-box b-ir" x="928" y="120" width="130" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="993.0" y="150.5" font-size="15">SIMULATED</text>
+<text class="dg-note t-note" x="40" y="90" text-anchor="start" font-size="14">任一步失败都不进入下一状态；不产生部分计划。</text>
+<rect class="dg-box b-note" x="188" y="230" width="400" height="60" rx="8"/>
+<text class="dg-blabel t-note" x="388.0" y="250.5" font-size="15">scaffold 生成骨架</text>
+<text class="dg-bsub dg-mono t-note" x="388.0" y="265.5" font-size="12">只填可从调用证明的 selector / inputs / attrs，其余 REQUIRED</text>
+<text class="dg-bsub dg-mono t-note" x="388.0" y="279.5" font-size="12">占位</text>
+<polyline class="dg-arrow a-block" points="253,172 253,226" marker-end="url(#ah)"/>
+<rect class="dg-box b-note" x="640" y="230" width="420" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-note" x="850.0" y="257.5" font-size="15">cost-eval semantics validate / explain</text>
+<text class="dg-bsub dg-mono t-note" x="850.0" y="272.5" font-size="12">用户补完 → digest 更新 → 缓存失效 → 重新编译</text>
+<polyline class="dg-arrow a-note" points="588,260 636,260" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-sem dg-dash" points="850,230 850,200 484,200 484,176" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="40" y="364" text-anchor="start" font-size="14">阻断只针对「未注册 op」。已注册但含 measured / assumed 量的 ⇒ 放行，并在报告里逐项标注 —— 这两件事必须分开，</text>
+<text class="dg-note t-note" x="40" y="394" text-anchor="start" font-size="14">否则 assumed 通道无处落脚。</text>
+<text class="dg-note t-block" x="40" y="438" text-anchor="start" font-size="14">已知失效模式：用户为跑通而在骨架里填一个看似合理的数，该数与真值不可区分。故 assumed 必须带 basis 且独立统计。</text>
+</svg>
+</div>
+<figcaption><span><b>图 7</b>　未知 op 的阻断与用户闭环</span><span class="src">diagrams/07-unknown-op-loop.excalidraw</span></figcaption>
+</figure>
+
+<h3>10.1 阻断的范围（相对 v1 收紧了定义）</h3>
+<div class="tw"><table>
+<tr><th>情形</th><th>处理</th><th>为什么</th></tr>
+<tr><td class="nw"><b>未注册 op</b></td><td>阻断 + 生成骨架</td>
+  <td>语义未知时任何数都是编的；且这种情况罕见（新 kernel 才会遇到）</td></tr>
+<tr><td class="nw"><b>已注册，含 measured 量</b></td><td>放行 + 报告标注</td>
+  <td>标定值是<b>已声明的实测事实</b>，不是猜测</td></tr>
+<tr><td class="nw"><b>已注册，含 assumed 量</b></td><td>放行 + 报告标注依据与方向</td>
+  <td>否则第 2 章的第三态无处落脚，稀疏模型永远跑不起来</td></tr>
+<tr><td class="nw">形状/类型解不出</td><td>阻断</td>
+  <td><code>source_derived</code> 缺失即不可判定</td></tr>
+</table></div>
+<div class="cal why"><span class="lbl">为什么这两件事必须分开</span>
+<p>把它们混在同一条不变量里（「不完整就阻断」）会导致：要么 <code>assumed</code> 无处安放，
+要么为了让工具能跑而把 <code>assumed</code> 伪装成 <code>source_derived</code>。后者是最坏的结果。</p></div>
+
+<h3>10.2 闭环流程</h3>
+<ol class="flow">
+<li>发现未绑定调用 → 阻断，并输出：符号、各输入的形状与类型、赋值目标、两个注册域的查找结果。</li>
+<li>生成骨架：<b>只填能从调用证明的</b>（selector、输入、attrs），其余全部 <code>REQUIRED</code> 占位。</li>
+<li>用户补完 → 校验 → 解释（打印该 op 展开后的完整七面语义，供人复核）。</li>
+<li>快照 digest 更新 → 上游产物缓存失效 → 重新编译 → 联合预检 → 开始仿真。</li>
+</ol>
+<p>骨架里<b>不含</b>源码文件与行号——那些只出现在诊断输出，避免用户配置与源码位置耦合。</p>
+
+<h2 id="c11"><span class="cn">Chapter 11</span>验收与迁移</h2>
+
+<h3>11.1 对照物只能是真机</h3>
+<div class="cal bad"><span class="lbl">一条方法论错误必须避免</span>
+<p>迁移期做新旧双跑是必要的，但<b>不能用旧路径判对错</b>。以旧路径为准绳，等于把旧路径的已知偏差
+编码成新系统的验收标准。</p>
+<p><b>一个仿真器的正确性定义只能来自被仿真的对象，不能来自它的前一版。</b>
+双跑的正确用途是<b>变更归因</b>（哪些数变了、为什么），判对错必须对真机实测。</p></div>
+
+<div class="tw"><table>
+<tr><th class="nw">门</th><th>断言</th><th class="nw">性质</th></tr>
+<tr><td class="nw">真机对照</td><td>逐 stage 峰值、逐层驻留、step time 与实测比值；实测数据带指纹校验，不得编辑</td><td><b>唯一对错判据</b></td></tr>
+<tr><td class="nw">结构不变量</td><td>×1 于层数、×1 于微批数这类结构性关系必须由模型<b>导出</b>而非被公式告知</td><td>正确性</td></tr>
+<tr><td class="nw">轴代入一致</td><td>两个后端路径对同一符号形状 × 同一并行度，本地元素数必须逐字节相等</td><td>防分道</td></tr>
+<tr><td class="nw">provenance 闭合</td><td>报告里每个字节可归到三类之一；<code>assumed</code> 项均有依据</td><td>诚实性</td></tr>
+<tr><td class="nw">阻断有效性</td><td>参数化删除任一必填字段 → 必须阻断；显式空值 ≠ 缺失</td><td>安全性</td></tr>
+<tr><td class="nw">后端隔离</td><td>两后端双向 import 禁令；后端不读源码/配置/注册表</td><td>解耦</td></tr>
+<tr><td class="nw">新旧双跑</td><td>逐项差异归因，已知设计修正列入 accepted delta</td><td><b>归因，非判据</b></td></tr>
+</table></div>
+
+<h3>11.2 迁移策略</h3>
+<p>不做全量重写（数值变化无法归因），不做长期双轨（两个真相源必然漂移）。
+采用<b>适配层 + 按算子族收编 + 双跑归因</b>，每收编一族就删掉对应旧分支。</p>
+<div class="tw"><table>
+<tr><th class="nw">阶段</th><th>内容</th><th>该阶段的门</th></tr>
+<tr><td class="nw">1</td><td>语义基础设施：类型系统、组合子库、DSL 编译器、三注册域</td><td>加载期阻断用例全绿</td></tr>
+<tr><td class="nw">2</td><td>适配层：把现有语义表接进新描述，可证明部分数值不变；<b>由缺字段/默认零产生的值一律标 legacy 假设</b>，未经显式收编不得通过完整性门</td><td>真机对照不劣化</td></tr>
+<tr><td class="nw">3</td><td>按族收编：视图/类型转换/比较 → 逐元素/归一化 → 矩乘 → 注意力 → MoE → 集合通信 → 融合</td><td>每族收编后真机对照 + 双跑归因</td></tr>
+<tr><td class="nw">4</td><td>CoreIR + BackwardIR + 两个计划层</td><td>不变量校验 + 轴代入一致门</td></tr>
+<tr><td class="nw">5</td><td>后端切换：显存改吃事件视图，时间经适配复用现有两级仿真</td><td>真机对照成为权威判据</td></tr>
+<tr><td class="nw">6</td><td>开放用户通道：注册、校验、解释、骨架生成</td><td>闭环用例全绿</td></tr>
+<tr><td class="nw">7</td><td>收口：删除旧分支，只留兼容 API</td><td>全门绿</td></tr>
+</table></div>
+
+<h3>11.3 起点距离必须先量化</h3>
+<div class="cal honest"><span class="lbl">诚实边界</span>
+<p>「可执行 IR 中不存在 opaque 节点」是目标态的不变量，不是今天的状态。启动阶段 2 之前
+必须先量化并公布起点距离：当前抽取链上有多少调用还绑不上语义、级联根在哪几处、
+哪些量在原理上读不出（融合 kernel 自身输出的形状在编译产物里，不在源码里）。
+<b>不量化就开工，等于把「什么时候算做完」变成一个没人能回答的问题。</b></p></div>
+
+<h2 id="c12"><span class="cn">Chapter 12</span>决策记录与边界</h2>
+
+<h3>12.1 决策记录</h3>
+<div class="tw"><table>
+<tr><th class="nw">#</th><th>决策</th><th>关键理由</th></tr>
+<tr><td class="nw">D1</td><td>结构从框架源码抽取，是唯一结构源</td><td>手写图的失效是静默的；可证伪性优先</td></tr>
+<tr><td class="nw">D2</td><td>op 语义用纯配置描述，不开放代码插件</td><td>可静态校验、可版本化、用户可扩展</td></tr>
+<tr><td class="nw">D3</td><td>op 类型拆到原子级（一类型 = 一条形状关系）</td><td>消灭代码里的二次分派；避免不同语义共用一条反向规则</td></tr>
+<tr><td class="nw">D4</td><td>三注册域物理隔离；patch 整条替换 + 版本/hash 门禁</td><td>加载顺序决定胜者 = 不可复现</td></tr>
+<tr><td class="nw">D5</td><td>未注册 op 硬阻断 + 生成骨架</td><td>语义未知时任何数都是编的</td></tr>
+<tr><td class="nw">D6</td><td><b>provenance 三分（source_derived / measured / assumed）作为全 IR 横切契约</b></td><td>分界线是「源码可判定与否」，横穿内存与时间；稀疏模型必须有第三态</td></tr>
+<tr><td class="nw">D7</td><td><b>BackwardIR 为独立派生层，重算节点入图</b></td><td>三类节点同构；删掉一族契约类与一条 lowering 路径；CoreIR 保持 policy-free</td></tr>
+<tr><td class="nw">D8</td><td>四层身份，禁止按名字推断复用</td><td>名称去重必然同时少算与多算</td></tr>
+<tr><td class="nw">D9</td><td>dtype 分 storage / compute / accum，编译期求值，无退化档</td><td>它是 <code>source_derived</code>；缺依据即阻断，不默认继承首输入</td></tr>
+<tr><td class="nw">D10</td><td><b>placement 有推导与声明两种输入模式</b></td><td>非规则化切分的框架在原理上推不出来</td></tr>
+<tr><td class="nw">D11</td><td>轴代入只有一份实现</td><td>两份实现必然分道，且不会被任何现有测试发现</td></tr>
+<tr><td class="nw">D12</td><td>两后端只读、互不 import、自包含视图</td><td>后端回读上游会让 profile 复用静默失灵</td></tr>
+<tr><td class="nw">D13</td><td><b>验收对照物是真机；新旧双跑只做归因</b></td><td>正确性定义只能来自被仿真对象</td></tr>
+</table></div>
+<p>其中 <b>D6 / D7 / D10 / D13</b> 是本版相对 v1 的实质改动，其余为承接。</p>
+
+<h3>12.2 非目标</h3>
+<ul>
+<li>不把自动并行策略搜索器纳入核心（但因此必须有 placement 声明通道，见 D10）。</li>
+<li>配置不执行任意代码，不开放语法扩展或解释器插件。</li>
+<li>基础语义库不保存某型号设备上的实测耗时（那属于标定/profile）。</li>
+<li>不追求一次性删除全部旧路径。</li>
+</ul>
+
+<h3>12.3 诚实边界</h3>
+<div class="cal honest"><span class="lbl">这套设计做不到的事</span>
+<ul>
+<li><b>融合 kernel 自身输出的保存集</b>：末轴在编译产物里、不在源码里。声明通道能承载它，
+    但没人声明时就是 <code>Unknown</code>——<b>照样不给数</b>，不猜。</li>
+<li><b>数据依赖量的精确值</b>：MoE 实际负载只能是 <code>assumed</code>。报告能说清方向与依据，
+    但不能把它变成精确值。</li>
+<li><b>反馈回路长度</b>：干净分层的固有代价是第一个可与现实比对的数字要等整条链。
+    适配层 + 按族收编是缓解，不是消除——所以阶段 2 的门必须是真机而非旧路径。</li>
+<li><b>覆盖面</b>：目标态不承诺一次覆盖所有模型族；未覆盖的层型必须显式阻断，不产空层。</li>
+</ul></div>
+
+<div class="foot">
+<p>图的可编辑源：<code>docs/target-design-v2/diagrams/*.excalidraw</code>（直接拖进 excalidraw 打开）。
+本页 SVG 由 <code>docs/target-design-v2/tools/gen_diagrams.py</code> 与其同源生成，
+改图后重跑 <code>tools/build_doc.py</code> 即同步。</p>
+</div>
+
+</main>
+</div>
+<button id="tt" aria-label="切换明暗主题" title="切换明暗主题">◐</button>
+<style>
+#tt{position:fixed;right:16px;bottom:16px;z-index:50;width:40px;height:40px;
+  border-radius:50%;border:1px solid var(--line);background:var(--panel);
+  color:var(--ink2);font-size:17px;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.12)}
+#tt:hover{color:var(--ink)}
+@media print{#tt{display:none}}
+</style>
+<script>
+(function(){
+  var r=document.documentElement, k='cev-doc-theme', s=localStorage.getItem(k);
+  if(s){r.setAttribute('data-theme',s);}
+  document.getElementById('tt').addEventListener('click',function(){
+    var cur=r.getAttribute('data-theme');
+    if(!cur){cur=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';}
+    var nxt=cur==='dark'?'light':'dark';
+    r.setAttribute('data-theme',nxt); localStorage.setItem(k,nxt);
+  });
+})();
+</script>
+</body>
+</html>
