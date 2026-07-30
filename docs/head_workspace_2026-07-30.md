@@ -293,7 +293,7 @@ _EMB_GATHER_DGRAD_BWD_WS = {
 
 | # | 事项 | 状态 |
 |---|---|---|
-| ① | **`lm_head` / loss 段自己的反向 kernel workspace** | **未测 → 留 0，已知欠读。**这是 13 个 OOM-不安全锚点的峰值事件所在（`bwd@head`，由 2020 MiB 满 vocab fp32 `bwd_scratch` 主导）。要抬它们，必须测 **MatMul wgrad / log_softmax / CE 链**的 kernel scratch，而不是把本项挪过去。已用 `tests/test_bwd_kernel_workspace.py::test_default_is_zero_and_byte_neutral_for_untagged_specs` 钉住这一格为 0。 |
+| ① | **`lm_head` / loss 段自己的反向 kernel workspace** | **未测 → 留 0，已知欠读。**这是 13 个 OOM-不安全锚点的峰值事件所在（`bwd@head`，由 2020 MiB 满 vocab fp32 `bwd_scratch` 主导）。要抬它们，必须测 **MatMul wgrad / log_softmax / CE 链**的 kernel scratch，而不是把本项挪过去。已用 `tests/test_bwd_kernel_workspace.py::test_default_is_zero_and_byte_neutral_for_untagged_specs` 钉住这一格为 0。<br>**→ 2026-07-30 已闭合，见 [`head_loss_bwd_workspace_2026-07-30.md`](head_loss_bwd_workspace_2026-07-30.md)。**实测 dgrad `(2·vocab+4·H)·(B·S)+20 MiB+1024`（16 点逐字节，vocab 轴扫了 11 个值）；**13 个 OOM-不安全锚点里 12 个被抬起**（其中 11 个翻过 1.0 = 过读 = OOM 安全侧），仍不安全的 23 条见该文 §14。⚠ 同时暴露出 `bwd_scratch` 的 `K_CE` 多记 4 张满 vocab fp32 平面（该文 §8.2）。 |
 | ② | **vocab 轴** | **未扫**（两次采集都是 129280）。写成 `4·vocab·H` 是**归因推断**（依据：它逐字节等于该 op 自己输出的那张 fp32 梯度表，而那张表在采集 ② 的同一 CSV 里被单独看见）。若真值其实与 vocab 无关，则小 vocab 模型上本项过读、大 vocab 欠读。 |
 | ③ | **tp 轴** | **未测**。`4·vocab·H` 走字符串通道 → **不 ÷tp**；而源码上 `emb_w` 是 `Shard(0)`（`head.py` 的 `shard={0:"tp"}`，pynative TP>1 无条件 RowwiseParallel）→ tp>1 时真值应更小 ⇒ 本式**过读 = OOM 安全侧**。今天所有锚点 tp=1，无一依赖这条。 |
 | ④ | **cp 轴** | 结构上已分开处理（常数项不缩放、每-token 项 ÷cp），但 cp>1 **未实测**。 |

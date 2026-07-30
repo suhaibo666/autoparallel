@@ -325,7 +325,7 @@ OpSpec(f"{prefix}_hc_pre_sinkhorn", OpType.ELEMENTWISE, [streams], h_pre,
 
 | # | 事项 | 状态 |
 |---|---|---|
-| ① | **`lm_head` / loss 段自己的反向 kernel workspace** | **未测 → 留 0，已知欠读。**这是当前**最要紧的待测项**：§2.2 量到事件线的 36 条里，峰值事件落在 **lm_head 反向**（8L 模型 `bwd@9` / 4L 模型 `bwd@5` / 4L+MTP `bwd@6`）的有 **15 条**，其中 **13 条 OOM-不安全**（ratio<1；另 2 条 `185 U1` 1.117 / `185 U2` 1.372 在过读侧）。本轮**没有也不该**用本项去补它（相位、kernel、量级都不同）。已由 `tests/test_bwd_kernel_workspace.py::test_default_is_zero_and_byte_neutral_for_untagged_specs` 钉住那一格为 0。 |
+| ① | **`lm_head` / loss 段自己的反向 kernel workspace** | **未测 → 留 0，已知欠读。**这是当前**最要紧的待测项**：§2.2 量到事件线的 36 条里，峰值事件落在 **lm_head 反向**（8L 模型 `bwd@9` / 4L 模型 `bwd@5` / 4L+MTP `bwd@6`）的有 **15 条**，其中 **13 条 OOM-不安全**（ratio<1；另 2 条 `185 U1` 1.117 / `185 U2` 1.372 在过读侧）。本轮**没有也不该**用本项去补它（相位、kernel、量级都不同）。已由 `tests/test_bwd_kernel_workspace.py::test_default_is_zero_and_byte_neutral_for_untagged_specs` 钉住那一格为 0。<br>**→ 2026-07-30 已闭合，见 [`head_loss_bwd_workspace_2026-07-30.md`](head_loss_bwd_workspace_2026-07-30.md)。**本文这里预判的「15 条峰在 lm_head 反向、13 条 OOM-不安全」正是那一轮的目标；实测落位后 12 条被抬起。 |
 | ② | **非融合 mHC 分支的前向 workspace** | **未测 → 留 0，已知欠读。**非融合走 `rms_norm/matmul/sinkhorn` 小算子链（`hyper_connection.py:246-301`），**根本不是这个 kernel**；167 那次跑的是 fused 配置。**不拿融合分支的数去顶**（照 r0/r128/unfused 反向 workspace 留 0 的先例）。影响面：记分卡两条 DSv4 锚（0.906 / 0.894）走的正是这条分支。 |
 | ③ | **B / n（`num_residual_streams`）/ H / `mhc_sinkhorn_iterations` 四条轴** | **一律未扫**（只有 B=1 / n=4 / H=4096 / 站点默认迭代数**这一个点**）。本项是常数 → **不承诺**随它们变化。若真值随某维增长则更大配置上欠读，反之过读。**今天全部走融合分支的锚点（pp4 / pp8 / MTP / 185 F·U 相位）都恰在这一个点上**，故没有任何在用锚点依赖外推。 |
 | ④ | **S 轴的点数** | 记载不一致（§1.2）：该文 §8③ 说 2 点、§9 与交接书说 3 点。两者都判 S 无关，本项按更弱的那条用。 |
@@ -428,7 +428,7 @@ $ PYTHONIOENCODING=utf-8 python -m pytest tests -q
 
 ### 下一步该测什么（按能抬起多少排序，与上一轮的排序一致且更有据）
 
-1. **`lm_head` / loss 段的反向 kernel workspace** —— 上表里 **10 个 OOM-不安全锚点**的
+1. ~~**`lm_head` / loss 段的反向 kernel workspace**~~ —— **已于 2026-07-30 完成**（[`head_loss_bwd_workspace_2026-07-30.md`](head_loss_bwd_workspace_2026-07-30.md)）。上表里 **10 个 OOM-不安全锚点**的
    峰值事件就在那里（`bwd@9` / `bwd@5` / `bwd@6`）。做法与前两轮同：
    `MS_ALLOC_CONF=memory_tracker:True` 跑一次**末 stage 有 loss** 的 config，
    在 `bwd@head` 窗口取 BWD 相位单 kernel 极大值（`Erfinv` 标记法可直接复用）。
