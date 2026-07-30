@@ -44,7 +44,7 @@
 <text class="dg-bsub dg-mono t-input" x="945.0" y="480.5" font-size="12">tp / pp / ep / cp / dp</text>
 <rect class="dg-box b-input" x="820" y="578" width="250" height="40" rx="8"/>
 <text class="dg-blabel t-input" x="945.0" y="595.5" font-size="15">BufferCalibration</text>
-<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">measured 量载体</text>
+<text class="dg-bsub dg-mono t-input" x="945.0" y="610.5" font-size="12">modeled 量的常数来源</text>
 <polyline class="dg-arrow a-note" points="590.0,114 590.0,158" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590.0,244 590.0,288" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-note" points="590.0,374 590.0,418" marker-end="url(#ah)"/>

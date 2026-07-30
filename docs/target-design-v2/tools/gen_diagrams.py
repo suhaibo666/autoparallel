@@ -300,7 +300,7 @@ def d1():
     g.box(90, 188, 250, 40, "源码 → DraftGraph", "input", sub="符号 / 数据流 / attrs 字面值")
     g.box(820, 318, 250, 40, "RecomputeSpec", "input", sub="重算策略（派生输入）")
     g.box(820, 448, 250, 40, "ParallelConfig", "input", sub="tp / pp / ep / cp / dp")
-    g.box(820, 578, 250, 40, "BufferCalibration", "input", sub="measured 量载体")
+    g.box(820, 578, 250, 40, "BufferCalibration", "input", sub="modeled 量的常数来源")
 
     # 主干箭头
     for y0, y1 in ((114, 158), (244, 288), (374, 418), (504, 548), (634, 690)):
@@ -339,33 +339,41 @@ def d1():
 # D2 — 知识分级（provenance）
 # ══════════════════════════════════════════════════════════════════════════════
 def d2():
-    g = D("d2", "知识分级：逐量 provenance，而非按层设置回退档", 1160, 700)
+    g = D("d2", "知识分级：逐量 provenance；「实测」是取值手段，不是一类知识", 1160, 792)
     cols = [
-        (60,  "source_derived", "sd",
+        (60,  "derived", "sd",
          ["shape / dtype", "alias / inplace", "saved 结构", "数据流与依赖"],
-         "源码 + 算子定义\n可判定", "缺失 ⇒ 阻断"),
-        (450, "measured", "me",
-         ["workspace_bytes", "bwd_scratch", "kernel duration", "allocator 参数"],
-         "只能实测标定\n源码中不存在", "缺 key ⇒ 阻断\n命中 ⇒ 带 confidence"),
+         "机制在建模范围内\n源码 + 算子定义可判定", "缺失 ⇒ 阻断", "可外推"),
+        (450, "modeled", "me",
+         ["workspace_bytes", "bwd_scratch", "allocator 对齐/分块", "kernel duration"],
+         "机制在范围外但确定性\nkernel tiling / allocator 策略",
+         "越出适用域 ⇒\n阻断 或 降级并标方向", "域内可外推"),
         (840, "assumed", "as",
          ["MoE 每专家负载", "专家 capacity", "非规则化 placement"],
-         "需要建模假设\n值依赖运行期数据", "必须显式声明\n缺声明 ⇒ 阻断"),
+         "取值依赖运行期数据\n静态不可判定", "未显式声明 ⇒ 阻断", "不可外推"),
     ]
-    for x, name, tone, items, why, rule in cols:
-        g.frame(x, 60, 280, 470, name, tone)
-        g.label(x + 16, 74, why, 13, "start", tone)
+    for x, name, tone, items, why, rule, extra in cols:
+        g.frame(x, 74, 280, 480, name, tone)
+        g.label(x + 16, 86, why, 12, "start", tone)
         for i, s in enumerate(items):
-            g.box(x + 20, 132 + i * 52, 240, 40, s, tone, mono=True)
-        g.box(x + 20, 132 + 4 * 52 + 14, 240, 60, "判据", "block", sub=rule)
+            g.box(x + 20, 146 + i * 52, 240, 40, s, tone, mono=True)
+        g.box(x + 20, 146 + 4 * 52 + 10, 240, 62, "判据", "block", sub=rule)
+        g.label(x + 140, 528, extra, 12, "middle", tone)
 
-    g.label(60, 18, "同一契约字段的 provenance 贯穿 S1→S7；分界线是"
-                    "「源码可判定 / 不可判定」，横穿内存与时间两侧。", 15)
-    g.box(390, 578, 380, 56, "UnifiedReport", "note",
-          sub="按 provenance 分别统计覆盖率与 confidence", mono=True)
+    g.label(60, 14, "两次追问定类：① 机制在建模范围内吗 —— 不在则不是 derived；"
+                    "② 机制是确定性的、还是取决于运行期数据 —— 确定性的可以建成公式，"
+                    "取决于数据的只能声明假设。", 14)
+
+    # 实测不是一类知识：它只喂 modeled 的常数 + 校验全链
+    g.box(60, 600, 290, 62, "实测 / profile", "note", sub="不进 IR，只做两件事")
+    g.box(470, 600, 290, 62, "modeled.constants", "note", sub="公式里的常数取值", mono=True)
+    g.box(830, 600, 240, 62, "UnifiedReport", "note",
+          sub="分类统计 + 越域标注", mono=True)
+    g.arrow([(350, 631), (466, 631)], tone="me", label="标定：给常数定值", lpos=(352, 626))
     for x in (200, 590, 980):
-        g.arrow([(x, 530), (x, 560), (580, 560), (580, 574)])
-    g.label(60, 660, "关键：assumed 不是 fallback。未声明时仍然阻断；"
-                     "只有显式声明后才允许执行，且 basis 与方向（上界/下界/标称）必须进入报告。", 14)
+        g.arrow([(x, 554), (x, 576), (950, 576), (950, 596)])
+    g.arrow([(205, 662), (205, 706), (950, 706), (950, 666)], tone="note",
+            label="校验：真机对照全链（第 11 章）", lpos=(330, 728))
     return g
 
 
