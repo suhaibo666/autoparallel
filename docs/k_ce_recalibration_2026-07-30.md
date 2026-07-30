@@ -18,8 +18,12 @@
 PYTHONIOENCODING=utf-8 PYTHONPATH=. python scratchpad/probe_realmachine_planes.py
 # ② 模型侧对应份数（逐锚点：loss 层 bwd 事件的 bwd_scratch ÷ 一张平面）
 PYTHONIOENCODING=utf-8 PYTHONPATH=. python scratchpad/probe_k_ce_planes.py
-# ③ 逐锚点台账 before/after
+# ③ 逐锚点台账 before/after（同一进程两跑逐行 join，不手数）
+PYTHONIOENCODING=utf-8 PYTHONPATH=. python scratchpad/probe_k_ce_ledger_ab.py
+# ③' 单跑版（当前树的绝对值 + 峰值事件）
 PYTHONIOENCODING=utf-8 PYTHONPATH=. python scratchpad/probe_head_bwd_ws_ledger.py
+# ③'' D1 margin ON/OFF 对照点
+PYTHONIOENCODING=utf-8 PYTHONPATH=. python scratchpad/probe_d1_margin_off.py
 # ④ 八跑门
 PYTHONIOENCODING=utf-8 PYTHONPATH=. python tools/liveness_ab_validate.py --grad-mode chain2 --deltas
 ```
@@ -34,7 +38,8 @@ PYTHONIOENCODING=utf-8 PYTHONPATH=. python tools/liveness_ab_validate.py --grad-
 | **真正的过读是 1 张平面，且两个 fat 分支都是 1 张** | 从 **9 份仓内 profiler CSV 逐块数**出来的 high-water 在世满 vocab 平面：**7 份 pp=1 的 campaign（跨 DSv3 与 DSv4-align 两个模型族）全部是 3 张 fp32 + 1 张 bf16**；唯一一份 pp>1 的（pp2-stage1，正是 `K_CE=8` 那条锚点自己那次采集）是 **5 张 fp32 + 5 张 bf16**。模型侧对应的量是 `K_CE + 0.5` 张 fp32-等效。解出来：**pp1 该取 3（现 4）、pp>1 该取 7（现 8）**——两边**各过读恰好 1 张**。 |
 | **那 1 张就是代码注释里自己写的「+1 保守」** | `mem_timeline.py:664` 逐字：「实测 3 份共存（cp2-none/select），代码取 **4 = 3 观测 + 1 保守**（OOM-安全侧）」。本轮做的事 = **把这条被明示的 padding 拿掉，让常数回到它声称的物理语义**。 |
 | **`lean` 分支不动** | `ce_pynative_lean` 的 `K_CE=4` 只有 116/MS2.9 的**峰值差分拟合**背书，**没有逐块台账**（那批探针只记 `max_memory_allocated`）。按任务书「不能确立就保守划界」→ **留 4，并写明什么测量能定它**（§5.3）。 |
-| **代价如实记** | 拿掉那 1 张平面 = 在 fat 门开的锚点上减 1 张（N=4096 → 2020 MiB / N=8192 → 4040 MiB）。逐锚点位移与 OOM-不安全数见 §8（实跑重算，非预测）。方向上这是对的：**真值 + 明示余量**，而不是把错常数留着当顺手的 padding。 |
+| **代价如实记** | 拿掉那 1 张平面 = 在 fat 门开的锚点上减 1 张（N=4096 → 2020 MiB / N=8192 → 4040 MiB）。**48 条锚点/stage 里只有 3 条位移**（其余 45 条逐 MiB 不动），三条全部**由过读跌回欠读**：`pp2-stage1` 1.0450→**0.9565**、`cp2-none` 1.0433→**0.9429**、`DSv3 8L none` 1.0342→**0.9330**；OOM-不安全 **23 → 26**，反向翻转 0 条（§8）。方向上这是对的：**真值 + 明示余量**，而不是把错常数留着当顺手的 padding。 |
+| **上一轮那 15 条过读，`K_CE` 只解释 3 条** | 任务书预期「修 `K_CE` 会把 1.02–1.08 那 15 条拉回 ~1.0」。**实测只拉动 3 条**：另外 5 条走「有重算 → 门关」、4 条走未动的 `K_CE_LEAN`、其余在别的桶上（§8.2）。而门关那条路已被 7 份台账证明**逐张同构、零误差** ⇒ 那 5 条的过读**一定不在 loss 区满 vocab 平面这一格**，搜索空间因此被切掉一块。 |
 
 ---
 
@@ -108,6 +113,10 @@ pool high-water。逐份对照 `scorecard_anchors.py` 的 `real`：
 9/9 命中（≤0.5 MiB）。**故这些 CSV 就是锚点真机值的来源台账，用它们数平面不是「另一次测量」。**
 （附带订正两处目录命名误导：`select_ffn/` 那份实际是 **8L-none** 那条锚点的采集；
 仓根 `operator_memory_rank0.csv` 是 **4L-full** 那条。以 high-water 对齐为准。）
+
+> 上表用的是**改动前**的锚点 label。本轮把两个 label 里的 `k_ce` 值同步到新值
+> （`pp2-stage1 (loss,k_ce=8)` → `(loss,k_ce=7)`、`cp2-none (loss,k_ce=4)` → `(loss,k_ce=3)`），
+> 理由与影响面见 §11。
 
 ### 2.2 high-water 那一刻在世的**满 vocab 平面**（逐块数出来）
 
@@ -332,3 +341,252 @@ K_CE_LEAN = 4     # 不动    —— ce_pynative_lean（无逐块台账）
   `logsoftmax`/`nll` 的 bf16 满 vocab 瞬态。二者都不是标定问题，是建模问题。
 - `lean` 的 4 **整个**仍是峰值差分拟合值（§5.3）。
 - `pp==1 非 lean` 的 3 **不再吸收任何东西**（逐张同构）。
+
+---
+
+## 7. 改了什么（全部为**减法/重命名**，未标注者逐字节不变）
+
+| 文件 | 改动 |
+|---|---|
+| `cost_eval/mem_timeline.py` | 顶部新增**模块级命名常数** `K_CE_PP1 = 3` / `K_CE_PP = 7` / `K_CE_LEAN = 4`（含全部台账出处、对账算式、仍被吸收的效应、逐轴边界）；使用处（`_KCE_USE` 标记那一行）由字面量 `4 if lean else (8 if pp>1 else 4)` 改为引用这三个常数 |
+| `cost_eval/liveness/simulate.py` | 删掉**第二份**字面量 `(4 if ce_lean else (8 if pp>1 else 4))`，改为 `from ..mem_timeline import K_CE_LEAN, K_CE_PP, K_CE_PP1` —— 此前两处各写一份，任何单侧重标都会**静默分叉**（本轮若只改 `mem_timeline`，`hand_spec` 就会与 `bucket` 用不同的 K） |
+| `scorecard_anchors.py` | 3 条 band 下移 + note 改写；顶部那段「真机 3 张 vs `K_CE=8` 记 7 张」的**事实错误就地订正**；两条锚点 label 里的 `k_ce=8` / `k_ce=4` 改为 `k_ce=7` / `k_ce=3` |
+| 4 个测试文件 | 重钉，见 §11（保留全部不变量，只移举例/带） |
+| 5 处注释（`llm_config.py` / `model_spec.py` / `presets.py` / `from_mindformers.py` / `serve_explorer.py` / `test_oom_safety_advisories.py`） | 「pp>1 已由 `K_CE=8` 平衡到 ~1.007」这条**旧理由已随本轮失效**（pp2-s1 现 0.9565）→ 逐处改写并标注；**D1 margin 的 gate（`pp == 1`）与 factor（0.6）一个字节没动**，只是它现在是「未经重标定的历史范围」，如实记 |
+| `scratchpad/probe_realmachine_planes.py` / `probe_k_ce_planes.py` / `probe_k_ce_ledger_ab.py` | **新增**三个纯读数探针（数台账 / 数模型 / 同进程 before-after join） |
+
+**没有新建任何通道、没有新增任何常数**（`K_CE_LEAN=4` 是原值搬家，不是新值）。
+
+---
+
+## 8. 逐锚点 before → after（**同一进程两跑逐行 join，不手数**）
+
+复现：`PYTHONIOENCODING=utf-8 PYTHONPATH=. python scratchpad/probe_k_ce_ledger_ab.py`
+（`before` = 把 `K_CE_PP1/K_CE_PP` 临时设回 `4/8` 再跑同一条取数路径 ⇒ 差异只可能来自这两个常数）。
+
+**48 条锚点/stage 里只有 3 条位移，其余 45 条逐 MiB 不动。**
+
+| 锚点 | real MiB | before | **after** | Δ MiB | ratio before → **after** | 判 |
+|---|---:|---:|---:|---:|---|---|
+| **pp2-stage1 (loss,k_ce 8→7)** | 45655.0 | 47707.4 | **43667.4** | **−4040.0** | 1.0450 → **0.9565** | ↓ 转 OOM-不安全，欠 **1987.6** |
+| **cp2-none (loss,k_ce 4→3)** | 20119.4 | 20991.1 | **18971.1** | **−2020.0** | 1.0433 → **0.9429** | ↓ 转 OOM-不安全，欠 **1148.3** |
+| **DSv3 8L none (dp2)** (k_ce 4→3) | 19967.3 | 20649.5 | **18629.5** | **−2020.0** | 1.0342 → **0.9330** | ↓ 转 OOM-不安全，欠 **1337.8** |
+| 其余 45 条 | — | — | **逐 MiB 相同** | 0 | 逐位相同 | 不走 `K_CE` 那一行 |
+
+「其余 45 条」为什么一分不动（三类，各有 `file:line` 依据）：
+
+| 类 | 条数 | 为什么 |
+|---|---:|---|
+| `cross_entropy_fused=True` → `loss_lids` 空 | 26（pp4 ON/OFF/MTP 各 4、pp8 8、185 P3-P/F0/U1/U2 4、DSv4-fused、DSv4 mHC+MTP） | `mem_timeline.py:324` —— 门恒不进 |
+| stage 内有重算 → `_stage_no_recompute` False | 12（DSv3 4L/8L full、ep2、cp2 colossal/ulysses、select ×3、185 std ON ×4） | `mem_timeline.py:329-331` |
+| `ce_pynative_lean=True` → 走**未动**的 `K_CE_LEAN` | 6（116 std mha/gqa × {pp2-s0, pp2-s1, pp1-s0}） | `tests/test_std_attn_anchor.py:120` 的 `_BUILD_FACTS` |
+| 无 loss 层（非末 stage） | 1（pp2-stage0） | `parallel_model.py:122`：head 恒在末 stage |
+
+（26 + 12 + 6 + 1 = 45 ✓）
+
+### 8.1 OOM-不安全数：**23 → 26**
+
+```
+条目总数 48；可评分 48；位移 3、逐位不动 45
+OOM-不安全（ratio<1）: before 23 → after 26
+由 ≥1.0 跌到 <1.0（转 OOM-不安全）3 条: pp2-stage1 1.0450→0.9565 /
+                                      cp2-none 1.0433→0.9429 / DSv3 8L none 1.0342→0.9330
+由 <1.0 升到 ≥1.0                0 条
+```
+
+**两个方向都如实报**：本轮**没有任何**锚点往安全侧移动，3 条往不安全侧移动。
+这是「减字节」这一轮的必然形状，且**是对的**：那 3 条此前的「安全」来自一张台账里数不出来的
+padding 平面。**没有为了保余量停在错值上。**
+
+### 8.2 上一轮「15 条翻过 1.0（1.02–1.08）」现在落在哪里
+
+> 那 15 条 = `head_loss_bwd_workspace_2026-07-30.md` §8.2 里由 <1.0 翻到 ≥1.0 的那批。
+> 任务书预期「修 `K_CE` 会把它们拉回 ~1.0」——**实测只有 3 条被拉动，其余 12 条一分未动**，
+> 因为它们**根本不在 `K_CE` 这条路径上**（§8 的三类表）。这正是 hazard 1 要防的那种误归因。
+
+| 上一轮翻过 1.0 的锚点 | ratio before | **after** | 走哪条路 |
+|---|---:|---:|---|
+| cp2 colossal full 4L (B2) | 1.0844 | **1.0844** | 有重算 → 门关 |
+| cp2 ulysses full 4L (B2) | 1.0837 | **1.0837** | 有重算 → 门关 |
+| DSv3 4L full (dp2,sp) | 1.0809 | **1.0809** | 有重算 → 门关 |
+| DSv3 4L full ep=2 | 1.0774 | **1.0774** | 有重算 → 门关 |
+| DSv3 8L full (dp2) | 1.0683 | **1.0683** | 有重算 → 门关 |
+| **pp2-stage1** | 1.0450 | **0.9565** | **`K_CE_PP` 8→7** |
+| 116 std mha pp2 s1 | 1.0442 | **1.0442** | `K_CE_LEAN`（未动） |
+| **cp2-none** | 1.0433 | **0.9429** | **`K_CE_PP1` 4→3** |
+| 116 std gqa pp2 s1 | 1.0421 | **1.0421** | `K_CE_LEAN`（未动） |
+| 185 std ON kv8 s1 | 1.0368 | **1.0368** | 有重算 → 门关 |
+| 116 std mha pp1 s0 | 1.0342 | **1.0342** | `K_CE_LEAN`（未动） |
+| **DSv3 8L none (dp2)** | 1.0342 | **0.9330** | **`K_CE_PP1` 4→3** |
+| 185 std ON kv32 s1 | 1.0312 | **1.0312** | 有重算 → 门关 |
+| select self_attn (keep-FFN) | 1.0258 | **1.0258** | 有重算 → 门关 |
+| 116 std gqa pp1 s0 | 1.0208 | **1.0208** | `K_CE_LEAN`（未动） |
+
+**结论**：那 15 条过读里，`K_CE` 只解释 **3** 条。剩下 12 条的过读**另有其因**，且已被本轮
+排除在 `K_CE` 之外——**5 条在「有重算 → 门关」路径上，而门关路径已被 7 份台账证明是
+逐张同构、零误差的**（§4 第一行）：所以那 5 条的过读**一定不在 loss 区满 vocab 平面这一格**，
+必须去别处找（下一步清单 §12）。4 条在 `K_CE_LEAN` 上（须 116 逐块台账，§5.3），
+其余在 pp8 / 185 std 的解码层与 embedding 侧。
+
+### 8.3 边缘位（任务点名要看的）—— 报告，不调
+
+| 位 | before | **after** | 为什么不动 |
+|---|---:|---:|---|
+| **pp8 s2** | 1.0007 | **1.0007，逐 MiB 不动** | 双重原因：① 该族 `cross_entropy_fused=True` → `loss_lids` 空；② pp8 每 stage 1 层，s2 上**没有 head 段**（head 恒在末 stage，`parallel_model.py:122`）。**没有越界。** |
+| **pp8 s3** | 1.0698 | **1.0698，逐 MiB 不动** | 同上 |
+
+---
+
+## 9. 八跑验收门 before → after —— **整份输出逐字节相同**
+
+`PYTHONIOENCODING=utf-8 PYTHONPATH=. python tools/liveness_ab_validate.py --grad-mode chain2 --deltas`
+
+**这不是推断，是实跑对比**：把 `K_CE_PP1/K_CE_PP` 临时设回 `4/8` 跑一份、恢复后再跑一份，
+`diff` 两份完整输出 → **零行不同**。
+
+| 指标 | before | **after** |
+|---|---|---|
+| bucket 聚合 mean / min / max（n=28） | 0.847 / 0.703 / 1.038 | **0.847 / 0.703 / 1.038（逐位相同）** |
+| hand_spec·chain2 mean / min / max（n=28） | 0.860 / 0.675 / 1.110 | **0.860 / 0.675 / 1.110（逐位相同）** |
+| hand_spec·dataflow | 0.799 / 0.662 / 1.067 | **同上，逐位相同** |
+| 32 格逐格 sim/real | — | **32/32 逐 MiB 相同**（`diff` 零行） |
+| `unfused − fused` delta（bucket） | 0.477 | **0.477（逐位相同）** |
+| `unfused − fused` delta（hand_spec） | 0.638 | **0.638（逐位相同）** |
+| I1/I2 **真机** ×1（层数 / 微批数） | PASS / PASS | **PASS / PASS** |
+| I1/I2 **模型** ×1（bucket & hand_spec，共 4 条） | PASS ×4 | **PASS ×4** |
+| `REAL_SHA256` 指纹 | `41e279e591ae4ae9…` PASS | **同值 PASS（一个字节未动）** |
+
+**为什么一格不动**：那 8 跑全是 `dsv4h_*` 系列 ⇒ `cross_entropy_fused=True` ⇒
+`loss_lids` 空（桶路径 `mem_timeline.py:324`、liveness 路径 `liveness/simulate.py:289` 两处同判据）
+⇒ `K_CE` 两处都取不到。**注意这一条与上一轮相反**：上一轮 `hand_spec` 三行之所以不动是因为
+liveness **不读** `bwd_workspace_bytes`；本轮 liveness **是**读 `k_ce` 的
+（`simulate.py` 里 `self._run_backward(..., k_ce=k_ce, ...)` 那个实参），它不动是因为
+`loss_lids` 空。**这也是为什么本轮必须把两处的字面量合并成单一来源**——否则
+「liveness 读不读」这件事会在未来某次重标定里变成一次静默分叉。
+
+### 9.1 `unfused − fused` delta 的漂移（点名要报）
+
+| 时间 | bucket delta ratio | 事件 |
+|---|---:|---|
+| 2026-07-29 之前 | 0.522 | — |
+| 2026-07-30（`lm_head` 反向 workspace 入账） | **0.477** | 只抬 fused 侧 s3（+1094.0），unfused 侧 s3 峰在 `bwd@8:sparse_attn` 一分未动 → delta 净 −1094.0 |
+| 2026-07-30（本轮 `K_CE`） | **0.477** | 逐位不动（该族 fused-CE，门关） |
+
+**如实记：缺口没有变小，本轮也没有触及它。** 该 delta 的成因在
+**unfused mHC 的解码层反向**（`bwd@8:sparse_attn`），与 loss 区满 vocab 平面正交
+——`kernel_workspace_2026-07-29.md` §8 ② 的「r0/r128 反向 workspace 未测」才是它的对口项。
+hand_spec 那一列（0.638）比 bucket 高，说明 liveness 的 live-set 记账比桶模型多抓到一部分，
+两条来源**都仍欠读**这个 ×1 量。
+
+---
+
+## 10. `REAL_*` / `CSV_*` / 指纹未动的 diff 级证明
+
+判据（照前三轮）= 只看 `-` 侧有没有**既有真机常数定义行**被删改。三条都是零命中：
+
+```
+① 任务书那条过滤（base = 3abe5ea，排除 docs/ 与 scratchpad/）：
+   git diff ... -U0 | grep -nE '^[-+].*(REAL|CSV|MEASURED|sha256)'
+   → 零命中
+
+② 更强的一条：整份 diff 里连一个 REAL_* / CSV_* / MEASURED_ **标识符**都没出现过
+   git diff ... | grep -E '^[-+]' | grep -E '\b(REAL_|CSV_|MEASURED_)[A-Za-z0-9_]*'
+   → 零命中
+   （比前几轮更强：那几轮「-」侧还有「引用 REAL_* 的断言行」被改写，本轮连引用都没动）
+
+③ 指纹：git diff ... | grep -i sha256
+   → 零命中（REAL_SHA256 根本不在 diff 里）
+```
+
+> 提醒：若把 ① 的过滤放宽到**包含 `docs/`**，会命中若干 `+` 侧**中文散文**里出现的
+> 字面词 "CSV"（如「9 份仓内 profiler CSV 逐块清点」）。那是**注释文本**、不是常数；
+> ① 与 ② 分别覆盖「常数定义行」与「标识符出现」，在代码/测试范围内都是零命中。
+
+本轮**唯一被改写的既有数值**是 4 个测试文件里的**模型侧期望值 / band**，以及
+`tests/test_scorecard_anchors.py` 的 `_D1_OFF_RATIO`（那是**模型在 margin 关掉时的比值记录**，
+由 `scratchpad/probe_d1_margin_off.py` 实跑得出，**不是**真机测量）—— 逐条理由见 §11。
+
+---
+
+## 11. 重钉台账（old → new，逐条理由）
+
+**未动**：`REAL*` / `CSV*` 一切真机常数、`REAL_SHA256` 指纹、两条真机 ×1 不变量与四条模型 ×1
+不变量、run d 不可评分规则、`nr_moe_frag_factor`（仍 0.6）与 `kept_frag_factor` 两个标定 margin
+及其 gate、`K_CE_LEAN`（仍 4）、`8*S*B*vocab` 本式、`layers/head.py` 的一切。
+
+| 位置 | old → new | 理由 |
+|---|---|---|
+| `cost_eval/mem_timeline.py`（模块级） | 无 → `K_CE_PP1=3` / `K_CE_PP=7` / `K_CE_LEAN=4` 三个命名常数 + 台账注释块 | 常数从**字面量**升为**可 grep、可被门钉住、带出处**的命名量；这是「混合常数」这类债务能被后续轮次继续拆的前提 |
+| `...` 使用处（`_KCE_USE` 标记那一行） | `4 if lean else (8 if pp>1 else 4)` → 引用三常数 | 值的变化理由见 §4；形式变化理由见上一行 |
+| `cost_eval/liveness/simulate.py` 的 `k_ce =` 那两行 | 第二份字面量 → `from ..mem_timeline import K_CE_LEAN, K_CE_PP, K_CE_PP1` | **消除静默分叉**（DRY）。本轮若不合并，`hand_spec` 会用 8/4 而 `bucket` 用 7/3，八跑门的 `hand_spec` 三行会与 `bucket` 讲不同的故事 |
+| `scorecard_anchors.py` 顶部注释 | 「真机只共存 3 张瞬态…而 `K_CE=8` 记 7 张…修 K_CE 属另一条任务线」→ **就地订正 + 指向本文** | §1：那两个数不在同一条路径上。**不删旧文、标明订正**（`CLAUDE.md` 的「never delete，只 extend/annotate」） |
+| `scorecard_anchors.py` 的 `pp2-stage1` 锚点 | label `(loss,k_ce=8)` → **`(loss,k_ce=7)`**；band `(1.04,1.05)` → **`(0.95,0.96)`**；note 改写 | label 的用途就是标出这条锚点走哪个分支，留 `8` 会主动误导（P2-08 文档漂移）；band 下移到实测落点 0.9565 两侧各 ~0.006，**两侧都守**（>hi 会抓住「有人把 K_CE 调回 8」） |
+| `scorecard_anchors.py` 的 `cp2-none` 锚点 | label `(loss,k_ce=4)` → **`(loss,k_ce=3)`**；band `(1.04,1.05)` → **`(0.94,0.95)`**；note 改写 | 同上；实测 0.9429 |
+| `scorecard_anchors.py` 的 `DSv3 8L none (dp2)` 锚点 | band `(1.03,1.04)` → **`(0.93,0.94)`**；note 改写 | 实测 0.9330 |
+| `tests/test_scorecard_anchors.py` 的 `_D1_OFF_RATIO` | `0.9130 / 0.9172` → **`0.8648 / 0.8694`** | **实测重取**（`probe_d1_margin_off.py`）。`K_CE` 4→3 在 ON/OFF 两侧**同幅**下移一张平面（−2020.0）⇒ `on − off` 的幅度**一点没变** ⇒ margin 的存在性判据不受本次重标定影响。dict key 随 label 改名同步 |
+| `...::test_d1_margin_is_present_and_effective` | 举例「过读带 `1.02 ≤ on ≤ 1.05`」→ **「欠读带 `0.92 ≤ on ≤ 0.95`」** | **不变量原样**（① `on > off + 0.02` 的机制断言、② band 断言、margin 仍 0.6 一个字节没动）；只有**举例**第二次搬家（0.981 → 1.034 → 0.9330）。照 `opdag_walker_core_2026-07-25.md` §6.6「保留不变量、只移举例」 |
+| `tests/test_ce_optstep.py` 模块 docstring | 「stage1 峰 = unfused CE 链 **~8 满 vocab fp32** 共存」→ 订正为 **5 fp32 + 5 bf16 = 7.5 fp32-等效**（附产出者名字） | 这句是 `K_CE=8` 最初的口头依据，且**它本身就数错了**（把 bf16 平面漏掉、把总数当成 fp32 张数）。订正而非删除 |
+| `...::test_pp2_8L_norecompute_matches_real_machine` | s1 带 `46000-48500` → **`43400-44000`**；s0 带**未动** | s1 −4040.0；s0 峰在 `bwd@0`(embedding)、不含 loss 区 fat |
+| `tests/test_x4_p2p_pp.py::test_pp2_stage_peaks_byte_identical_to_recorded_anchor` | s1 `47707.4` → **`43667.4`**；`_s1_ratio` 带 `[1.040,1.050]` → **`[0.950,0.960]`**；s0 `10573.0` **未动**、s0 方向门（`>= 10246.0`）**未动** | s1 −4040.0（一张 `4·S·B·vocab` @ B·S=8192）；**该锚点自己那份 CSV 就是判据来源**（op_816365.csv high-water 45655.46 逐 MiB 命中其 real）。带**不放宽方向**：两侧都守 |
+| `tests/test_oom_safety_advisories.py` 的 D1-R 注释 | 「由 `K_CE=8` 平衡 → D1-R 不触发」→ 改写并标注该理由已失效 | 该门守的是 **gate 语义**（pp>1 不进 margin），与 `K_CE` 取值无关 → **断言逐字节未动、仍绿**；只订正注释里那条已失效的解释 |
+| `llm_config.py` / `model_spec.py` / `presets.py` / `configs/from_mindformers.py` / `serve_explorer.py` 各一处注释 | 「pp>1 已由 `K_CE=8` 平衡（到 ~1.007）」→ 逐处改写为「走 `K_CE_PP` 分支、不进本 margin」+ 标注该理由本轮起失效 | **纯注释**。D1 margin 的 gate（`pp == 1`）与 factor（0.6）**一个字节没动**；但它「为什么排除 pp>1」的原始理由已随 pp2-s1 落到 0.9565 而失效 → 它现在是**未经重标定的历史范围**，如实记而**不顺手改 gate**（改 gate 会引入新的拟合） |
+| `tests/test_kept_frag_margin.py` 的 per-stage K_CE 门 | **未动** | 它断言「per-stage select 下未重算的 loss stage 与全局 None 等值」——两侧同时用新 `K_CE_PP` ⇒ 仍相等，**逐字节仍绿** |
+| `test_dsv3_golden` / `test_regression_dsv3` / `test_dsv4_preset` / `test_cp_activation` / `test_from_mindformers` / `test_x4_experts_wrap` / `test_migration_outputs` / `test_fsdp_prefetch` / `test_acceptance_gate` / `test_probe185_recon` / `test_pp4_recompute_anchor` | **全部未动** | 这些锚点或有重算（门关）、或 fused-CE（门关）→ 逐 MiB 不变。**本轮重钉面 = 4 个文件**，比上一轮的 13 个小得多，正因为 `K_CE` 的作用域窄（只 3 条锚点） |
+
+**没有删除任何一条不变量、没有删除任何用例、也没有新增用例**（本轮不引入新机制，
+只把一个已有常数从错值改到台账值 + 把两份字面量合并成一处）。
+
+---
+
+## 12. 诚实清单：本轮**不**支持什么 / 仍欠什么
+
+| # | 事项 | 状态 |
+|---|---|---|
+| 1 | **`K_CE_LEAN = 4`** | **未定，本轮不动。** 只有 116/MS2.9 整机峰值差分反解背书，**无逐块 CSV**；跨 build 外推已被证伪（167/MS2.10 同链多一张 fp32）。**闭合它需要**：在跑该 build 的机器上开 `MS_ALLOC_CONF="memory_tracker:True"` 采**一次** std MHA pp1，用 §2.2 同一把尺数 high-water 在世张数。**一次单跑即可，不需扫轴。** 影响面 = 4 条 116 std 锚点（现 1.0208–1.0442）。 |
+| 2 | **`K_CE_PP = 7` 仍是混合常数** | 6 张瞬态里只有 2 张是真的 fp32 瞬态；另 4 张（fp32-等效）代表 **2 组在途微批 loss 区 saved 对** + **2 张 bf16 满 vocab 瞬态**（§5.1 逐块）。去混属**建模**工作：(a) 让 `pinned` 在 pp 末 stage 按在途微批组数 pin loss 区 saved（该 fork 调度器的 `warmup=min(pp−stage,m)` 是入口，见 `tests/test_std_attn_anchor.py` docstring ③）；(b) 在 op 图里声明 `logsoftmax`/`nll` 的 bf16 满 vocab 瞬态。**两者都会重新抬高 pp2-s1**，方向上缩小本轮制造的 1987.6 MiB 缺口。 |
+| 3 | **pp>1 的份数只有 1 个采集点** | `K_CE_PP=7` 由**唯一**一份 pp>1 的 CSV 数出（pp2-s1）。pp=4/8 的无重算 loss stage **没有逐块台账**（167 那批虽是 pp4，但模型侧 fused → 走不到这条路）。若 pp 更深时在途组数更多，7 会偏小 = OOM-**不安全**方向。**闭合需要**：一次 pp4 或 pp8、`cross_entropy_fused=False` 的 tracker 采集。 |
+| 4 | **`chunk_loss_num`（分块 CE）** | 份数是否随 k 变**无台账**（`chunked` 无任何真机锚点，只在 `tests/test_mtp_loss.py` 结构门里）。结构上 `K_CE` 是份数、fat 自动 ∝1/k（§5.4）→ 未为它引入分档，如实记为未测。 |
+| 5 | **`loss_type="vocab_parallel_ce"`** | **本轮之前就存在的不一致**，未动：该变体 `sm.bwd_scratch` 只有 1 张（`layers/head.py` 走 `bwd_scratch_ref`），而 `mem_timeline` 的 `// 2 * (K_CE−1)` 假设它是 2 张 ⇒ 会给出 `(K_CE−1)/2` 张。无锚点触及。如实单列。 |
+| 6 | **167 站点 `cross_entropy_fused=True` 与现场不符** | §1 末的独立发现，**本轮一个字节没动**：现场 `_LogSoftmax`/`_NLLLoss` 标记 fired（真机是 unfused），模型侧该族标 fused ⇒ 不吃 fat ⇒ 该族**欠读 ≥1 张平面/锚点**。改它会把 26 条锚点搬到 fat 分支，属另一条任务线。**闭合需要**：`dsv4h_*` yaml 里决定 CE 融合的那个键 + 167 build 的 loss 实现标识。 |
+| 7 | **D1 margin 的 `pp == 1` gate 失去了原理由** | gate 与 factor **一个字节没动**（不引入新拟合）；但它「排除 pp>1 因为那边已由 `K_CE=8` 平衡到 ~1.007」的理由随 pp2-s1 落到 0.9565 而**失效**。它现在是**未经重标定的历史范围**。要处理它须先闭合 2/3（否则会用一个标定 margin 去补另一个标定常数的洞）。 |
+| 8 | **「时间分辨」这一层本轮同样没做** | 既有通道算 `max_t live + max_t ws`（上界），真值是 `max_t[live+ws]`。本轮只改 `live` 侧的份数，**没有**改这条组合语义（`head_loss_bwd_workspace_2026-07-30.md` §7 ⑪ 量出 S=4096 站点余量 4950.0 MiB）。 |
+| 9 | **门关路径的零误差是「这一格」意义上的** | 7 份 CSV 上模型 3.5 = 真机 3.5，且 pp=1 下**逐张同构**（2 瞬态 fp32 + 1 saved fp32 + 1 saved bf16，产出者一一对应）。但这只说 **loss 区满 vocab 平面这一格**准；那 5 条「有重算 → 门关」却仍过读 1.06–1.08 的锚点，过读**必在别处**（§8.2 末）。 |
+
+### 12.1 下一步该做什么（按能纠正多少排序）
+
+1. **`K_CE_LEAN` 的逐块台账**（清单 1）—— 唯一一条「一次单跑就能闭合」的；影响 4 条锚点。
+2. **pp 末 stage 的在途微批 loss 区 saved 建模**（清单 2a）—— 把 `K_CE_PP` 里那 2 张 fp32-等效
+   从标定挪进结构，直接缩小 pp2-s1 的 1987.6 MiB 缺口，且**顺带**给清单 7 一个真理由。
+3. **op 图里声明 `logsoftmax`/`nll` 的 bf16 满 vocab 瞬态**（清单 2b）—— 台账里逐块可查
+   （`Copy` / `ZerosLikeExt`），是纯 op 图工作、不需新真机采集。
+4. **那 5 条「门关却仍过读 1.06–1.08」的锚点**（清单 9）—— 现在已能确定过读**不在** loss 区
+   满 vocab 平面这一格，搜索空间被切掉一块；下一处该查 `remat_saves` / `recomp_scratch`
+   的已知部分重叠（`structure_mem` 三桶同源派生）。
+5. **r0 / r128 的反向 kernel workspace**（`kernel_workspace_2026-07-29.md` §8 ②）——
+   仍是 OOM-不安全那 26 条里缺口最大一批（pp4 ON s0 欠 7909 MiB）的对口项，也是
+   `unfused − fused` delta 0.477 的对口项。
+
+---
+
+## 13. 验收
+
+```
+$ PYTHONIOENCODING=utf-8 python -m pytest tests -q
+2030 passed, 268 warnings in 108.25s
+```
+
+与基线 `3abe5ea` **同数 2030**（本轮不新增用例、不删用例；4 个文件的重钉不改用例数）。
+八跑门 32 格 + 三条聚合 + `REAL_SHA256` + 四条 ×1 不变量：**全部 PASS 且逐字节等同 before**（§9）。
+
+**本轮没有跑任何真机测量**，也没有登陆任何真机：所有实测数字来自 `analysis/realmachine/**`
+既有 CSV 与前两轮报告里的逐块 dump（§0 抬头）。
+
+---
+
+## Related
+
+- [`head_loss_bwd_workspace_2026-07-30.md`](head_loss_bwd_workspace_2026-07-30.md) —— 上一轮：把 `K_CE` 单列为发现的那一轮（其 §5.1/§8.2 的归因由本文 §1 订正；其 §7 ③ 与 §14 下一步第 1 条由本文闭合）
+- [`head_workspace_2026-07-30.md`](head_workspace_2026-07-30.md) —— word-embedding 反向；`N == H` 尺寸歧义这个坑的第一次记录（本文 §2.2 的 DSv4 那格同一个坑）
+- [`kernel_workspace_2026-07-29.md`](kernel_workspace_2026-07-29.md) —— 本条线第一轮；§8 ② 是本文 §12.1 第 5 条的对口项
+- [`census_fix_mhc_rmsnorm_2026-07-29.md`](census_fix_mhc_rmsnorm_2026-07-29.md) —— **本轮 hazard 2 的直接先例**：`norm_compute_dtype_bytes` 那次不做全局翻转、改成逐 norm 种类分档
+- [`opdag_walker_core_2026-07-25.md`](opdag_walker_core_2026-07-25.md) §6.6 —— 「保留不变量、只移举例」的改测试规矩（本文 §11 逐条照它）
