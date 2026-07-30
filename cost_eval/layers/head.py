@@ -71,6 +71,72 @@ _EMB_GATHER_DGRAD_BWD_WS = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# `lm_head` **反向** kernel workspace（两个 `MatMulExt`：dgrad + wgrad）—— 167 真机实测驱动，
+#   源码快照里读不出来（aclnn matmul 内部 scratch）。见 `docs/head_loss_bwd_workspace_2026-07-30.md`。
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# **实测律**（dgrad，层内 max 的那一笔）：
+#
+#     bwd_ws(lm_head dgrad) = (2·vocab + 4·H)·(B·S)  +  20 MiB  +  1024 B
+#                              └── 每-token 项        └── 与 H/vocab 无关的 matmul base
+#
+#   同一 op 的 wgrad 那一笔实测 `(2·vocab + 2·H)·(B·S) + 20 MiB + 2048`，**恒小于 dgrad**
+#   （4·H > 2·H）→ 层内取 max 即 dgrad，故只挂一个值。
+#
+# ── 采集 ①：167 / MindSpore 2.10 memory-tracker，8 卡真机训练（run `c` 家族）───────────────
+#   `dsv4h_fused_pp4_norecomp_ab.yaml`：fused / 无重算 / L8 / m4 / pp4·dp2·ep2、B=1、tp=1、cp=1。
+#   tracker 装在 **rank 6 = 末 stage**（持有 lm_head+loss；`parallel_model.py:122`），
+#   窗口由新种的 `nll_bwd_enter … head_in_bwd` 标记切出；kernel 由**输出签名**认定
+#   （dgrad 输出 = `S·B·H·2 + 512`；wgrad 输出 = `H·vocab·2 + 512`），不靠 `node_name`。
+#   逐字节实测（每格 12 个窗口的极大值）：
+#       S=1024 → 302515200 ／ S=2048 → 584057856 ／ S=4096 → **1147143168** B
+#       H=1792 → 1109394432 ／ H=2048 → 1113588736（S=4096, vocab=129280）
+#       vocab=32320 → 352846848（S=4096, H=4096）
+#   本式在这 6 点上 delta **= 0 B**。
+#   **层型对照**：同层型、无 head 的 rank 4（stage 2）上这一笔**根本不出现**
+#   （其 BWD 单 kernel 极大值是 730.0005 MiB = 已建模的 r4 融合稀疏 flash-MLA）。
+#
+# ── 采集 ②：单卡密集 shape 图（`probe_head_matmul_ws.py`，按 `linear.py:132-135` 逐字复刻
+#   `transpose(w,1,0)` → `matmul(x3d, w)`，用 `ms.grad` 走真 autograd）──────────────────
+#   与采集 ① 共有的 **7 个 shape 逐字节相同**。在 vocab=129280 上再加 H∈{2560,3072,5120,6144}
+#   与 B=2（N=8192, H∈{1792,4096}）共 **16 个点全部 delta = 0 B**；
+#   vocab 轴另在 {32320,40400,48480,56560,72720,80800,96960,113120,121200} **9 个值**上成立。
+#
+# ── 采集 ③：仓内既有 profiler（`analysis/realmachine/pp2_norecomp/op_816365.csv`，H=1792、
+#   B=2、AdamW 旧 build）──────────────────────────────────────────────────────────────
+#   其 **wgrad** 那一笔 `2168457216 B` == `(2·vocab + 2·H)·8192 + 20 MiB + 2048` 逐字节吻合
+#   → wgrad 律跨 2 个站点成立；`20 MiB + 1024` 的裸 base 在该文件里独立出现 **159 次**
+#   → **`20 MiB` 与 H 无关**（本式把它写成常数的依据）。
+#
+# **缩放的适用边界（超出即未测 / 已知不成立，不外推）**：
+#   · S：3 点 ✓（1024/2048/4096）  · H：6 点 ✓（1792…6144）  · B：2 点 ✓（1/2，经 B·S）
+#   · vocab：**扫了 11 个值**，10 个成立；**vocab=64640 处本式不成立**——实测只有
+#     `4·H·(B·S) + 20 MiB + 1024`（`2·vocab` 整项消失），单卡逐字节复现。即 operand-copy 是
+#     aclnn 的 **kernel 选择**，不是 shape 的光滑函数。该 shape 上本式**过读 = OOM 安全侧**。
+#   · 采集 ③ 的 build 在同一 shape 上 dgrad 取 `c_V = 4`（多一份 `2·vocab·B·S`）→ 本式在那个
+#     build 上**欠读 2·vocab·B·S**（OOM-**不安全**），如实记（报告 §7 ②）。
+#   · tp：走 TensorRef 但**不标 shard** → 不 ÷tp；真机 `head_w` 是 `Shard(1)`（vocab ÷tp）
+#     ⇒ tp>1 时真值更小 ⇒ 本式**过读 = OOM 安全侧**，未实测。今天所有锚点 tp=1。
+#   · cp：常数项走字符串通道不 ÷cp（整体 ÷cp 会让 cp>1 欠读 = OOM-不安全）；每-token 项走
+#     TensorRef → `resolve_tensor` 只对首个 S 维 ÷cp（结构正确），cp>1 **未实测**。
+#
+# **与既有 `bwd_scratch` 不双计**（报告 §5）：`nll.bwd_scratch = 8·S·B·vocab` 建的是
+#   `PyNativeOutput` 型的**满 vocab fp32 平面**（真机 high-water 那一刻共存 4 张，逐块可查）；
+#   本项是 `type` 为空、寿命 1 tick 的**另一类池块**，在**另一个 tick**。字节不重叠。
+#   ⚠ 但二者在**时间上不共存**：S=4096 站点上本项落地时 pool 离 high-water 还有 4950.0 MiB
+#   → 既有通道 `max_t live + max_t ws` 是**上界**（真值 `max_t[live+ws]`）。这是该通道**既有**
+#   的性质（r4 那一笔同理），本轮没有改动它；本项因此是上界 = OOM 安全侧。
+_HEAD_MATMUL_BWD_WS = {
+    # 与 H / vocab / S 都无关的 matmul base（采集 ③ 里独立出现 159 次）。
+    # 走字符串通道 → 不吃 cp 整除（shape_eval 刻意不对 `bwd_workspace` 施加「含 S 就 ÷cp」）。
+    "bwd_workspace": "20971520 + 1024",
+    # 每-token 项 `2·vocab + 4·H` B/token：dtype_bytes=2 × (vocab + 2·H)。
+    # 走 TensorRef → 首个 S 维按 cp 切；不标 shard → tp>1 不切（过读 = 安全侧）。
+    "bwd_workspace_ref": TensorRef("head_matmul_bwd_ws", ("B", "S", "vocab + 2*H"),
+                                   dtype_bytes=2),
+}
+
+
 def _cfg_norm_kind(cfg: LLMConfig) -> str:
     """`LLMConfig` → norm 种类（head 段无 DimTable 在手，直接走 `to_dimtable` 的同一条派生）。"""
     from ..llm_config import to_dimtable
@@ -152,15 +218,23 @@ def build_head_and_loss_ops(cfg: LLMConfig) -> list:
     # Shard(0)（out-features=vocab；parallelize.py:765-767 + style.py:439-443），且
     # gather_output=False（style.py:425 默认未覆盖）→ logits 每卡 [N, V/tp] 不 all-gather。
     # dtype 同 embedding（P1-04 接线）。
+    # `bwd_workspace{,_ref}`（2026-07-30）：`lm_head` 反向那两个 `MatMulExt`（dgrad/wgrad）的
+    # kernel workspace，三套独立采集逐字节吻合——出处/律/适用边界逐条见本文件顶部
+    # `_HEAD_MATMUL_BWD_WS` 与 `docs/head_loss_bwd_workspace_2026-07-30.md`。
+    # 它**叠在**反向工作集之上（用完即还，寿命 1 tick），与 `nll.bwd_scratch` 的满 vocab fp32
+    # 平面**是两类块** → 不双计（报告 §5.1 逐块可查）。tie 与非 tie 两条路挂同一份：
+    # 实测的是 kernel，与权重是否与 embedding 共享无关。
     if cfg.tie_word_embeddings:
         # 复用 embedding 权重：不新增 head_w 参数（vocab×H 只在 embedding 计一次）
         w = TensorRef("emb_w", ("vocab", "H"), shard={0: "tp"}, is_weight=True,
                       dtype_bytes=cfg.embedding_params_dtype_bytes)
-        head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[], saves=[x])
+        head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[], saves=[x],
+                         **_HEAD_MATMUL_BWD_WS)
     else:
         w = TensorRef("head_w", ("H", "vocab"), shard={1: "tp"}, is_weight=True,
                       dtype_bytes=cfg.embedding_params_dtype_bytes)
-        head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x])
+        head_op = OpSpec("lm_head", OpType.MATMUL, [x, w], logits, params=[w], saves=[x],
+                         **_HEAD_MATMUL_BWD_WS)
 
     # NLL 反向：默认/chunked 用 bwd_scratch（满 vocab 瞬态物化）；vocab_parallel 用 sharded probs save。
     if cfg.loss_type == "vocab_parallel_ce":

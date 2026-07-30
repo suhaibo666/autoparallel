@@ -72,11 +72,16 @@ def test_d1_margin_is_present_and_effective():
         # ② 幅度钉住（防漂移，也防有人把 margin 悄悄调大去凑 ≥1.0）。
         lo, hi = a.band
         assert lo <= on <= hi, f"{label}: ratio={on:.4f} 越出 band=({lo},{hi})"
-        # ③ **如实记账**：2026-07-29 起二者都在 OOM-**不安全**侧，这是已知、已解释、已量化的状态。
-        assert on < 1.0, (
-            f"{label}: ratio={on:.4f} ≥ 1.0 —— 若确实靠**源码级证据**回到 OOM-安全侧，"
-            f"请更新本断言与 docs/census_fix_mhc_rmsnorm_2026-07-29.md；"
-            f"若是靠调大标定 margin 凑上去的，那正是本门要拦的。")
+        # ③ **如实记账**（2026-07-30 举例更新，不变量原样）：2026-07-29 起二者都在
+        #    OOM-**不安全**侧；本轮 `lm_head` 反向 kernel workspace **实测**入账后二者
+        #    翻回 OOM-**安全**侧（0.981→1.034 / 0.991→1.043）。不变量仍是「不得靠调大
+        #    标定 margin 凑」——margin 一个字节没动（仍 0.6，由 ① 的 on>off 断言守住），
+        #    翻转来自**源码级/真机级证据**（docs/head_loss_bwd_workspace_2026-07-30.md）。
+        #    举例因此从「必须 < 1.0」换成「必须落在已记录的过读带内」，两侧都守。
+        assert 1.02 <= on <= 1.05, (
+            f"{label}: ratio={on:.4f} 越出已记录的过读带 (1.02, 1.05)。<1.02 说明本项被削或"
+            f"又出现新的欠读；>1.05 说明过读继续膨胀（查 K_CE 等 DSv3-era 常数）。"
+            f"任何一侧都须查明再改带，不得靠调 margin 凑。")
 
 
 def test_d2_flip_would_trip_mhc_mtp_band():

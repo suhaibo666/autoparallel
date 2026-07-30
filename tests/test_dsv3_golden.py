@@ -50,10 +50,17 @@ GOLDEN_OPS = {
 GOLDEN_BREAKDOWN = {
     "persistent": 4016318976, "act_live": 3265265664, "gather_buf": 463346688,
     "grad_buf": 926686208, "recomp_scratch": 0, "bwd_scratch": 4236247040,
-    "swap_buf": 0, "workspace": 0, "framework": 185597952,
+    # workspace 0 -> 1109394432（2026-07-30）：`lm_head` 反向 kernel workspace 实测入账
+    #   = `(2*129280 + 4*1792)*4096 + 20 MiB + 1024`（H=1792 站点 167 实测逐字节，
+    #   见 docs/head_loss_bwd_workspace_2026-07-30.md 2.1）。这是该桶在 DSv3 冻结口径上**第一次非 0**
+    #   —— BWD 事件的 workspace 通道此前只被 r4 融合层用过。
+    "swap_buf": 0, "workspace": 1109394432, "framework": 185597952,
 }
 GOLDEN_PEAK_EVENT = "bwd@5"
-GOLDEN_PEAK_BYTES = 13093462528        # = 12486.9 MiB（真机 12473.1 → 1.0011）
+GOLDEN_PEAK_BYTES = 14202856960        # = 13544.9 MiB（真机 12473.1 → 1.0859）
+#   13093462528 → 14202856960（+1109394432 = +1058.0 MiB，2026-07-30）：见上。
+#   ⚠ 比值由 1.0011 变 1.0860 = **过读侧**（OOM 安全）。**不为凑回 1.00 而动本项**：
+#   本项是逐字节实测，缺口在 DSv3-era 冻结常数群（该文 6.4/7.3 有量化）。
 
 
 def _spec():
@@ -87,6 +94,6 @@ def test_dsv3_breakdown_frozen_and_anchor():
         assert getattr(b, k) == v, (k, getattr(b, k), v)
     assert p.peak_event == GOLDEN_PEAK_EVENT
     assert p.peak_bytes == GOLDEN_PEAK_BYTES
-    assert abs(p.peak_bytes / MiB - 12486.9) < 0.1
+    assert abs(p.peak_bytes / MiB - 13544.9) < 0.1
     # 逐桶之和恰为峰值（无遗漏/重复）
     assert sum(GOLDEN_BREAKDOWN.values()) == GOLDEN_PEAK_BYTES

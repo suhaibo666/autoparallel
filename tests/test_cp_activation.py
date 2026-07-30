@@ -291,7 +291,11 @@ def test_cp2_4L_full_recompute_matches_real_machine():
                        HardwareSpec(max_device_memory=64 * GiB, framework_reserve=0),
                        RecomputeSpec(mode="full", full_layers=fl), SwapSpec())
         peaks[method] = ev.evaluate().per_stage[0].peak_bytes / MiB
-        # 真机 colossal 12433 / ulysses 12441；Bug A(loss÷cp) + 正确 B=2 → ~12409.5（band 12000-12600）。
-        assert 12000 <= peaks[method] <= 12600, f"{method}: {peaks[method]:.1f} MiB 越界"
+        # 真机 colossal 12433 / ulysses 12441；Bug A(loss÷cp) + 正确 B=2 → 曾 12423.9。
+        # 2026-07-30 重钉 band 12000-12600 → 13000-13600：`lm_head` 反向 kernel workspace
+        #   入账（+1058.0 MiB，docs/head_loss_bwd_workspace_2026-07-30.md）→ 13481.9，比值 0.999 → 1.084 =
+        #   **过读侧**（OOM 安全）。每-token 项走 TensorRef → 首个 S 维**已按 cp 切**
+        #   （常数项刻意不 ÷cp，整体除会让 cp>1 欠读 = OOM-不安全）；cp>1 真值未实测。
+        assert 13000 <= peaks[method] <= 13600, f"{method}: {peaks[method]:.1f} MiB 越界"
     # 全重算下 colossal==ulysses（KV all-gather 在重算层、off loss 峰）——修正模型的预期恒等
     assert peaks["colossal"] == peaks["ulysses"]

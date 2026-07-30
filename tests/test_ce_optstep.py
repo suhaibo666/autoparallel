@@ -35,7 +35,9 @@ def test_pp2_8L_norecompute_matches_real_machine():
     r = _rep(8, B=2, pp=2, mode="None", mbs=2)
     s0, s1 = r.per_stage[0].peak_bytes / MiB, r.per_stage[1].peak_bytes / MiB
     assert 10200 <= s0 <= 11300, s0            # 无重算逐层反向（含 ln2/fp32 norm 常驻，OOM-安全过预测）
-    assert 43000 <= s1 <= 47000, s1            # ① fat CE + ② + fp32 norm + ln2
+    # 2026-07-30：`lm_head` 反向 kernel workspace 入账 → s1 45611.4 → 47707.4
+    #   （B*S=8192 → 律给 2096.0 MiB）。真机 45655.5 → 0.999 → **1.045**（过读 = OOM 安全）。
+    assert 46000 <= s1 <= 48500, s1            # fat CE + fp32 norm + ln2 + head-ws
 
 
 def test_optstep_event_present_stage0():
@@ -64,4 +66,6 @@ def test_dsv3_4L_full_recompute_anchor_unchanged():
     # DSv3 4L full 重算：① 不触发（非无重算）、② 不上峰（opt-step < loss 反向）→ 12437.9 逐字节
     r = _rep(4, B=1, pp=1, mode="full", dp=2, mbs=1)
     # 2026-07-29 二次重钉：12437.9 → 12423.9（RMSNorm 不 cast，见 test_dsv3_golden 同注）。
-    assert abs(r.per_stage[0].peak_bytes / MiB - 12423.9) < 0.05, r.per_stage[0].peak_bytes / MiB
+    # 2026-07-30 三次重钉：12423.9 → 13481.9（`lm_head` 反向 kernel workspace 实测入账 +1058.0；
+    #   docs/head_loss_bwd_workspace_2026-07-30.md）。① / ② 两条结论**不变**。
+    assert abs(r.per_stage[0].peak_bytes / MiB - 13481.9) < 0.05, r.per_stage[0].peak_bytes / MiB

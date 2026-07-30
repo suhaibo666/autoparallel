@@ -150,7 +150,9 @@ def test_dsv3_dp2_full_anchor_byte_stable():
     p = r.per_stage[0]
     assert p.peak_event == "bwd@5", p.peak_event
     # 2026-07-29 二次重钉：12437.9 → 12423.9（RMSNorm 不 cast）；experts 拆分仍不改峰值。
-    assert abs(p.peak_bytes / MiB - 12423.9) < 0.1
+    # 2026-07-30 三次重钉：12423.9 → 13481.9（`lm_head` 反向 kernel workspace 入账 +1058.0）；
+    #   experts 拆分**仍不改峰值**（本项挂在 head 段，与 experts 事件正交）。
+    assert abs(p.peak_bytes / MiB - 13481.9) < 0.1
 
 
 # ---------------------------------------------------------------------------

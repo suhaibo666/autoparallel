@@ -83,16 +83,30 @@ def anchors() -> list:
         漂移"，不假装 OOM-安全通过。任一带都足够紧到能让 D2 的 1.088↔0.920 翻转触红。
     """
     return [
+        # ── 2026-07-30 重钉（`lm_head` 反向 kernel workspace 实测入账）────────────────
+        #   167 memory-tracker 实测 dgrad `(2*vocab + 4*H)*(B*S) + 20 MiB + 1024`，16 个
+        #   vocab=129280 的点逐字节吻合（docs/head_loss_bwd_workspace_2026-07-30.md 2.1/2.2）。
+        #   DSv3 族（H=1792）每条 +1058.0 MiB（B*S=4096）或 +2096.0（B*S=8192）。
+        #   ⚠ 因此**十条锚点由欠读翻成过读**（1.02–1.08）= OOM-**安全**侧。band 只上移到
+        #   刚好封住当前实测落点（±0.01），**没有为了凑回 ~1.00 而削本项**：本项是逐字节
+        #   实测，缺口在 DSv3-era 冻结常数群（实测证据：真机 loss 层反向只共存 **3** 张
+        #   瞬态满 vocab fp32 平面，而 `mem_timeline` 的 `K_CE=8` 记 **7** 张 —— 该文 5.1/7.3。
+        #   修 `K_CE` 属另一条任务线，**本轮一个字节没动**）。
         Anchor("DSv3 4L full (dp2,sp)", "full",
-               lambda: dsv3(4, FULL4), 12473.1, (0.97, 1.05)),
+               lambda: dsv3(4, FULL4), 12473.1, (1.07, 1.09),
+               note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.996 → **1.081**（过读 = OOM 安全）"),
         Anchor("DSv3 8L full (dp2)", "full",
-               lambda: dsv3(8, FULL8), 13953.3, (0.97, 1.05)),
+               lambda: dsv3(8, FULL8), 13953.3, (1.06, 1.08),
+               note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.992 → **1.068**"),
         Anchor("DSv3 4L full ep=2", "full+ep",
-               lambda: dsv3(4, FULL4, ep=2), 12474.1, (0.97, 1.05)),
+               lambda: dsv3(4, FULL4, ep=2), 12474.1, (1.07, 1.09),
+               note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.993 → **1.077**"),
         Anchor("cp2 colossal full 4L (B2)", "cp+full",
-               lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="colossal"), 12433.0, (0.98, 1.05)),
+               lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="colossal"), 12433.0, (1.08, 1.09),
+               note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.999 → **1.084**；每-token 项按 cp 切、常数项不切"),
         Anchor("cp2 ulysses full 4L (B2)", "cp+full",
-               lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="ulysses"), 12441.0, (0.98, 1.05)),
+               lambda: dsv3(4, FULL4, B=2, dp=1, cp=2, method="ulysses"), 12441.0, (1.08, 1.09),
+               note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.999 → **1.084**"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.089 → **1.021**。仍 OOM-安全，但保守余量被压掉大半。
         # 2026-07-30 三次重钉（**word-embedding 反向 kernel workspace 实测入账**，
         #   docs/head_workspace_2026-07-30.md）：1.021 → **1.032**，且**峰值事件由 `bwd@4`
@@ -110,27 +124,27 @@ def anchors() -> list:
                     "lo=1.00 守住「仍在安全侧」这一条不变量"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.999**（欠 43.6 MiB / 0.10%）——**刚翻到 OOM-不安全侧**，如实记。
         Anchor("pp2-stage1 (loss,k_ce=8)", "pp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1), 45655.0, (0.98, 1.05),
-               note="2026-07-29 起 0.999：**OOM-不安全**（欠 43.6 MiB）；band 未动，仅记录方向翻转"),
+               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1), 45655.0, (1.04, 1.05),
+               note="2026-07-29 起 0.999（OOM-不安全，欠 43.6 MiB）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.999 → **1.045**，翻回 OOM-安全侧。这一笔正是这条锚点自己那次采集的 profiler 量到的（op_816365.csv 的 MatMulExt wgrad 2168457216 B 与本律逐字节吻合）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.991**。D1 margin 未动（仍开、仍是 0.6），是普查去掉了一处真实过读。
         Anchor("cp2-none (loss,k_ce=4)", "cp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (0.96, 1.02),
-               note="2026-07-29 起 0.991：**OOM-不安全**（D1 margin 仍在，但 RMSNorm 过读被修掉，"
-                    "抵消消失）；band 仅防进一步漂移，不为凑 ≥1.0 而重标 margin"),
+               lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (1.04, 1.05),
+               note="2026-07-29 起 0.991（OOM-不安全）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.991 → **1.043**，翻回 OOM-安全侧；D1 margin 一个字节没动（仍 0.6）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.003 → **0.981**。同上，D1 两点标定之一，margin 未重标。
         Anchor("DSv3 8L none (dp2)", "norecomp",
-               lambda: dsv3(8, NONE), 19967.3, (0.95, 1.01),
-               note="2026-07-29 起 0.981：**OOM-不安全**（D1 margin 仍在）；band 仅防进一步漂移"),
+               lambda: dsv3(8, NONE), 19967.3, (1.03, 1.04),
+               note="2026-07-29 起 0.981（OOM-不安全）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.981 → **1.034**，翻回 OOM-安全侧；D1 margin 一个字节没动（仍 0.6）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.001 → **0.970**（保留层的 ln1/ln2/q_a_norm/kv_a_norm 不再抬 fp32）。
         Anchor("select self_attn (keep-FFN)", "select",
-               lambda: dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2, (0.94, 1.00),
-               note="2026-07-29 起 0.970：**OOM-不安全**；kept_frag margin 未重标，band 仅防漂移"),
+               lambda: dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2, (1.02, 1.03),
+               note="2026-07-29 起 0.970（OOM-不安全）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.970 → **1.026**，翻回 OOM-安全侧；kept_frag margin 一个字节没动"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.955 → **0.932**（已跌出 ±5% 安全带）。
         Anchor("select mlp (keep-attn)", "select",
-               lambda: dsv3(8, RecomputeSpec("select", select_ops=MLP)), 15764.7, (0.90, 0.96),
-               note="2026-07-29 起 0.932：**OOM-不安全**，已跌出 ±5%；band 仅防进一步漂移"),
+               lambda: dsv3(8, RecomputeSpec("select", select_ops=MLP)), 15764.7, (0.99, 1.005),
+               note="2026-07-29 起 0.932（OOM-不安全，跌出 ±5%）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.932 → **0.9993** —— 本项恰好补上了这一格的缺口（仍在欠侧 0.7 MiB，最贴近的一条）"),
         Anchor("select both (=full,退化端)", "select",
-               lambda: dsv3(8, RecomputeSpec("select", select_ops=BOTH)), 13953.3, (0.98, 1.05)),
+               lambda: dsv3(8, RecomputeSpec("select", select_ops=BOTH)), 13953.3, (1.07, 1.08),
+               note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 1.0005 → **1.076**（select-both 退化到 full，与 8L full 同因）"),
         # 2026-07-23(185 F 差分): +core_out 逆 RoPE 保留(hybrid:277)入账 → 0.974→1.024(转
         # 保守侧;185 F0/F1 同源差分 ±2% 背书)。band 上移,仍紧(±4%)。
         # **2026-07-29**（`docs/census_arbitration_2026-07-29.md`）：手写普查按权威快照逐条订正
@@ -142,8 +156,8 @@ def anchors() -> list:
         #   两个真机数彼此不自洽（seq2048 的 3109 > seq4096 的 2239），故以直测为准。
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：0.908 → **0.902**（融合 mHC ctx −421.8/层、RMSNorm −268.0/层）。
         Anchor("DSv4-fused (base)", "dsv4+norecomp",
-               _dsv4_sim(0, 0), 15415.5, (0.87, 0.93),
-               note="2026-07-29 起为已知欠预测 0.902（普查按源订正后）；band 仅防进一步漂移"),
+               _dsv4_sim(0, 0), 15415.5, (0.93, 0.95),
+               note="2026-07-29 起为已知欠预测 0.902；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.906 → **0.941**：仍 OOM-不安全，缺口收窄 912.7 MiB"),
         # D2（2026-07-16）：mHC+MTP 锚点入卡。真机 21153.1（2026-07-01 采）；MTP tie 修复后由 1.088
         #   翻转为 0.920 欠预测，**此前不在记分卡故翻转无人察觉**（Z2）。D1 无重算 margin **不覆盖**它
         #   （DSv4 fused-CE → loss_lids 空 → margin 不触发）→ 独立残差，留待单独诊断（band 仅防进一步漂移，

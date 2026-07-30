@@ -212,7 +212,20 @@ _STD_ON_REAL = {32: {0: 11131.6, 1: 15370.0}, 8: {0: 10747.6, 1: 14986.0}}
 #   **s1 逐 MiB 不变**——尾 stage 没有 embedding 层（`parallel_model.py:122`：embedding→stage0）。
 #   四点仍全部 sim < 真机（框架缺口不变量不动），方向：MHA s0 0.723→0.747、GQA s0 0.704→0.749，
 #   缺口**收窄**。
-_STD_ON_THEO = {32: {0: 8310.7, 1: 14786.8}, 8: {0: 8046.7, 1: 14474.8}}
+# ── 2026-07-30 重钉（`lm_head` 反向 kernel workspace 实测入账，docs/head_loss_bwd_workspace_2026-07-30.md）──
+#   **s1 各 +1062.0**（该 config seq=4096·B=1、H=4096 → 律给
+#   (2*129280+4*4096)*4096 + 20 MiB + 1024 = 1094.001 MiB；层内 max 换手后净抬 1062.0）：
+#     MHA s1 14786.8 → **15848.8** ／ GQA s1 14474.8 → **15536.8**。
+#   **s0 逐 MiB 不变**——s0 的峰值事件是 `bwd@0`（embedding 反向），不是 head 段。
+_STD_ON_THEO = {32: {0: 8310.7, 1: 15848.8}, 8: {0: 8046.7, 1: 15536.8}}
+
+#: ⚠ 框架缺口不变量（理论 < 真机）在 **s1 两点上已被本项翻转**，如实记、不删断言：
+#:   MHA s1 15848.8 vs 真机 15370.0（比值 1.031）、GQA s1 15536.8 vs 14986.0（1.037）。
+#:   成因**不是**本项算错——它是逐字节实测；而是该 config 的框架缺口（~500 MiB/层，
+#:   注意段 bprop 保留）**小于**本项的 1062.0 MiB。故不变量按 stage 分档：s0 仍守
+#:   `sim < real`（框架缺口成立），s1 改为钉住已翻转后的比值带（防止继续漂移，也防止
+#:   有人把它「调回去」）。band 只封住当前实测落点，**不为凑回 <1 而动本项**。
+_STD_ON_GAP_FLIPPED = {(32, 1): (1.025, 1.040), (8, 1): (1.030, 1.045)}
 
 
 @pytest.mark.parametrize("kv,stage", [(32, 0), (32, 1), (8, 0), (8, 1)])
@@ -229,9 +242,19 @@ def test_std_recompute_on_185_framework_gap(kv, stage):
     """(b) 框架缺口：真机全重算不释放注意段 bprop 保留(~500/层)——理论 < 真机,差距为框架缺口。"""
     sim = _peaks(_std_on_q(kv))[stage]
     real = _STD_ON_REAL[kv][stage]
-    assert sim < real, (
-        f"185 std {'MHA' if kv == 32 else 'GQA'} ON stage{stage}: 理论 {sim:.1f} 应 < 真机 {real}"
-        f"（框架释放缺口={real-sim:.0f}MiB，注意段 bprop 保留 MS 全重算不释放，非模型误差）。")
+    band = _STD_ON_GAP_FLIPPED.get((kv, stage))
+    if band is None:
+        assert sim < real, (
+            f"185 std {'MHA' if kv == 32 else 'GQA'} ON stage{stage}: 理论 {sim:.1f} 应 < 真机 {real}"
+            f"（框架释放缺口={real-sim:.0f}MiB，注意段 bprop 保留 MS 全重算不释放，非模型误差）。")
+    else:
+        # 2026-07-30：本点的框架缺口已被 `lm_head` 反向 workspace 实测项盖过 → 翻成过读。
+        # 断言从「< 真机」改为「钉住翻转后的比值带」，两侧都守（见 _STD_ON_GAP_FLIPPED）。
+        lo, hi = band
+        assert lo <= sim / real <= hi, (
+            f"185 std {'MHA' if kv == 32 else 'GQA'} ON stage{stage}: sim/real={sim / real:.4f} "
+            f"越出已记录的过读带 ({lo}, {hi})；sim={sim:.1f} real={real}。<lo 说明有人把它调回 "
+            f"OOM-不安全侧或本项被削；>hi 说明过读继续膨胀，二者都须查明。")
 
 
 # ── D. pp4 ON m=8 **纯理论**（去经验饱和 cap）────────────────────────────────────────

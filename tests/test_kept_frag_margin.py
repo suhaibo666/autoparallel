@@ -38,8 +38,10 @@ def test_margin_off_reproduces_pre_fix_underprediction():
     #   显式基线 → 15516.4 → 15712.5（+196.1=7 个 MoE 层各一份 [S,B,H] fp32 cast）。
     # 2026-07-29 二次重钉：15712.5 → 15474.5（RMSNorm 不 cast → select-keep-FFN 的保留层
     #   ln1/ln2/q_a_norm/kv_a_norm 保留输入不再抬 fp32）。margin 仍是唯一变量、仍可关。
+    # 2026-07-30 三次重钉：15474.5 → 16532.5（`lm_head` 反向 kernel workspace 入账 +1058.0）。
+    #   margin 仍是唯一变量、仍可关（本项挂在 head 段，与 kept_frag margin 正交）。
     off = _peak(RecomputeSpec("select", select_ops=ATTN), factor=0.0)
-    assert abs(off - 15474.5) < 1.0, off
+    assert abs(off - 16532.5) < 1.0, off
 
 
 def test_select_mlp_keepattn_unchanged_moe_recomputed():
@@ -51,15 +53,18 @@ def test_select_mlp_keepattn_unchanged_moe_recomputed():
     off = _peak(RecomputeSpec("select", select_ops=MLP), factor=0.0)
     # 2026-07-29 二次重钉：15062.0 → 14696.0（同上）。真机 15765 → 0.955 → **0.932**，
     #   已跌出 ±5% 安全带 —— **OOM-不安全，如实记**（scorecard 同锚 band 一并下移）。
+    # 2026-07-30 三次重钉：14696.0 → 15754.0（同上）。真机 15765 → 0.932 → **0.9993**
+    #   —— 本项恰好补上了这一格的缺口（**不是调参，是实测值本身**）。
     assert abs(on - off) < 1e-6, (on, off)
-    assert abs(off - 14696.0) < 1.0, off
+    assert abs(off - 15754.0) < 1.0, off
 
 
 def test_full_recompute_hard_gate_unbroken():
     # full 重算：kept-MoE=0 → margin 0 → DSv3 4L 硬门 12437.9 逐字节不破。
     # 2026-07-29 二次重钉：12437.9 → 12423.9（同 test_dsv3_golden）。
+    # 2026-07-30 三次重钉：12423.9 → 13481.9（同上）。kept-MoE=0 → margin 仍 0、门仍不破。
     p = _peak(RecomputeSpec("full", full_layers={1, 2, 3, 4}), N=4)
-    assert abs(p - 12423.9) < 0.05, p
+    assert abs(p - 13481.9) < 0.05, p
 
 
 def test_per_stage_none_loss_stage_keeps_kce_fat():

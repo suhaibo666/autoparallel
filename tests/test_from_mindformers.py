@@ -157,7 +157,11 @@ def test_dsv4align_roundtrip_same_peak():
     #   两个 `mul` 各留一个操作数 `t`/`t_rot`。本配置 `cyc=[0,4,128]`、n=4 → `compress=[0,4,128,0]`
     #   **只有 1 个 r4 层**，seq2048 下该对各 32.000 MiB → **+64.0 整**。
     #   真机 15415.5 → 0.902 → **0.906**：仍是 OOM-**不安全**方向，但缺口收窄。
-    assert abs(_peak(bundle) - 13963.8) < 1.0
+    # → **14502.8**（2026-07-30）：`lm_head` 反向 kernel workspace 入账。该 config seq=2048
+    #   → 律给 (2*129280+4*4096)*2048 + 20 MiB + 1024 = 557.0 MiB；层内 max 换手后净抬
+    #   **+539.0**。真机 15415.5 → 0.906 → **0.941**：仍 OOM-不安全，缺口收窄。
+    #   见 docs/head_loss_bwd_workspace_2026-07-30.md 6.4。
+    assert abs(_peak(bundle) - 14502.8) < 1.0
 
 
 # ── (b) DSv3 round-trip ───────────────────────────────────────────────────────────────
@@ -174,7 +178,8 @@ def test_dsv3_roundtrip_same_peak_12409():
     bundle = from_mindformers_dict(_dsv3_mf())
     assert bundle.recompute.mode == "full" and bundle.recompute.full_layers == {1, 2, 3, 4}
     # 2026-07-29 二次重钉：12437.9 → 12423.9（RMSNorm 不 cast；DSv3 同样走 FusedRMSNorm）。
-    assert abs(_peak(bundle) - 12423.9) < 1.0
+    # 2026-07-30 三次重钉：12423.9 → 13481.9（`lm_head` 反向 kernel workspace 实测入账）。
+    assert abs(_peak(bundle) - 13481.9) < 1.0
 
 
 def test_dsv3_8L_roundtrip_peak_matches_preset():

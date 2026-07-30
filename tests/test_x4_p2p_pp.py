@@ -150,7 +150,15 @@ def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
     #   瞬态块 `Size(KB)=1093379.0` = 1119620096 B = 1067.753 MiB，逐字节对上（该文件正是
     #   这条锚点 real=10246.0 的同一次采集）。s1 逐 MiB 不变（末 stage 无 embedding 层）。
     assert abs(s0.peak_bytes / MiB - 10573.0) < 0.1
-    assert abs(s1.peak_bytes / MiB - 45611.4) < 0.1
+    # 2026-07-30 重钉：s1 45611.4 → **47707.4**（`lm_head` 反向 kernel workspace 实测入账；
+    #   该 config B*S=8192、H=1792 → 律给 (2*129280+4*1792)*8192 + 20 MiB + 1024 = 2096.0 MiB）。
+    #   ⚠ 这一笔**正是这条锚点自己那次采集的 profiler 量到的**：
+    #   `analysis/realmachine/pp2_norecomp/op_816365.csv`（持有 lm_head 的那个 rank）里
+    #   `MatMulExt` 的瞬态块 `2168457216 B` == wgrad 律 `(2*vocab+2*H)*8192 + 20 MiB + 2048`
+    #   **逐字节吻合**；同文件里 dgrad 那一档是 `4315940352 B`（比本律多一份 `2*vocab*B*S`
+    #   的 operand 拷贝 —— 那是**另一个 build 的 kernel 选择**，今天单卡同 shape 量到的是
+    #   本律的值，见 docs/head_loss_bwd_workspace_2026-07-30.md 2.3/7.2）。s0 逐 MiB 不变。
+    assert abs(s1.peak_bytes / MiB - 47707.4) < 0.1
     assert s0.peak_event.startswith("bwd") and s1.peak_event.startswith("bwd")
     # ── 方向门（2026-07-29 二次重钉后**分两档**，如实记录 s1 的翻转）────────────────────
     # s0 仍 OOM-安全（预测 ≥ 真机 10246.0，比值 1.032；原 1.021，本轮因实测 workspace 入账回升）。
@@ -161,8 +169,11 @@ def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
     #   **按纪律不调参掩盖**：不重标 margin、不放宽 census。真正的补法是 kernel workspace 项，
     #   需真机 profiler 明细（见 docs/census_fix_mhc_rmsnorm_2026-07-29.md §残差）。
     #   本门把翻转**钉死**：既守它没继续恶化（下界），也守它没被偷偷"调回去"（上界）。
+    # 2026-07-30：s1 由 0.9990（OOM-不安全）**翻回 OOM-安全侧 1.0450** —— 翻转来自
+    #   真机实测项入账，**不是**调参（margin / census 一个字节没动）。带随之上移，
+    #   两侧仍都守：<lo 说明本项被削或又出现新欠读；>hi 说明过读继续膨胀。
     _s1_ratio = s1.peak_bytes / MiB / 45655.0
-    assert 0.995 <= _s1_ratio <= 1.0, (
-        f"pp2 stage1 sim/real={_s1_ratio:.4f} 越出已记录的欠读带 (0.995, 1.0]；"
+    assert 1.040 <= _s1_ratio <= 1.050, (
+        f"pp2 stage1 sim/real={_s1_ratio:.4f} 越出已记录的过读带 [1.040, 1.050]；"
         f"sim={s1.peak_bytes / MiB:.1f} real=45655.0。>1.0 说明有人把它调回 OOM-安全侧——"
         f"请核对是不是又加了拟合常数；<0.995 说明欠读继续恶化，须查明。")

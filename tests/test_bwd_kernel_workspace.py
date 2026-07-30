@@ -126,10 +126,20 @@ def test_default_is_zero_and_byte_neutral_for_untagged_specs():
     t = TensorRef("x", ("S", "B", "H"))
     op = OpSpec("plain", OpType.MATMUL, [t], t)
     assert op.bwd_workspace is None and op.bwd_workspace_ref is None
+    # 2026-07-30：`lm_head` 那一格**已被真机测出**（167 memory-tracker，dgrad
+    # `(2·vocab+4·H)·(B·S)+20 MiB+1024`，见 docs/head_loss_bwd_workspace_2026-07-30.md）
+    # → 样例按 `opdag_walker_core_2026-07-25.md` §6.6「只移动举例、保留不变量」搬到 head 段
+    # 里**仍未测**的三个 op 上：`final_norm` / `logsoftmax` / `nll`。
+    # （它们的 kernel workspace 实测存在但**远小于层内 max**：`RmsNormGrad` 16.002 MiB、
+    #  `_LogSoftmax.backward` 的 Cast 无 workspace、`nll` 的 `ScatterAddExt`
+    #  `4·(B·S)+16 MiB+1536`；均未建模 = 已知欠读，本门防止有人拿别处的数来顶。）
     lay = _layer(_resolve(_FUSED_TAG), "lm_head")
-    assert estimate_structure_memory(lay.ops).bwd_workspace == 0, (
-        "lm_head/loss 段的反向 kernel workspace 未经测量 → 必须留 0。"
-        "若有人在此填数，须先有真机测量（见 docs/head_workspace_2026-07-30.md §6①）。")
+    per = {op.name: getattr(op, "bwd_workspace_bytes", 0) for op in lay.ops}
+    for nm in ("final_norm", "logsoftmax", "nll"):
+        assert per.get(nm, 0) == 0, (
+            "%s 的反向 kernel workspace 未建模 → 必须留 0（已知欠读）。"
+            "若有人在此填数，须先有真机测量。" % nm)
+    assert per.get("lm_head", 0) > 0, "lm_head 那一格已有实测（2026-07-30），不得回退成 0"
 
 
 def test_bwd_workspace_is_additive_not_a_partition_of_the_working_set():
