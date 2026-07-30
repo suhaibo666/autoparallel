@@ -23,6 +23,12 @@ PALETTE = {
     "block":   ("#ffe3e3", "#c92a2a"),   # 阻断
     "note":    ("#f8f9fa", "#868e96"),   # 旁注
     "derived": ("#e5dbff", "#6741d9"),   # 派生层
+    # provenance 三色。**刻意与"层"色分开成另一类视觉对象**（描边不填色，
+    # 与正文 `.pill` 同款）：层色表达"在哪一层"，provenance 表达"这个量算哪种知识"，
+    # 两者横切。若共用填色块，读者会把「绿=CoreIR 层」误读成「绿=source_derived」。
+    "sd":      ("transparent", "#1f7a3d"),
+    "me":      ("transparent", "#b35309"),
+    "as":      ("transparent", "#7c3aed"),
 }
 FRAME_STROKE = "#adb5bd"
 TEXT = "#1e1e1e"
@@ -335,13 +341,13 @@ def d1():
 def d2():
     g = D("d2", "知识分级：量的 provenance 而非层的退化档", 1160, 700)
     cols = [
-        (60,  "source_derived", "ir",
+        (60,  "source_derived", "sd",
          ["shape / dtype", "alias / inplace", "saved 结构", "数据流与依赖"],
          "源码 + 算子定义\n可判定", "缺失 ⇒ 阻断"),
-        (450, "measured", "plan",
+        (450, "measured", "me",
          ["workspace_bytes", "bwd_scratch", "kernel duration", "allocator 参数"],
          "只能实测标定\n源码里不存在", "缺 key ⇒ 阻断\n命中 ⇒ 带 confidence"),
-        (840, "assumed", "backend",
+        (840, "assumed", "as",
          ["MoE 每专家负载", "专家 capacity", "非规则化 placement"],
          "需要建模假设\n值依赖运行期数据", "必须显式声明\n缺声明 ⇒ 阻断"),
     ]

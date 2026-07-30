@@ -1,0 +1,231 @@
+/* ═══ 蓝图 / 规格书 ══════════════════════════════════════════════════════════
+   调色：冷纸底 + 发丝线 + 近零圆角，强调用偏墨的靛蓝。
+   字族：正文无衬线；**结构层等宽** —— 这份文档讲 IR 与 DSL，等宽是它的母语，
+        所以章号 / eyebrow / 层名 / 表头 / 批注标签 / 图号全部走等宽。
+   承重信息：provenance 三色（source_derived / measured / assumed）不是装饰，
+            它们在全文表格、标记、图里表达同一套语义，故独立于强调色。
+   ─────────────────────────────────────────────────────────────────────────── */
+:root{
+  --paper:#f7f8fa; --panel:#ffffff;
+  --ink:#111318; --ink2:#3f4654; --ink3:#767d8c; --ink4:#9aa1ae;
+  --rule:#dfe3ea; --rule2:#edeff3;
+  --accent:#1e4fa8; --accent-soft:#eaf0fb;
+  --sd:#1f7a3d; --me:#b35309; --as:#7c3aed;
+  --code-bg:#f2f4f7; --code-ink:#1b1f27;
+  --dg-frame:#c2c8d2; --dg-ink:#111318;
+  --b-input:#eceff3; --s-input:#5a6371;
+  --b-sem:#e6eefb;   --s-sem:#1e4fa8;
+  --b-ir:#e2f3e7;    --s-ir:#1f7a3d;
+  --b-plan:#fdeedd;  --s-plan:#b35309;
+  --b-backend:#f0e7fb;--s-backend:#6d28d9;
+  --b-block:#fce8e8; --s-block:#b02525;
+  --b-note:#f2f4f7;  --s-note:#646c7a;
+  --b-derived:#e9e3fb;--s-derived:#5b32c9;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei","PingFang SC",
+    "Hiragino Sans GB","Source Han Sans SC",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"Cascadia Mono","JetBrains Mono",Consolas,
+    "Microsoft YaHei",monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --paper:#0d0f13; --panel:#14171d;
+    --ink:#e8eaef; --ink2:#a9b0bd; --ink3:#7b8391; --ink4:#5f6675;
+    --rule:#242932; --rule2:#1b1f26;
+    --accent:#7aa7ff; --accent-soft:#16233b;
+    --sd:#5fcf7d; --me:#f0a65a; --as:#b494f7;
+    --code-bg:#171b22; --code-ink:#dde1e9;
+    --dg-frame:#39404b; --dg-ink:#e8eaef;
+    --b-input:#20242c; --s-input:#98a0ad;
+    --b-sem:#13243d;   --s-sem:#7aa7ff;
+    --b-ir:#12301f;    --s-ir:#5fcf7d;
+    --b-plan:#33230d;  --s-plan:#f0a65a;
+    --b-backend:#241540;--s-backend:#b494f7;
+    --b-block:#331717; --s-block:#f08282;
+    --b-note:#1a1e25;  --s-note:#8b93a1;
+    --b-derived:#1e1740;--s-derived:#a98bf5;
+  }
+}
+:root[data-theme=light]{
+  --paper:#f7f8fa; --panel:#ffffff;
+  --ink:#111318; --ink2:#3f4654; --ink3:#767d8c; --ink4:#9aa1ae;
+  --rule:#dfe3ea; --rule2:#edeff3;
+  --accent:#1e4fa8; --accent-soft:#eaf0fb;
+  --sd:#1f7a3d; --me:#b35309; --as:#7c3aed;
+  --code-bg:#f2f4f7; --code-ink:#1b1f27;
+  --dg-frame:#c2c8d2; --dg-ink:#111318;
+  --b-input:#eceff3;--s-input:#5a6371; --b-sem:#e6eefb;--s-sem:#1e4fa8;
+  --b-ir:#e2f3e7;--s-ir:#1f7a3d; --b-plan:#fdeedd;--s-plan:#b35309;
+  --b-backend:#f0e7fb;--s-backend:#6d28d9; --b-block:#fce8e8;--s-block:#b02525;
+  --b-note:#f2f4f7;--s-note:#646c7a; --b-derived:#e9e3fb;--s-derived:#5b32c9;
+}
+:root[data-theme=dark]{
+  --paper:#0d0f13; --panel:#14171d;
+  --ink:#e8eaef; --ink2:#a9b0bd; --ink3:#7b8391; --ink4:#5f6675;
+  --rule:#242932; --rule2:#1b1f26;
+  --accent:#7aa7ff; --accent-soft:#16233b;
+  --sd:#5fcf7d; --me:#f0a65a; --as:#b494f7;
+  --code-bg:#171b22; --code-ink:#dde1e9;
+  --dg-frame:#39404b; --dg-ink:#e8eaef;
+  --b-input:#20242c;--s-input:#98a0ad; --b-sem:#13243d;--s-sem:#7aa7ff;
+  --b-ir:#12301f;--s-ir:#5fcf7d; --b-plan:#33230d;--s-plan:#f0a65a;
+  --b-backend:#241540;--s-backend:#b494f7; --b-block:#331717;--s-block:#f08282;
+  --b-note:#1a1e25;--s-note:#8b93a1; --b-derived:#1e1740;--s-derived:#a98bf5;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.75 var(--sans);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+.wrap{display:grid;grid-template-columns:270px minmax(0,1fr);max-width:1520px;margin:0 auto}
+
+/* ── 目录：等宽栏 ────────────────────────────────────────────────────── */
+nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+  padding:34px 18px 60px;border-right:1px solid var(--rule);
+  font:12.5px/1.5 var(--mono);background:var(--panel)}
+nav .navtitle{margin:0 0 16px;padding:0 8px;font-size:10.5px;letter-spacing:.18em;
+  color:var(--ink4);text-transform:uppercase}
+nav ol{display:flex;flex-direction:column;gap:1px;list-style:none;margin:0;padding:0}
+nav a{display:grid;grid-template-columns:2.4em 1fr;gap:2px;padding:5px 8px;
+  color:var(--ink2);text-decoration:none;border-left:2px solid transparent}
+nav a:hover{background:var(--accent-soft);color:var(--accent);border-left-color:var(--accent)}
+nav .num{color:var(--ink4);font-variant-numeric:tabular-nums}
+nav .sub a{grid-template-columns:1fr;padding-left:38px;color:var(--ink3);font-size:11.8px}
+nav .grp{margin:16px 0 4px;padding:0 8px;font-size:10px;letter-spacing:.16em;
+  color:var(--ink4);text-transform:uppercase}
+main{padding:36px 46px 150px;min-width:0}
+
+/* ── 排版 ────────────────────────────────────────────────────────────── */
+h1{margin:6px 0 12px;font:600 33px/1.22 var(--sans);letter-spacing:-.022em;
+  text-wrap:balance}
+h2{margin:64px 0 6px;padding-top:26px;border-top:2px solid var(--ink);
+  font:600 24px/1.3 var(--sans);letter-spacing:-.014em;text-wrap:balance}
+h2 .cn{display:block;margin-bottom:9px;font:11px/1 var(--mono);letter-spacing:.18em;
+  color:var(--accent);text-transform:uppercase}
+h3{margin:34px 0 8px;font:600 17.5px/1.4 var(--sans);text-wrap:balance}
+/* 承载中文的微标签：不做 uppercase（对汉字无效）、字距收紧、字号上调 —— 拉丁文的
+   「小字号 + 大字距 + 全大写」惯例套到中文上只会把字拉散并变小。*/
+h4{margin:26px 0 7px;font:600 12.5px/1.4 var(--mono);letter-spacing:.06em;
+  color:var(--ink3)}
+p{margin:12px 0;max-width:68ch}
+ul,ol{margin:12px 0;padding-left:24px;max-width:68ch}
+li{margin:6px 0}
+li::marker{color:var(--ink4)}
+code{font:13px/1.5 var(--mono);background:var(--code-bg);color:var(--code-ink);
+  padding:1.5px 5px;border-radius:3px}
+pre{margin:16px 0;padding:16px 18px;background:var(--code-bg);
+  border:1px solid var(--rule);border-left:2px solid var(--ink3);overflow-x:auto}
+pre code{padding:0;background:none;font-size:12.8px;line-height:1.66}
+.lede{margin:14px 0 24px;max-width:62ch;font-size:18px;line-height:1.6;color:var(--ink2)}
+.meta{margin:20px 0 30px;padding:14px 0 14px 16px;border-left:2px solid var(--rule);
+  display:flex;flex-direction:column;gap:5px;font:12.8px/1.6 var(--mono);color:var(--ink3)}
+.meta b{color:var(--ink2);font-weight:600}
+.thesis{margin:24px 0;padding:22px 26px;background:var(--panel);
+  border:1px solid var(--rule);border-top:3px solid var(--accent);
+  font-size:17px;line-height:1.72;max-width:74ch}
+
+/* ── 批注：标签压在上边框（非左侧强调条）──────────────────────────────── */
+.cal{position:relative;margin:26px 0 20px;padding:20px 20px 16px;background:var(--panel);
+  border:1px solid var(--rule);border-top:2px solid var(--rule);
+  max-width:74ch;font-size:14.8px;line-height:1.68}
+.cal .lbl{position:absolute;top:-10px;left:16px;padding:0 10px;background:var(--panel);
+  font:600 12.5px/1.6 var(--mono);letter-spacing:.03em}
+.cal p{margin:9px 0;max-width:none}
+.cal ol,.cal ul{max-width:none}
+.cal>:first-child+*{margin-top:0}
+.cal>:last-child{margin-bottom:0}
+.cal pre{margin:12px 0}
+.cal.why{border-top-color:var(--accent)}   .cal.why .lbl{color:var(--accent)}
+.cal.inv{border-top-color:var(--sd)}       .cal.inv .lbl{color:var(--sd)}
+.cal.honest{border-top-color:var(--me)}    .cal.honest .lbl{color:var(--me)}
+.cal.bad{border-top-color:var(--s-block)}  .cal.bad .lbl{color:var(--s-block)}
+
+/* ── 规格表 ──────────────────────────────────────────────────────────── */
+.tw{margin:18px 0;overflow-x:auto;border-top:2px solid var(--ink);
+  border-bottom:1px solid var(--rule)}
+table{width:100%;border-collapse:collapse;font-size:14px;background:transparent}
+th,td{padding:10px 14px 10px 0;text-align:left;vertical-align:top;
+  border-bottom:1px solid var(--rule2)}
+th:first-child,td:first-child{padding-left:2px}
+th{font:600 12.5px/1.5 var(--mono);letter-spacing:.04em;color:var(--ink3);
+  white-space:nowrap;border-bottom:1px solid var(--rule)}
+tr:last-child td{border-bottom:0}
+td code{font-size:12.4px}
+.nw{white-space:nowrap}
+
+/* ── 图 ──────────────────────────────────────────────────────────────── */
+figure{margin:30px 0;padding:0;background:var(--panel);border:1px solid var(--rule)}
+figure .fw{overflow-x:auto;padding:18px 18px 8px}
+figure svg{display:block;min-width:660px;width:100%;height:auto}
+figcaption{display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between;
+  align-items:baseline;padding:9px 18px 11px;border-top:1px solid var(--rule);
+  background:var(--code-bg);font:12px/1.5 var(--mono);color:var(--ink3)}
+figcaption b{color:var(--accent);font-weight:600;letter-spacing:.06em}
+figcaption .src{color:var(--ink4);white-space:nowrap}
+
+/* ── 图内 SVG 主题 ───────────────────────────────────────────────────── */
+svg.dg text{font-family:var(--sans)}
+svg.dg .dg-mono{font-family:var(--mono)}
+svg.dg .dg-frame{fill:none;stroke:var(--dg-frame);stroke-dasharray:7 5;stroke-width:1.3}
+svg.dg .dg-box{stroke-width:1.7}
+svg.dg .dg-blabel{text-anchor:middle;font-weight:650}
+svg.dg .dg-bsub{text-anchor:middle;opacity:.92}
+svg.dg .dg-ftitle{font-family:var(--mono);font-size:13px;font-weight:700;letter-spacing:.06em}
+svg.dg .dg-arrow{fill:none;stroke-width:1.8;stroke-linejoin:round}
+svg.dg .dg-dash{stroke-dasharray:6 4}
+svg.dg .dg-alabel{font-size:12.5px}
+svg.dg .dg-note{font-size:13px;fill:var(--ink2)}
+svg.dg .dg-ah{fill:var(--dg-ink)}
+svg.dg .b-input{fill:var(--b-input);stroke:var(--s-input)}
+svg.dg .b-sem{fill:var(--b-sem);stroke:var(--s-sem)}
+svg.dg .b-ir{fill:var(--b-ir);stroke:var(--s-ir)}
+svg.dg .b-plan{fill:var(--b-plan);stroke:var(--s-plan)}
+svg.dg .b-backend{fill:var(--b-backend);stroke:var(--s-backend)}
+svg.dg .b-block{fill:var(--b-block);stroke:var(--s-block)}
+svg.dg .b-note{fill:var(--b-note);stroke:var(--s-note)}
+svg.dg .b-derived{fill:var(--b-derived);stroke:var(--s-derived)}
+/* provenance：描边不填色 —— 与正文 .pill 同款，与「层」色块区分成另一类对象 */
+svg.dg .b-sd{fill:none;stroke:var(--sd)}
+svg.dg .b-me{fill:none;stroke:var(--me)}
+svg.dg .b-as{fill:none;stroke:var(--as)}
+svg.dg .t-sd{fill:var(--sd)} svg.dg .t-me{fill:var(--me)} svg.dg .t-as{fill:var(--as)}
+svg.dg .a-sd{stroke:var(--sd)} svg.dg .a-me{stroke:var(--me)} svg.dg .a-as{stroke:var(--as)}
+svg.dg .t-input{fill:var(--s-input)} svg.dg .t-sem{fill:var(--s-sem)}
+svg.dg .t-ir{fill:var(--s-ir)} svg.dg .t-plan{fill:var(--s-plan)}
+svg.dg .t-backend{fill:var(--s-backend)} svg.dg .t-block{fill:var(--s-block)}
+svg.dg .t-note{fill:var(--ink2)} svg.dg .t-derived{fill:var(--s-derived)}
+svg.dg .a-note{stroke:var(--ink3)} svg.dg .a-input{stroke:var(--s-input)}
+svg.dg .a-sem{stroke:var(--s-sem)} svg.dg .a-ir{stroke:var(--s-ir)}
+svg.dg .a-plan{stroke:var(--s-plan)} svg.dg .a-block{stroke:var(--s-block)}
+svg.dg .a-backend{stroke:var(--s-backend)} svg.dg .a-derived{stroke:var(--s-derived)}
+
+/* ── provenance 标记：与图、表同一套语义色 ───────────────────────────── */
+.pill{display:inline-block;padding:1.5px 7px;border:1px solid;border-radius:2px;
+  font:10.5px/1.6 var(--mono);letter-spacing:.06em;vertical-align:1px}
+.p-sd{color:var(--sd);border-color:var(--sd)}
+.p-me{color:var(--me);border-color:var(--me)}
+.p-as{color:var(--as);border-color:var(--as)}
+
+/* ── 编号步骤：只用于真正的顺序（各层的逻辑流程）─────────────────────── */
+.flow{counter-reset:st;list-style:none;margin:16px 0;padding:0;max-width:74ch;
+  border-top:1px solid var(--rule2)}
+.flow li{counter-increment:st;display:grid;grid-template-columns:34px 1fr;gap:12px;
+  margin:0;padding:10px 0;border-bottom:1px solid var(--rule2)}
+.flow li::before{content:counter(st,decimal-leading-zero);
+  font:11.5px/1.9 var(--mono);color:var(--accent);letter-spacing:.06em;
+  font-variant-numeric:tabular-nums}
+
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;margin:14px 0;
+  max-width:74ch;font-size:14.4px}
+.kv dt{font:12.5px/1.7 var(--mono);color:var(--accent);white-space:nowrap}
+.kv dd{margin:0;color:var(--ink2)}
+
+hr{border:0;border-top:1px solid var(--rule);margin:44px 0}
+.foot{margin-top:78px;padding-top:20px;border-top:2px solid var(--ink);
+  font:12.5px/1.7 var(--mono);color:var(--ink3)}
+.foot p{max-width:none}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:1040px){
+  .wrap{grid-template-columns:1fr}
+  nav{position:static;height:auto;border-right:0;border-bottom:1px solid var(--rule)}
+  main{padding:26px 20px 100px}
+}

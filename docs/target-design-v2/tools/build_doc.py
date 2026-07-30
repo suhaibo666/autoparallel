@@ -16,6 +16,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "src", "index.template.html")
+CSS = os.path.join(ROOT, "src", "style.css")
 SVG_DIR = os.path.join(ROOT, "build", "svg")
 
 sys.path.insert(0, HERE)
@@ -83,6 +84,8 @@ def main():
         return figure(name)
 
     body = re.sub(r"\{\{SVG:([\w-]+)\}\}", sub, tpl)
+    with open(CSS, "r", encoding="utf-8") as fh:
+        body = body.replace("{{CSS}}", "<style>\n" + fh.read().rstrip() + "\n</style>")
 
     if missing:
         raise SystemExit(f"build_doc: 模板引用了不存在的图：{missing}（先跑 gen_diagrams.py）")
