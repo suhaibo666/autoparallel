@@ -92,7 +92,8 @@ class LLMConfig:
     kept_frag_factor: float = 0.0
     # **无重算-MoE OOM-安全标定 margin 因子**（D1，2026-07-16；非物理，2 点标定）：与 kept_frag 同族碎片
     #   （dispatch/permute/grouped-GEMM fp32-cast + <100MiB 长尾），但作用域是**无重算-MoE**而非 select-kept。
-    #   仅 pp==1 单 stage 无重算 loss-BWD 生效（pp>1 已由 K_CE=8 平衡）。factor=0.6 由 8L-none+cp2-none 两锚点
+    #   仅 pp==1 单 stage 无重算 loss-BWD 生效（pp>1 走 `K_CE_PP` 分支，不进本 margin；⚠ 2026-07-30
+    #   `K_CE` 重标定 8→7 后「已由 K_CE 平衡」这条旧理由不再成立，gate 未动、如实记）。factor=0.6 由 8L-none+cp2-none 两锚点
     #   联合标定使二者 OOM-安全（预测≥真机）；两点理想 factor 0.53/0.45 差 ~15%，故明示为标定常数、可单值调/关。
     #   默认 0=关（回归安全）。fused-CE（DSv4）不触发。见 mem_timeline nr_moe_frag_factor / kept_frag 桶。
     nr_moe_frag_factor: float = 0.0
@@ -103,9 +104,11 @@ class LLMConfig:
     # 现改默认 2 = 已验证行为、字段真实接线；fp32 直存场景显式置 4。
     embedding_params_dtype_bytes: int = 2
     # unfused CE 链 lean 口径（2026-07-23，116 std MHA/GQA 锚点定标）：True = 无重算 loss stage 的
-    # CE fat 取 K_CE=4（≈3 份满 vocab fp32 co-live + 1 保守——116 std pp1 与 pp2-s1 差分实测一致,
-    # 与 pp 无关）；False = 制度常数（pp>1→8 / pp==1→4——DSv3-era 在含未建模效应的旧探针上标定的
-    # 混合常数,该族锚点冻结在此口径,勿动）。仅 cross_entropy_fused=False 且无重算 loss stage 有差异。
+    # CE fat 取 `K_CE_LEAN=4`（116 std pp1 与 pp2-s1 峰值差分反解「~3.3-4 份」,与 pp 无关；
+    # **无逐块台账**,2026-07-30 重标定刻意未动它——见 mem_timeline 顶部 `K_CE_LEAN` 注释）；
+    # False = 按 pp 分档的 `K_CE_PP / K_CE_PP1`（2026-07-30 由 8/4 重标定为 **7/3**,
+    # 依据是 9 份仓内 profiler CSV 逐块清点,`docs/k_ce_recalibration_2026-07-30.md`）。
+    # 仅 cross_entropy_fused=False 且无重算 loss stage 有差异。
     ce_pynative_lean: bool = False
 
     # ---- ③ 残差变体（横切）----

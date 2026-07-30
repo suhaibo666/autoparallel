@@ -29,6 +29,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..framework import framework_reserve as _framework_reserve
+# **仅** import 三个标定常数（不是桶计算）——本模块 docstring 第 9 行的
+# 「非 liveness 层沿用桶模型的既有公式与标定」正是指这类量；此前它们在两处各写一份
+# 字面量，2026-07-30 重标定时改为单一来源（`docs/k_ce_recalibration_2026-07-30.md`）。
+# `mem_timeline` 不 import 本包 → 无循环。
+from ..mem_timeline import K_CE_LEAN, K_CE_PP, K_CE_PP1
 from ..parallel_model import ParallelModel
 from ..schedule import (_1f1b_from_warmup, build_interleaved_1f1b,
                         interleaved_virtual_order)
@@ -444,9 +449,14 @@ class _StageSim:
                     nb["swap_buf"] = ((sm.activation_saves if lid in offloaded else 0)
                                       + _prefetch_swap(order, idx, swap_depth))
                     nb["optstep"] = muon_ns_overlap
-                    # unfused CE 链 K_CE 份满 vocab fp32（与 mem_timeline 同门同式）。
+                    # unfused CE 链 K_CE 份满 vocab 平面（与 mem_timeline 同门同式）。
+                    # 2026-07-30 重标定（`docs/k_ce_recalibration_2026-07-30.md`）：三个值
+                    # **直接从 `mem_timeline` import**，不再在此复写字面量——此前两处各写一份
+                    # `(4 if lean else (8 if pp>1 else 4))`，任何单侧重标都会静默分叉。
+                    # 台账出处/对账算式/仍被吸收的效应见 `mem_timeline` 顶部注释块。
                     ce_lean = getattr(self.dims, "ce_pynative_lean", False)
-                    k_ce = (4 if ce_lean else (8 if pp > 1 else 4))
+                    k_ce = (K_CE_LEAN if ce_lean
+                            else (K_CE_PP if pp > 1 else K_CE_PP1))
                     if kept_frag_factor and lid in loss_lids:
                         ka = live.bytes_of_layers(kept_lids)
                         nb["kept_frag"] = round(kept_frag_factor * ka) if ka else 0

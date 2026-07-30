@@ -56,7 +56,9 @@ def test_d1r_preset_injected_margin_silent():
 def test_d1r_pp_gt_1_silent_kce_covers():
     spec, _, _ = build_dsv3_spec(8)
     spec.dims.nr_moe_frag_factor = 0.0
-    # pp>1 无重算 loss stage 由 K_CE=8 平衡 → D1-R 不触发（不误报）。
+    # pp>1 无重算 loss stage 走 `K_CE_PP` 分支（不吃 D1 margin）→ D1-R 不触发（不误报）。
+    # ⚠ 2026-07-30 `K_CE_PP` 8→7 后该 stage 已不再「被平衡到 ~1.0」（0.9565）；本门守的是
+    #   **gate 语义**（pp>1 不进 margin），与 K_CE 取值无关，故逐字节仍绿。
     assert not _warns(spec, RecomputeSpec("None"), pp=2, dp=1, needle="nr_moe_frag_factor")
 
 

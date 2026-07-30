@@ -119,7 +119,8 @@ class DimTable:
     #   默认 False（pynative 常态）。仅在**无重算 + unfused** 下 loss bwd_scratch fat（mem_timeline ①）。
     cross_entropy_fused: bool = False
     # unfused CE lean 口径（2026-07-23 std 锚点定标,详见 llm_config.ce_pynative_lean）：True →
-    # 无重算 loss stage K_CE=4（pp 无关,116 std pp1/pp2-s1 实测一致）；False → 制度常数 8/4（冻结）。
+    # 无重算 loss stage 走 `K_CE_LEAN=4`（pp 无关,116 std 峰值差分；**无逐块台账**,2026-07-30 未动）；
+    # False → 按 pp 分档的 `K_CE_PP / K_CE_PP1` = **7 / 3**（2026-07-30 由 8/4 重标定,台账逐块）。
     ce_pynative_lean: bool = False
     # **标定 margin 因子**（B 方案，2026-07-09；非 op 图导出）：保留(非重算)模块在 loss 峰的
     #   fp32-cast 横切 + 小张量长尾占「当前 kept 激活」的比例。源码级 op-DAG 提取证实此残差**在 op 图
@@ -128,7 +129,8 @@ class DimTable:
     #   对 **select-kept-MoE** 层生效（mem_timeline kept_frag 桶）。
     kept_frag_factor: float = 0.0
     # **无重算-MoE OOM-安全标定 margin 因子**（D1，2026-07-16；同族碎片、独立作用域）：仅 pp==1 单 stage
-    #   无重算 loss-BWD 生效（pp>1 由 K_CE 平衡）。2 点标定（8L-none+cp2-none），明示为标定常数、非物理。
+    #   无重算 loss-BWD 生效（pp>1 走 K_CE_PP 分支、不进本 margin；⚠ 2026-07-30 后「由 K_CE 平衡」
+    #   不再成立）。2 点标定（8L-none+cp2-none），明示为标定常数、非物理。
     #   默认 0=关。fused-CE 不触发。见 mem_timeline nr_moe_frag_factor。
     nr_moe_frag_factor: float = 0.0
     dtype_bytes: int = 2

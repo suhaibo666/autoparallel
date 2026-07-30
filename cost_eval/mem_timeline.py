@@ -97,6 +97,75 @@ class StagePeak:
     peak_mb: int = -1      # 峰值事件的 microbatch 序号（P2-06；非微批事件 = -1）
 
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# `K_CE` —— 无重算 loss stage 在 loss 反向峰**同驻的满 vocab 平面总数**
+#   （单位 = 一张 fp32 满 vocab 平面 `4·S·B·vocab`；使用见 `_KCE_USE` 标记那一行）
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# **2026-07-30 重标定**（`docs/k_ce_recalibration_2026-07-30.md`）：此前 8/4 被代码注释自己
+#   描述为「**含当时未建模效应的混合常数**」，其中有一部分是被明示的纯 padding
+#   （旧注释逐字：「实测 3 份共存…代码取 **4 = 3 观测 + 1 保守**」）。本轮把那一张 padding
+#   拿掉，让常数回到它声称的物理语义。**没有引入任何新的拟合值**——两个新值都是从
+#   **仓内既有 profiler 台账逐块数出来再解方程**得到的（下面逐分支给出台账与算式）。
+#
+# ── 对账口径（三行，缺一不可）──────────────────────────────────────────────────────
+#   模型侧 loss 区满 vocab 总量（以 fp32 平面为单位）
+#       = `(K_CE − 1)` 张瞬态（本文件 `_KCE_USE` 那一行改写 `bwd_scratch`）
+#       + 1 张 saved fp32（`logsm`，`layers/head.py:214`，在 `act_live`）
+#       + 0.5 张 saved bf16（`logits_lm`，`layers/head.py:213`，在 `act_live`）
+#       = **K_CE + 0.5**
+#   真机侧 = high-water 那一刻在世的 `4·N·vocab±8 KiB` 张数 + `2·N·vocab±8 KiB` 张数 ÷2
+#            （`N = B·S/cp`；判据与清点脚本 `scratchpad/probe_realmachine_planes.py`）
+#   ⇒ `K_CE = 实测 fp32-等效总数 − 0.5`
+#
+# ── `K_CE_PP1`（`pp == 1` 且非 lean）= 3 ────────────────────────────────────────────
+#   台账：**7 份**仓内 CSV 的 high-water 在世平面**全部** = 3 张 fp32 + 1 张 bf16 = **3.5**
+#     · `analysis/realmachine/pp2_norecomp/..` 之外的全部 pp=1 采集：
+#       `cp2_none/`、`select_ffn/`（实为 8L-none 那条锚点）、`select_attn/`、`select_mlp/`、
+#       `operator_memory_rank0.csv`（实为 4L-full 那条）、`cp2_colossal/`、`dsv4_fused/`
+#     · 跨 **2 个模型族**（DSv3 / DSv4-align）、**2 个 seq**（2048/4096）、2 个 B、2 个 cp、
+#       3 种重算态、融合与非融合 CE、3 次不同日期 campaign —— 份数一个没变
+#     · 产出者逐块可查：fp32 = `{Log, Neg, ScatterAddExt}`（= `loss.py:185-196` 的
+#       saved log_softmax + probs + grad_log_softmax），bf16 = `{Copy|MatMulExt}`（= logits）
+#     · 仓内 2026-07-06 的诊断早已写下同一句：`analysis/realmachine/dsv4_fused/DIAGNOSIS.md:20`
+#       逐字「1010 fp32 vocab | **3** | … **恰 3 个**」+ 下一行「505 bf16 vocab logits | 1」
+#   ⇒ `3.5 − 0.5 = 3`。此值下 fat 改写退化成 `8·S·B·vocab` 本值（2 张瞬态）
+#     —— 与真机**逐张同构**（2 瞬态 fp32 + 1 saved fp32 + 1 saved bf16），不再吸收任何东西。
+#
+# ── `K_CE_PP`（`pp > 1` 且非 lean）= 7 ──────────────────────────────────────────────
+#   台账：该分支**唯一**的锚点 `pp2-stage1` 自己那次采集
+#     `analysis/realmachine/pp2_norecomp/op_816365.csv`（其 pool high-water = 45655.46 MiB，
+#     逐 MiB 命中 `scorecard_anchors.py` 的 `real=45655.0`）→ 在世 **5 张 fp32 + 5 张 bf16
+#     = 7.5** ⇒ `7.5 − 0.5 = 7`。
+#   **仍然是混合常数，但混的两件事已定位并量化**（报告 §5.1）：那 6 张瞬态里
+#     · 2 张 = 真的 fp32 瞬态（物理，同 pp1）；
+#     · 2 张 = **另外 2 组在途微批的 loss 区 saved 对**（`Log` fp32 + `Copy` bf16，台账里
+#       3 组长寿、模型的 `pinned[(mb,lid)]` 在 loss 层只 pin 1 组）；
+#     · 2 张 = **2 张 bf16 满 vocab 瞬态**（`Copy`/`ZerosLikeExt`，op 图未声明）。
+#   要去掉这部分混合是**建模**工作（按在途微批数 pin loss 区 saved + 在 op 图里声明 bf16
+#   瞬态），不是标定工作，本轮不做。
+#
+# ── `K_CE_LEAN`（`ce_pynative_lean`）= 4，**本轮不动** ──────────────────────────────
+#   它的出处是 116/MS2.9 的**整机峰值差分反解**（`tests/test_std_attn_anchor.py:27-29` 逐字
+#   「实测 ~3.3-4 份…与 pp 无关」），那批探针只记 `max_memory_allocated`，**仓内没有 116 的
+#   逐块 CSV**，故该值吸收了该 config 其它全部误差，**不能当平面份数用**（「~3.3-4」本身就
+#   横跨 3.5，分辨不到 0.5 张）。而把 DSv3-era 的逐块份数外推到该 build 已被证伪：
+#   167/MS2.10 同一族 op 链是 **1 saved + 3 瞬态 = 4 张 fp32**
+#   （`docs/head_loss_bwd_workspace_2026-07-30.md` §5.1 的逐块 dump），比 MS2.9 多一张。
+#   → **宁可留一个明示为拟合的值，也不用另一个猜测替换它。**
+#   **定它只需一次单跑**：在跑该 build 的机器上开 `MS_ALLOC_CONF="memory_tracker:True"` 采一次
+#   std MHA pp1 的 `memory_block.csv`，用与上面完全同一把尺数 high-water 在世张数即可。
+#
+# ── 边界（报告 §5.4）────────────────────────────────────────────────────────────────
+#   · `K_CE` 是**份数**不是尺寸 → 分块 CE 自动 ∝1/k（`head.py:253-256` 已把 `bwd_scratch`
+#     ÷k，本文件只乘份数）；**份数是否随 k 变无台账**（`chunked` 无任何真机锚点）→ 未测。
+#   · `loss_type="vocab_parallel_ce"` 的 `bwd_scratch` 只有 1 张（`head.py:249-251` 走
+#     `bwd_scratch_ref`）→ 下面 `// 2` 的「2 张里去掉一张」前提不成立。这是**本轮之前就
+#     存在**的不一致，且无锚点触及（只在 `tests/test_mtp_loss.py` 结构门里）→ 如实单列，未动。
+K_CE_PP1 = 3      # was 4（= 3 观测 + 1 保守）；台账 7 份 CSV 逐块 → 拿掉那 1 张保守
+K_CE_PP = 7       # was 8（DSv3-era 冻结口径的混合常数）；台账 pp2-s1 逐块 5+5=7.5 → 7
+K_CE_LEAN = 4     # 未动：无逐块台账（见上），保持 2026-07-23 的 116 std 差分标定值
+
+
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
@@ -491,7 +560,8 @@ class MemTimeline:
             #   - select-mlp（重算 FFN）：MoE 已重算 → 不计（sm 0.940 保持准确、不推过头）；
             #   - **no-recompute（None）此 kept_act 桶不计**：无重算-MoE 的同族残差改由**独立的
             #     `_nr_moe_act` + `nr_moe_frag_factor` 桶**处理（D1，2026-07-16，见下），gate 到 pp==1
-            #     单 stage 无重算 loss-BWD；pp>1 无重算 loss stage 仍由 k_ce=8 制度化平衡、不进任一 margin。
+            #     单 stage 无重算 loss-BWD；pp>1 无重算 loss stage 走 `K_CE_PP` 分支、不进任一 margin
+            #     （⚠ 2026-07-30 `K_CE` 8→7 后该 stage 由 1.045 落到 0.9565，「已被平衡」不再成立）。
             # 随 FWD pin / BWD pop 同步。
             kept_act = 0
             # D1（2026-07-16）：无重算-MoE 保留态碎片长尾的**标定基**——无重算下各 MoE 层（非 loss）
@@ -657,23 +727,24 @@ class MemTimeline:
                         # 用 fwd 期同一个 `workspace` 桶（同一物理量、不同相位；FWD 事件已在
                         # 上面用完并清零 → 不双计）。层内取 max 的实测依据见 structure_mem。
                         B.workspace = sm.bwd_workspace
-                        # ① 无重算下 loss 层：unfused CE 链共存 k_ce 份满 vocab fp32。现 bwd_scratch
-                        #   =8·S·B·vocab=2 份（probs+grad）→ 改到 k_ce-1 份（logsm 1 份在 act_live）。
-                        #   **k_ce 与制度相关（真机 profiler）**：流水线末 stage（pp>1，有 loss）CE 链保留更多
-                        #   中间量 → k_ce≈8（pp2-stage1 实测）；单 stage（pp=1）CE 链释放快 → 实测 3 份
-                        #   共存（cp2-none/select），代码取 **4 = 3 观测 + 1 保守**（OOM-安全侧，
-                        #   P2-08 注释对齐 2026-07-14）。
+                        # ① 无重算下 loss 层：unfused CE 链共存 K_CE 份满 vocab 平面。现 bwd_scratch
+                        #   =8·S·B·vocab=2 份（probs+grad）→ 改到 K_CE-1 份（logsm 1 份在 act_live）。
+                        #   **三个 K_CE 值的台账出处、对账算式、仍被吸收的效应、以及各自的适用边界，
+                        #     逐条见本文件顶部 `K_CE_PP1 / K_CE_PP / K_CE_LEAN` 的注释块**
+                        #     （2026-07-30 重标定：`docs/k_ce_recalibration_2026-07-30.md`；
+                        #      pp1 4→3、pp>1 8→7，lean 4 未动）。
                         #   **2026-07-14 修（review P0.1）**：判据从「全局 mode=='None'」改为
                         #   「**本 stage 无任何层被重算**」——全局 None/full/select 下行为逐字节不变
                         #   （None→全 stage 无重算→fat ✓;full/select→loss stage 含被重算 transformer→lean ✓）;
                         #   per-stage select（如 s0:both;s1:none）时未重算的 loss stage 恢复 fat
                         #   （修前被全局 mode=='select' 误关,低估 45%）。
+                        #   ⚠ 2026-07-30 起 `K_CE_PP1 == 3` ⇒ **pp==1 非 lean 下这条改写是恒等的**
+                        #     （`sm.bwd_scratch // 2 * 2 == sm.bwd_scratch`，因 8·S·B·vocab 必偶）。
+                        #     这不是把门关掉了，而是台账证明该 regime 本来就该等于门关值；分支保留，
+                        #     因为 `pp>1`（7）与 `lean`（4）两条仍非恒等，且 P0.1 的 per-stage 判据仍要守。
                         if _stage_no_recompute and lid in loss_lids and sm.bwd_scratch > 0:
-                            #   **ce_pynative_lean（2026-07-23，116 std MHA/GQA 锚点定标）**：该 build
-                            #   的 unfused CE 链实测 ~3.3-4 份 co-live 且 **与 pp 无关**（std pp1 与
-                            #   pp2-s1 差分一致）→ lean K=4。制度常数 8/4 保留为默认（DSv3-era 冻结
-                            #   口径——那批探针的 K=8 是含当时未建模效应的混合常数,勿动其锚点）。
-                            K_CE = 4 if ce_pynative_lean else (8 if pp > 1 else 4)
+                            K_CE = (K_CE_LEAN if ce_pynative_lean          # _KCE_USE
+                                    else (K_CE_PP if pp > 1 else K_CE_PP1))
                             B.bwd_scratch = sm.bwd_scratch // 2 * (K_CE - 1)
                         # 激活 swap（§8.1 swap_buf="从 CPU 预取回的激活"）：被卸载层反向前 H2D 取回，
                         #   swap_buf = 复原当前层 saves（不在 act_live）+ 反向序后 swap_depth 层在飞预取窗
@@ -752,7 +823,9 @@ class MemTimeline:
                         #   长尾（profiler live-set 313 个 <100MiB 碎片，opdag_validation.md：**在 op 图
                         #   粒度之下**，不可显式建模——与 select-kept 的 kept_frag 同族残差，另一作用域）。
                         #   **gate = pp==1 单 stage 无重算 loss-BWD**：pp>1 的无重算 loss stage 已由
-                        #   K_CE=8（line 上文）制度化平衡到 ~1.007，故显式排除（探针实证：pp2-stage0/1、
+                        #   `K_CE_PP`（本文件顶部）制度化平衡到 ~1.007，故显式排除（探针实证：pp2-stage0/1、
+                        #   ⚠ 2026-07-30 `K_CE_PP` 8→7 后 pp2-s1 落到 0.9565，该「平衡」理由已失效；
+                        #   gate（pp==1）本轮一个字节没动 —— 它现在是未经重标定的历史范围，如实记。
                         #   select、full 锚点在任意 factor 下逐字节不动）。factor=0.6 由 8L-none(→1.009)+
                         #   cp2-none(→1.021) 两锚点联合标定使二者 OOM-安全（预测≥真机）；两点理想 factor
                         #   0.53/0.45 差 ~15% → 明示为**标定常数**、非精确物理，可由 preset 单值调/关。

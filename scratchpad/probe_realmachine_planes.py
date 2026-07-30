@@ -23,9 +23,9 @@ MiB = 2 ** 20
 
 # (label, path, N=B*S/cp, vocab, H, 记分卡锚点 real MiB)
 CAMPAIGNS = [
-    ("pp2-stage1 (loss,k_ce=8)", "pp2_norecomp/op_816365.csv", 8192, 129280, 1792, 45655.0),
+    ("pp2-stage1 (loss,k_ce=7)", "pp2_norecomp/op_816365.csv", 8192, 129280, 1792, 45655.0),
     ("pp2-stage0 (optstep)", "pp2_norecomp/op_816362.csv", 8192, 129280, 1792, 10246.0),
-    ("cp2-none (loss,k_ce=4)", "cp2_none/operator_memory.csv", 4096, 129280, 1792, 20119.4),
+    ("cp2-none (loss,k_ce=3)", "cp2_none/operator_memory.csv", 4096, 129280, 1792, 20119.4),
     ("DSv3 8L none (dp2)", "select_ffn/operator_memory.csv", 4096, 129280, 1792, 19967.3),
     ("select self_attn (keep-FFN)", "select_attn/operator_memory.csv", 4096, 129280, 1792, 18828.2),
     ("select mlp (keep-attn)", "select_mlp/operator_memory.csv", 4096, 129280, 1792, 15764.7),

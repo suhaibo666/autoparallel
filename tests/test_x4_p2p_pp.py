@@ -158,7 +158,15 @@ def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
     #   **逐字节吻合**；同文件里 dgrad 那一档是 `4315940352 B`（比本律多一份 `2*vocab*B*S`
     #   的 operand 拷贝 —— 那是**另一个 build 的 kernel 选择**，今天单卡同 shape 量到的是
     #   本律的值，见 docs/head_loss_bwd_workspace_2026-07-30.md 2.3/7.2）。s0 逐 MiB 不变。
-    assert abs(s1.peak_bytes / MiB - 47707.4) < 0.1
+    # 2026-07-30 同日续（`K_CE` 重标定 8 → 7，`docs/k_ce_recalibration_2026-07-30.md`）：
+    #   s1 47707.4 → **43667.4**（−4040.0 = 一张 4·S·B·vocab fp32 平面 @ B*S=8192）。
+    #   ⚠ 这一张同样是**这条锚点自己那次采集**判出来的：`op_816365.csv` 的 pool high-water
+    #   （`Allocation Total Allocated(MB)` 最大值 = **45655.46 MiB**，逐 MiB 命中本 real）
+    #   那一刻在世的满 vocab 平面是 **5 张 fp32（4·N·V+512 = 4236247552 B）+ 5 张 bf16
+    #   （2·N·V+512 = 2118124032 B）= 7.5 张 fp32-等效**；模型侧总量 = `K_CE + 0.5`
+    #   （K_CE−1 瞬态 + saved logsm fp32 + saved logits bf16 ÷2）→ K_CE = 7。
+    #   旧值 8 里那一张是 `mem_timeline` 注释自己写的「+1 保守」padding。s0 逐 MiB 不变。
+    assert abs(s1.peak_bytes / MiB - 43667.4) < 0.1
     assert s0.peak_event.startswith("bwd") and s1.peak_event.startswith("bwd")
     # ── 方向门（2026-07-29 二次重钉后**分两档**，如实记录 s1 的翻转）────────────────────
     # s0 仍 OOM-安全（预测 ≥ 真机 10246.0，比值 1.032；原 1.021，本轮因实测 workspace 入账回升）。
@@ -170,10 +178,14 @@ def test_pp2_stage_peaks_byte_identical_to_recorded_anchor():
     #   需真机 profiler 明细（见 docs/census_fix_mhc_rmsnorm_2026-07-29.md §残差）。
     #   本门把翻转**钉死**：既守它没继续恶化（下界），也守它没被偷偷"调回去"（上界）。
     # 2026-07-30：s1 由 0.9990（OOM-不安全）**翻回 OOM-安全侧 1.0450** —— 翻转来自
-    #   真机实测项入账，**不是**调参（margin / census 一个字节没动）。带随之上移，
-    #   两侧仍都守：<lo 说明本项被削或又出现新欠读；>hi 说明过读继续膨胀。
+    #   真机实测项入账，**不是**调参（margin / census 一个字节没动）。
+    # 2026-07-30 同日续（`K_CE` 8→7）：s1 **再翻回 OOM-不安全侧 0.9565**（欠 1987.6 MiB）。
+    #   这一次的方向是「减字节」，但同样**不是**调参：那一张平面是台账里数不出来的
+    #   （in-世 7.5 张 fp32-等效 vs 模型 8.5），`mem_timeline.py` 的注释本来就把它写成
+    #   「+1 保守」。**不为保余量停在错值上**（任务纪律）；缺口如实进 §9 清单。
+    #   带随之下移，两侧仍都守：<lo 说明欠读继续恶化；>hi 说明有人把 K_CE 调回 8 去凑安全侧。
     _s1_ratio = s1.peak_bytes / MiB / 45655.0
-    assert 1.040 <= _s1_ratio <= 1.050, (
-        f"pp2 stage1 sim/real={_s1_ratio:.4f} 越出已记录的过读带 [1.040, 1.050]；"
-        f"sim={s1.peak_bytes / MiB:.1f} real=45655.0。>1.0 说明有人把它调回 OOM-安全侧——"
-        f"请核对是不是又加了拟合常数；<0.995 说明欠读继续恶化，须查明。")
+    assert 0.950 <= _s1_ratio <= 0.960, (
+        f"pp2 stage1 sim/real={_s1_ratio:.4f} 越出已记录的欠读带 [0.950, 0.960]；"
+        f"sim={s1.peak_bytes / MiB:.1f} real=45655.0。>0.960 说明有人把 K_CE 调回 8（或加了"
+        f"别的拟合常数）去凑 OOM-安全侧——请核对；<0.950 说明欠读继续恶化，须查明。")

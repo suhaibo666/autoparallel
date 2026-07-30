@@ -517,7 +517,11 @@ def _build_llm_config(model: dict) -> LLMConfig:
                           else 0.0),
         # D1 无重算-MoE OOM-安全标定 margin（2026-07-16；非物理，2 点标定）：无重算下 MoE 保留态碎片长尾。
         #   注入条件同 kept_frag（MoE 且非 DSv4-fused）；仅 pp==1 单 stage 无重算 loss-BWD 实际生效
-        #   （mem_timeline gate，pp>1 由 K_CE=8 平衡）。factor=0.6 与 presets.deepseek_v3 同源（两锚点标定）。
+        #   （mem_timeline gate；pp>1 走 `K_CE_PP` 分支，不进任一 margin）。factor=0.6 与
+        #   presets.deepseek_v3 同源（两锚点标定）。⚠ 2026-07-30 `K_CE` 重标定（8→7）后，
+        #   「pp>1 已由 K_CE 平衡到 ~1.007」这条旧理由**不再成立**（pp2-s1 现 0.9565）——
+        #   gate 本身（`pp == 1`）一个字节没动，但它现在是**未经重标定的历史范围**，
+        #   如实记：`docs/k_ce_recalibration_2026-07-30.md` §9。
         # **round3 A(D1-R) 迁移风险留档**：0.6 仅在 **DSv3(MLA+MoE、topk4、S4096) 两锚点**标定过,却
         #   被注入**任意** MoE 非 fused-DSv4 的 YAML（含 Mixtral/GQA+MoE 等）。碎片长尾 ∝ dispatch/permute
         #   量 ∝ topk/capacity,跨结构未必同——**非 DSv3 结构的 0.6 是未经真机验证的外推**（方向仍偏 OOM

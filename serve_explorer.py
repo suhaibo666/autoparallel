@@ -641,7 +641,7 @@ def parse_and_validate(p):
     #   过估 ~10GiB（2026-07-22 185 pp4 锚点定标时修）。缺省不传 → 保留基座/默认（历史行为不变）。
     if (p.get("ce_fused") or "").strip() != "":
         over["cross_entropy_fused"] = _x_flag(p, "ce_fused", base.cross_entropy_fused)
-    # unfused CE lean 口径（隐藏字段 ce_lean,2026-07-23 std 锚点）：K_CE=4 与 pp 无关（116 std
+    # unfused CE lean 口径（隐藏字段 ce_lean,2026-07-23 std 锚点）：`K_CE_LEAN=4` 与 pp 无关（116 std
     # pp1/pp2-s1 实测一致）。缺省 → 制度常数 8/4（DSv3-era 冻结口径）。
     if (p.get("ce_lean") or "").strip() != "":
         over["ce_pynative_lean"] = _x_flag(p, "ce_lean", base.ce_pynative_lean)

@@ -20,7 +20,7 @@ def run(N, rc, factor, *, B=1, dp=2, cp=1, pp=1, ep=1, mbs=1, method="colossal",
 
 cases = {
     "DSv3 8L none (dp2)": (dict(N=8, rc=SA.NONE), 19967.3),
-    "cp2-none (loss,k_ce=4)": (dict(N=8, rc=SA.NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4),
+    "cp2-none (loss,k_ce=3)": (dict(N=8, rc=SA.NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4),
 }
 _dflt = build_dsv3_spec(4)[1].nr_moe_frag_factor
 print("default nr_moe_frag_factor =", _dflt)

@@ -36,12 +36,15 @@ def test_anchor_ratio_within_band(a):
 
 
 #: DSv3 无重算-MoE 两锚点**关掉 D1 margin**（`DimTable.nr_moe_frag_factor=0`）后的比值。
-#: **实测**（`scratchpad/probe_d1_margin_off.py`，2026-07-29 本轮改动后重测）：
-#:   DSv3 8L none (dp2)     ON 19591.5/0.9812  OFF 18230.5/0.9130（real 19967.3）
-#:   cp2-none (loss,k_ce=4) ON 19933.1/0.9907  OFF 18454.5/0.9172（real 20119.4）
+#: **实测**（`scratchpad/probe_d1_margin_off.py`，2026-07-30 `K_CE` 重标定后重测）：
+#:   DSv3 8L none (dp2)     ON 18629.5/0.9330  OFF 17268.5/0.8648（real 19967.3）
+#:   cp2-none (loss,k_ce=3) ON 18971.1/0.9429  OFF 17492.5/0.8694（real 20119.4）
+#: （2026-07-29 那次的对照点是 OFF 0.9130 / 0.9172，随 `K_CE` 4→3 各下移一张满 vocab
+#:  fp32 平面 = 2020.0 MiB —— 平面在 ON/OFF 两侧同幅下移，故 `on − off` 的**幅度不变**，
+#:  margin 的存在性判据因此**不受本次重标定影响**。）
 #: 这是 `test_d1_margin_is_present_and_effective` 的对照点：margin 的**存在与有效性**由
 #: 「开 > 关」证明，而不再由「开 ≥ 1.0」证明（后者在 2026-07-29 已不成立，见该测试 docstring）。
-_D1_OFF_RATIO = {"DSv3 8L none (dp2)": 0.9130, "cp2-none (loss,k_ce=4)": 0.9172}
+_D1_OFF_RATIO = {"DSv3 8L none (dp2)": 0.8648, "cp2-none (loss,k_ce=3)": 0.8694}
 
 
 def test_d1_margin_is_present_and_effective():
@@ -72,15 +75,19 @@ def test_d1_margin_is_present_and_effective():
         # ② 幅度钉住（防漂移，也防有人把 margin 悄悄调大去凑 ≥1.0）。
         lo, hi = a.band
         assert lo <= on <= hi, f"{label}: ratio={on:.4f} 越出 band=({lo},{hi})"
-        # ③ **如实记账**（2026-07-30 举例更新，不变量原样）：2026-07-29 起二者都在
-        #    OOM-**不安全**侧；本轮 `lm_head` 反向 kernel workspace **实测**入账后二者
-        #    翻回 OOM-**安全**侧（0.981→1.034 / 0.991→1.043）。不变量仍是「不得靠调大
-        #    标定 margin 凑」——margin 一个字节没动（仍 0.6，由 ① 的 on>off 断言守住），
-        #    翻转来自**源码级/真机级证据**（docs/head_loss_bwd_workspace_2026-07-30.md）。
-        #    举例因此从「必须 < 1.0」换成「必须落在已记录的过读带内」，两侧都守。
-        assert 1.02 <= on <= 1.05, (
-            f"{label}: ratio={on:.4f} 越出已记录的过读带 (1.02, 1.05)。<1.02 说明本项被削或"
-            f"又出现新的欠读；>1.05 说明过读继续膨胀（查 K_CE 等 DSv3-era 常数）。"
+        # ③ **如实记账**（2026-07-30 举例第二次更新，不变量原样）：2026-07-29 起二者都在
+        #    OOM-**不安全**侧（0.981 / 0.991）；同日 `lm_head` 反向 kernel workspace 实测入账
+        #    把它们翻到 OOM-**安全**侧（1.034 / 1.043）；紧接着的 `K_CE` 重标定（4→3，
+        #    `docs/k_ce_recalibration_2026-07-30.md`）又把它们**翻回 OOM-不安全侧**
+        #    （**0.9330 / 0.9429**）。不变量仍是「不得靠调大标定 margin 凑」——margin 一个
+        #    字节没动（仍 0.6，由 ① 的 on>off 断言守住）；两次翻转都来自**台账级证据**
+        #    （前者是 kernel workspace 逐字节实测，后者是 9 份仓内 profiler CSV 逐块清点）。
+        #    举例因此第二次搬家：从「过读带 (1.02,1.05)」换成「欠读带 (0.92,0.95)」，两侧都守。
+        #    **这一侧不放宽方向**：下界防欠读继续恶化，上界防有人把 K_CE 或 margin 调回去凑。
+        assert 0.92 <= on <= 0.95, (
+            f"{label}: ratio={on:.4f} 越出已记录的欠读带 (0.92, 0.95)。<0.92 说明欠读继续恶化，"
+            f"须查明（缺口方向见 docs/k_ce_recalibration_2026-07-30.md §9）；>0.95 说明有人"
+            f"把 K_CE 调回 4 或把 margin 调大去凑 OOM-安全——请核对是不是又加了拟合常数。"
             f"任何一侧都须查明再改带，不得靠调 margin 凑。")
 
 

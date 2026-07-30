@@ -89,9 +89,19 @@ def anchors() -> list:
         #   DSv3 族（H=1792）每条 +1058.0 MiB（B*S=4096）或 +2096.0（B*S=8192）。
         #   ⚠ 因此**十条锚点由欠读翻成过读**（1.02–1.08）= OOM-**安全**侧。band 只上移到
         #   刚好封住当前实测落点（±0.01），**没有为了凑回 ~1.00 而削本项**：本项是逐字节
-        #   实测，缺口在 DSv3-era 冻结常数群（实测证据：真机 loss 层反向只共存 **3** 张
-        #   瞬态满 vocab fp32 平面，而 `mem_timeline` 的 `K_CE=8` 记 **7** 张 —— 该文 5.1/7.3。
-        #   修 `K_CE` 属另一条任务线，**本轮一个字节没动**）。
+        #   实测，缺口在 DSv3-era 冻结常数群。
+        # ── 2026-07-30 后续（`K_CE` 重标定，`docs/k_ce_recalibration_2026-07-30.md`）────
+        #   ⚠ **订正紧邻上一段原先写的一句事实错误**。它原文写「实测证据：真机 loss 层反向只
+        #   共存 3 张瞬态满 vocab fp32 平面，而 `mem_timeline` 的 `K_CE=8` 记 7 张」——
+        #   **这两个数不在同一条代码路径上**：那 3 张是 167/DSv4-hybrid 站点量的，而该站点
+        #   `cross_entropy_fused=True` → `loss_lids` 空（`cost_eval/mem_timeline.py:324`）→
+        #   `K_CE` 那一行**根本不执行**（实测该站点 `bwd_scratch` = 2.00 张平面）。
+        #   把两侧放到同一条路径上重数（9 份仓内 profiler CSV 逐块，每份 high-water 都逐 MiB
+        #   命中它自己这条锚点的 `real`）后：真正的过读是**恰好 1 张**，两个 fat 分支都是
+        #   —— `K_CE` 由 `4/8` 改为 **`3/7`**（`lean` 无逐块台账，仍 4）。
+        #   **只有 3 条锚点因此位移**（其余逐 MiB 不变）：`pp2-stage1` 1.045→0.9565、
+        #   `cp2-none` 1.043→0.9429、`DSv3 8L none` 1.034→0.9330 —— **三条都跌回
+        #   OOM-不安全侧，如实记、band 随之下移，不为保余量停在错值上**。
         Anchor("DSv3 4L full (dp2,sp)", "full",
                lambda: dsv3(4, FULL4), 12473.1, (1.07, 1.09),
                note="2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.996 → **1.081**（过读 = OOM 安全）"),
@@ -123,17 +133,20 @@ def anchors() -> list:
                     "2026-07-30 因 embedding 反向 workspace 实测入账回到 1.032）；"
                     "lo=1.00 守住「仍在安全侧」这一条不变量"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.999**（欠 43.6 MiB / 0.10%）——**刚翻到 OOM-不安全侧**，如实记。
-        Anchor("pp2-stage1 (loss,k_ce=8)", "pp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1), 45655.0, (1.04, 1.05),
-               note="2026-07-29 起 0.999（OOM-不安全，欠 43.6 MiB）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.999 → **1.045**，翻回 OOM-安全侧。这一笔正是这条锚点自己那次采集的 profiler 量到的（op_816365.csv 的 MatMulExt wgrad 2168457216 B 与本律逐字节吻合）"),
+        Anchor("pp2-stage1 (loss,k_ce=7)", "pp+norecomp",
+               lambda: dsv3(8, NONE, B=2, dp=1, pp=2, mbs=2, stage=1), 45655.0, (0.95, 0.96),
+               note="2026-07-29 起 0.999（OOM-不安全）→ 2026-07-30 `lm_head` 反向 workspace 入账 1.045（安全侧）→ 同日 `K_CE` 重标定 8→7 后 **0.9565**（OOM-不安全，欠 1987.6 MiB）。"
+                    "标签里的 k_ce 值随之由 8 改 7：**这条是 `pp>1 且非 lean` 分支唯一的锚点**，7 由它自己那次采集逐块数出（op_816365.csv 的 high-water 45655.46 MiB 在世 5 张 fp32 + 5 张 bf16 满 vocab 平面 = 7.5 fp32-等效，模型侧是 K_CE+0.5）。见 docs/k_ce_recalibration_2026-07-30.md §2.2/§4"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.007 → **0.991**。D1 margin 未动（仍开、仍是 0.6），是普查去掉了一处真实过读。
-        Anchor("cp2-none (loss,k_ce=4)", "cp+norecomp",
-               lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (1.04, 1.05),
-               note="2026-07-29 起 0.991（OOM-不安全）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.991 → **1.043**，翻回 OOM-安全侧；D1 margin 一个字节没动（仍 0.6）"),
+        Anchor("cp2-none (loss,k_ce=3)", "cp+norecomp",
+               lambda: dsv3(8, NONE, B=2, dp=1, cp=2, method="colossal"), 20119.4, (0.94, 0.95),
+               note="2026-07-29 起 0.991（OOM-不安全）→ 2026-07-30 `lm_head` 反向 workspace 入账 1.043（安全侧）→ 同日 `K_CE` 重标定 4→3 后 **0.9429**（OOM-不安全，欠 1148.3 MiB）。"
+                    "3 由**它自己那份 CSV**（`cp2_none/operator_memory.csv`，high-water 20119.37 MiB 在世 3 张 fp32 + 1 张 bf16 = 3.5 fp32-等效）与另外 6 份 pp=1 采集共同数出；D1 margin 一个字节没动（仍 0.6，OFF 时 0.8694 → 机制门仍绿）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.003 → **0.981**。同上，D1 两点标定之一，margin 未重标。
         Anchor("DSv3 8L none (dp2)", "norecomp",
-               lambda: dsv3(8, NONE), 19967.3, (1.03, 1.04),
-               note="2026-07-29 起 0.981（OOM-不安全）；2026-07-30 因 `lm_head` 反向 kernel workspace 实测入账（docs/head_loss_bwd_workspace_2026-07-30.md） 由 0.981 → **1.034**，翻回 OOM-安全侧；D1 margin 一个字节没动（仍 0.6）"),
+               lambda: dsv3(8, NONE), 19967.3, (0.93, 0.94),
+               note="2026-07-29 起 0.981（OOM-不安全）→ 2026-07-30 `lm_head` 反向 workspace 入账 1.034（安全侧）→ 同日 `K_CE` 重标定 4→3 后 **0.9330**（OOM-不安全，欠 1337.8 MiB）。"
+                    "3 由**它自己那份 CSV**（`select_ffn/operator_memory.csv`，high-water 19967.28 MiB 逐 MiB 命中本 real；目录名误导，实为本锚点的采集）与另外 6 份 pp=1 采集共同数出；D1 margin 一个字节没动（仍 0.6，OFF 时 0.8648）"),
         # 2026-07-29 二次重钉（融合 mHC ctx + FusedRMSNorm 不 cast，docs/census_fix_mhc_rmsnorm_2026-07-29.md）：1.001 → **0.970**（保留层的 ln1/ln2/q_a_norm/kv_a_norm 不再抬 fp32）。
         Anchor("select self_attn (keep-FFN)", "select",
                lambda: dsv3(8, RecomputeSpec("select", select_ops=ATTN)), 18828.2, (1.02, 1.03),
