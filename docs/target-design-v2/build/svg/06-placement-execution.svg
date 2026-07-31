@@ -1,9 +1,9 @@
-<svg class="dg" viewBox="0 0 1160 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="布局传播与执行事件">
+<svg class="dg" viewBox="0 0 1160 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="G2 分片传播与 G4 执行事件">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
 </defs>
 <rect class="dg-frame" x="60" y="60" width="1030" height="228" rx="10"/>
-<text class="dg-ftitle t-plan" x="72" y="52">S4 布局：沿数据流传播逐值分片状态</text>
+<text class="dg-ftitle t-plan" x="72" y="52">G2 · Pass_shard：传播逐值 placement，失配处插 redistribute</text>
 <rect class="dg-box b-plan" x="90" y="120" width="150" height="44" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="165.0" y="146.5" font-size="15">段入口 x</text>
 <rect class="dg-box b-plan" x="300" y="120" width="150" height="44" rx="8"/>
@@ -31,9 +31,10 @@
 <text class="dg-bsub dg-mono t-block" x="735.0" y="266.5" font-size="12">sp / 非 sp</text>
 <polyline class="dg-arrow a-block" points="375,164 375,228" marker-end="url(#ah)"/>
 <polyline class="dg-arrow a-block" points="735,164 735,228" marker-end="url(#ah)"/>
-<text class="dg-note t-note" x="60" y="310" text-anchor="start" font-size="13">规则来自模块语义（Registry 的 placement 面），而非推测。carrier 歧义、Column∘Column、Row 前缺少 Column ⇒ 阻断。</text>
+<text class="dg-note t-note" x="60" y="310" text-anchor="start" font-size="13">规则来自 S1 的 placement 面，而非推测。图上的「跑完无失配」只是 Pass_shard 自己的终止条件 —— 它是后置条件不是门；规则表相对 placement 格的完备性，由装载期的</text>
+<text class="dg-note t-note" x="60" y="327" text-anchor="start" font-size="13">G-P1 枚举检出。</text>
 <rect class="dg-frame" x="60" y="360" width="1030" height="268" rx="10"/>
-<text class="dg-ftitle t-plan" x="72" y="352">S5 执行：生命周期 → 显式事件</text>
+<text class="dg-ftitle t-plan" x="72" y="352">G4 · Pass_sched：生命周期 → 显式事件</text>
 <polyline class="dg-arrow a-note" points="110,540 1050,540" marker-end="url(#ah)"/>
 <rect class="dg-box b-plan" x="130" y="460" width="130" height="40" rx="8"/>
 <text class="dg-blabel dg-mono t-plan" x="195.0" y="484.5" font-size="15">Allocate</text>

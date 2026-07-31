@@ -58,13 +58,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "S4 布局：沿数据流传播逐值分片状态",
+   "text": "G2 · Pass_shard：传播逐值 placement，失配处插 redistribute",
    "fontSize": 16,
    "fontFamily": 2,
    "textAlign": "left",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "S4 布局：沿数据流传播逐值分片状态",
+   "originalText": "G2 · Pass_shard：传播逐值 placement，失配处插 redistribute",
    "lineHeight": 1.25
   },
   {
@@ -1015,13 +1015,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "规则来自模块语义（Registry 的 placement 面），而非推测。carrier 歧义、Column∘Column、Row 前缺少 Column ⇒ 阻断。",
+   "text": "规则来自 S1 的 placement 面，而非推测。图上的「跑完无失配」只是 Pass_shard 自己的终止条件 —— 它是后置条件不是门；规则表相对 placement 格的完备性，由装载期的 G-P1 枚举检出。",
    "fontSize": 13,
    "fontFamily": 2,
    "textAlign": "start",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "规则来自模块语义（Registry 的 placement 面），而非推测。carrier 歧义、Column∘Column、Row 前缺少 Column ⇒ 阻断。",
+   "originalText": "规则来自 S1 的 placement 面，而非推测。图上的「跑完无失配」只是 Pass_shard 自己的终止条件 —— 它是后置条件不是门；规则表相对 placement 格的完备性，由装载期的 G-P1 枚举检出。",
    "lineHeight": 1.3
   },
   {
@@ -1079,13 +1079,13 @@
    "updated": 1,
    "link": null,
    "locked": false,
-   "text": "S5 执行：生命周期 → 显式事件",
+   "text": "G4 · Pass_sched：生命周期 → 显式事件",
    "fontSize": 16,
    "fontFamily": 2,
    "textAlign": "left",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "S5 执行：生命周期 → 显式事件",
+   "originalText": "G4 · Pass_sched：生命周期 → 显式事件",
    "lineHeight": 1.25
   },
   {

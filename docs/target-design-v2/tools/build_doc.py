@@ -33,7 +33,9 @@ sys.path.insert(0, HERE)
 import gen_diagrams as G  # noqa: E402
 
 TITLES = {name: fn().title for name, fn in G.DIAGRAMS}
-FIGNO = {name: i + 1 for i, (name, _fn) in enumerate(G.DIAGRAMS)}
+#: 图号按**正文出现顺序**编，不按生成器清单顺序 —— 两者不同（正文里 04 在 03 之前用到），
+#: 按清单编会出现「图 4 排在图 3 前面」。由 main() 在替换占位符前填好。
+FIGNO: dict[str, int] = {}
 
 #: CJK / 全角标点。用于判定「此处换行会不会在汉字间造出空隙」。
 CJK = r"[⺀-鿿豈-﫿︰-﹏＀-￯　-〿]"
@@ -165,6 +167,10 @@ def main():
     toc = build_toc(tpl)
 
     used, missing = [], []
+
+    # 先按正文出现顺序定图号，再替换（figure() 要读 FIGNO）
+    for i, name in enumerate(re.findall(r"\{\{SVG:([\w-]+)\}\}", tpl)):
+        FIGNO.setdefault(name, len(FIGNO) + 1)
 
     def sub(m):
         name = m.group(1)

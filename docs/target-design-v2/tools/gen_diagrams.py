@@ -495,10 +495,10 @@ def d3():
 # D4 — 结构层与反向层：source 给结构、registry 给语义；重算嵌进反向图
 # ══════════════════════════════════════════════════════════════════════════════
 def d4():
-    g = D("d4", "结构层与反向层", 1160, 780)
-    g.frame(60, 60, 1030, 190, "S2 结构层：二分法", "ir")
-    g.box(90, 100, 240, 48, "SourceFrontend", "input", sub="AST 内联可展开调用")
-    g.box(90, 172, 240, 48, "DraftGraph", "input",
+    g = D("d4", "G0 CoreIR 与 G1 TrainIR：源码给结构，注册域给语义", 1160, 780)
+    g.frame(60, 60, 1030, 190, "G0 · CoreIR = PE(Src, ModelSpec, EnvFacts, π₀)", "ir")
+    g.box(90, 100, 240, 48, "PE · 偏特化", "input", sub="在 π₀ 处内联并折叠 guard")
+    g.box(90, 172, 240, 48, "π₀ 残差", "input",
           sub="symbol / 数据流 / attrs 字面值", mono=True)
     g.box(430, 136, 240, 48, "SemanticResolver", "sem")
     g.box(430, 60 + 8, 240, 40, "TypedRegistrySnapshot", "ir",
@@ -512,7 +512,7 @@ def d4():
     g.label(90, 232, "源码仅提供三类信息：符号、数据流、attrs 字面值。"
                      "注册表提供完整语义。两者不重叠，因此结构上不会出现「两个真相源」。", 13)
 
-    g.frame(60, 300, 1030, 300, "S3 反向层：BackwardIR（派生，CoreIR 保持 policy-free）", "derived")
+    g.frame(60, 300, 1030, 300, "G1 · TrainIR（反向）与 G3 · RematIR（重算副本）：三类节点同构", "derived")
     # 前向链（CoreIR）
     fy = 352
     for nm, x in (("op1", 100), ("op2", 260), ("op3", 420)):
@@ -526,11 +526,11 @@ def d4():
     by = 480
     g.box(100, by, 120, 42, "op1′", "derived", mono=True)
     g.box(260, by, 120, 42, "op2′", "derived", mono=True)
-    g.box(420, by, 150, 42, "op2ʳ", "plan", sub="phase=recompute", mono=True)
+    g.box(420, by, 150, 42, "op2ʳ", "plan", sub="stage_role=remat", mono=True)
     g.box(610, by, 120, 42, "op3′", "derived", mono=True)
     for x0, x1 in ((610, 574), (420, 384), (260, 224)):
         g.arrow([(x0, by + 21), (x1, by + 21)], tone="derived")
-    g.label(100, by + 58, "BackwardIR 反向（右→左）", 13, "start", "derived")
+    g.label(100, by + 58, "TrainIR 反向（右→左）", 13, "start", "derived")
     # 复制关系
     g.arrow([(320, fy + 42), (320, 442), (495, 442), (495, by - 4)],
             dashed=True, tone="plan", label="复制")
@@ -540,13 +540,14 @@ def d4():
     g.label(610, by + 58, "重算节点 = 前向 op2 的副本：同 SemanticId、新 NodeId、"
                           "origin 回指。插在该区域反向节点之前。", 13, "start", "plan")
 
-    g.label(60, 640, "BackwardIR 必须作为派生层，而不能写入 CoreIR：CoreIR 必须保持 policy-free。"
-                     "否则每次修改重算配置都会使 CoreIR 缓存失效，而它是编译成本最高的一层。", 14)
-    g.label(60, 686, "结果是简化类型体系：AutogradContract / GradientValueSpec / "
-                     "GradientAccumulationSpec（fan-in 累加可表示为普通 add 节点）"
-                     "均可统一表示为图中的普通节点与边。", 14)
-    g.label(60, 732, "不变量：BackwardIR 只派生 CoreIR，不回写；RecomputeSpec 是它的输入，"
-                     "使用独立 digest。", 14)
+    g.label(60, 640, "反向必须是派生层而不能写进 G0：G0 的定义就是 policy-free"
+                     "（∀f: policy(·) ∉ f.roots），而重算范围是策略。这条不变量是 CoreIR "
+                     "唯一的断言点 —— 写进去就没地方陈述它了（G-L1）。", 14)
+    g.label(60, 686, "一组本来要写成「契约字段」的东西因此变成图里的普通节点与边："
+                     "autograd 契约就是边，梯度值规格就是 TensorValue + StorageRelation，"
+                     "fan-in 累加就是一个 add 节点。", 14)
+    g.label(60, 732, "不变量：改写 pass 只读上游、从不回写；RematSpec 是 G3 的输入；"
+                     "各层 digest 独立（G0 必须用内容 digest，否则其断言恒真）。", 14)
     return g
 
 
@@ -586,8 +587,8 @@ def d5():
 # D6 — 布局传播与执行事件
 # ══════════════════════════════════════════════════════════════════════════════
 def d6():
-    g = D("d6", "布局传播与执行事件", 1160, 720)
-    g.frame(60, 60, 1030, 228, "S4 布局：沿数据流传播逐值分片状态", "plan")
+    g = D("d6", "G2 分片传播与 G4 执行事件", 1160, 720)
+    g.frame(60, 60, 1030, 228, "G2 · Pass_shard：传播逐值 placement，失配处插 redistribute", "plan")
     chain = (("段入口 x", 90), ("Column", 300), ("act", 500), ("Row", 660), ("out", 870))
     for nm, x in chain:
         g.box(x, 120, 150, 44, nm, "plan", mono=True)
@@ -601,10 +602,11 @@ def d6():
     g.box(660, 232, 150, 44, "注入 RS / AR", "block", sub="sp / 非 sp")
     g.arrow([(375, 164), (375, 228)], tone="block")
     g.arrow([(735, 164), (735, 228)], tone="block")
-    g.label(60, 296, "规则来自模块语义（Registry 的 placement 面），而非推测。"
-                     "carrier 歧义、Column∘Column、Row 前缺少 Column ⇒ 阻断。", 13)
+    g.label(60, 296, "规则来自 S1 的 placement 面，而非推测。图上的「跑完无失配」"
+                     "只是 Pass_shard 自己的终止条件 —— 它是后置条件不是门；规则表相对 "
+                     "placement 格的完备性，由装载期的 G-P1 枚举检出。", 13)
 
-    g.frame(60, 360, 1030, 268, "S5 执行：生命周期 → 显式事件", "plan")
+    g.frame(60, 360, 1030, 268, "G4 · Pass_sched：生命周期 → 显式事件", "plan")
     tl = 420
     g.arrow([(110, tl + 120), (1050, tl + 120)], tone="note")
     ev = (("Allocate", 130), ("Bind", 270), ("Use", 400), ("Pin", 530),
