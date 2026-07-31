@@ -274,106 +274,173 @@ class D:
 # D1 — 总体分层与数据流
 # ══════════════════════════════════════════════════════════════════════════════
 def d1():
-    g = D("d1", "总体分层与数据流", 1180, 1010)
-    CX, BW, BH = 430, 320, 56
-    rows = [
-        (30,  "S0 输入", "input", [
-            ("MindFormers 源码", "只读，不执行"),
-        ]),
-    ]
-    # 逐层：(y, 层名, tone, 主产物, 副标)
+    """总体分层。左列 = 每层的**独有不变量**（G-L1 的断言点），右列 = 策略输入。
+
+    这个左右分工不是排版选择：G-L1 说「一层存在当且仅当它是某条不变量唯一能被陈述的位置」，
+    所以左列就是这张图要论证的东西本身。策略从右侧逐层注入，而 G0 右侧**必须空着** ——
+    那是 policy-free 的视觉表达。
+    """
+    g = D("d1", "总体分层：左＝该层独有不变量（G-L1 断言点），右＝策略输入", 1180, 1046)
+    CX, BW, BH = 392, 356, 46
+    LX, LW = 62, 300           # 左列：独有不变量
+    RX, RW = 782, 320          # 右列：策略输入
+
+    # ── S0 事实源 ────────────────────────────────────────────────────────────
+    g.frame(62, 26, 1040, 78, "S0 事实源（只有这五类产生新事实；表外字段 ⇒ BLK-UNCLASSIFIED）",
+            "input")
+    for i, (t, s) in enumerate([
+            ("框架源码", "AST + 版本"), ("算子语义快照", "三注册域"),
+            ("EnvFacts", "HBM / 设备"), ("CalibrationSet", "域片 + 实测点"),
+            ("八份 *Spec", "使用者配置")]):
+        g.box(76 + i * 206, 52, 196, 40, t, "input", sub=s)
+
+    # ── IR 链 ────────────────────────────────────────────────────────────────
     layers = [
-        (40,  "S1 语义层", "sem",     "TypedRegistrySnapshot", "Op 语义词典（冻结、带 digest）"),
-        (170, "S2 结构层", "ir",      "CoreIR",                "逻辑事实：Op / 值 / 存储关系"),
-        (300, "S3 反向层", "derived", "BackwardIR",            "前向+反向+重算，同一节点类型"),
-        (430, "S4 布局层", "plan",    "PlacementPlan",         "位置：mesh / shard / local shape"),
-        (560, "S5 执行层", "plan",    "ExecutionPlan",         "时序：event / lifetime / alloc-free"),
+        (128, "G0",   "ir",      "CoreIR", "PE(Src, ModelSpec, EnvFacts, π₀)",
+         "policy(·) ∉ roots\ndigest 在策略扰动下不变", None),
+        (210, "G0.5", "sem",     "ImplIR", "impl_select ∘ fusion_logical ∘ precision_fwd",
+         "op 集合自此定稿", "ImplSpec · PrecisionSpec"),
+        (292, "G1",   "derived", "TrainIR", "Pass_train_step",
+         "shape(grad_out[i]) == shape(in_i)\n每条梯度边恰一 producer", None),
+        (374, "G1.7", "derived", "PrecIR", "Pass_precision_opt",
+         "新增节点下游不含 grad_role\n持久字节守恒", "PrecisionSpec"),
+        (456, "G2",   "plan",    "ShardIR", "Pass_shard",
+         "placement 无失配\n桶数 = 真机归约 op 数",
+         "ParallelSpec · PlacementAnnotation\nDistOptSpec"),
+        (538, "G2.5", "plan",    "—", "Pass_fusion_dist",
+         "融合前后通信节点语义多重集守恒", None),
+        (620, "G3",   "plan",    "RematIR", "Pass_remat",
+         "stage_role==remat ⇒ origin 是前向节点", "RematSpec"),
+        (702, "G4",   "plan",    "SchedIR", "Pass_sched",
+         "事件不重不漏、偏序无环\nroots(t_free)∋calib ⟺ timing_dependent",
+         "ScheduleSpec · CalibrationSet"),
     ]
-    for y, name, tone, art, sub in layers:
-        g.frame(70, y, 1040, 92, name, tone)
-        g.box(CX, y + 18, BW, BH, art, tone, sub=sub, mono=True)
+    for y, tag, tone, art, defn, inv, spec in layers:
+        g.frame(62, y, 1040, 70, "", tone)
+        title = tag if art in ("—", None) else f"{tag}　{art}"
+        g.box(CX, y + 12, BW, BH, title, tone, sub=defn, mono=True)
+        g.label(LX, y + 16, inv, 11.5, "start", tone)
+        if spec:
+            g.box(RX, y + 14, RW, 42, spec, "input", mono=True)
+            g.arrow([(RX, y + 35), (CX + BW, y + 35)], tone="input")
+        # 主干
+        if y > 128:
+            g.arrow([(CX + BW / 2, y - 12), (CX + BW / 2, y + 8)])
+    g.arrow([(CX + BW / 2, 92), (CX + BW / 2, 124)], tone="input")
 
-    # 输入侧。**注意**：源码喂的是 S2 的 DraftGraph，不是 S1 的注册快照 —— 两者是
-    # 「结构」与「语义」两个正交事实源（§4.2 的二分），画反了会让整张图的论点失效。
-    g.box(90, 58, 250, 40, "Native / User / Patch", "input", sub="三个物理隔离注册域")
-    g.box(820, 58, 250, 40, "FrameworkRuntimeSnapshot", "input", sub="版本参与 digest")
-    g.box(90, 188, 250, 40, "源码 → DraftGraph", "input", sub="符号 / 数据流 / attrs 字面值")
-    g.box(820, 318, 250, 40, "RecomputeSpec", "input", sub="重算策略（派生输入）")
-    g.box(820, 448, 250, 40, "ParallelConfig", "input", sub="tp / pp / ep / cp / dp")
-    g.box(820, 578, 250, 40, "BufferCalibration", "input", sub="modeled 量的常数来源")
+    g.label(LX, 108, "独有不变量（断言点）", 11, "start", "note", mono=True)
+    g.label(RX, 108, "策略输入", 11, "start", "note", mono=True)
+    g.label(RX, 146, "（G0 右侧空着 —— 这就是 policy-free）", 11.5, "start", "block")
 
-    # 主干箭头
-    for y0, y1 in ((114, 158), (244, 288), (374, 418), (504, 548), (634, 690)):
-        g.arrow([(CX + BW / 2, y0), (CX + BW / 2, y1)])
-    # 侧向注入
-    g.arrow([(340, 78), (CX, 78)], tone="input")
-    g.arrow([(820, 78), (CX + BW, 78)], tone="input")
-    g.arrow([(340, 208), (CX, 208)], tone="input")
-    g.arrow([(820, 338), (CX + BW, 338)], tone="input")
-    g.arrow([(820, 468), (CX + BW, 468)], tone="input")
-    g.arrow([(820, 598), (CX + BW, 598)], tone="input")
+    # ── 两后端 ───────────────────────────────────────────────────────────────
+    g.frame(62, 800, 1040, 108, "两个只读后端：零新事实（不得引入新的 root 种类）", "backend")
+    g.box(120, 828, 380, 62, "MemorySimulator", "backend",
+          sub="liveness / allocator / peak 区间", mono=True)
+    g.box(664, 828, 380, 62, "TimeSimulator", "backend",
+          sub="定价 / 竞争 / 两级 DES", mono=True)
+    g.arrow([(CX + 60, 772), (310, 812), (310, 824)])
+    g.arrow([(CX + BW - 60, 772), (854, 812), (854, 824)])
+    g.label(582, 862, "互不 import\n不回写上游", 12, "middle", "block")
 
-    # S6 后端
-    g.frame(70, 690, 1040, 120, "S6 只读后端", "backend")
-    g.box(150, 716, 330, 72, "MemorySimulator", "backend",
-          sub="allocator / liveness / OOM")
-    g.box(700, 716, 330, 72, "TimeSimulator", "backend",
-          sub="cost / contention / pipeline DES")
-    g.arrow([(CX + 40, 634), (315, 700), (315, 712)])
-    g.arrow([(CX + BW - 40, 634), (865, 700), (865, 712)])
-    g.label(590, 740, "互不依赖\n不回写上游", 13, "middle", "block")
-
-    # S7 报告
-    g.frame(70, 838, 1040, 96, "S7 报告", "note")
-    g.box(CX, 862, BW, 52, "UnifiedReport", "note",
-          sub="结果 + provenance + confidence", mono=True)
-    g.arrow([(315, 788), (CX, 880)])
-    g.arrow([(865, 788), (CX + BW, 880)])
-
-    g.label(90, 952, "不变量：每层只增加一类信息；下游只读上游，从不回写。"
-                     "修改并行配置只使 S4/S5 失效，CoreIR 保持不变（由此支持交互式 what-if）。", 14)
+    # ── 报告 ─────────────────────────────────────────────────────────────────
+    g.frame(62, 928, 1040, 84, "报告", "note")
+    g.box(CX, 950, BW, 50, "oom_verdict : Q3[Bool]", "note",
+          sub="peak 只有区间形态；undetermined 附判定阻碍分解", mono=True)
+    g.arrow([(310, 890), (CX, 968)])
+    g.arrow([(854, 890), (CX + BW, 968)])
+    g.label(76, 962, "显存链：无外部裁判\n（全部为自洽性检查）", 11.5, "start", "block")
+    g.label(1040, 962, "时间链：op 级序列\n与时长为唯一 oracle", 11.5, "end", "sd")
     return g
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# D2 — 知识分级（provenance）
+# D2 — provenance 代数：两条正交轴 + readability 分派器
 # ══════════════════════════════════════════════════════════════════════════════
 def d2():
-    g = D("d2", "知识分级：逐量 provenance；「实测」是取值手段，不是一类知识", 1160, 792)
-    cols = [
-        (60,  "derived", "sd",
-         ["shape / dtype", "alias / inplace", "saved 结构", "数据流与依赖"],
-         "机制在建模范围内\n源码 + 算子定义可判定", "缺失 ⇒ 阻断", "可外推"),
-        (450, "modeled", "me",
-         ["workspace_bytes", "bwd_scratch", "allocator 对齐/分块", "kernel duration"],
-         "机制在范围外但确定性\nkernel tiling / allocator 策略",
-         "越出适用域 ⇒\n阻断 或 降级并标方向", "域内可外推"),
-        (840, "assumed", "as",
-         ["MoE 每专家负载", "专家 capacity", "非规则化 placement"],
-         "取值依赖运行期数据\n静态不可判定", "未显式声明 ⇒ 阻断", "不可外推"),
+    """v2 把两件正交的事压成了一条三值枚举，这是全篇病灶。
+
+    这张图的任务是让「正交」一眼可见：左轴回答**形状**（点还是区间），右轴回答**归因**
+    （错了谁负责）。下方的 readability 分派器是把「人的判断」与「源码事实」分开的机器判据。
+    """
+    g = D("d2", "provenance 代数：certainty × roots 两条正交轴，由 readability 机器分派", 1180, 968)
+
+    g.label(60, 16, "旧代数把 certainty 定义成 roots 的函数（「roots 必含标定才算 modeled」）。"
+                    "这一条同时造成两处症状：roofline 被判成事实；通信字节的嗅探门恒不可满足。", 13.5)
+
+    # ── 左轴：certainty ──────────────────────────────────────────────────────
+    g.frame(60, 68, 470, 300, "轴一 · certainty —— 即使输入全对，我们施加的函数是不是真的那个函数",
+            "note")
+    g.label(78, 96, "决定**形状**：答案该是点还是区间", 12.5, "start", "note")
+    for i, (nm, tone, sub) in enumerate([
+            ("exact", "sd", "只有工具自带的 ~15 个算术原语"),
+            ("modeled", "me", "经过一个复刻别人机制的算子"),
+            ("assumed", "as", "取值依赖运行期数据")]):
+        g.box(82, 128 + i * 72, 300, 52, nm, tone, sub=sub, mono=True)
+    g.label(400, 150, "⊔ = max\n只升不降（P8）", 12, "start", "note")
+    g.label(400, 232, "注册域拿不到\nexact（值域裁剪）", 12, "start", "block")
+    g.label(400, 300, "⇒ direction\n必单侧（P6）", 12, "start", "as")
+
+    # ── 右轴：roots ──────────────────────────────────────────────────────────
+    g.frame(566, 68, 554, 300, "轴二 · roots —— 输入的叶子事实来自哪里", "note")
+    g.label(584, 96, "决定**归因**：这条根错了，多少字节会变", 12.5, "start", "note")
+    groups = [
+        ("事实类", "sd", ["source", "configured", "transcribed", "calib"]),
+        ("复刻类", "me", ["replication"]),
+        ("人工判断类", "as", ["declared_semantics", "abstraction"]),
+        ("数据依赖", "as", ["assumption"]),
     ]
-    for x, name, tone, items, why, rule, extra in cols:
-        g.frame(x, 74, 280, 480, name, tone)
-        g.label(x + 16, 86, why, 12, "start", tone)
-        for i, s in enumerate(items):
-            g.box(x + 20, 146 + i * 52, 240, 40, s, tone, mono=True)
-        g.box(x + 20, 146 + 4 * 52 + 10, 240, 62, "判据", "block", sub=rule)
-        g.label(x + 140, 528, extra, 12, "middle", tone)
+    y = 126
+    for gname, tone, members in groups:
+        g.label(584, y + 4, gname, 11.5, "start", tone, mono=True)
+        for j, m in enumerate(members):
+            g.box(668 + j * 112, y, 106, 30, m, tone, mono=True)
+        y += 44
+    g.label(584, 306, "闭集八种；⊔ = ∪。按 root 聚合是**覆盖量不是划分**"
+                      "（一个字节可有多个根）⇒ 报表禁止饼图。", 12, "start", "note")
 
-    g.label(60, 14, "两次追问定类：① 机制在建模范围内吗 —— 不在则不是 derived；"
-                    "② 机制是确定性的、还是取决于运行期数据 —— 确定性的可以建成公式，"
-                    "取决于数据的只能声明假设。", 14)
+    # ── readability 分派器 ───────────────────────────────────────────────────
+    g.frame(60, 396, 1060, 214,
+            "readability —— PE 在阻断时刻计算并写入，用户不可填（AST 在不在是客观事实）", "block")
+    g.box(90, 434, 220, 44, "readability(target)", "block", mono=True)
+    rows = [
+        (492, "FULL", "PySub 可解析全部可达体", "abstraction", "强制 reconstructed"),
+        (536, "PARTIAL", "入口可解析，体内有阻断站点", "abstraction（未求值站点）", "强制 reconstructed"),
+        (580, "NONE", "无 AST（C 扩展 / 二进制 kernel）", "declared_semantics", "可为 calibrated"),
+    ]
+    g.label(96, 496, "readability", 11, "start", "note", mono=True)
+    g.label(300, 496, "判据", 11, "start", "note", mono=True)
+    g.label(660, 496, "分派的根", 11, "start", "note", mono=True)
+    g.label(910, 496, "evidence.grade", 11, "start", "note", mono=True)
+    for yy, nm, crit, root, grade in rows:
+        g.label(96, yy + 24, nm, 12.5, "start", "block", mono=True)
+        g.label(300, yy + 24, crit, 12.5, "start", "note")
+        g.label(660, yy + 24, root, 12.5, "start", "as", mono=True)
+        g.label(910, yy + 24, grade, 12.5, "start", "me", mono=True)
+    g.arrow([(200, 478), (200, 508)], tone="block")
+    g.label(90, 466, "self_certainty ≥ modeled，三档一律如此", 11.5, "start", "block")
 
-    # 实测不是一类知识：它只喂 modeled 的常数 + 校验全链
-    g.box(60, 600, 290, 62, "实测 / profile", "note", sub="不进 IR，只做两件事")
-    g.box(470, 600, 290, 62, "modeled.constants", "note", sub="公式里的常数取值", mono=True)
-    g.box(830, 600, 240, 62, "UnifiedReport", "note",
-          sub="分类统计 + 越域标注", mono=True)
-    g.arrow([(350, 631), (466, 631)], tone="me", label="标定：给常数定值", lpos=(352, 626))
-    for x in (200, 590, 980):
-        g.arrow([(x, 554), (x, 576), (950, 576), (950, 596)])
-    g.arrow([(205, 662), (205, 706), (950, 706), (950, 666)], tone="note",
-            label="校验：真机对照全链（第 11 章）", lpos=(330, 728))
+    # ── P4 / P5 ──────────────────────────────────────────────────────────────
+    g.frame(60, 638, 520, 290, "P4 存在位下传 —— 承重墙，一条律解三处", "sd")
+    g.box(84, 676, 300, 40, "Prov(q) ⊒ Prov(exist(n))", "sd", mono=True)
+    for i, t in enumerate([
+            "被抽象节点的字节继承 abstraction 根",
+            "通信节点的字节继承 replication 根",
+            "overlap 下 Free 时刻带标定根 ⇒ 显存继承时间根"]):
+        g.label(84, 740 + i * 46, "· " + t, 12.5, "start", "note")
+    g.label(84, 886, "没有它，抽象只污染「这是什么算子」，"
+                     "不污染「它产出多少字节」。", 12, "start", "block")
+
+    g.frame(614, 638, 506, 290, "P5 own_residual 的四个来源 + 兜底", "me")
+    for i, t in enumerate([
+            "① G-B1a 抽象残差 hull(S_P, R_P)",
+            "② 反向双候选 hull(a, b)",
+            "③ 标定残差 residual_rel（grade=calibrated）",
+            "④ declaration_unverified_bound"]):
+        g.label(638, 682 + i * 34, t, 12.5, "start", "me", mono=True)
+    g.box(638, 824, 458, 56, "兜底：无一适用 ⇒ 取单侧", "block",
+          sub="**不得保持点值** —— 否则最不可信的那部分对区间宽度贡献为零")
+    g.label(638, 906, "⇒ peak.hi 不可计算 ⇒ verdict = undetermined ⇒ 判定阻碍分解列出该标定谁",
+            12, "start", "block")
     return g
 
 

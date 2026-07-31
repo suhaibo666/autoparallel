@@ -1,4 +1,4 @@
-<title>统一源码级 Model IR — 目标方案设计 v2</title>
+<title>统一源码级 Model IR — 目标方案设计 v3</title>
 {{CSS}}
 
 <div class="wrap">
@@ -6,308 +6,807 @@
 
 <main>
 
-<h1>统一源码级 Model IR — 目标方案设计 v2</h1>
-<p class="lede">将显存与时间两条独立的模型构造链统一起来：结构从源码抽取，语义由纯配置描述，
-布局与执行作为派生计划层，两个后端只读使用计划结果。</p>
+<h1>统一源码级 Model IR — 目标方案设计 v3</h1>
+<p class="lede">显存与时间共用一条模型构造链：结构由源码偏特化得到，语义由纯配置补齐，
+策略以改写 pass 逐层注入，两个后端只读消费同一份计划。本版的主题不是"能不能建"，
+而是<b>每一个数凭什么可信、以及在哪里我们承认不可信</b>。</p>
 
 <div class="meta">
   <div><b>文档类型</b>　目标方案（To-Be）总体设计与分层设计</div>
-  <div><b>代码基线</b>　<code>feat/unified-llm-modelspec</code> @ <code>6b72d8d</code></div>
-  <div><b>方案版本</b>　v2 · 2026-07-30 · 状态：设计（待过审）</div>
-  <div><b>前作</b>　<code>specs/2026-07-30-unified-code-grounded-ir-design.md</code>（分层与缺陷清单）、
-       <code>docs/pynative-cost-evaluator-target-solution-design-2026-07-30.md</code>（v1 全量规范）</div>
-  <div><b>本版相对 v1 的实质改动</b>　新增 BackwardIR 派生层（重算入图）、
-       用「逐量 provenance」取代「按层设置回退档」、placement 增加声明通道、
-       验收对照物从 legacy 改为真机</div>
+  <div><b>方案版本</b>　v3 · 2026-07-31 · 状态：三轮对抗后定稿（待第三轮反驳回填）</div>
+  <div><b>产出方式</b>　四流并行修复（policy-free 支点 / provenance 代数 / 门体系 / 规模与缺输入）
+       + 仲裁裁定书；<b>全过程未读现有实现代码</b>，以免既有实现污染目标形态</div>
+  <div><b>前作</b>　v2（2026-07-30，分层与 provenance 三分）、
+       <code>specs/2026-07-30-unified-code-grounded-ir-design.md</code></div>
   <div><b>图</b>　可编辑源在 <code>docs/target-design-v2/diagrams/*.excalidraw</code>；
        页面内 SVG 与其同源生成（<code>tools/gen_diagrams.py</code>）</div>
 </div>
 
-<h2 id="c0"><span class="cn">Chapter 0</span>导读与基线</h2>
+<h2 id="c0"><span class="cn">Chapter 0</span>导读、硬前提与本版差异</h2>
 
 <p>这份文档回答一个问题：<b>如果从原理出发重新设计这个仿真器的模型表示，其目标形态应当如何。</b>
-它不是现有代码的改造清单，而是目标形态的分层规范——每一层说明四项内容：<b>是什么</b>、
-<b>为什么这样切</b>、<b>主要数据结构</b>、<b>数据流与逻辑流程</b>。</p>
+它不是现有代码的改造清单。每一层说明四件事：<b>是什么</b>、<b>为什么这样切</b>、
+<b>主要数据结构</b>、<b>数据流与逻辑流程</b>；此外每引入一个新构件，都要过一遍<b>零逃逸六判据</b>。</p>
 
-<h4>要解决的四个问题</h4>
+<h3 id="c0-1">0.1 三条硬前提</h3>
+<p>v3 与 v2 的全部实质差异都从这三条流出。它们不是设计选择，是<b>委托方裁定的约束</b>，
+设计只能在其中求解。</p>
+
 <div class="tw"><table>
-<tr><th>问题</th><th>当前形态</th><th>本方案</th></tr>
-<tr><td class="nw">模型演进速度</td>
-  <td>Op 图与 <code>saves=[...]</code> 手写在 Python 中，框架代码变更后容易<b>静默</b>失效</td>
-  <td>结构从源码抽取，重跑编译即更新</td></tr>
-<tr><td class="nw">未知算子</td>
-  <td>三种不一致结果：抛错 / 只进 <code>opaque_calls</code> / 透传首输入 shape</td>
-  <td>统一阻断 + 生成待填骨架</td></tr>
-<tr><td class="nw">两条建模链彼此独立</td>
-  <td>显存侧使用手写图，时间侧使用抽取图；轴代入与反向语义分别实现</td>
-  <td>共享 Structure、Backward 与 Placement，后端只保留各自的计算口径</td></tr>
-<tr><td class="nw">不确定量缺少统一表达</td>
-  <td>时间侧设有分级回退与 confidence；形状/内存侧只有「精确或阻断」</td>
-  <td>provenance 作为全 IR 横切契约（<a href="#c2">第 2 章</a>）</td></tr>
+<tr><th class="nw">前提</th><th>内容</th><th>它删掉了什么</th></tr>
+<tr><td class="nw"><b>P-oracle</b></td>
+  <td>真机对照数据<b>仅限</b> op 级 duration 记录（含 op 序列本身——逐 op 计时蕴含"哪些 op 跑了、跑了几次、什么次序"）</td>
+  <td>allocator snapshot、活跃集合、保活集合差分、各 rank 分片形状 dump、显存事件序</td></tr>
+<tr><td class="nw"><b>P-peak</b></td>
+  <td>端到端峰值标量<b>同样排除</b>（峰值是显存量，不是 time 记录）</td>
+  <td>显存链的<b>最后一根</b>外部柱子</td></tr>
+<tr><td class="nw"><b>P-noexc</b></td>
+  <td>不接受任何人工例外条款。"评审"、"责任人"、"到期日"、"豁免"都是<b>流程</b>而不是<b>机制</b></td>
+  <td>全部 waiver / accepted delta / 告警式放行</td></tr>
 </table></div>
 
-<div class="cal why"><span class="lbl">为什么需要重构，而不是继续局部修补</span>
-<p>手写图的失效模式是<b>静默的</b>：框架结构已经变化，旧结果仍可继续输出，却没有机制能够发现。
-因此，可证伪性是这里最关键的性质——无法追溯来源的结论，与猜测没有区别。</p></div>
+<div class="cal bad"><span class="lbl">P-oracle + P-peak 的直接后果，必须先说</span>
+<p><b>显存链没有任何外部裁判。</b>峰值与 OOM 判定这个头号输出，其正确性只能由内部一致性、
+与源码文本的对照、以及时间侧 oracle 的<b>间接</b>约束提供。</p>
+<p>因此本文对显存侧的一切检查一律称<b>自洽性检查</b>，<b>禁止</b>使用"验证 / 校验 / 正确性判据"
+这三个词——它们会让读者以为存在一个说"算对了"的东西。报表首页强制打印这一事实（见
+<a href="#c10">第 10 章</a>）。</p>
+<p>唯一允许的外部信号是用户自发报告的 <b>OOM 布尔事实</b>，且它<b>只能做反证</b>：进缺陷台账，
+<b>不得</b>作为标定输入，<b>不得</b>成为 CI 门。理由——用户的偶发观测不可复现、无指纹，
+拿它去标定就是用链的输入裁判链自己。</p>
+<p><b>特别地：框架 OOM 报错文本里的数字</b>（<code>tried to allocate X bytes</code>、
+<code>reserved Y</code>、<code>free Z</code>）<b>同样排除</b>。它是<b>本方案最便宜的一条旁路</b>——
+不需要 profiler、不需要改框架、用户随手一贴就有，而它恰好给出显存链最缺的那个数。
+可采信的只有"这次跑 OOM 了"这一个比特；<b>报错文本里的任何数值都不得进入链的任何位置</b>，
+这一条必须在实现里以指纹表显式登记（<code>G-X4</code>）。</p></div>
 
-<h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体设计与分层</h2>
+<h3 id="c0-2">0.2 零逃逸六判据</h3>
+<p>本方案的每一个"用户可以补充信息"的通道，都必须过这六条。它们是全篇的验收器：</p>
+<div class="tw"><table>
+<tr><th class="nw">#</th><th>判据</th><th>它挡住的失效模式</th></tr>
+<tr><td class="nw">1</td><td>可证伪性：存在一个观测能与之矛盾</td><td>不可证伪的声明等于装饰</td></tr>
+<tr><td class="nw">2</td><td>可达阻断性：违反时有一条真的到达 <code>BLK-*</code> 的路径</td><td>标签式"告警"——它不是类型</td></tr>
+<tr><td class="nw">3</td><td>非普适性：不能给所有量都打上它</td><td>万能通道等于没有通道</td></tr>
+<tr><td class="nw">4</td><td>被计数且被设阈：有首页数字，有触发后果</td><td>可见但无后果 = 无成本</td></tr>
+<tr><td class="nw"><b>5</b></td><td><b>代价单调性（硬）</b>：用了它，答案形状必须变差。强形式：<b>同一份配置内不存在一种填法使答案变好</b></td><td><b>本方案最主要的失效模式</b>：补救使指标变好 ⇒ 人被激励去用它</td></tr>
+<tr><td class="nw">6</td><td>设置权归属</td><td><b>已放弃</b>——真实场景里使用者就是算子语义作者，"只有作者能设"不是辩护</td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">为什么判据 5 是硬要求，而其余五条是必要条件</span>
+<p>前四条保证"逃逸可见"，第六条保证"逃逸难做"。但可见且难做的东西，只要<b>做了有收益</b>，
+长期一定会被做——尤其当收益是"报表更好看"而成本是"读者要多看一行"。</p>
+<p>判据 5 换一个方向：让逃逸<b>在收益侧就不成立</b>。用户来这里要的是一句"装得下，余量 X GiB"，
+那么任何一条补救都必须让这句话更难拿到。这是全篇唯一不依赖人的自觉的判据。</p></div>
+
+<h3 id="c0-3">0.3 v3 相对 v2 的实质差异</h3>
+<div class="tw"><table>
+<tr><th class="nw">位置</th><th>v2</th><th>v3</th><th class="nw">起因</th></tr>
+<tr><td class="nw">分层判据</td><td>"每层只增加一类信息"</td><td><b><code>G-L1</code></b>：一层存在，当且仅当它是某条不变量<b>唯一能被陈述</b>的位置</td><td>旧判据不可证伪</td></tr>
+<tr><td class="nw">层数与层序</td><td>S1–S7 七层，融合/精度隐含</td><td>G0 → G0.5 → G1 → G1.7 → G2 → G2.5 → G3 → G4；<b>实现选择、逻辑融合、前向精度前移到反向生成之前</b></td><td>反向模板逐 op 查表 ⇒ op 集合必须先定稿</td></tr>
+<tr><td class="nw">provenance</td><td>三值枚举 <code>derived/modeled/assumed</code></td><td><b>两条正交轴</b>：<code>certainty</code>（我们对映射本身的把握）× <code>roots</code>（知识来源，八种闭集）。三个旧名降为 <code>certainty</code> 的<b>命名投影</b></td><td>旧定义把"注册一条算子语义"判成 <code>derived</code></td></tr>
+<tr><td class="nw">策略的位置</td><td>策略作为各层输入</td><td><b>π₀ 策略正则形</b>：CoreIR 在策略单位元处偏特化；策略由改写 pass 重新引入，逐 guard 负 <b>PGRO</b> 重建义务</td><td>policy-free 需要一个可机器判定的支点</td></tr>
+<tr><td class="nw">头号输出</td><td>峰值标量 + OOM 布尔</td><td><b>峰值只有区间形态</b>（标量形态在类型上不存在）；<code>oom_verdict : Q3[Bool]</code>，第三值 <code>undetermined</code> 附<b>判定阻碍分解</b></td><td>无外部裁判 ⇒ 点估计是不诚实的</td></tr>
+<tr><td class="nw">验收</td><td>真机对照为唯一正确性判据</td><td>时间链有 oracle；<b>显存链无外部裁判</b>，全部改称自洽性检查</td><td>P-oracle + P-peak</td></tr>
+<tr><td class="nw">诚实边界</td><td>四条散列</td><td>合并为一条命名性质 <b>边界 E</b> + 一个必须打印的数 <code>unverifiable_coverage</code></td><td>四流自曝重叠在同一格</td></tr>
+</table></div>
+
+<h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体架构与分层</h2>
 
 <h3 id="c1-1">1.1 主线</h3>
 <div class="thesis">
-以<b>框架源码</b>为模型结构的唯一入口；以<b>纯配置描述的原子 Op 语义</b>补齐源码无法证明的算子契约；
-编译成不可变的 <code>CoreIR</code>；由 <code>BackwardIR</code> → <code>PlacementPlan</code> →
-<code>ExecutionPlan</code> 三个<b>派生</b>计划层逐步加信息；最后由显存与时间两个<b>只读</b>后端消费。
+以<b>框架源码在策略单位元 π₀ 处的偏特化残差</b>为模型结构的唯一入口，得到 policy-free 的
+<code>CoreIR</code>；以<b>纯配置描述的原子 Op 语义</b>补齐源码证明不了的算子契约；
+其后每一层策略都由一个<b>只增不改</b>的改写 pass 注入，pass 必须能重建源码在真实策略下本来会写出的东西
+（<b>PGRO</b>）；最后由显存与时间两个<b>只读</b>后端消费同一份 <code>SchedIR</code>。
 </div>
 
 <p>四类角色必须分清，这是全篇的骨架：</p>
 <dl class="kv">
-  <dt>事实源</dt><dd>源码（结构）、配置（语义）、标定（实测量）——只有这三类输入产生新事实</dd>
-  <dt>不可变核</dt><dd><code>CoreIR</code>：与设备、并行、时序全部无关的逻辑事实</dd>
-  <dt>派生层</dt><dd><code>BackwardIR</code> / <code>PlacementPlan</code> / <code>ExecutionPlan</code>：
-      各自接收一类策略输入，只读上游、从不回写</dd>
-  <dt>只读后端</dt><dd>显存、时间：只消费计划，互不 import，不改 IR</dd>
+  <dt>事实源 S0</dt><dd>源码、算子语义注册域、环境转录、标定报告、八份 <code>*Spec</code>——只有这五类输入产生新事实</dd>
+  <dt>不可变核 G0</dt><dd><code>CoreIR = PE(Src, ModelSpec, EnvFacts, π₀)</code>：与设备、并行、精度、时序全部无关</dd>
+  <dt>改写 pass</dt><dd>G0.5 … G4：每个读<b>声明过的</b>策略字段子集，只增加带合成标记的节点与存储，<b>不得就地修改源节点</b></dd>
+  <dt>只读后端</dt><dd>显存、时间：只消费 <code>SchedIR</code> 的投影，互不 import，不改 IR</dd>
 </dl>
 
 {{SVG:01-layering}}
 
-<h3 id="c1-2">1.2 为什么在这里划分层级边界</h3>
-<p>分层的判据只有一条：<b>每层只增加一类信息</b>。层数并非越多越好，但边界设置不当会在具体
-场景中暴露问题。下面通过三个压力场景验证这一划分。</p>
+<h3 id="c1-2">1.2 分层判据：<code>G-L1</code></h3>
+<p>v2 用的判据是"每层只增加一类信息"。<b>它不可证伪</b>——"一类信息"没有机器定义，
+永远可以把两类说成一类，也永远可以把一类拆成两类。新判据把层数从审美问题变成记账问题：</p>
 
+<div class="cal inv"><span class="lbl">G-L1 · 分层判据</span>
+<p>每一层的输出必须至少绑定一条<b>独有不变量</b>——该不变量在上一层的类型里<b>不可陈述</b>（对象还不存在），
+在下一层的类型里<b>不再可陈述</b>（对象已被改写）。且每条不变量必须有一个<b>已实现的检查器</b>。</p>
+<p><b>停止条件</b>：若某层的独有不变量集合为空 ⇒ 该层必须与相邻层合并。CI 断言"每层的检查器清单非空"。</p></div>
+
+<div class="cal why"><span class="lbl">为什么是这条，而不是"按变化频率分层"或"按数据依赖分层"</span>
+<p><b>按变化频率</b>（v2 的实际依据，理由是"并行策略是 what-if 的主要变量"）在委托方明确
+"不需要交互式 what-if，配好配置直接出结果"之后，<b>既无消费者也不可证伪</b>，整条论证作废。</p>
+<p><b>按数据依赖</b>只能推出偏序，推不出层数——任意细分都满足数据依赖。</p>
+<p>只有"不变量的断言点"同时给出层数的<b>上界</b>（不变量的条数）与<b>下界</b>（每条不变量必须有位置）。
+它的代价是：加一层就必须交出一条不变量 + 一个检查器，交不出就不许加。</p></div>
+
+<h3 id="c1-3">1.3 定稿层序、独有不变量与相邻序理由</h3>
 <div class="tw"><table>
-<tr><th>压力测试</th><th>如果层级边界设置不当</th><th>本分层的表现</th></tr>
-<tr><td class="nw"><b>重算</b></td>
-  <td>同一逻辑算子执行两次且生命周期不同。若将其视为结构事实，就必须生成 CoreIR 分支</td>
-  <td>落 <code>BackwardIR</code>：重算节点 = 被复制进反向图的前向节点。CoreIR 不动 ✓</td></tr>
-<tr><td class="nw"><b>算子融合</b></td>
-  <td>融合与否取决于框架版本，看似是环境事实而非模型事实</td>
-  <td>源码中直接调用融合 kernel，且框架版本快照参与语义绑定，因此它属于编译期可确定的源码事实 ✓</td></tr>
-<tr><td class="nw"><b>交互式 what-if</b></td>
-  <td>如果修改一次 <code>tp</code> 就使整条链失效，系统将无法支持交互式探索</td>
-  <td>修改并行配置只使 S4/S5 失效；修改重算配置只使 S3 及其下游失效；CoreIR（编译成本最高的一层）保持不变 ✓</td></tr>
+<tr><th class="nw">层</th><th class="nw">定义式</th><th><b>独有不变量（断言点）</b></th><th>与相邻层合并会失去什么</th></tr>
+<tr><td class="nw">S0 事实源</td><td>—</td><td>每个事实源有 digest；表外字段 ⇒ <code>BLK-UNCLASSIFIED</code></td><td>无法断言"输入是闭集"</td></tr>
+<tr><td class="nw"><b>G0</b> CoreIR</td><td class="nw"><code>PE(Src,ModelSpec,EnvFacts,π₀)</code></td>
+  <td><b><code>∀f ∈ G0: policy(·) ∉ f.roots</code></b>；<code>digest(G0)</code> 在策略扰动下不变</td>
+  <td><b>policy-free 唯一的断言点</b></td></tr>
+<tr><td class="nw"><b>G0.5</b> ImplIR</td><td class="nw"><code>impl_select ∘ fusion_logical ∘ precision_fwd</code></td>
+  <td>每节点 <code>semantic_id ∈</code> S1 注册域；<b>op 集合自此定稿</b></td>
+  <td>反向模板"逐 op 查表"没有定义点</td></tr>
+<tr><td class="nw"><b>G1</b> TrainIR</td><td class="nw"><code>Pass_train_step</code></td>
+  <td><code>∀ 可微输入 i: shape(grad_out[i]) == shape(in_i)</code>；每条梯度边恰一 producer</td>
+  <td>反向正确性无断言点</td></tr>
+<tr><td class="nw"><b>G1.7</b> PrecIR</td><td class="nw"><code>Pass_precision_opt</code></td>
+  <td>新增节点的<b>下游可达集不含 <code>grad_role</code> 节点</b>；持久字节守恒式</td>
+  <td>fp32 主副本字节无归属；"无第二套反向机制"不可机器检</td></tr>
+<tr><td class="nw"><b>G2</b> ShardIR</td><td class="nw"><code>Pass_shard(·, ParallelSpec, PlacementAnnotation, DistOptSpec)</code></td>
+  <td>placement 类型健全（无失配）；桶数 = 真机归约算子个数</td>
+  <td>"漏插通信"不再是编译期类型错误</td></tr>
+<tr><td class="nw">G2.5</td><td class="nw"><code>Pass_fusion_dist</code></td>
+  <td>融合前后通信节点的<b>语义多重集守恒</b></td><td>通信-计算融合的正确性无断言点</td></tr>
+<tr><td class="nw"><b>G3</b> RematIR</td><td class="nw"><code>Pass_remat(·, RematSpec)</code></td>
+  <td><code>∀n: stage_role==remat ⇒ origin 是前向节点</code>；非幂等前置断言</td>
+  <td>重算克隆的边界无断言点</td></tr>
+<tr><td class="nw"><b>G4</b> SchedIR</td><td class="nw"><code>Pass_sched(·, ScheduleSpec, CalibrationSet)</code></td>
+  <td>事件不重不漏、偏序无环；<code>roots(t_free) ∋ calib ⟺ 边标 timing_dependent</code></td>
+  <td>时序依赖泄漏进显存侧不可检</td></tr>
+<tr><td class="nw">两后端</td><td class="nw"><code>project(G4)</code></td>
+  <td><b>零新事实</b>：后端不得引入新的 root 种类</td><td>后端可以偷偷加假设</td></tr>
 </table></div>
 
-<div class="cal why"><span class="lbl">为什么这样划分源码与配置的职责</span>
-<p>源码只提供<b>三类信息</b>：符号、数据流、attrs 字面值。配置提供<b>完整</b>语义
-（<code>(输入 shape, attrs) → 输出</code>）。两者不重叠，所以结构上不可能出现
-「这个 shape 应采用源码还是声明」的仲裁问题——<b>这种划分从结构上消除了「两个真相源」</b>。</p></div>
-
-<h3 id="c1-3">1.3 层的职责边界</h3>
+<h4>相邻序的物理理由（新判据只论证层的存在与边界，<b>不论证顺序</b>，故必须逐对补）</h4>
 <div class="tw"><table>
-<tr><th>层</th><th>只负责</th><th>不负责</th><th class="nw">策略输入</th></tr>
-<tr><td class="nw">S1 语义</td><td>注册域加载、DSL 校验、冻结成快照</td><td>解析具体模型实例</td><td>—</td></tr>
-<tr><td class="nw">S2 结构</td><td>解析源码、绑定语义、产出逻辑事实</td><td>并行策略、执行时序和物理字节</td><td>—</td></tr>
-<tr><td class="nw">S3 反向</td><td>反向图、重算节点、fan-in 累加</td><td>放置位置和本地规模</td><td class="nw"><code>RecomputeSpec</code></td></tr>
-<tr><td class="nw">S4 布局</td><td>mesh / shard / local shape / 集合通信</td><td>生命周期、定价</td><td class="nw"><code>ParallelConfig</code></td></tr>
-<tr><td class="nw">S5 执行</td><td>事件、依赖、流、生命周期、分配释放</td><td>改逻辑模型</td><td class="nw">调度 + 标定</td></tr>
-<tr><td class="nw">S6 后端</td><td>显存：liveness/allocator/OOM；时间：定价/竞争/流水</td><td>重新推导任何上游事实</td><td class="nw">硬件 + profile</td></tr>
-<tr><td class="nw">S7 报告</td><td>汇总 + 覆盖率 + provenance + confidence</td><td>隐藏未覆盖项</td><td>—</td></tr>
+<tr><th class="nw">相邻对</th><th>顺序理由</th></tr>
+<tr><td class="nw"><b>G0.5 在 G1 之前</b></td>
+  <td><b>反向模板是逐 op 查表的</b>（<code>granularity(bwd(op)) = template(op)</code>）⇒ <b>op 集合必须在反向生成前定稿</b>。
+      若把 quantize / 融合 kernel 的替换排在反向之后，就必须为这些新节点<b>另行生成对偶</b>——那正是"第二套反向机制"。
+      放在前面，它们的反向由<b>同一个</b> <code>Pass_train_step</code> 按各自注册的模板生成，代价为零</td></tr>
+<tr><td class="nw">G1 在 G2 之前</td><td>梯度 placement 是 primal 的对偶，同一状态机自然产出</td></tr>
+<tr><td class="nw">G1.7 在 G1 之后</td><td>主副本挂在梯度值与优化器状态上，那些在反向生成之前不存在；且优化器路径<b>不被微分</b> ⇒ 不需要对偶</td></tr>
+<tr><td class="nw">G2 在 G3 之前</td><td>重算副本是<b>已切分、已插通信</b>子图的结构复制</td></tr>
+<tr><td class="nw">G2.5 在 G2 之后</td><td>融合对象是 shard 产出的通信节点</td></tr>
+<tr><td class="nw">G3 在 G4 之前</td><td>实例化必须在图定稿后</td></tr>
 </table></div>
+
+<div class="cal honest"><span class="lbl">G0.5 内部三 pass 的固定序，以及它为什么对外原子化</span>
+<p>G0.5 内部固定为 <code>impl_select → fusion_logical → precision_fwd</code>：前向精度要插 quantize 节点，
+而插在哪里依赖实现族的选择（融合 attention 的量化点与非融合的不同）。</p>
+<p>三者合起来对外是<b>一个原子步</b>——只暴露 G0.5 的 digest，不暴露中间态。<b>这是为了不把内部序
+误当成可重排的自由度</b>：若把中间态暴露出去，层序表就会多出三个相邻对，而它们之间的顺序
+并不由物理理由决定，而是由"谁先谁后都能跑通、但结果不同"这种最坏的性质决定。</p></div>
 
 <h3 id="c1-4">1.4 全局不变量</h3>
 <div class="cal inv"><span class="lbl">不变量</span>
 <ol>
-<li><b>单向</b>：派生层只读上游，任何层都不回写上游。</li>
-<li><b>policy-free 核</b>：<code>CoreIR</code> 不含任何策略痕迹（并行度、重算、调度）。</li>
+<li><b>单向</b>：改写 pass 只读上游，任何层都不回写上游。</li>
+<li><b>policy-free 核</b>：<code>∀f ∈ G0: policy(·) ∉ f.roots</code>；策略只能由 pass 重新引入。</li>
+<li><b>改写纪律</b>：一切改写只能以"<b>新增带合成标记的节点与存储</b>"实施，
+    <b>不得</b>以"就地修改源节点的形状/属性/存储"实施（由 <code>G-C1</code> 机器执行）。</li>
 <li><b>唯一绑定</b>：一个原子源码调用在一次编译中只能解析到一条 Op 语义。</li>
 <li><b>无 opaque</b>：可执行 IR 中不存在未知算子或不透明节点。</li>
 <li><b>缺失 ≠ 空</b>：字段缺失（未描述）与显式空值（描述为无）严格区分。</li>
 <li><b>全或无</b>：预检不过就不产生任何可供后端执行的部分计划。</li>
-<li><b>身份不靠名字</b>：逻辑值、逻辑存储、放置、物理实例是四个独立 ID（<a href="#c6">第 6 章</a>）。</li>
-<li><b>provenance 必填</b>：每个进入报告的量都带 provenance；<code>modeled</code> 必带公式与
-    <b>适用域</b>、<code>assumed</code> 必带依据（<a href="#c2">第 2 章</a>）。</li>
-<li><b>适用域受检</b>：<code>modeled</code> 量的适用域是机器校验的字段，不是注释。当前配置落在域外
-    ⇒ 阻断，或降级并在报告中标注偏差方向。</li>
+<li><b>身份不靠名字</b>：逻辑值、逻辑存储、放置、物理实例是四个独立 ID（<a href="#c5">第 5 章</a>）。</li>
+<li><b><code>Prov</code> 只升不降</b>：代数里不存在使 provenance 任一分量下降的算子（<a href="#c2">第 2 章</a> P8）。</li>
+<li><b>无标量出口</b>：报告 schema 中峰值与 step time <b>只有区间形态</b>，标量形态在类型上不存在。</li>
 </ol></div>
 
-<h2 id="c2"><span class="cn">Chapter 2</span>横切契约：知识分级</h2>
+<h2 id="c2"><span class="cn">Chapter 2</span>横切契约：provenance 代数</h2>
 
-<h3>2.1 是什么</h3>
-<p>仿真建模中的量具有不同的知识来源。本方案为<b>每个量</b>标注 <code>provenance</code>，
-而不是为<b>每一层</b>设置统一的回退等级。类型限定为以下三种，构成闭集：</p>
+<h3 id="c2-1">2.1 病灶：v2 的定义把"人的判断"算成了"事实"</h3>
+<p>v2 写：<code>derived</code> ＝ 由建模范围<b>内</b>的事实推出（<b>源码 + 算子定义</b>）。
+<b>"算子定义"四个字就是漏洞本体</b>——注册域就是"算子定义"，于是：</p>
+<ul>
+<li>把 <code>ColumnParallelLinear</code> 判成逻辑 <code>Linear</code> 并注册为原子 ⇒ 它的 shape/storage 面来自注册域
+    ⇒ 按定义是 <code>derived</code> ⇒ 区间塌成点 ⇒ 阻断消失 ⇒ CoreIR 更小 ⇒ 报告 100% derived。<b>每一个指标都变好。</b></li>
+<li>把某个策略字段改判为"模型变量" ⇒ 污点判据不再触发 ⇒ 阻断消失，该量仍是精确值。<b>同样每一个指标都变好。</b></li>
+</ul>
+<p>两条路径的共同结构是：<b>人的一次判断被系统当成了一条事实，而事实是零代价的</b>。
+所以修复必须做且只需做一件事——</p>
+<div class="thesis">
+让<b>经人工判断获得的语义</b>在代数里是一个与<b>源码事实</b>类型不同的东西，
+且这个类型差别是<b>机器计算的、不可声明的</b>，并强制向下游传播到每一个字节。
+</div>
 
+<h3 id="c2-2">2.2 两条正交轴</h3>
+<p>v2 把两件正交的事压成了一条枚举。拆开是全章的地基：</p>
 <div class="tw"><table>
-<tr><th class="nw">provenance</th><th>含义</th><th>典型量</th><th>必带</th><th class="nw">能否外推</th></tr>
-<tr><td class="nw"><span class="pill p-sd">derived</span></td>
-  <td>由建模范围<b>内</b>的事实推出（源码 + 算子定义）</td>
-  <td>shape、dtype、alias/inplace、saved 结构、数据流</td><td>—</td>
-  <td>是</td></tr>
-<tr><td class="nw"><span class="pill p-me">modeled</span></td>
-  <td>机制在范围<b>外但确定性</b>——由 kernel tiling / allocator 策略 / 框架预留决定，
-      表达为<b>带适用域的公式</b>，常数由实测标定</td>
-  <td><code>workspace_bytes</code>、<code>bwd_scratch</code>、allocator 对齐与分块、kernel duration</td>
-  <td>公式 + <b>适用域</b> + 常数出处</td>
-  <td><b>域内可以</b></td></tr>
-<tr><td class="nw"><span class="pill p-as">assumed</span></td>
-  <td>取值依赖运行期<b>数据</b>，静态不可判定</td>
-  <td>MoE 每专家实际负载、专家 capacity、非规则化 placement</td>
-  <td><code>basis</code> + 方向（上界/下界/标称）</td>
-  <td>否</td></tr>
+<tr><th class="nw">轴</th><th>回答什么</th><th>用途</th></tr>
+<tr><td class="nw"><code>roots</code></td><td>输入的<b>叶子事实</b>来自哪里</td><td><b>归因</b>："如果这条根错了，多少字节会变"</td></tr>
+<tr><td class="nw"><code>certainty</code></td><td><b>即使输入全对</b>，我们施加的那个函数是不是真的那个函数</td><td><b>形状</b>："答案该是点还是区间"</td></tr>
 </table></div>
 
-<div class="cal why"><span class="lbl">为什么没有「实测」这一类</span>
-<p>「实测」不是一类<b>知识</b>，而是一种<b>取值手段</b>。把它与前两类并列，等于把「这个量是什么性质」
-和「我们怎么拿到它」混进同一个轴——对显存尤其错，因为<b>显存要的是仿真，不是查表</b>。</p>
-<p>所以实测在本方案里只承担两个角色：<b>给 <code>modeled</code> 的常数定值</b>（标定），
-<b>给整条链做校验</b>（真机对照，见<a href="#c11">第 11 章</a>）。它本身不进 IR。</p>
-<p>结果是：<b>显存链上没有任何一个量是查表得来的</b>——激活字节由 shape 推出（<code>derived</code>），
-workspace 由公式算出、allocator 行为由策略模拟（<code>modeled</code>）。</p></div>
+<div class="cal why"><span class="lbl">一处根因，两处症状，一次修复</span>
+<p>旧代数把 <code>certainty</code> 定义成 <code>roots</code> 的函数（"roots 必含标定根才算 modeled"）。这一条同时造成：</p>
+<p><b>症状一</b>：roofline 时长 <code>= flops / peak_flops</code>，两个输入都精确、根里无标定 ⇒ 判成 <code>derived</code>。
+allocator 的池划分/对齐/split 阈值同理。<b>代数里没有"机制确定性、但我们的公式可能不准"这个位置</b>。</p>
+<p><b>症状二</b>：通信节点的字节 <code>= prod(shape)*sizeof(dtype)</code>，形状全来自源码，根里没有也不该有标定根
+⇒ 旧定义下只能算 <code>derived</code> ⇒ "通信字节的 <code>modeled</code> 占比必须 &gt; 0"这道嗅探门<b>恒不可满足</b>。</p>
+<p><code>floor_div</code> 是我们自己的定义，不存在"可能不是那个函数"；<code>allocator_align</code> 是<b>对别人机制的复刻</b>，
+输入再准也可能错。<b>所以 <code>certainty</code> 是算子的属性，不是它参数根的函数。</b></p></div>
 
 {{SVG:02-provenance}}
 
-<h3>2.2 为什么分界线在这里</h3>
-<p>一种直观的划分是「内存侧要求精确、时间侧允许估算」。<b>这种划分并不成立</b>，两个反例即可说明：</p>
+<h3 id="c2-3">2.3 类型集合</h3>
+<pre><code>Q[T] := {
+  value     : T                       # π₀ / 当前配置下的求值结果
+  expr      : Expr                    # 规范形，参与 digest
+  certainty : Certainty               # 全序闭集
+  roots     : Set[Root]               # 集合，⊔ = ∪
+  evidence  : Evidence | ⊥            # certainty = exact 时为 ⊥
+  direction : Direction               # {exact, upper, lower}；**无 nominal、无 unknown**
+  interval  : Interval                # 两端各自可为「不可计算」，**不得以 0/∞ 填充**
+}
+
+Certainty := exact &lt; modeled &lt; assumed                    # 全序，⊔ = max
+
+Root :=                                                    # **闭集，八种**
+  source(anchor)                    # 模型源码 AST 上、经 PE 求值得到的事实（内容寻址）
+  configured(spec_path)             # 使用者的配置选择：它**定义问题本身**
+  transcribed(env_fact)             # 我们对环境的转录：HBM 容量、设备型号、框架版本
+  calib(calib_key)                  # 标定报告中的实测常数
+  replication(framework_ver#rule)   # 我们对框架并行/调度/分桶行为的**复刻规则**
+  declared_semantics(symbol@ver)    # 对**无 AST** 对象的语义声明
+  abstraction(target@ver, kind)     # **人工判断替换了可读源码**，或改判了策略字段
+  assumption(invariant_id)          # 运行期数据依赖的显式假设（RuntimeInvariant、MoE 负载）
+
+  kind ∈ { atom_substitution, policy_reclassification, placement_declaration,
+           captures_declaration, bwd_ambiguity }           # 闭集
+
+Evidence  := { grade ∈ {calibrated &lt; vendor_documented &lt; reconstructed}, ref, sweep }
+Direction := exact | upper | lower
+Q3[Bool]  := true | false | undetermined                   # **无到 Bool 的转换算子**
+Sample[T] := 观测样本的极值集合                             # **不是界**；无区间算术、无比较、不进 OOM 链</code></pre>
+
+<h4>相对 v2 的四处改动，各一句理由</h4>
+<div class="tw"><table>
+<tr><th class="nw">改动</th><th>理由</th></tr>
+<tr><td class="nw">旧的单一"规定量"根拆成 <code>configured</code> + <code>transcribed</code></td>
+  <td>它混装了"<b>定义问题</b>的量"（<code>tp=8</code>，不可证伪且应当精确）与"<b>我们对环境的转录</b>"（HBM 容量、池划分，高度可证伪且我们可能抄错或过期）。两者的证伪手段完全不同，不能共用一个根</td></tr>
+<tr><td class="nw">新增 <code>declared_semantics</code> 与 <code>abstraction</code></td>
+  <td>把"人的判断"从"算子定义"这个合法来源里拆出来（§2.1 的本体）。<b>分成两种而非一种</b>，因为二者证伪手段不同：无 AST 的声明可以有标定点；对可读源码的抽象<b>不可能</b>有比源码更强的证据</td></tr>
+<tr><td class="nw"><code>Evidence</code> 与 <code>Direction</code> 从 <code>assumed</code> 专属升为全类型字段</td>
+  <td><code>modeled</code> 也需要证据等级；<code>direction</code> 需要在 <code>assumed</code> 上强制单侧</td></tr>
+<tr><td class="nw">删除 <code>direction: nominal</code></td>
+  <td><b>它使区间塌成点</b>。<code>certainty = assumed ⇒ direction ∈ {upper, lower}</code>，必然单侧开口。
+      这是 v2 里一处此前两轮评审都无人点名的活口子</td></tr>
+</table></div>
+
+<div class="cal inv"><span class="lbl">三个旧名的地位</span>
+<p><code>derived</code> / <code>modeled</code> / <code>assumed</code> 不再是类型，而是 <code>certainty</code> 的<b>命名投影</b>：
+<code>name(q) = derived iff certainty(q) = exact</code>，其余同理。投影是全函数、无重叠。
+<b><code>roots</code> 是正交的第二个轴，不参与命名。</b></p>
+<p><code>modeled</code> 的新定义：<b>该量的产生过程中至少经过一个 <code>self_certainty = modeled</code> 的算子</b>，
+即我们复刻了一个不属于我们的机制。"根里必须有标定"从定义<b>降级为证据强度</b>（<code>evidence.grade</code>）。</p></div>
+
+<h3 id="c2-4">2.4 <code>readability</code>：一个机器计算、用户不可设的三值分类</h3>
+<p>每一次"注册为原子"都发生在一个具体的阻断点上，而<b>阻断发生时 PE 已经知道它当时能读到多少</b>。
+把这件已知的事升格为注册表的必填字段：</p>
+<pre><code>RegistryEntry.origin : {
+  block_code   : BLK-*                       # 触发注册的阻断码
+  site         : H(qualname, framework_ver)  # 内容寻址锚点，不含行号
+  readability  : NONE | PARTIAL | FULL       # ← PE 在阻断时刻计算并写入，**用户不可填**
+}
+
+readability(target) :=
+  FULL     PySub 可解析 target 的全部可达体，PE 已求出残差
+  PARTIAL  可解析入口，但体内有一个或多个 BLK-* 站点（站点集随之记录）
+  NONE     target 无 AST（C 扩展、内置、二进制 kernel）</code></pre>
+
+<div class="cal why"><span class="lbl">为什么用"AST 在不在"，而不是别的判据</span>
+<p>需要一个"这次抽象是不是掩盖了可读源码"的判据，而<b>唯一不可能被声明伪造的候选是"AST 在不在"</b>
+——它是框架源码的客观属性，不是任何人的意见。</p>
+<p><code>NONE → FULL</code> 不可能（没法给 C 扩展凭空造 AST）；<code>FULL → NONE</code> 需要改框架源码使 PE 读不懂，
+而这会改变框架源码的 digest，digest 进报告首页。<b>代价是"我为了让报告好看去改了框架源码"这件事被打印出来。</b></p></div>
+
+<p>分派规则<b>由 <code>readability</code> 机器决定，不由人选</b>：</p>
+<div class="tw"><table>
+<tr><th class="nw"><code>readability</code></th><th class="nw">根</th><th class="nw"><code>self_certainty</code></th><th class="nw"><code>evidence.grade</code></th></tr>
+<tr><td class="nw"><code>FULL</code></td><td class="nw"><code>abstraction</code></td><td class="nw"><code>modeled</code></td><td>强制 <code>reconstructed</code></td></tr>
+<tr><td class="nw"><code>PARTIAL</code></td><td>已求值部分沿用真实根；<b>未求值站点 ⇒ <code>abstraction</code></b></td><td class="nw"><code>modeled</code></td><td>强制 <code>reconstructed</code></td></tr>
+<tr><td class="nw"><code>NONE</code></td><td class="nw"><code>declared_semantics</code></td><td class="nw"><code>modeled</code></td><td>可为 <code>calibrated</code> / <code>vendor_documented</code> / <code>reconstructed</code></td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">为什么两个根分开，而不是合成一种</span>
+<p>它们的证伪手段不同。<code>NONE</code> 的声明<b>可以有标定点</b>（融合 kernel 的 workspace 能被实测）；
+<code>FULL</code> 的抽象<b>不可能</b>有比源码更强的证据——我们手上就有源码却选择不看，
+所以证据等级只能是 <code>reconstructed</code>，这一格由 schema 钉死，不是自觉。</p></div>
+
+<div class="cal bad"><span class="lbl">阶梯的代价方向必须显式校正（第三轮反驳发现的反向失败）</span>
+<p>朴素实现下这个阶梯的代价方向<b>是反的</b>，<code>FULL</code> 被严格支配：<code>FULL</code> 要吃抽象残差区间、
+进两道 Θ 门；<code>PARTIAL</code> 因"体内有阻断站点"而算不出完整残差；<code>NONE</code> 若声明为 <code>calibrated</code>，
+则对两道 Θ 门<b>同时隐身</b>。于是最省事的做法是把可读的东西弄成不可读的。两处校正，都是定义级的：</p>
+<ol>
+<li><b><code>θ_abs</code> 的分子是两个根的并</b>：<code>abstraction_covered_bytes + declared_semantics_covered_bytes</code>。
+    只算前者，等于给"声明无 AST 对象的语义"开免费通道。</li>
+<li><b><code>PARTIAL</code> 不得因残差算不全而退回点值</b>：可求值部分照算残差，未求值站点各自成为
+    独立的 <code>abstraction</code> 条目并按 §2.5 的 P5 兜底取单侧。<b>缺少信息不能换来更窄的区间</b>——
+    这是 P5 兜底条款存在的全部理由。</li>
+</ol></div>
+
+<h3 id="c2-5">2.5 传播律</h3>
+<pre><code>P1  roots      roots(f(x₁..xₙ)) = ⋃ᵢ roots(xᵢ) ∪ own_roots(f)
+
+P2  certainty  certainty(f(x₁..xₙ)) = max( ⊔ᵢ certainty(xᵢ), self_certainty(f) )
+               self_certainty 必填，值域按算子类别裁剪：
+                 Primitive.self_certainty    ∈ { exact }              # 工具自带 ~15 个算术原语，闭集
+                 RegisteredOp.self_certainty ∈ { modeled, assumed }   # **exact 不在值域里**
+                 MechanismOp.self_certainty  ∈ { modeled }            # allocator / roofline / tiling / 通信复刻
+
+P3  evidence   evidence(f(...)) = weakest( {evidence(xᵢ)} ∪ {evidence(f)} )
+
+P4  **存在位下传**  ∀ q 由节点 n 产出:  Prov(q) ⊒ Prov(exist(n))
+               节点存在位的 Prov 来自：PE 折叠 guard 时的控制上下文污点，
+               或产生该节点的 pass 的 own_roots（如 Pass_shard 的 replication）
+
+P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residual(f)
+               own_residual 的**四个来源，全部机器算出**：
+                 ① G-B1a 抽象残差 hull(S_P, R_P)                        （§2.6）
+                 ② 反向双候选 hull(a, b)                                （§7.2）
+                 ③ 标定残差 residual_rel                                （grade = calibrated）
+                 ④ **declaration_unverified_bound**：声明量 d 无独立佐证时，
+                    区间由**该声明自身的语义**给出两端——
+                    lo = 声明成立时的值；hi = 声明完全不成立时该量的无声明上界。
+                    两端均由定义式算出，**不是猜的误差棒**
+               **兜底（无一适用时）**：direction := 单侧（按该量对峰值的偏置方向定 upper/lower），
+                 **不得保持点值**
+
+P6  direction  按逐原语单调性声明变换；non_monotone 且该参数非 exact ⇒ BLOCK
+               certainty = assumed ⇒ direction ∈ {upper, lower}（不得 exact，不存在 nominal）
+
+P7  折叠保根   π₀ 特化模式**禁用一切吸收/幂等化简**；∀ fold 规则 r: roots(r(e)) ⊇ ⋃ roots(子式)
+               P7 同样适用于 certainty 与 evidence——fold 不得降低任一分量
+
+P8  不可降     不存在使 Prov 任一分量下降的算子。
+               验证：对闭原语集（约 15 条）做 property test，随机取样断言 Prov(f(x)) ⊒ ⊔ᵢ Prov(xᵢ)</code></pre>
+
+<div class="cal bad"><span class="lbl">P5 兜底条款：本方案第三轮改动中最重要的一条</span>
+<p>前一版的兜底是「<code>evidence.grade ∈ {vendor_documented, reconstructed}</code> 时 <code>own_residual</code>
+无机器来源 ⇒ <b>不伪造一个数</b> ⇒ 该量的 interval 保持点值」。<b>拒绝伪造是对的，保持点值是错的。</b></p>
+<p><b>后果</b>：不可验证的那一部分字节（结构上正是最该被怀疑的那部分：allocator 行为、融合 workspace、
+通信复刻、分桶规则）对区间宽度的贡献<b>恰好为零</b>。于是"峰值只有区间形态"这条不变量被架空——
+输出是一个<b>伪装成区间的点估计</b>，而且它最容易错的方向（低估）正是用户最想采信的那个方向
+（"装得下"）。</p>
+<p><b>改法</b>：兜底不是"保持点值"，而是"<b>取单侧</b>"。含义是——我们不知道它的宽度，
+所以我们不声称它有上界。<code>peak.hi</code> 因此不可计算，<code>oom_verdict</code> 落 <code>undetermined</code>，
+并由<b>判定阻碍分解</b>（§10.3）逐条列出"要回答你的头号问题，先去标定这几个量"。</p>
+<p><b>这不是把工具做废，而是把标定集变成真正的交付物。</b><code>evidence.grade</code> 从三个词变成一条产品路线：
+标定一个量 ⇒ 它获得来源 ③ 的真实残差 ⇒ 它退出单侧 ⇒ <code>peak.hi</code> 向可计算前进一步。
+判据 5 在此是<b>顺向且构造性</b>的：诚实使用不受罚，省事必然拿不到那句"装得下"。</p></div>
+
+<div class="cal inv"><span class="lbl">P4 是承重墙：一条律解三处</span>
+<ol>
+<li><b>抽象根生效</b>：没有 P4，一个被抽象掉的 <code>Linear</code> 的激活字节 <code>prod(shape)*sizeof(dtype)</code>
+    的每个输入都来自源码根，算出来仍然精确——<b>抽象只污染了"这是什么算子"，没污染"它产出多少字节"</b>。
+    P4 把"若 <code>n</code> 根本不该存在，它的字节也不该被计"变成传播律。</li>
+<li><b>通信字节嗅探门可满足</b>：<code>Pass_shard</code> 的"失配处插 redistribute"是一个
+    <code>self_certainty = modeled</code> 的<b>结构算子</b>，<code>own_roots = {replication(rule)}</code>
+    ⇒ 通信字节继承 <code>modeled</code> 与 <code>replication</code> 根，且根里没有标定根。门可满足且非平凡。</li>
+<li><b>显存 ← 时间的耦合自动表达</b>：overlap 开启时 <code>Free</code> 事件的时刻是通信时长的函数
+    ⇒ 该 <code>Free</code> 的存在位带标定根 ⇒ 受影响 storage 在峰值时刻的<b>存活成员资格</b>继承标定根。
+    "显存 provenance 是时间 provenance 的函数"这件事不需要额外机制。</li>
+</ol>
+<p><b>连带定案</b>：由 pass 合成的存储（fp32 主权重/主梯度、fp8 的 amax/scale 缓冲、梯度桶缓冲）
+其存在位带 <code>replication(rule)</code> ⇒ <b>这些字节是 <code>modeled</code> 而不是 <code>derived</code></b>，
+即便它们的字节公式本身是 <code>numel × sizeof(dtype)</code> 这样的平凡式。
+判据是"这个节点<b>为什么存在</b>"，不是"它的字节<b>怎么算</b>"。</p></div>
+
+<h3 id="c2-6">2.6 <code>G-B1a</code> 抽象残差：判据 5 唯一的构造性执行体</h3>
+<p>前面的机制只做到"可见"。而 <code>certainty = modeled</code> 本身<b>不改变形状</b>。
+所以必须有宽度，而宽度不能是猜的误差棒：</p>
+<div class="thesis">抽象残差不是误差棒，是<b>一个由被隐藏的源码机器算出的量</b>。</div>
+
+<pre><code>设模块 M 被判成逻辑原子 A，readability(M) = FULL。对报告要输出的每个策略点 P：
+
+  R_P := PE(M 的源码体, ModelSpec, EnvFacts, P)     # 在**真实策略**处偏特化，不经 π₀
+  S_P := rewrite(A, P) 在 A 处产出的子图            # CoreIR→…→G4 这条**重建链**的产物
+
+G-B1a（硬阻断）：shape 面 / arity 在 R_P 与 S_P 上不一致 ⇒ **阻断**
+                （人声明的语义与源码直接矛盾，这不是抽象，是错误，不该被定价而该被拒）
+
+抽象残差：其余各面逐项取凸包
+  interval(A.q) := hull( S_P.q , R_P.q )   对 q ∈ {激活字节, 临时字节, workspace, flops, 通信字节}</code></pre>
+
+<div class="cal why"><span class="lbl">三点必须讲清楚</span>
+<p><b>① 为什么在真实策略 P 处比，而不是在 π₀ 处比两支残差。</b>在 π₀ 处比 <code>then/else</code> 两支是错的——
+<code>else</code> 支里的 AllReduce 会被 <code>Pass_shard</code> 名正言顺地重新插回来，把它计成不确定度是<b>双计</b>。
+正确的对照物是"重建链在 P 处产出的东西"vs"PE 直接在 P 处读源码得到的东西"。</p>
+<p><b>② 判断正确时残差为零。</b>若 <code>ColumnParallelLinear</code> 真等价于逻辑 <code>Linear</code> + 我们的通信复刻规则，
+则宽度 0，抽象不付代价。<b>这是有意的</b>——否则做对判断的人被惩罚，工具不可用。</p>
+<p><b>③ 判断错时代价与错的大小成正比。</b>若该"并行原语"偷偷多做了一次 scaling、少了一次 bias、
+dropout 位置不同，则逐面不同 ⇒ 宽度正比于被隐藏的差异 ⇒ 经区间算术直达峰值。</p></div>
+
+<div class="cal honest"><span class="lbl">G-B1a 的诚实定性（不等反驳，先说）</span>
+<p><b>它是抽样门，不是证明。</b><code>P</code> 取自报告要出的策略点集，不是 guard 的全部取值。</p>
+<p><b>更要命的第二层：共模误读会让它安静通过。</b><code>S_P</code> 由我们的复刻规则产出，<code>R_P</code> 由 PE 读框架源码产出。
+两条路径<b>形式上独立</b>，但可以<b>同源地错</b>——写"<code>ColumnParallelLinear</code> ≡ 逻辑 <code>Linear</code>"这条抽象的人，
+和写"列并行出口插 AllReduce"这条复刻规则的人，很可能是同一个人，带着同一份对框架的理解。
+若这份理解错了，两边<b>一致地错</b> ⇒ 残差为零 ⇒ 抽象免费通过，且报告显示它"经检验无残差"。</p>
+<p><b>因此残差列禁止打印裸 <code>0</code></b>，必须打印 <code>0（P_test 覆盖 N 点，非证明）</code>。</p></div>
+
+<h3 id="c2-7">2.7 比较、聚合与归因</h3>
+<pre><code>cmp : Q[Real] × Q[Real] → Q3[Bool]
+  a &lt; b  ⇒ true         iff a.hi &lt;  b.lo        （两端均可计算）
+         ⇒ false        iff a.lo ≥  b.hi
+         ⇒ undetermined otherwise，或所需的任一端不可计算</code></pre>
+<p>三条硬规定：<b>①</b> <code>Q3[Bool] → Bool</code> 的转换算子<b>不存在</b>（结构性复活检测断言之）；
+需要 <code>Bool</code> 的消费者遇 <code>undetermined</code> ⇒ 阻断。<b>②</b> <code>Sample[T]</code> 上没有 <code>cmp</code>
+——makespan 不能与任何容量或预算比较。<b>③</b> 只有一端可计算时，只保留能被证明的那一侧。</p>
+
+<p>归因口径固定为<b>峰值时刻活跃集合分解</b>：<code>peak = Σ_{i ∈ live(t*)} size_i</code>。三种聚合，性质不同，
+报表必须分开呈现：</p>
+<div class="tw"><table>
+<tr><th class="nw">聚合</th><th>定义</th><th class="nw">守恒性</th><th>呈现约束</th></tr>
+<tr><td class="nw">按 <code>certainty</code></td><td><code>Σ_{i: certainty(size_i)=c} size_i</code></td><td><b>划分，守恒</b>（每量恰一个 certainty）</td><td>三行</td></tr>
+<tr><td class="nw">按 <code>evidence.grade</code></td><td>同上，取最弱级</td><td><b>划分，守恒</b></td><td>三行</td></tr>
+<tr><td class="nw">按 <code>root</code> 种类</td><td><code>coverage(r) = Σ_{i: r∈roots(size_i)} size_i</code></td><td><b>不是划分</b>，<code>Σ ≥ peak</code></td><td>schema 标 <code>presentation: not_a_partition</code>；<b>禁止饼图</b></td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">按 root 为什么选覆盖量而不是划分</span>
+<p>任何划分都要引入一个人为的<b>主根优先序</b>；而"如果我们把 X 判成 Y 是错的，哪些字节会变"
+问的本来就是<b>覆盖量</b>，不是划分。这也正是可见性的准确形式：
+<code>bytes_at_risk(judgment j) = coverage(abstraction(j))</code>。</p>
+<p>守恒的那一份由 <code>certainty</code> 三分承担——"provenance 闭合"这道门要的正是它，它被保住了。</p></div>
+
+<div class="cal inv"><span class="lbl">t* 要在四个角上求</span>
+<p>原方案只在<b>字节区间</b>两端各跑一次 liveness。但 <code>CalibrationSet</code> 上移到 S0 之后，
+<b>事件序也依赖时长估计</b>（overlap 场景下 <code>Free</code> 时刻是通信时长的函数）⇒ <code>t*</code> 也随
+<b>时长区间</b>移动。因此归因必须在 <b>(字节端点 × 时长端点)</b> 四角上跑 liveness；
+退化到 2 次的条件是"该图无 <code>timing_dependent</code> 边"。</p>
+<p><b>可加性的限定必须进报表脚注</b>：<code>peak</code> 是对 <code>t</code> 取 max，宽度可加只在<b>固定的 <code>t*</code></b> 上成立。</p></div>
+
+<h3 id="c2-8">2.8 <code>configured</code> 根的三道闭合</h3>
+<p><code>configured</code> 是八种根里<b>唯一允许精确</b>的那个（它定义问题本身，<code>tp=8</code> 无所谓真假），
+所以它必须自带闭合——否则"把难算的量改名成规定量"就是零代价逃逸：把 MoE 每专家负载写成
+<code>ModelSpec.expert_load_per_rank</code> ⇒ 根是 <code>configured</code> ⇒ 精确 ⇒ 区间塌点 ⇒ OOM 从三值变回二值。</p>
+<div class="tw"><table>
+<tr><th class="nw">闭合</th><th>规则</th><th>理由</th></tr>
+<tr><td class="nw"><b>叶子限定</b></td>
+  <td>带 <code>configured</code> 根的量必须形如 <code>Q{expr: spec_field(p), roots: {configured(p)}}</code>；
+      <code>expr</code> 不是 <code>spec_field(·)</code> 却带该根 ⇒ 加载期阻断</td>
+  <td><code>configured</code> 的正当性是"它定义了问题"，只有那个字段本身定义问题，<b>由它算出的物理量不定义问题</b></td></tr>
+<tr><td class="nw"><b>数据依赖轴</b></td>
+  <td>S1 的 shape 面为每个输出轴必填 <code>axis_kind ∈ {static, data_dependent}</code>；
+      <code>data_dependent</code> 的位置<b>只接受 <code>certainty = assumed</code> 的量</b>，
+      用 <code>configured</code> 根绑定该位置 ⇒ <b>类型错误</b>，不是警告</td>
+  <td>数据依赖是<b>算子的性质</b>，在 S1 声明一次；声明成 <code>static</code> 就必须给出表达式，
+      而表达式只能引用 (输入 shape, attrs)——<code>top_k</code> 的输出长度写不出这样的表达式</td></tr>
+<tr><td class="nw"><b><code>G-B4</code> 守恒-均匀</b></td>
+  <td>一组量满足算子声明的守恒约束（如 <code>Σ_experts tokens_e = topk · num_tokens</code>）<b>且取值均匀</b>
+      ⇒ 机器判定为"完美均衡假设"：<code>certainty := assumed</code>、<code>direction := lower</code>、
+      <code>roots ∪= {assumption(perfect_balance)}</code>，<b>无论用户把这些数写在哪份 spec 里</b></td>
+  <td>均匀分布 + 守恒是"完美均衡"的<b>充要指纹</b>，机器可识别，且它是一个假设而不是一个配置选择</td></tr>
+</table></div>
+<p><b>闭合后的激励</b>：把 MoE 负载写成一个数，得到 <code>assumed / lower</code> ⇒ <code>peak.hi</code> 不可计算
+⇒ verdict ∈ {<code>true</code>, <code>undetermined</code>}，<b>永远证不出"装得下"</b>。而"装得下"正是用户来这里要的那句话。</p>
+
+<h2 id="c3" data-part="第二部分 · 事实与核"><span class="cn">Chapter 3</span>S0 事实源与策略正则形 π₀</h2>
+
+<h3 id="c3-1">3.1 五类事实源</h3>
+<p>只有这五类输入产生新事实。<b>表外字段一律 <code>BLK-UNCLASSIFIED</code></b>——这是"输入是闭集"的断言点，
+也是 S0 独立成层的唯一理由。每一份都有 digest，全部参与编译产物的身份。</p>
+<div class="tw"><table>
+<tr><th class="nw">类</th><th>内容</th><th class="nw">谁产出</th><th class="nw">典型根</th></tr>
+<tr><td class="nw">框架源码</td><td><code>SourceAST</code> + <code>framework_ver</code>；含配置规范化函数与配置校验断言</td><td>框架</td><td><code>source</code></td></tr>
+<tr><td class="nw">算子语义</td><td>三个物理隔离注册域的冻结快照（<a href="#c6">第 6 章</a>）</td><td>工具 + 用户</td><td><code>declared_semantics</code> / <code>abstraction</code></td></tr>
+<tr><td class="nw">环境转录</td><td><code>EnvFacts</code>：HBM 容量、设备型号、运行时版本、框架版本</td><td>工具</td><td><code>transcribed</code></td></tr>
+<tr><td class="nw">标定报告</td><td><code>CalibrationSet</code>：域片 + 实测点。<b>是链的输入，不是链的裁判</b></td><td>标定流程</td><td><code>calib</code></td></tr>
+<tr><td class="nw">八份 <code>*Spec</code></td><td><code>ModelSpec</code> · <code>ParallelSpec</code> · <code>DistOptSpec</code> · <code>PrecisionSpec</code> · <code>RematSpec</code> · <code>ScheduleSpec</code> · <code>ImplSpec</code> · <code>PlacementAnnotation</code></td><td>使用者</td><td><code>configured</code></td></tr>
+</table></div>
+
+<div class="cal bad"><span class="lbl">标定 ≠ 对照：一条一句话的规则，堵住一个真实的口子</span>
+<p>裁决收窄的是<b>对照数据</b>，没有删掉<b>标定</b>。于是出现一个口子：<b>把真机显存观测改叫"标定报告"，就绕过了限制。</b></p>
+<p><b><code>G-X4</code>（标定/对照分离门）</b>：任一实测数据的指纹<b>要么</b>出现在 <code>CalibrationSet</code>（输入位）
+<b>要么</b>出现在某道门的 oracle 位，<b>不可两者兼有</b>；且<b>显存类实测量不得出现在任何门的 oracle 位</b>。</p>
+<p>一句话规则：<b>用链的输入去裁判链自己，是循环论证。</b></p></div>
+
+<h3 id="c3-2">3.2 策略正则形 π₀</h3>
+<p>CoreIR 要 policy-free，但源码里到处是 <code>if tp &gt; 1: ...</code> 这样的策略分支。
+不能同时保留两支（那是 opaque），也不能任选一支（那把策略写进了核）。<b>π₀ 是这个矛盾的解：
+在策略的单位元处偏特化。</b></p>
+<pre><code>CoreIR := PE(SourceAST, ModelSpec, EnvFacts, π₀)
+
+π₀ : 每个策略字段绑定到它的**单位元**——并行度取 1、重算取 None、
+     融合取"不融合"、精度取"全精度"、调度取"无流水"</code></pre>
+
+<h4>三类策略字段</h4>
+<div class="tw"><table>
+<tr><th class="nw">类</th><th>特征</th><th class="nw">有单位元？</th><th>处置</th></tr>
+<tr><td class="nw"><code>Π_extent</code></td><td><b>广延型</b>：并行度、重算范围、桶大小——取值改变规模，不改变数学</td><td>有</td><td>π₀ 取单位元；由对应 pass 重新引入，负 <b>PGRO</b> 义务</td></tr>
+<tr><td class="nw"><code>Π_impl</code></td><td><b>实现型</b>：融合 kernel 与否、attention 后端、grouped GEMM——同一数学的不同实现</td><td>无</td><td>π₀ 取"逻辑原子形态"；由 <code>Pass_impl_select</code> 替换。<b>替身判错的可见性由 <code>abstraction</code> 根承担</b></td></tr>
+<tr><td class="nw"><code>Π_semantic</code></td><td><b>改变模型数学</b>：路由负载均衡策略（不同取值增删一个辅助损失项）</td><td>—</td><td><b>它不是策略。</b>归 Model 变量，进 CoreIR，随 <code>ModelSpec</code> 走；要 what-if 就编译两次</td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">为什么改变数学的东西不给它一个 pass 来重建</span>
+<p>可以给，但那意味着 pass 要能"插入一个损失项"——那是<b>模型定义</b>，不是并行/重算/调度。
+<b>允许 pass 改数学 = policy-free 失去意义</b>（CoreIR 不再是模型的完整表达）。</p>
+<p>判据机器可判：一个 policy-tainted guard 的两支，若<b>其中一支含另一支没有的、参与梯度或损失的节点</b>，
+即为 <code>Π_semantic</code>。该判定必须由 PE 的分叉机制<b>机器产出</b>，并与出厂分类表的 <code>class</code> 列比对；
+<b>不一致 ⇒ 阻断</b>——工具表错了要改工具，不是改用户配置。</p></div>
+
+<h3 id="c3-3">3.3 策略分类表与 <code>class_origin</code></h3>
+<p>分类表（哪个字段属哪一类、π₀ 取值是什么、<b>谁重新引入它</b>）是<b>工具随框架版本发布的制品</b>，
+参与 digest。既然有出厂基线，用户的改动就是一个 diff，而 diff 是机器可见的：</p>
+<pre><code>PolicyClassTable.row : { field, class, pi0, reintroducer, class_origin }
+class_origin : tool_shipped | user_override      # 由与出厂表比对得出，**不可填**</code></pre>
+
+<div class="cal bad"><span class="lbl">这一格堵的是"改表"这条逃逸路径</span>
+<p>把某个策略字段从 <code>Π_extent</code> 改判为 <code>Model</code> ⇒ 污点判据不再触发 ⇒ 阻断消失，该量仍精确。
+前面所有机制对这条路径<b>完全无效</b>，因为改表不产生任何带 <code>abstraction</code> 根的节点，
+它改的是<b>根的种类</b>。两条后果，都是机制：</p>
+<p><b>(a)</b> <code>class_origin = user_override ∧ class = Model</code> ⇒ 由该字段流出的每个量携带
+<code>abstraction(policy_reclassification, f@ver)</code> 根 ⇒ 与"注册为原子"落进同一个报表口径、同一道 Θ 门。</p>
+<p><b>(b)</b> <b>扫描维度集合由类别机器导出，<code>Model</code> 不是扫描维度</b>：
+<code>sweep_dims := {f : class(f) ∈ {Π_extent, Π_impl}} ∪ RematSpec ∪ ScheduleSpec ∪ ImplSpec 的字段</code>。
+把一个字段改判为 <code>Model</code>，<b>它就从敏感性扫描里消失了</b>，报表的 <code>excluded_from_sweep</code>
+机器生成一行；同时它进入模型身份 digest，两次运行不再可比。</p>
+<p><b>为什么不是"禁止改表"</b>：禁止改表等于宣称出厂表永远正确，那是假的（新框架版本、新字段）。
+允许改、但让改的人<b>失去他来这个工具是为了得到的那个东西</b>（这个旋钮的 what-if），
+是唯一既不撒谎又满足判据 5 的走法。</p></div>
+
+<h3 id="c3-4">3.4 <code>PolicyStateBinding</code>：策略经函数访问器进入源码时怎么办</h3>
+<p>策略常常不是以 <code>config.tp</code> 的形态出现，而是经
+<code>get_tensor_model_parallel_world_size()</code> 这类<b>函数访问器</b>、局部变量、闭包、模块级常量进入源码。
+"表外任意 <code>config.X</code> ⇒ 阻断"在这些形态上<b>不触发</b>。</p>
+<p><b>不采用</b>「访问器 → 策略字段」映射表——访问器是<b>函数</b>，会有无穷多个，判据 3 过不了。
+<b>采用</b>：把策略的<b>状态源</b>声明为事实源，让 PE 的既有污点机制自然覆盖访问器。</p>
+<pre><code>PolicyStateBinding : { 模块级限定名 → 策略字段, π₀ 绑定值 }
+  例：&lt;parallel_state 模块&gt;._TP_WORLD_SIZE → policy(tp), π₀ = 1
+
+PE **内联访问器函数体**（它是 PySub 里的普通 Python）
+  ⇒ 读到已声明全局得到带 policy(·) root 的 Q ⇒ 污点自然流出，**不需要新机制**
+局部变量与闭包不需要额外机制：它们的值由 PE 求得，污点随值走</code></pre>
+
+<div class="cal bad"><span class="lbl"><code>BLK-UNDECLAREDSTATE</code> 必须是「默认拒绝」，不能是「被写过才拒绝」</span>
+<p>朴素设计是：读取任何"import 后<b>被写过</b>"的模块级可变全局，而它不在 <code>PolicyStateBinding</code> 里 ⇒ 阻断。
+"被写过"由 PE 对源码树的赋值点集合静态判定。<b>这个判定有一类结构性假阴性：</b></p>
+<pre><code>_STATE = {'tp': 1}          # 模块级绑定**一次**
+def init(...): _STATE['tp'] = world_size    # 运行期只改**字典内容**，绑定从未被重写</code></pre>
+<p>于是"被写过"为假 ⇒ 不阻断 ⇒ PE 把 <code>tp</code> 读成 <code>1</code>，provenance 是 <code>source / exact</code>。
+<b>策略污点从未生成，policy-free 的断言平凡通过，而答案是错的</b>——并且每一个指标都变好。</p>
+<p><b>改法</b>：判据画在<b>读</b>的一侧而不是<b>写</b>的一侧。PE 读取<b>任何</b>模块级可变全局
+（含其任意深度的属性/下标派生值），若该限定名不在 <code>PolicyStateBinding</code> 里 ⇒ 阻断。
+可变性判据是"非 <code>Final</code> 的模块级绑定"，与是否被赋值无关。声明是闭集、可枚举、进 digest；
+未声明就走不通，而不是"未声明且我们没看见有人写它就放行"。</p></div>
+
+<h3 id="c3-5">3.5 配置规范化函数：在 PE 内求值，<b>不建侧表</b></h3>
+<p><code>validate_args</code> 一类函数填默认值、推导派生字段（<code>padded_vocab_size</code> 正是在这里被算出来的）、
+做跨字段校正。它<b>是被分析源码的一部分</b>，不是新事实源；但必须在事实源清单里点名"模型配置的规范化入口"，
+因为它决定了哪些字段有值。</p>
+<p>它的输出分两路：</p>
 <ul>
-<li><code>workspace_bytes</code> 在<b>内存</b>侧，机制却不在建模范围内——它由 kernel 的 tiling 决定，
-    编译进二进制，Python 源码里读不出；</li>
-<li>MoE 每专家负载在<b>形状</b>侧，却只能假设——它是 router 输出<b>值</b>的函数，不是输入 shape 的函数。</li>
+<li><code>roots</code> 无策略污点 ⇒ 直接进 CoreIR（绝大多数模型默认值属此，必须保留）。</li>
+<li><code>roots ∋ policy</code> ⇒ 不进 CoreIR。<b>需要它的 pass 在自己的策略绑定处现场调 PE 求值。</b></li>
 </ul>
-<p>所以真正的轴不是「内存 / 时间」，而是<b>两次追问</b>：<b>① 机制在建模范围内吗？</b>
-不在则不是 <code>derived</code>；<b>② 机制是确定性的、还是取决于运行期数据？</b>
-确定性的可以建成公式（<code>modeled</code>），取决于数据的只能声明假设（<code>assumed</code>）。</p>
 
-<div class="cal honest"><span class="lbl">一个真实例子：这个量到底属于哪一类</span>
-<p>现有代码里那笔融合注意力反向 workspace 被写成<b>截距 + 斜率</b>的线性式
-（常数 200 MiB，加上按 <code>B·S</code> 线性的项），而不是一张实测表——所以它能在任意
-<code>S</code>/<code>B</code> 上求值，是 <code>modeled</code> 而非「实测值」。</p>
-<p>它同时带着一份适用域声明：序列长度三点验证线性；<code>cp&gt;1</code> 未实测；<code>tp</code>
-不切分意味着过读、属 OOM 安全侧；批量只测过 1；而<b>斜率系数的机理未知</b>——它无法被
-head 数、topk、head_dim 整除分解。</p>
-<p>这正是 <code>modeled</code> 该有的诚实形态：<b>公式可外推，但只在声明的域内；域外要么阻断，
-要么标明偏差方向</b>。今天这份适用域只是注释，目标态里它必须是受检字段。</p></div>
+<div class="cal why"><span class="lbl">为什么是"现场调 PE"，而不是导出一张 <code>PolicyDerived</code> 侧表</span>
+<p>侧表方案（把 <code>padded_vocab = ceil_div(vocab, 128·tp)·128·tp</code> 抽出来存成条目）看起来更整齐，
+但它有两个致命性质：<b>①</b> 一个手写条目与一个自动抽取的条目<b>在数据上不可区分</b>，
+于是"任何算不出的量都可以写成一条派生规则"——它是"规定量"逃逸的同构物；
+<b>②</b> 补一道"每个条目都能在当前 <code>SourceAST</code> 上重新推导出来"的门救不了它：
+若该门就是重跑同一套抽取，它<b>恒真</b>；若它换一套推导，它<b>不完备</b>。而且它是加载期门去查编译期产物，
+<b>相位是错的</b>。</p>
+<p>现场调 PE 没有这些问题：<b>没有可被手写的中间制品</b>。规则始终留在源码里，谁需要谁去求值。
+代价是同一个规范化函数会被求值多次——这是 PGRO 与 <code>G-C3</code> 本来就需要的能力（在任意策略处跑 PE），
+不构成新增成本。</p>
+<p>收益仍在：CoreIR 里只有 <code>vocab_size</code>（policy-free ✓），padding 规则来自源码而非人脑（保真度 ✓），
+且该表达式的 <code>roots ∋ policy(tp)</code> 全程可见（provenance ✓）。</p></div>
 
-<div class="cal why"><span class="lbl">为什么必须引入 assumed 类型</span>
-<p>被仿真的对象是<b>稀疏模型</b>。top-k 操作后的实际长度、每个专家处理的实际 token 数、动态稀疏注意力的选中数
-——这些在原理上<b>不是</b><code>(输入 shape, attrs)</code> 的函数，任何静态语义都证明不了。</p>
-<p>如果系统只有「精确或阻断」两种状态，则两种处理方式都不可取：要么始终阻断（工具无法用于稀疏模型），
-要么隐式使用容量因子代替真实值（正是本方案禁止的「用缺省值替代未声明」）。
-<b>第三种状态不是妥协，而是将原本隐含的假设显式化。</b></p></div>
+<h3 id="c3-6">3.6 π₀ 的准入义务</h3>
+<p>框架自带的配置校验断言在 PE 内正常求值；求值为 False ⇒ <code>BLK-CONFIGASSERT</code>，<b>无人工豁免通道</b>。
+这条比表面看起来便宜，但有一类真风险：</p>
+<div class="tw"><table>
+<tr><th class="nw">断言类型</th><th>π₀ 下的表现</th><th class="nw">风险</th></tr>
+<tr><td class="nw">整除类</td><td><code>h % 1 == 0</code> 平凡成立</td><td>无</td></tr>
+<tr><td class="nw">纯模型字段间</td><td>P-model，正常求值</td><td>无</td></tr>
+<tr><td class="nw"><b>跨策略字段</b></td><td>形如 <code>assert pp &gt; 1 or not interleaved</code>——π₀ 令 <code>pp=1</code>，某些组合会走进"π₀ 本身不是一个合法配置"</td><td><b>真</b></td></tr>
+</table></div>
+<div class="cal inv"><span class="lbl">π₀ 的准入义务</span>
+<p><b>π₀ 必须整体通过被分析框架的全部配置校验断言。</b>若不存在这样的赋值，则 <code>BLK-NOVALIDPI0</code>
+——此时方案在该框架上不成立，须由人重新裁决（<b>而不是开豁免</b>）。</p>
+<p>它把"π₀ 是逐字段投影、跨字段约束不保证成立"这个隐患，从散落各处的断言失败
+<b>变成一次编译期的整体检查</b>。</p></div>
 
-<div class="cal bad"><span class="lbl">这一档要挡住的失效模式</span>
-<p>如果只有阻断，用户为了让仿真继续执行，可能会在骨架中填写一个表面合理的数值。
-该数值一旦进入系统，就会<b>与真值不可区分</b>——它具有完整 schema、通过类型检查，
-provenance 也表明它来自用户注册域。这会破坏本方案最重视的可追溯性。</p>
-<p>所以 <code>assumed</code> 必须带 <code>basis</code>，且在报告里<b>独立统计</b>。</p></div>
+<h2 id="c4"><span class="cn">Chapter 4</span>G0 · CoreIR = PE(Src, ModelSpec, EnvFacts, π₀)</h2>
 
-<h3>2.3 数据结构</h3>
-<pre><code># 每个可进入报告的量都采用这一结构（闭集 tagged union）
-Quantity:
-  provenance: derived | modeled | assumed
-  value:      &lt;Expr&gt;                 # 受控表达式，见 3.4
+<h3 id="c4-1">4.1 PySub 与偏特化</h3>
+<p>前端不是"解析器 + 启发式内联"，而是一个<b>偏求值器</b>（PE）作用在一个<b>封闭语法子集</b>（PySub）上。
+这个定位差别是本章全部结论的来源：偏求值器的输出叫<b>残差</b>，残差是良定义的对象，
+可以被比较、被规范化、被 digest；启发式内联的输出只能被人看。</p>
+<pre><code>PE 的输出 = 残差程序 = CoreIR
+PySub    = 封闭语法子集（进快照、参与 digest）；语法构件超出 ⇒ BLK-SYNTAX
 
-  # provenance == modeled ────────────────────────────────────────────────
-  mechanism:  &lt;str&gt;                  # 机制是什么（kernel tiling / allocator 策略 / …）
-  domain:     [DomainConstraint]     # **适用域，受检字段**；域外即阻断或降级
-  constants:  {name: {value, source, sweep}}
-                                     # 常数出处：标定报告 / 厂商文档；sweep=扫过哪些点
-  out_of_domain: block | degrade     # degrade 时必须给 direction
+三条纪律（与 §2.5 的 P7 同源）：
+  · π₀ 特化模式**禁用一切吸收/幂等化简**（`x*1 → x` 会把 policy root 吃掉）
+  · 条件不可判定 ⇒ 立即阻断，**禁止同时保留两条分支**
+  · 分叉有 fuel 上限，超限 ⇒ BLK-FUEL；fuel 值**必须进 digest**（否则两次不同 fuel 的运行结果不同而无痕）</code></pre>
 
-  # provenance == assumed ────────────────────────────────────────────────
-  basis:      &lt;str&gt;                  # 为什么这样假设
-  direction:  upper | lower | nominal
+{{SVG:04-structure-backward}}
 
-DomainConstraint:                    # 例：{axis: "cp", tested: [1], rule: "==1"}
-  axis: &lt;dim&gt;; tested: [值...]; rule: &lt;可判定谓词&gt;
-  direction_if_violated: upper | lower | unknown   # 越界时偏向哪边（unknown ⇒ 只能阻断）</code></pre>
+<h3 id="c4-2">4.2 四类 policy guard 与 PGRO</h3>
+<p>朴素的做法是要求每个 policy guard 的<b>两支残差同构</b>才允许在 π₀ 折叠。<b>这个判据是错的</b>，
+证据就在它自己的例子里：通信包装 <code>if world_size == 1: return x</code>——<code>else</code> 支的残差含一个
+AllReduce 节点，两支<b>不同构</b>，按该判据必须阻断；但这个 guard <b>显然应该放行</b>，
+因为 <code>Pass_shard</code> 本来就会在 placement 失配处插 AllReduce。</p>
+<p>真实要求不是"两支一样",而是：</p>
+<div class="thesis">π₀ 残差必须携带足够信息，使下游 pass 能<b>重建</b>任意策略配置下的图。</div>
 
-<div class="cal inv"><span class="lbl">不变量</span>
-<p><code>modeled</code> 的适用域是<b>受检字段</b>而非注释。「<code>tp&gt;1</code> 不切分 = 过读 =
-OOM 安全侧」这类判断必须由机器执行——人读注释的方式无法保证每次配置变更都被复核。</p></div>
+<div class="tw"><table>
+<tr><th class="nw">guard 类</th><th>特征</th><th>放行义务（机器可判）</th><th class="nw">不满足</th></tr>
+<tr><td class="nw"><b>G-irrelevant</b></td><td>两支残差同构（如日志/断言分支）</td><td><code>digest(res_then) == digest(res_else)</code></td><td>降级到下三类继续判</td></tr>
+<tr><td class="nw"><b>G-reconstructible</b></td><td><b>非-π₀ 支的残差正是某个 pass 会插入的东西</b></td><td><b>PGRO</b>（见下）</td><td><code>BLK-UNRECONSTRUCTIBLE</code></td></tr>
+<tr><td class="nw"><b>G-absorbable</b></td><td>两支算同一数学，只是粒度/实现不同</td><td>注册一条逻辑原子 Op 后两支塌成同一节点，再判 digest 相等</td><td><code>BLK-NOTABSORBABLE</code></td></tr>
+<tr><td class="nw"><b>G-semantic</b></td><td>两支<b>数学不同</b></td><td>无义务——它根本不是策略（§3.2）</td><td>改归 Model 变量</td></tr>
+</table></div>
 
-<h3>2.4 数据流</h3>
-<p><code>provenance</code> 在 S1 声明，随量流经 S2–S5，在 S6 参与 confidence 计算，
-并在 S7 分类统计。<b>它不得丢失</b>——任何一层将 <code>assumed</code> 转换成普通数值都属于契约违规。</p>
-<div class="cal inv"><span class="lbl">不变量</span>
-<p>报告必须能回答三件事：这个峰值里有多少字节来自 <code>modeled</code>、多少来自
-<code>assumed</code>；每一项的依据是什么；<b>有没有 <code>modeled</code> 量的适用域被越过</b>——
-越过了就要标明偏差方向。若无法回答，说明实现不符合本方案。</p></div>
+<div class="cal inv"><span class="lbl">PGRO · 逐 guard 重建义务</span>
+<pre><code>PGRO(g, p, v) :=  canon( Pass_X( residual(g @ π₀), p := v ) )  ≡  canon( residual(g @ p:=v) )</code></pre>
+<p><code>Pass_X</code> 是分类表"谁重新引入它"一列指定的那个 pass——<b>这一列从此不是说明性文字，
+而是 PGRO 的形式参数</b>。<code>canon(·)</code> 是规范化：α-等价 + 确定性拓扑序 + 已注册的代数恒等，
+规则集<b>必须闭且版本化</b>，且<b>不得含吸收策略常量的化简</b>。</p>
+<p>不满足 ⇒ <code>BLK-UNRECONSTRUCTIBLE</code>，工单附 diff，并指明三条补救之一：
+<b>补 pass 能力</b> / <b>该字段其实是模型变量</b> / <b>该字段其实改变数学</b>。</p></div>
 
-<h2 id="c3" data-part="第二部分 · 逐层"><span class="cn">Chapter 3</span>S1 语义层</h2>
+<div class="cal why"><span class="lbl">PGRO 的价值：把一个端到端的义务拆成可归因的局部义务</span>
+<p><b><code>Π_extent</code> 的 guard 绝大多数落在 G-reconstructible，而不是 G-irrelevant。</b>
+要求它们过"同构"判据，等于给它们套了一个<b>它们按定义就过不了</b>的义务——
+"π₀ 折叠几乎处处非法"这个结论的根源在此。</p>
+<p>两个典型反例都因此消解：<code>if recompute_granularity == 'full': checkpointed_forward(...)</code>
+⇒ <code>Pass_remat</code> 的职责恰是"结构复制 + saved 边改接"；
+<code>if sequence_parallel: scatter_to_sequence_parallel_region(...)</code>
+⇒ scatter-to-SP-region 就是一次 placement 重分布，<code>Pass_shard</code> 在失配处插 redistribute 正是此事
+（<b>不需要把 embedding 注册为原子</b>）。</p>
+<p>更重要的是：<b>PGRO 是"重建保真度"这个端到端义务在 guard 粒度上的分解</b>——
+它把一个不可归因的整体义务，拆成一组局部、可定位、纯静态可判的义务，
+且每一条都指着一个具体的 pass 和一个具体的策略取值。</p></div>
 
-<h3>3.1 是什么</h3>
-<p>这是 Op 语义的<b>唯一</b>词典：语义通过配置文件描述，并编译成不可变快照。
-它不依赖任何具体模型，只回答「这个算子是什么」。</p>
+<div class="cal honest"><span class="lbl">PGRO 的边界，以及它最大的风险</span>
+<p><b>边界</b>：PGRO 只能证明"pass 重建出的图 ≡ 源码 <code>else</code> 支写的图"。
+它<b>不能</b>证明"源码 <code>else</code> 支写的图 ≡ 框架真机上真正执行的图"——后者只能由 op 级 time 序列兜。
+<b>静态的一半做实了，真机那一半仍在原处。</b></p>
+<p><b>风险</b>：判定完全依赖 <code>canon</code> 的规范化能力。<code>canon</code> <b>太弱</b> ⇒ 大量本应通过的 guard
+因表面差异被误判为不可重建 ⇒ 假阻断泛滥，用户被迫去"补 pass 能力"来迎合规范化器，
+反而把错误的实现写进 pass；<code>canon</code> <b>太强</b>（加入过多代数恒等）⇒ 两个真正不同的图被判为相等
+⇒ <b>PGRO 静默放行一个错误的重建</b>，这是本方案最怕的失效模式。</p>
+<p>规则集闭且版本化是必要条件，但<b>"规则集是否恰好够用"没有任何判据</b>，只能一条条撞出来。
+这一条进能力边界（<a href="#c14">第 14 章</a>）。</p></div>
+
+<h3 id="c4-3">4.3 数据结构</h3>
+<pre><code>CoreIR:
+  ops:        [OpInstance]
+  values:     [TensorValue]
+  storages:   [Storage]
+  params:     [ParameterBinding]
+  buffers:    [BufferContract]         # 声明式，尚未放置
+  regions:    [RepeatRegion]           # **折叠**：层与专家不逐个展开，count 是 Q[Int]
+
+OpInstance:
+  id: OpId; semantic_id: SemanticId; inputs/outputs: [TensorId]
+  attrs: {...}                         # 源码字面值
+  dtype: { compute, accum }
+
+TensorValue:
+  id: TensorId; shape: ShapeExpr; storage_dtype: DType; storage_id: StorageId
+  layout: LayoutExpr; relation: StorageRelation   # new | alias(base,offset,stride) | inplace(base)
+
+Storage: { id: StorageId; size: BytesExpr; kind; persistence; alignment }</code></pre>
+<p><b>CoreIR 不包含</b>源码文件、行号和调用原文——它们通过可剥离的 SourceMap 旁路传递，
+不参与语义 hash（否则换一个注释就会失效整条缓存）。但<b>"不承载源码信息"不等于"Op 没有可读名称"</b>：
+算子在模型中的<b>限定名</b>（由内联帧路径 + 调用点属性名拼成）是<b>逻辑身份</b>而非源码定位，
+标定表以它为索引挂载，重算 selector 按它匹配。</p>
+
+<h3 id="c4-4">4.4 逻辑流程</h3>
+<ol class="flow">
+<li>从 <code>ModelSpec</code> 定位入口；在 PE 内求值配置规范化函数与全部校验断言（§3.5–3.6）。</li>
+<li>PE 在 π₀ 下偏特化：逐个内联可展开调用，按污点分类每个 guard（§4.2），逐 guard 履行放行义务。</li>
+<li>识别重复结构（层、专家）折叠成 <code>RepeatRegion</code>，<code>count</code> 保持为符号。</li>
+<li>每个原子调用与 S1 快照绑定 ⇒ <code>SemanticId</code>；未绑定 ⇒ 阻断 + 生成骨架（<a href="#c11">第 11 章</a>）。</li>
+<li>按 <code>shape</code> / <code>dtype</code> / <code>storage</code> 三面求值，得到 <code>TensorValue</code> 与 <code>Storage</code>。</li>
+<li>校验 G0 不变量：<b>无 policy root</b>、无 opaque、每输出恰一条存储规则、alias 链无环无悬空、side-effect 算子未被跳过。</li>
+</ol>
+<p><code>digest(G0)</code> 必须是<b>内容 digest</b>（不能用构造式 digest）——它是"CoreIR 在策略扰动下不变"
+这条断言的<b>唯一载体</b>，换成构造式 digest 会使该断言恒真，等于删掉这道门。</p>
+
+<h2 id="c5"><span class="cn">Chapter 5</span>身份体系：四层 ID</h2>
+
+<h3 id="c5-1">5.1 是什么与为什么</h3>
+<p>系统需要四类独立 ID，原因是：<b>使用名称推断物理复用，必然会在两个方向上同时出错。</b></p>
+
+{{SVG:05-identities}}
+
+<div class="tw"><table>
+<tr><th class="nw">ID</th><th>是什么</th><th>回答的问题</th><th class="nw">诞生于</th></tr>
+<tr><td class="nw"><code>TensorId</code></td><td>逻辑值身份（一次赋值 = 一个）</td><td>这是同一个值，还是同名的新值？</td><td>G0</td></tr>
+<tr><td class="nw"><code>StorageId</code></td><td>逻辑存储 / <b>alias 等价类</b></td><td>这两个值共享同一块存储吗？</td><td>G0</td></tr>
+<tr><td class="nw"><code>StoragePlacementId</code></td><td>rank / stage 上的放置模板</td><td>它在哪张卡上、切成多大？</td><td>G2</td></tr>
+<tr><td class="nw"><code>StorageInstanceId</code></td><td>某次执行 lifetime 的物理分配（带 epoch）</td><td>这次分配占多少字节、何时释放？</td><td>G4</td></tr>
+</table></div>
+
+<div class="cal bad"><span class="lbl">按名称去重会在两个方向上同时出错</span>
+<pre><code>x = f(a)           # 逻辑值 1，存储 1
+y = x.view(...)    # 逻辑值 2，存储 1   ← 别名，零分配
+x = g(y)           # 逻辑值 3，存储 2   ← 同名，但是新值</code></pre>
+<p>按名称取首次定义：值 1 与值 3 被视为同一个值（<b>少算</b>），值 1 与值 2 被视为两次分配（<b>多算</b>）。
+四层身份同时消除这两类错误，并使"零字节别名"<b>可表达</b>——这是基于分桶的记账方式做不到的。</p></div>
+
+<div class="cal honest"><span class="lbl"><code>StorageId</code> 是 alias 判断的载体，而 alias 判断没有验证手段</span>
+<p><code>StorageId</code> 把"这两个值是不是同一块存储"这件事变成一个等价类。这个等价类由 S1 的 <code>storage</code> 面
+（<code>new</code> / <code>alias</code> / <code>inplace</code>）逐算子推出——<b>而 alias 判错既不改变 op 序列、也几乎不改变时长</b>，
+在唯一的 oracle 上结构性不可见。</p>
+<p>后果不止于字节记账：<b><code>peak_lower</code>（§10.2）的正确性直接依赖它</b>。这一条进能力边界。</p></div>
+
+<h2 id="c6"><span class="cn">Chapter 6</span>S1 · 算子语义注册域</h2>
+
+<h3 id="c6-1">6.1 是什么</h3>
+<p>这是 Op 语义的<b>唯一</b>词典：语义通过配置文件描述，编译成不可变快照。
+它不依赖任何具体模型，只回答"这个算子是什么"。</p>
 
 {{SVG:03-semantic-layer}}
 
-<h3>3.2 为什么是三个物理隔离的注册域</h3>
+<h3 id="c6-2">6.2 三个物理隔离的注册域</h3>
 <div class="tw"><table>
-<tr><th class="nw">注册域</th><th>用途</th><th>能否改 native</th><th>加载</th></tr>
+<tr><th class="nw">注册域</th><th>用途</th><th class="nw">能否改 native</th><th class="nw">加载</th></tr>
 <tr><td class="nw">Native</td><td>随仿真器版本发布的内置语义</td><td>否</td><td>只读</td></tr>
 <tr><td class="nw">User</td><td>补 native 未覆盖的算子</td><td>否（只能新增）</td><td>用户目录</td></tr>
 <tr><td class="nw">NativePatch</td><td>显式修正一条 native</td><td><b>整条替换</b></td><td>独立目录 + 开关</td></tr>
 </table></div>
-<div class="cal why"><span class="lbl">为什么不采用单表加优先级</span>
-<p><b>如果由加载顺序决定最终生效项，结果将不可复现。</b> User 声明了 native 已占用的 selector，
-必须在加载期直接报冲突，而不是「后者覆盖前者」。</p>
-<p><b>Patch 为什么必须整条替换</b>：字段级 merge 会产生「native 的 shape + user 的 autograd
-+ 默认的 cost」这类未经整体设计和验证的混合语义，无法明确其责任归属。</p></div>
+<div class="cal why"><span class="lbl">为什么不是单表加优先级</span>
+<p><b>如果由加载顺序决定最终生效项，结果将不可复现。</b>User 声明了 native 已占用的 selector，
+必须在加载期直接报冲突，而不是"后者覆盖前者"。</p>
+<p><b>Patch 为什么必须整条替换</b>：字段级 merge 会产生"native 的 shape + user 的 autograd + 默认的 cost"
+这类未经整体设计和验证的混合语义，无法明确其责任归属。</p></div>
 
-<h3>3.3 原子 Op：一种类型对应一条形状关系</h3>
-<p>Op 类型必须拆到<b>原子级</b>。不推荐的做法是将 14 种视图语义
-（reshape / permute / transpose / squeeze / unsqueeze / concat / stack / split / chunk /
-slice / tile / roll / broadcast / contiguous）合并为一个 <code>View</code> 类型，
-再在代码中通过判别字段进行二次分派。这相当于重新解析配置中已有的信息，
-并迫使不同语义共用一条反向规则。</p>
-<div class="cal inv"><span class="lbl">不变量</span>
-<p>一个 Op 类型只对应一条形状关系、一条反向规则和一条布局规则。分派只发生在 selector 绑定阶段，
-不发生在语义求值。</p></div>
-
-<h3>3.4 数据结构：Op 描述的七个面</h3>
-<p>描述是<b>纯配置</b>，不含任何代码引用。字段值是受控表达式，由固定函数集求值。</p>
+<h3 id="c6-3">6.3 Op 描述的九个面</h3>
+<p>描述是<b>纯配置</b>，不含任何代码引用。字段值是受控表达式，由固定函数集求值。
+v2 是七个面；v3 增加两个，都是前两轮对抗直接逼出来的：</p>
 <div class="tw"><table>
-<tr><th class="nw">面</th><th>回答</th><th class="nw">消费者</th></tr>
-<tr><td class="nw">selector</td><td>哪个源码符号绑定到本条</td><td>S2</td></tr>
-<tr><td class="nw">shape</td><td>输出形状与输入/attrs 的关系</td><td>S2–S5</td></tr>
-<tr><td class="nw">dtype</td><td>storage / compute / accum 三类分别是什么</td><td>S2 / 两后端</td></tr>
-<tr><td class="nw">storage</td><td>每个输出是 new / alias / inplace</td><td>S2</td></tr>
-<tr><td class="nw">autograd</td><td>反向读什么、保存什么、产哪些梯度值</td><td>S3</td></tr>
-<tr><td class="nw">placement</td><td>分片如何沿本算子传播</td><td>S4</td></tr>
-<tr><td class="nw">resource</td><td>逐 phase 的 flops / 访存 / buffer</td><td>S5 / 时间</td></tr>
+<tr><th class="nw">面</th><th>回答</th><th class="nw">消费者</th><th class="nw">v3 新增</th></tr>
+<tr><td class="nw">selector</td><td>哪个源码符号绑定到本条</td><td>G0</td><td></td></tr>
+<tr><td class="nw">shape</td><td>输出形状与输入/attrs 的关系；<b>每个输出轴必填 <code>axis_kind</code></b></td><td>G0–G4</td><td>轴类别</td></tr>
+<tr><td class="nw">dtype</td><td>storage / compute / accum 三类分别是什么</td><td>G0 / 两后端</td><td></td></tr>
+<tr><td class="nw">storage</td><td>每个输出是 new / alias / inplace</td><td>G0</td><td></td></tr>
+<tr><td class="nw">autograd</td><td>反向读什么、<b>捕获点在哪</b>、产哪些梯度值</td><td>G1</td><td>捕获点绑定</td></tr>
+<tr><td class="nw">placement</td><td>分片如何沿本算子传播</td><td>G2</td><td></td></tr>
+<tr><td class="nw">resource</td><td>逐 phase 的 flops / 访存 / buffer</td><td>G4 / 时间</td><td></td></tr>
+<tr><td class="nw"><b>origin</b></td><td><b>这条是怎么来的</b>：<code>block_code</code> / <code>site</code> / <code>readability</code>（§2.4）</td><td>provenance 代数</td><td><b>新</b></td></tr>
+<tr><td class="nw"><b>epistemics</b></td><td><b><code>self_certainty</code> + <code>evidence{grade, ref, sweep}</code></b>（§2.5 P2/P3）</td><td>provenance 代数</td><td><b>新</b></td></tr>
 </table></div>
 
-<pre><code>dsl_version: 1
+<pre><code>dsl_version: 3
 ops:
   Reshape:
-    selector:  { symbols: [mint.reshape, mint.view, ops.reshape, mint.flatten] }
+    selector:  { symbols: [mint.reshape, mint.view, ops.reshape] }   # **不含 mint.flatten**
     shape:
-      rel:   reshape                      # 固定组合子
+      rel:   reshape                       # 固定组合子
       args:  { input: in0, target: attrs.reshape_dims }
-      on_unresolved: numel_only           # reshape 恒不改变元素数（算子定义）⇒ 降级为仅保留元素数约束
+      axes:  [{ kind: static }, ...]       # 每个输出轴必填 axis_kind
       why:   "单缺维由元素数守恒唯一确定"
-    dtype:     { outputs: [same_as(in0)] }
-    storage:   [{ kind: alias, of: in0 }] # 视图：零 Allocate
-    autograd:  { saved_inputs: [], saved_outputs: [], saved_internal: [] }
+    dtype:     { storage: same_as(in0), compute: same_as(in0), accum: same_as(in0) }
+    storage:   [{ kind: alias, of: in0 }]  # 视图：零 Allocate
+    autograd:  { saved_inputs: [], saved_outputs: [], saved_internal: [],
+                 capture_site: none }      # 无捕获 ⇒ Tier 1 平凡成立
     placement: passthrough
     resource:
       forward:  { cost_mode: analytic, components: [{ name: view, stream: host_only,
                   flops: 0, bytes_read: 0, bytes_written: 0, cost_family: host }] }
       backward: { reuse_inverse_of: forward }
+    origin:     { block_code: null, site: builtin, readability: FULL }
+    epistemics: { self_certainty: modeled, evidence: { grade: reconstructed } }
+    precision:  { has_internal_quant_buffer: false }   # 见 §6.5</code></pre>
 
-  Permute:
-    selector: { symbols: [mint.permute] }
-    shape:
-      rel:    permute
-      args:   { input: in0, dims: attrs.permute_dims }
-      guards: [dims_is_permutation]       # 谓词库里的具名断言
-      on_guard_fail: numel_only
-      why:    "out.shape[i] = x.shape[dims[i]]（算子定义）"
-    # …余下六面同上</code></pre>
+<div class="cal bad"><span class="lbl">selector 里为什么剔掉了 <code>mint.flatten</code></span>
+<p>v2 的示例把 <code>mint.flatten</code> 与 <code>mint.reshape</code> 绑到同一条。<b>但 <code>flatten</code> 没有
+<code>attrs.reshape_dims</code></b>——它的目标形状由 <code>start_dim/end_dim</code> 与输入 rank 决定。
+把两者绑到同一条 shape 关系，等于让引擎在求值时二次分派，正是"一种类型对应一条形状关系"要禁止的。</p>
+<p>这是 v2 里一处<b>自己违反自己规则</b>的示例。示例错了比正文错了更危险——读者会照着实现。</p></div>
 
-<div class="cal why"><span class="lbl">为什么引擎中的组合子不等于「Op 关联了代码」</span>
-<p><code>rel: reshape</code> 里的 <code>reshape</code> 是<b>表达式求值器的原语</b>，与任何具体 Op 无关
-——正如在配置中写 <code>2*x</code> 并不意味着配置关联了代码。判据很明确：
-<b>组合子可以跨 Op 复用</b>（九个原子 Op 共用 <code>same_as</code>），
-而 Op 独有的知识只有「关系名 + 参数来源 + 守卫 + 回退策略」，这些内容全部以数据表示。</p>
-<p>组合子构成闭集，当前共 20 个：<code>same_as</code> · <code>broadcast</code> ·
-<code>replace_last</code> · <code>bmm</code> · <code>halve_last</code> · <code>reshape</code> ·
-<code>permute</code> · <code>swap_axes</code> · <code>squeeze</code> · <code>expand_dims</code> ·
-<code>concat</code> · <code>stack</code> · <code>split</code> · <code>chunk</code> ·
-<code>slice</code> · <code>tile</code> · <code>literal</code> · <code>range_len</code> ·
-<code>index_compose</code> · <code>declared</code>。引用不存在的组合子 → 加载即阻断，
-并要求说明其算子定义。这是显式、数量可控且必须说明理由的扩展点，不是隐式代码扩展入口。</p></div>
+<h3 id="c6-4">6.4 原子性、类型系统与禁止项</h3>
+<p>Op 类型必须拆到<b>原子级</b>。不推荐把 14 种视图语义合并为一个 <code>View</code> 类型再在代码里二次分派
+——那相当于重新解析配置中已有的信息，并迫使不同语义共用一条反向规则。</p>
 
-<h4>固定类型系统</h4>
 <div class="tw"><table>
 <tr><th class="nw">类型</th><th>用途</th><th>例</th></tr>
 <tr><td class="nw"><code>IntExpr</code></td><td>轴长、元素数、整数属性</td><td><code>dim(x,-1)</code></td></tr>
@@ -318,372 +817,837 @@ ops:
 <tr><td class="nw"><code>ValueRefExpr</code></td><td>primal / 梯度 / 内部值引用</td><td><code>grad_output(0)</code></td></tr>
 <tr><td class="nw"><code>PlacementExpr</code></td><td>分片规则</td><td><code>shard(x,axis=-1,mesh="tp")</code></td></tr>
 </table></div>
-<p><b>禁止</b>：循环、递归、赋值、可变状态、文件/网络/环境访问、import、用户自定义函数、
-运行期改注册表、用缺省值替代未声明项。</p>
 
-<h3>3.5 数据流与逻辑流程</h3>
+<div class="cal why"><span class="lbl">组合子不等于「Op 关联了代码」</span>
+<p><code>rel: reshape</code> 里的 <code>reshape</code> 是<b>表达式求值器的原语</b>，与任何具体 Op 无关
+——正如在配置中写 <code>2*x</code> 并不意味着配置关联了代码。判据很明确：<b>组合子可以跨 Op 复用</b>，
+而 Op 独有的知识只有"关系名 + 参数来源 + 守卫"，全部以数据表示。</p>
+<p>组合子构成<b>闭集</b>：<code>same_as</code> · <code>broadcast</code> · <code>replace_last</code> · <code>bmm</code> ·
+<code>halve_last</code> · <code>reshape</code> · <code>permute</code> · <code>swap_axes</code> · <code>squeeze</code> ·
+<code>expand_dims</code> · <code>concat</code> · <code>stack</code> · <code>split</code> · <code>chunk</code> ·
+<code>slice</code> · <code>tile</code> · <code>literal</code> · <code>range_len</code> · <code>index_compose</code>。
+引用不存在的组合子 → 加载即阻断。</p>
+<p><b>每个组合子必须声明其归约类</b>（是否可交换、是否幂等、单调方向），否则 P6 的方向传播与
+P8 的 property test 无从执行——v2 的 20 个组合子<b>一个都没有声明归约类</b>，这是一处真实缺口。
+同时删掉 <code>declared</code> 这个"组合子"：它不是关系，是一个万能出口，判据 3 不过。</p></div>
+
+<p><b>禁止</b>：循环、递归、赋值、可变状态、文件/网络/环境访问、import、用户自定义函数、
+运行期改注册表、<b>用缺省值替代未声明项</b>。</p>
+
+<h3 id="c6-5">6.5 三处必填声明（各堵一个真实的洞）</h3>
+<div class="tw"><table>
+<tr><th class="nw">必填项</th><th>内容</th><th>不填会怎样</th></tr>
+<tr><td class="nw"><code>axis_kind</code></td>
+  <td>每个输出轴 ∈ <code>{static, data_dependent}</code>；<code>data_dependent</code> 的位置只接受
+      <code>assumed</code> 量</td>
+  <td>数据依赖轴被 <code>configured</code> 根绑定 ⇒ MoE 负载被写成"规定量"⇒ 区间塌点（§2.8）</td></tr>
+<tr><td class="nw"><code>capture_site</code></td>
+  <td>反向模板必须绑定一个<b>机器可解析的捕获点</b>，否则该 op 强制落入 Tier 2（§7.2）</td>
+  <td><code>captures</code> 变成自由声明，融合 attention 少列一个保存张量无人发现</td></tr>
+<tr><td class="nw"><code>has_internal_quant_buffer</code></td>
+  <td>被注册为原子的 op 必须声明<b>其内部是否含量化 / 精度缓冲</b>（布尔 + 字节公式）</td>
+  <td><b>fp8 字节静默漏计</b>：若 <code>Linear</code> 被注册为原子而 quantize 藏在其内部，
+      <code>Pass_precision_fwd</code> 插不进节点，那部分字节根本不存在于图里。开 fp8 而未声明 ⇒ 阻断</td></tr>
+</table></div>
+
+<h3 id="c6-6">6.6 <code>atomic_scope</code> 白名单</h3>
+<p>"注册为原子"这条通道必须有粒度上限，否则把整个 model 注册成一个原子就得到一份完美的报告。</p>
+<div class="cal inv"><span class="lbl">不变量</span>
+<p><code>atomic_scope</code> 白名单<b>禁止 layer / block / model 级</b>的注册目标（机器可查）。</p>
+<p>并声明一条性质：若白名单被放宽，<code>abstraction_covered_bytes</code> 随之暴涨、Θ 门自动触发
+——<b>放宽的代价自动出现在答案形状里，不需要再加一条规则</b>。</p></div>
+
+<h3 id="c6-7">6.7 逻辑流程</h3>
 <ol class="flow">
 <li>加载三个注册域的原始文件及框架/运行时版本快照。</li>
-<li>解析 schema（closed schema：未知字段、字段拼写错误、未知枚举和未知版本全部拒绝）。</li>
-<li>模板展开 → 静态类型检查 → 语义完整性检查（七个面按需齐备）。</li>
-<li>冲突检测：selector 重复、User selector 与 Native 冲突、patch 目标不存在或 hash 不匹配 → 阻断。</li>
-<li>冻结成不可变快照 + digest（框架版本参与 digest：同一份文件在不同框架版本下不得复用旧快照）。</li>
-<li>此后<b>只做绑定</b>：解析器不再读配置文件、不再展开模板。</li>
+<li>解析 schema（closed schema：未知字段、拼写错误、未知枚举、未知版本全部拒绝）。</li>
+<li>模板展开 → 静态类型检查 → 语义完整性检查（九个面按需齐备；<b>缺失 ≠ 空值</b>）。</li>
+<li><b>值域裁剪校验</b>：<code>RegisteredOp.self_certainty ∉ {exact}</code>；声明 <code>evidence.grade = calibrated</code>
+    的，其 <code>CalibKey</code> 必须在 <code>CalibrationSet</code> 快照中<b>解析成功</b>，否则加载期阻断
+    （<b>谎称有标定点当场阻断</b>）。</li>
+<li>冲突检测：selector 重复、User 与 Native 冲突、patch 目标不存在或 hash 不匹配 → 阻断。</li>
+<li>冻结成不可变快照 + digest（框架版本参与 digest）。此后<b>只做绑定</b>：不再读配置文件、不再展开模板。</li>
 </ol>
 
-<h2 id="c4"><span class="cn">Chapter 4</span>S2 结构层</h2>
+<h3 id="c6-8">6.8 注册历史</h3>
+<p>新增一份<b>只增不改</b>的事实源 <code>RegistryHistory</code>：按模型序列记录每条注册的引入点与 <code>origin</code>，
+参与 digest。它承载词汇收敛的可证伪断言：</p>
+<pre><code>new_lexicon(k)     := 第 k 个模型引入的、readability = NONE 的条目数        # 真的没有 AST
+new_abstraction(k) := 第 k 个模型引入的、readability ∈ {FULL, PARTIAL} 的条目数
 
-<h3>4.1 是什么</h3>
-<p>读取框架源码并产出 <code>CoreIR</code>——一张只包含<b>逻辑事实</b>的图：有哪些算子、
-算子之间如何连接，以及每个值的形状、类型和存储关系。它与设备、并行和时序<b>全部无关</b>。</p>
+G-Z1a（词汇收敛，可证伪形式）：对 k ≥ 3，new_lexicon(k) ≤ new_lexicon(k−1)
+                              违反 ⇒「语义按算子族复用」这一基本假设被证伪 ⇒ **停止实施**
 
-{{SVG:04-structure-backward}}
+G-Z1b（抽象增长）：**无上界断言**。每条永久进入 abstraction_ledger，
+                  abstraction_covered_bytes / peak 是首页数字，超 θ_abs ⇒ VERDICT-WITHDRAW</code></pre>
+<div class="cal honest"><span class="lbl">为什么是"递减"而不是"必须为 0"，以及为什么 <code>G-Z1b</code> 没有断言</span>
+<p>"新增条目数必须为 0"<b>是假命题</b>——新模型用了新算子族本来就该新增注册。一旦被现实打脸，
+就只能靠人工例外来救，而人工例外正是要消灭的东西。递减是同一假设的<b>真的</b>可证伪形式：
+算子族有限，词汇必须收敛。</p>
+<p><code>G-Z1b</code> 给不出真的断言，所以<b>选择说没有，而不是假装有</b>。
+把本该记为词汇的东西记成抽象（或反之）来做数字——做不到，<code>readability</code> 由 PE 在阻断时刻写入。</p>
+<p><b>连带的诚实结论</b>：<b>本方案没有"到此为止、可以宣布收敛"的硬停止条件。</b>
+<code>G-Z1a</code> 是<b>证伪条件</b>（不递减 ⇒ 基本假设被推翻 ⇒ 停止实施），不是<b>完成条件</b>
+（没有任何 k 使我们能宣布注册工作结束）。旧的"必须为 0 + 人工例外"同时冒充了这两者，
+那是它最初就错的地方。</p></div>
 
-<h3>4.2 为什么源码只给结构</h3>
-<p>前端只做三件事：解析源码、内联可展开调用、识别原子调用与数据依赖。它<b>不推断</b>任何算子语义——
-未绑定的调用进入 <code>UnresolvedCall</code>，由 S1 的绑定结果决定该调用能否进入可执行 IR。</p>
-<div class="cal why"><span class="lbl">为什么这种职责划分清晰</span>
-<p>源码天然知道的是「调用了谁、拿了什么、传了什么常量」；它<b>不</b>知道「这个算子的反向要读什么」。
-将前者交给源码、后者交给配置，正好沿着知识的天然边界划分职责。当前「形状推断由代码实现、
-部分参数来自源码 attrs」的混合形态，正是这条边界划分不清的结果。</p></div>
+<h2 id="c7" data-part="第三部分 · 改写链"><span class="cn">Chapter 7</span>G0.5 / G1 / G1.7 · 实现、反向与精度</h2>
 
-<h3>4.3 数据结构</h3>
-<pre><code>CoreIR:
-  ops:        [OpInstance]
-  values:     [TensorValue]
-  storages:   [Storage]
-  params:     [ParameterBinding]
-  buffers:    [BufferContract]         # 声明式，尚未放置
+<h3 id="c7-1">7.1 G0.5 · 实现选择、逻辑融合、前向精度</h3>
+<p>三个 pass 都改变 <b>op 集合</b>，因此都必须排在反向生成之前（§1.3）。</p>
+<div class="tw"><table>
+<tr><th class="nw">pass</th><th>读什么</th><th>产出</th><th class="nw">provenance</th></tr>
+<tr><td class="nw"><code>Pass_impl_select</code></td><td><code>ImplSpec</code></td>
+  <td>把逻辑原子替换为实现族节点（融合 attention、grouped GEMM）</td>
+  <td>被替换节点带 <code>abstraction(atom_substitution)</code>；<code>modeled</code></td></tr>
+<tr><td class="nw"><code>Pass_fusion_logical</code></td><td><code>ImplSpec</code></td>
+  <td>逻辑融合（<code>Bias+GeLU</code> 一类）</td><td>合成节点带 <code>replication(fusion_rule)</code></td></tr>
+<tr><td class="nw"><code>Pass_precision_fwd</code></td><td><code>PrecisionSpec</code></td>
+  <td>quantize / cast 节点、<code>amax</code> 更新节点、<code>amax_history</code> 与 <code>scale</code> 存储、低精副本存储</td>
+  <td>新增存储的存在位带 <code>replication(precision_rule)</code> ⇒ 其字节 <code>modeled</code>（P4）</td></tr>
+</table></div>
 
-OpInstance:
-  id:          OpId
-  semantic_id: SemanticId              # 指向 S1 快照中的对应 Op 描述
-  inputs:      [TensorId]
-  outputs:     [TensorId]              # 可为空（side-effect 算子不得被跳过）
-  attrs:       {...}                   # 源码字面值
-  dtype:       { compute, accum }
+<div class="cal why"><span class="lbl">前移的收益是"代价为零"，不只是"顺序更合理"</span>
+<p>若 quantize 节点插在反向生成<b>之后</b>，就必须为它们<b>另行生成对偶</b>——那正是要消灭的
+"第二套反向机制"：一套是 <code>Pass_train_step</code> 的模板查表，另一套是精度 pass 自己的对偶规则。
+两套机制必然分歧，而分歧不可检。</p>
+<p>放在<b>前面</b>，quantize 的反向由<b>同一个</b> <code>Pass_train_step</code> 按 quantize 算子自己注册的
+template 生成。<b>不需要写任何新代码</b>，这是层序改动真正买到的东西。</p></div>
 
-TensorValue:
-  id:            TensorId              # 逻辑值身份（见第 6 章）
-  shape:         ShapeExpr
-  storage_dtype: DType
-  storage_id:    StorageId
-  layout:        LayoutExpr
-  relation:      StorageRelation       # new | alias(base,offset,stride) | inplace(base)
-
-Storage:
-  id: StorageId; size: BytesExpr; kind; persistence; alignment</code></pre>
-<p><b>CoreIR 不包含</b>源码文件、行号和调用原文。它们通过可剥离的 SourceMap 旁路传递，
-不参与语义 hash——否则换一个注释就会失效整条缓存。</p>
-
-<div class="cal honest"><span class="lbl">需要澄清的一点</span>
-<p>「不承载源码信息」不等于「Op 没有可读名称」。算子在模型中的<b>限定名</b>
-（形如 <code>attn.indexer.linear_wq_b</code>，由内联帧路径 + 调用点属性名拼成）
-是<b>逻辑身份</b>而非源码定位：标定表以它为索引挂载，重算 selector 按它匹配，报告也用它提供可读名称。
-它应当能够从 <code>OpId</code> 中解析，而不是只能通过旁路查询。</p></div>
-
-<h3>4.4 数据流与逻辑流程</h3>
-<ol class="flow">
-<li>从模型配置定位入口，按框架的模块规格解析出<b>本次实际实例化的模块树</b>。</li>
-<li>逐个内联可展开函数，并按配置剪除未命中的条件分支；<b>条件不可判定时立即阻断</b>，禁止同时保留两条分支。</li>
-<li>按语句生成原子调用节点，用单赋值表记录「当前变量由哪个节点产出」，据此补全数据流边。</li>
-<li>每个调用都与 S1 快照执行语义绑定 → 得到 <code>SemanticId</code>；未绑定 → 阻断（<a href="#c10">第 10 章</a>）。</li>
-<li>按 <code>shape</code> / <code>dtype</code> / <code>storage</code> 三面求值，得到 <code>TensorValue</code> 与 <code>Storage</code>。</li>
-<li>校验 CoreIR 不变量：无 opaque、每输出恰一条存储规则、alias 链无环无悬空、side-effect 算子未被跳过。</li>
-</ol>
-
-<h2 id="c5"><span class="cn">Chapter 5</span>S3 反向层</h2>
-
-<h3>5.1 是什么</h3>
-<p>将反向图<b>显式化</b>为一层派生 IR。前向节点、反向节点和重算节点<b>使用同一种节点类型</b>，
-共用同一套形状、类型、布局与资源计算机制。</p>
-
-<h3>5.2 为什么采用显式反向图，而不是将反向信息挂在前向算子上</h3>
-<p>另一种做法是把反向信息编码成前向算子的「契约字段」（保存哪些输入、产哪些梯度值……），
-再通过 lowering pass 展开。这样做的代价是：反向值无法与前向值采用同一套表示——
-它们的形状、类型和放置需要依赖一组专用字段与特殊分支，而不能复用同一条处理链。</p>
-<p>显式化之后，这一组契约类可以<b>统一表示为图中的普通节点与边</b>：</p>
+<h3 id="c7-2">7.2 G1 · <code>Pass_train_step</code>：反向、累加与捕获集</h3>
+<p>前向节点、反向节点和重算节点<b>使用同一种节点类型</b>，共用同一套形状、类型、布局与资源计算机制。
+一组原本要写成"契约字段"的东西因此变成图里的普通节点与边：</p>
 <div class="tw"><table>
 <tr><th>挂字段的做法</th><th>显式反向图之后</th></tr>
 <tr><td>autograd 契约（保存输入/输出/内部值三个列表）</td><td>就是图的边</td></tr>
 <tr><td>梯度值规格 + phase 存储规则 + phase 值 ID</td><td>就是 <code>TensorValue</code> + <code>StorageRelation</code></td></tr>
 <tr><td>梯度 fan-in 累加规格</td><td>表现为一个 <b>add 节点</b>——累加本身就是算子计算</td></tr>
-<tr><td>重算的独立 lowering 路径</td><td>无需保留：重算就是被复制进图的前向节点</td></tr>
-<tr><td>每个事件/资源对象分别携带 phase 字段</td><td>phase 成为图属性</td></tr>
+<tr><td>重算的独立 lowering 路径</td><td>无需保留：重算就是被复制进图的前向节点（G3）</td></tr>
 </table></div>
 
-<div class="cal inv"><span class="lbl">必须保持的性质</span>
-<p><code>BackwardIR</code> 是<b>派生层</b>，<code>RecomputeSpec</code> 是它的<b>输入</b>，digest 独立。
-不能将它写入 <code>CoreIR</code>——否则每次修改重算配置都会使 CoreIR 缓存失效，而 CoreIR 是编译成本最高的一层，
-系统也将无法支持交互式 what-if。</p></div>
-
-<h3>5.3 数据结构</h3>
-<pre><code>BackwardIR:                            # = f(CoreIR, RecomputeSpec)
-  nodes: [Node]                        # 与 CoreIR 同构：phase ∈ {forward,backward,recompute}
-  edges: [(NodeId, NodeId)]
-  release: [ReleaseJoin]               # 由「最后一个 reader」的边直接推出，不再手写
-
-Node:                                  # 三类节点唯一的区别是 phase 与来源
-  id:          NodeId
-  semantic_id: SemanticId              # 重算节点与其前向节点「同一个」SemanticId
-  phase:       forward | backward | recompute
-  origin:      NodeId?                 # 重算/反向节点回指其前向节点
-  inputs/outputs/attrs                 # 同 CoreIR</code></pre>
-
-<h3>5.4 数据流与逻辑流程</h3>
-<ol class="flow">
-<li>按 CoreIR 拓扑逆序，为每个可微算子生成反向节点；不可微算子（比较、常量、detach）不生成。</li>
-<li>反向节点的输入按 <code>autograd</code> 面解析：需要保存的前向值在图上连出<b>跨相边</b>——
-    这条边同时就是它的生命周期依据。</li>
-<li>一个前向值收到多个下游梯度贡献时，插入 <b>add 节点</b>；上游只绑定唯一的累加结果。</li>
-<li>按 <code>RecomputeSpec</code> 选中的区域，把该区域的前向节点<b>复制</b>进反向图
-    （同 <code>SemanticId</code>、新 <code>NodeId</code>、<code>phase=recompute</code>、
-    <code>origin</code> 回指），插在该区域反向节点之前。</li>
-<li>校验：每个梯度边恰一个 producer；重算节点的输入在其插入点可达；释放点在偏序上晚于所有 reader。</li>
-</ol>
-
-<h2 id="c6"><span class="cn">Chapter 6</span>身份体系</h2>
-
-<h3>6.1 是什么与为什么</h3>
-<p>系统需要四类独立 ID，原因是：<b>使用名称推断物理复用，必然会在两个方向上同时出错。</b></p>
-
-{{SVG:05-identities}}
-
+<h4><code>captures</code>：从"注册时声明"改成"从可解析的捕获点导出"</h4>
+<p>真机保活集合差分已被排除，但<b>框架自己在源码里就写了它保什么</b>。这是静态读框架反向声明文本
+这条能力<b>尚未被用到的那一半</b>：前一半核对反向的<b>算子序列</b>，这一半核对反向的<b>捕获集</b>。</p>
 <div class="tw"><table>
-<tr><th class="nw">ID</th><th>是什么</th><th>回答的问题</th></tr>
-<tr><td class="nw"><code>TensorId</code></td><td>逻辑值身份（一次赋值 = 一个）</td><td>这是同一个值，还是同名的新值？</td></tr>
-<tr><td class="nw"><code>StorageId</code></td><td>逻辑存储 / alias 等价类</td><td>这两个值共享同一块存储吗？</td></tr>
-<tr><td class="nw"><code>StoragePlacementId</code></td><td>rank / stage 上的放置模板</td><td>它在哪张卡上、切成多大？</td></tr>
-<tr><td class="nw"><code>StorageInstanceId</code></td><td>某次执行 lifetime 的物理分配</td><td>这次分配占多少字节、何时释放？</td></tr>
+<tr><th class="nw">捕获点形态</th><th>捕获集怎么读出来</th><th class="nw">档</th></tr>
+<tr><td class="nw"><code>derivatives.yaml</code> 条目</td>
+  <td>反向函数调用的<b>实参表</b>中属于前向 inputs/outputs 的那些名字（融合算子把
+      <code>logsumexp</code>、rng 状态直接写在实参里）</td><td class="nw">Tier 1</td></tr>
+<tr><td class="nw">Python <code>autograd.Function</code></td><td><code>ctx.save_for_backward(...)</code> 的实参表（PE 直接读 AST）</td><td class="nw">Tier 1</td></tr>
+<tr><td class="nw">框架 <code>bprop</code> 闭包</td><td>闭包对前向值的<b>自由变量集</b>（机器导出）</td><td class="nw">Tier 1</td></tr>
+<tr><td class="nw">C++ / 二进制内</td><td>不可解析</td><td class="nw">Tier 2</td></tr>
+<tr><td class="nw">无任何可命名绑定点</td><td>—</td><td class="nw">Tier 3 ⇒ 阻断</td></tr>
+</table></div>
+<pre><code>Tier 1 · derived      captures 的 roots 含 source(framework)
+                      **G-D4 生效**：template_free_vars ∩ forward_values == capture_site_args
+Tier 2 · 保守区间      roots ∋ abstraction(captures_declaration@ver)，certainty = modeled
+                      saved 字节区间 = [0, Σ 该 op 全部前向可见张量字节]      ← P5 来源 ④
+Tier 3 · 阻断          S1 加载期阻断</code></pre>
+<p>Tier 2 的下界取 <code>0</code> 有依据、不是保守过头：融合 attention 反向确实<b>在 kernel 内部重算</b> scores
+而不保存它们，"什么都不保存"不是空想。判据 5：用 Tier 2 使该 op 的显存塌成一个宽区间并按传播律
+污染整份报告 ⇒ 没人会为了省事而选它。</p>
+
+<div class="cal honest"><span class="lbl">必须承认的两件事</span>
+<p><b>①</b> <code>G-D4</code> 核对的是<b>框架声明要保什么</b>，不是<b>分配器实际保了什么</b>。
+二者在别名导致的额外保活、框架自己的 bug、图外引用（hook、<code>retain_graph</code>）下不同。这一层无手段。</p>
+<p><b>②</b> Tier 2 的存在意味着：对<b>风险最高的那一类</b>（融合 kernel 的 captures），
+我们仍然只有"惩罚"没有"验证"。<b>"验证力度与风险大小成反比"这个病没有被解决，只被降级为一个代价单调的区间。</b></p></div>
+
+<h4><code>G-D1</code> 反向交叉核对：不同构时的三类归属</h4>
+<p><code>G-D1</code> 断言"我们的反向模板展开 ≅ 框架声明式导数公式的 op 多重集"。它是本方案<b>唯一独立的静态对照物</b>，
+所以<b>不能给它配豁免通道</b>。但也不能一律阻断（框架可能用了未注册的融合原语，或做了数值稳定性变换）。
+出路是<b>把二值门改成归属判定，三个出口没有一个是"放行"</b>：</p>
+<div class="tw"><table>
+<tr><th class="nw">类</th><th>机器判据</th><th>处置</th><th>为什么不是豁免</th></tr>
+<tr><td class="nw">1 词汇缺口</td><td>diff 中出现 S1 未注册的符号</td><td><b>阻断 + 生成骨架</b></td><td>这不是分歧，是未注册算子，早有归属</td></tr>
+<tr><td class="nw">2 双候选</td><td>两侧符号集都已注册，且两侧<b>各自</b>通过类型/守恒自检与线性性检查</td>
+  <td><b>不选。</b>该 op 的反向资源量取两候选的<b>区间并</b> <code>hull(a,b)</code>（P5 来源 ②）；
+      <code>modeled</code> / <code>reconstructed</code> / <code>roots ∋ abstraction(bwd_ambiguity)</code></td>
+  <td>不确定性被<b>搬进答案的形状</b>，不是被批准掉</td></tr>
+<tr><td class="nw">3 我们的解析器错</td><td>框架侧那份自己过不了类型自检（<code>shape(grad_out[i]) ≠ shape(in_i)</code>）</td>
+  <td><b>阻断在解析器上</b>，记为工具 bug，<b>不生成用户工单</b></td><td>不该由用户承担</td></tr>
+</table></div>
+<p>第 2 类逐判据核：<b>可证伪</b> ✓（两个候选反向的算子序列不同 ⇒ 真机 op 序列能判别是哪一个——
+这是 op 级 oracle 被正面用上的一处）；<b>可阻断</b> ✓（两候选字节差超 <code>θ_bwd</code> ⇒ 直接阻断，
+差太大说明不是"两种实现"，是我们读错了）；<b>非普适</b> ✓（全打双候选 ⇒ 每个反向 op 都是区间）；
+<b>被计数</b> ✓（<code>bwd_ambiguous_ops</code> 首页）；<b>代价单调</b> ✓（一个点变成一个区间，
+宽度 = 两候选的真实分歧，不是拍的）。</p>
+
+<h3 id="c7-3">7.3 G1.7 · <code>Pass_precision_opt</code>：训练态最大的持久项</h3>
+<div class="cal bad"><span class="lbl">"只注入 dtype 字段"在类型上表达不了优化器侧的存储</span>
+<div class="tw"><table>
+<tr><th>精度策略引入的<b>真实存储</b></th><th class="nw">字节</th><th class="nw">dtype 字段能表达吗</th></tr>
+<tr><td>fp32 主权重</td><td class="nw"><code>4 × numel(param)</code></td><td class="nw"><b>不能</b>：这是新 Storage</td></tr>
+<tr><td>fp32 主梯度</td><td class="nw"><code>4 × numel(param)</code></td><td class="nw"><b>不能</b></td></tr>
+<tr><td>fp8 per-tensor <code>amax_history</code> + <code>scale</code> + <code>scale_inv</code></td>
+  <td class="nw"><code>(hist_len + 2) × 4 B × 张量数</code></td><td class="nw"><b>不能</b></td></tr>
+<tr><td>fp8 quantize 后的低精副本</td><td class="nw"><code>1 × numel</code></td><td class="nw"><b>不能</b>：新值、新 Storage</td></tr>
+<tr><td>loss scaling 的 unscale 中间量、grad-norm 归约临时量</td><td class="nw">视实现</td><td class="nw"><b>不能</b>：是新节点</td></tr>
+</table></div>
+<p><b>bf16 权重 2 B/param，加上 fp32 主权重 4 + 主梯度 4 + Adam m,v 8 = 16 B/param。
+优化器侧持久内存是权重的 8 倍，是训练态最大的持久项。</b>
+"只注入 dtype 字段"意味着<b>该项在设计里根本不存在</b>——这不是精度问题，是漏了最大的一项。</p></div>
+
+<pre><code>PrecisionSpec:                                   # 取值域受 framework_ver 约束（G-N1）
+  params_dtype / compute_dtype / accum_dtype: DType
+  master_weights:   Bool
+  main_grad_dtype:  DType
+  fp8: { recipe: {none|delayed|current}, format, amax_history_len: Q[Int], margin }
+  loss_scaling: { mode: {none|static|dynamic}, window: Q[Int] }</code></pre>
+
+<p><b>为什么 <code>Pass_precision_opt</code> 在反向之后</b>：它的产物挂在<b>梯度值与优化器状态</b>上，
+那些在反向生成之前不存在；且优化器路径<b>不被微分</b>，不需要对偶。四条机器可检的后置条件：</p>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th>抓什么</th></tr>
+<tr><td class="nw"><code>G-N4</code></td><td><code>Pass_precision_fwd</code> 后每个 matmul 族节点的输入 dtype ∈ 该 op 注册的 <code>supported_input_dtypes</code></td>
+  <td>"只改了字段没插 cast"——字段一改就与注册域冲突</td></tr>
+<tr><td class="nw"><code>G-N5</code></td><td><code>Pass_precision_opt</code> 新增的每个节点，其<b>下游可达集不含任何 <code>grad_role</code> 节点</b></td>
+  <td><b>"没有第二套反向机制"的机器判据</b></td></tr>
+<tr><td class="nw"><code>G-N6</code></td><td>持久字节守恒：<code>Σ persistent(after) − Σ persistent(before) == Σ bytes(新增 Storage)</code>，逐 Storage 可归因</td>
+  <td>精度改写把字节"搬家"时的双计/漏计</td></tr>
+<tr><td class="nw"><code>G-N7</code></td><td><b>存在性嗅探</b>：<code>fp8.recipe ≠ none</code> 而图中不存在任何 <code>amax</code> 类 Storage ⇒ <b>阻断</b></td>
+  <td>"声明了 fp8 但没建缓冲"的静默漏计</td></tr>
 </table></div>
 
-<div class="cal bad"><span class="lbl">按名称去重会在两个方向上同时出错</span>
-<pre><code>x = f(a)          # 逻辑值 1，存储 1
-y = x.view(...)    # 逻辑值 2，存储 1   ← 别名，零分配
-x = g(y)          # 逻辑值 3，存储 2   ← 同名，但是新值</code></pre>
-<p>如果按名称采用首次出现时的定义，值 1 与值 3 会被视为同一个值（<b>少算</b>），
-值 1 与值 2 会被视为两次分配（<b>多算</b>）。四层身份能够同时消除这两类错误，
-并使「零字节别名」<b>可表达</b>——这是基于分桶的记账方式无法做到的。</p></div>
-
-<h2 id="c7"><span class="cn">Chapter 7</span>S4 布局层</h2>
-
-<h3>7.1 是什么</h3>
-<p>布局层接收并行配置，并为每个值计算：各维度由哪个 mesh 轴切分、本地形状是多少，
-以及需要在哪些位置插入集合通信。</p>
+<h2 id="c8"><span class="cn">Chapter 8</span>G2 / G2.5 · 分片与分布式优化器</h2>
 
 {{SVG:06-placement-execution}}
 
-<h3>7.2 为什么它必须独立成层，并提供声明通道</h3>
-<p>独立成层的依据是变化频率：并行策略是 what-if 的主要变量。将其隔离后，
-修改 <code>tp</code> 只需重新计算这一层及其下游。</p>
-<div class="cal honest"><span class="lbl">可推导性的边界（本方案相对 v1 的修正）</span>
-<p>「placement 可由模块语义推导」只在<b>框架的切分本身是规则化、且我们复刻了那套规则</b>时成立。
-半自动/自动并行的策略传播是一个<b>求解器</b>，不是一组规则。</p>
-<p>将策略搜索器列为非目标是合理的；但排除求解器之后，<b>必须允许 placement 作为声明输入</b>
-——可以从源码布局标注中读取（<code>derived</code>），也可以由用户声明（<code>assumed</code>）。
-如果设计只支持「推导」这一种模式，就无法覆盖此类框架。</p></div>
+<h3 id="c8-1">8.1 placement 格与 redistribute 全域性</h3>
+<p><code>Pass_shard</code> 的定义就是"沿数据流传播 placement 状态，失配处插 redistribute"。
+跑完之后检查"无失配"，<b>是在检查该算法自己的终止条件</b>——所以图上的那道检查只是<b>后置条件</b>，
+不是门（它只能抓改写器在某条代码路径上的实现遗漏）。</p>
+<p>真正的规格级缺陷是<b>规则表相对 placement 格不完备</b>，而 placement 格是<b>有限闭集</b>、
+规则表是<b>快照的一部分</b> ⇒ 这件事应当在<b>装载期、脱离任何模型</b>就被枚举检出：</p>
+<div class="cal inv"><span class="lbl"><code>G-P1</code> · redistribute 全域性门（装载期）</span>
+<p>由已注册 op 的 placement 面可达的<b>每一对</b>格点 <code>(p_src, p_dst)</code>，redistribute 规则表都必须有一条。</p>
+<p><b>会因为什么失败</b>：新注册一个产出 <code>Partial(max)</code> 的 op 面（在线 softmax、router 取 max）
+而规则表只有 <code>Partial(sum)</code>；或新增一个 mesh 轴而无跨 mesh 规则。</p></div>
 
-<h3>7.3 数据结构</h3>
-<pre><code>PlacementPlan:                         # = f(BackwardIR, ParallelConfig)
-  values:      [ValuePlacement]
-  storages:    [StoragePlacement]
-  buffers:     [BufferPlacement]
-  collectives: [CollectivePlan]
+<div class="cal honest"><span class="lbl">"漏插通信降级为编译期类型错误"这句话的准确适用范围</span>
+<p>它<b>仅对实现遗漏成立</b>。若 <b>op 的 placement 面本身写错</b>（声明接受 <code>Shard(1)</code>
+而框架实际要求 <code>Replicated</code>，或声明某 op 是 placement-透明而框架在那里做了一次 AllGather），
+<b>类型检查会顺利通过一张缺少该通信的图</b>。</p>
+<p>规格错误只能由 op 序列 oracle 暴露；<b>无对照 trace 的部署下，placement 面的规格错误无验证手段。</b></p></div>
 
-ValuePlacement:
-  value:       ValueRef                # 覆盖 primal 与梯度，统一引用
-  shard:       { axis_key: mesh_axis }  # tp / ep / cp / sp
-  local_shape: Shape
-  layout:      LayoutSignature         # 含 stride/offset/对齐（进 profile 签名）
-  source:      derived | declared      # ← 7.2 的声明通道
-  provenance:  derived | assumed</code></pre>
+<h3 id="c8-2">8.2 <code>DistOptSpec</code>：一个字节量级最大的缺输入</h3>
+<p>梯度桶结构此前<b>上游被策略污点拦掉、下游没有生产者</b>——<code>Pass_shard</code> 的签名里没有任何字段
+能承载 bucket size / gather 粒度 / prefetch 深度 / free 时机。</p>
+<p><b>字节量级</b>：连续梯度缓冲 = 全部参数 numel × 主梯度 dtype；ZeRO-3 + 全层重算下，
+<code>param_gather.free_policy</code> 的两种取值使峰值相差 <code>(L−1) × 每层参数字节</code>——
+L=61 时<b>几十 GB</b>，直接决定 OOM 与否。</p>
 
-<h3>7.4 数据流与逻辑流程</h3>
-<ol class="flow">
-<li>在段入口初始化分片状态：外部输入若包含序列轴且启用序列并行，则标记为序列驻留。</li>
-<li>沿数据流传播每个值的分片状态；规则来自 S1 的 <code>placement</code> 面（列并行产出特征载体、
-    行并行消耗载体、序列并行权重不切）。</li>
-<li>在汇合点合并状态；如果序列驻留状态存在分歧，则在驻留侧注入布局重分布通信。</li>
-<li>模块语义要求的通信按规则注入（列并行入口聚合、行并行出口归约/散播）。</li>
-<li>无法推导的值：走声明通道；既无推导也无声明 → 阻断，逐条记录。</li>
-<li>校验：载体歧义、列∘列、行并行前缺少列并行、不整除 → 全部阻断（禁止隐式取整）。</li>
-</ol>
-<div class="cal inv"><span class="lbl">不变量</span>
-<p>轴代入规则<b>只能有一份实现</b>。如果两个后端分别实现，结果必然产生分歧；而现有测试<b>无法</b>
-发现这种分歧，因为没有断言对两者进行统一比较。</p></div>
+<pre><code>DistOptSpec:                                  # Pass_shard 读；Pass_sched 读其 free/prefetch 面
+  grad_reduce:
+    bucket_bytes:       Q[Int]
+    bucket_order:       {reverse_param_order | param_order | declared}
+    reduce_dtype:       {fp32 | bf16 | fp16 | same_as_param}
+    contiguous_buffer:  Bool
+    free_policy:        {after_reduce | at_step_end | never}
+  param_gather:                               # ZeRO-3 / 分布式优化器
+    gather_unit:        {param | bucket | layer_declared}
+    gather_bytes:       Q[Int]
+    prefetch_depth:     Q[Int]
+    free_policy:        {after_last_use | at_segment_end | keep_gathered}
+  optimizer_state:
+    shard_axis:         {dp | none};  states_per_param: Q[Int];  state_dtype: DType</code></pre>
 
-<h2 id="c8"><span class="cn">Chapter 8</span>S5 执行层</h2>
+<div class="cal why"><span class="lbl">为什么是新的一份 spec，而不是塞进 <code>ParallelSpec</code></span>
+<p><code>ParallelSpec</code> 是<b>广延型</b>策略（各并行度的数值），本条是<b>实现策略</b>（何时分配/释放多少字节）。
+混进去会让"能力受限视图"按字段授权失去分辨力——<code>Pass_sched</code> 需要读 <code>free_policy</code>
+但<b>不该</b>读 <code>tensor_model_parallel_size</code>。</p></div>
 
-<h3>8.1 是什么</h3>
-<p>执行层将「逻辑生命周期」转换为明确的申请与释放事件顺序，并为每个算子实例生成
-自包含的定价请求。</p>
+<div class="cal bad"><span class="lbl">这里是最容易作弊的地方，provenance 必须分成两半</span>
+<div class="tw"><table>
+<tr><th>量</th><th class="nw">root</th><th class="nw">certainty</th><th>理由</th></tr>
+<tr><td><code>DistOptSpec</code> 各字段值本身</td><td class="nw"><code>configured</code></td><td class="nw"><code>exact</code></td><td>它是<b>使用者的配置选择</b>，定义了问题</td></tr>
+<tr><td><b>桶的划分结果</b>（几个桶、哪些参数进哪个桶、每桶字节）</td>
+  <td class="nw"><code>replication(bucketing_rule)</code></td><td class="nw"><code>modeled</code></td>
+  <td>这是<b>我们对框架分桶算法的复刻</b>，不是源码事实</td></tr>
+<tr><td><code>GatherParam</code> / <code>FreeParam</code> 的<b>插入位置</b></td>
+  <td class="nw">同上</td><td class="nw"><code>modeled</code></td><td>它不能由 placement 失配推出，是实现策略</td></tr>
+</table></div>
+<p><b>不允许用户直接声明"桶字节数"</b>——那是"把难算的量改名成规定量"的终极形态。
+用户只能声明<b>框架暴露的旋钮</b>；分桶<b>算法</b>必须由我们复刻并背上 <code>replication</code> 根。</p>
+<p><b><code>G-N1</code></b>：每个枚举字段的取值必须 ∈ <code>FrameworkModelSpec[framework_ver].supported_values</code>，
+否则阻断。<b>这堵住的是</b>：为了让峰值好看而声明一个该框架版本根本没实现的 <code>free_policy</code>。</p></div>
 
-<h3>8.2 为什么两个视图都必须自包含</h3>
-<div class="cal why"><span class="lbl">为什么后端不得回读上游</span>
+<div class="cal inv"><span class="lbl">桶结构<b>恰好</b>落在 op 序列这个窄口子里，因此可证伪</span>
+<p><b><code>G-N2</code>（桶数对照）</b>：真机 op 序列中<b>归约类算子的出现次数</b>必须等于我们模型产出的桶数
+（× 累加步数）。不等 ⇒ 阻断，工单附"我们算出 N 桶、真机 M 个归约 op"。</p>
+<p>只用 op 序列的<b>计数</b>，不需要 allocator snapshot、不需要保活集合、不需要分片形状 dump。</p>
+<p><b>但它不是独立 oracle</b>：它与 op 序列同构门共用同一条 trace，是后者的一个<b>特例投影</b>。
+它的价值是把失败信息<b>定位</b>到分桶（诊断价值），<b>不计入"我们有 N 道独立门"的任何陈述</b>。</p>
+<p><b>抓不到</b>：桶的<b>内容</b>（哪些参数进哪个桶）——只要桶数对，内容错也过。进能力边界。</p></div>
+
+<h3 id="c8-3">8.3 声明通道与 <code>declaration_unverified_bound</code></h3>
+<p>"placement 可由模块语义推导"只在<b>框架的切分本身是规则化、且我们复刻了那套规则</b>时成立。
+半自动/自动并行的策略传播是一个<b>求解器</b>，不是一组规则。排除求解器之后，
+<b>必须允许 placement 作为声明输入</b>，否则整类框架无法覆盖。</p>
+<p>关键是先<b>拆量</b>——一张分片表其实声明了两件可验证性完全不同的东西：</p>
+<div class="tw"><table>
+<tr><th class="nw">分量</th><th>它决定什么</th><th>可否佐证</th></tr>
+<tr><td class="nw"><b>degree</b></td><td>每个 mesh 轴的分片倍数 ⇒ 决定 <code>numel</code> ⇒ 决定<b>字节</b></td>
+  <td><b>可</b>：分片倍数决定集合通信的种类与个数，且通信时长随传输字节变化</td></tr>
+<tr><td class="nw"><b>axis</b></td><td>切哪一根张量轴 ⇒ 只决定<b>插哪种通信</b>，<b>不改变字节</b></td>
+  <td><b>部分可</b>：切错轴通常改变通信种类（AllGather↔ReduceScatter）；若两轴等长且通信种类相同则抓不到</td></tr>
+</table></div>
+<pre><code>certainty = modeled                      # **不是 assumed**：assumed 的定义轴是"取值依赖运行期数据"，
+                                         # 手写分片表不是数据依赖，是对一个求解器输出的复刻
+evidence.grade = reconstructed
+roots ∋ abstraction(placement_declaration@spec_id)
+interval:  degree 侧 = [numel/∏degree, numel]        # P5 来源 ④：两端都由声明自身的语义算出
+           axis   侧 = 不进字节区间（切哪一轴不改字节），风险由 op 序列门承担
+坍缩条件： 相关集合通信在 op 序列门中逐条匹配、时长残差在域内 ⇒ degree 获佐证 ⇒ 区间坍缩为点</code></pre>
+
+<div class="cal inv"><span class="lbl">准入的硬条件：把逃逸从"有代价"改成"不可用"</span>
+<p><b>当推导模式对该 op / 该子图可用时，声明模式必须与推导结果逐值一致，否则阻断。</b>
+声明模式<b>只在推导原理上不可用的地方</b>被允许。这比罚它更彻底，且机器可判（两边都算，比较）。</p></div>
+
+<div class="cal honest"><span class="lbl">这条设计用"诚实"换掉了"可用性"，而这笔交换的数我给不出</span>
+<p>无对照 trace 时 <code>tp=8</code> 就是 8 倍宽的区间，报告事实上只剩"介于 12 GB 与 96 GB 之间"
+这种没有决策价值的输出。<b>声明通道从"有一条通道"降级成了"有一条没人会用的通道"。</b></p>
+<p>这一步是否值得，取决于"用户宁要一个可能错 8 倍的点，还是要一个正确的 8 倍宽区间"——
+<b>这是产品判断，不是设计判断</b>，本文不替它下结论。唯一能缓解的路径（用端到端峰值标量弱佐证 degree）
+已被前提 P-peak 关闭。</p></div>
+
+<h2 id="c9"><span class="cn">Chapter 9</span>G3 / G4 · 重算与调度</h2>
+
+<h3 id="c9-1">9.1 G3 · 重算入图</h3>
+<p>重算不是一条独立的 lowering 路径，而是<b>被复制进图的前向节点</b>：同 <code>SemanticId</code>、
+新 <code>NodeId</code>、<code>stage_role = remat</code>、<code>origin</code> 回指前向节点。
+它排在 G2 之后，因为<b>重算副本是"已切分、已插通信"子图的结构复制</b>——排在 G2 之前就要为副本
+重跑一遍分片，而那是同一件事做两遍。</p>
+<p>独有不变量：<code>∀n: stage_role == remat ⇒ origin 是前向节点</code>；<code>Pass_remat</code> 有非幂等前置断言
+（输入图中不存在 <code>stage_role = remat</code> 的节点）。</p>
+<p><code>RematSpec.reuse_gathered_params</code> 与 <code>DistOptSpec.param_gather.free_policy</code> 是同一件事的两个自由度：
+前者管"重算区是否重新 gather"，后者管"前向侧何时放"。<b>四种组合各对应一个真实实现，报告必须显示当前组合</b>
+——这样"<code>Pass_remat</code> 单方面裁决 <code>GatherParam</code>"的问题就消失了：<b>不是 pass 在猜，是两份 spec 各出一个字段。</b></p>
+
+<h3 id="c9-2">9.2 G4 · 事件、生命周期与 <code>timing_dependent</code></h3>
+<pre><code>SchedIR = Pass_sched(G3, ScheduleSpec, CalibrationSet)
+  targets:   [ExecutionTarget]         # rank 类 / device / stage / 资源域
+  events:    [ExecEvent]               # Allocate|Bind|Use|Pin|Retire|Free，含 deps 与 stream
+  memory:    MemoryEventView           # 给显存后端的**自包含**视图
+  requests:  [ResourceRequest]         # 给时间后端的**自包含**定价请求
+  instances: [StorageInstance]         # StorageInstanceId + epoch</code></pre>
+
+<div class="cal why"><span class="lbl">为什么两个视图都必须自包含</span>
 <p>后端一旦回读 IR 或计划来补充信息，其 profile / cache key 就会随上游<b>结构</b>变化而失效——
-上游每次重构都可能使实测画像复用静默失效，而外在表现只是「命中率下降」，并不会报错。
-代价是执行计划体积增大（信息需要复制到计划中），这是有意以空间开销换取解耦。</p></div>
+上游每次重构都可能使实测画像复用静默失效，而外在表现只是"命中率下降"，<b>不会报错</b>。
+代价是执行计划体积增大，这是有意以空间换解耦。</p></div>
 
-<h3>8.3 数据结构</h3>
-<pre><code>ExecutionPlan:                         # = f(BackwardIR, PlacementPlan, 调度配置, 标定)
-  targets:   [ExecutionTarget]         # rank / device / stage / 资源域
-  events:    [ExecEvent]               # kind / target / stream / deps
-  memory:    MemoryEventView           # 给显存后端的自包含视图
-  requests:  [ResourceRequest]         # 给时间后端的自包含定价请求
-  instances: [StorageInstance]         # StorageInstanceId + epoch
+<div class="cal inv"><span class="lbl"><code>timing_dependent</code> 不是标签，是一个投影</span>
+<p>把它当作人或 pass <b>打上去的标记</b>是错的：标记可以漏打，漏打不可检 ⇒ 判据 2 不过。正确形态：</p>
+<pre><code>∀ Free/Alloc 事件 e:   (roots(e.time_expr) ∋ calib)  ⟺  e.edge 标记 timing_dependent
+不成立 ⇒ 阻断</code></pre>
+<p>它就是 §2.5 的 P4（存在位下传）在 <code>Free</code> 事件上的实例，<b>不是第二个机制</b>。
+漏打即刻可检，因为标记不再是独立信息。</p>
+<p><b>它有三个消费者</b>（缺一它就退回标签）：<b>①</b> P4 的根继承——受影响 storage 在峰值时刻的存活成员资格
+继承标定根；<b>②</b> 敏感性扫描的维度集合（维度不是"每个 kernel 的 duration"，
+而是每条 <code>timing_dependent</code> 边所依赖的通信算子的 <code>CalibKey</code> 族）；
+<b>③</b> 归因 liveness 的次数从 2 变 4（§2.7 四角）。</p></div>
 
-MemoryEventView:                       # 自包含：不依赖时间后端的内部状态
-  events:      [Allocate|Bind|Use|Pin|Retire|Free]
-  descriptors: [AllocationDescriptor]  # 每个 Allocate 可唯一解析出字节/域/池/对齐
-  order:       dependency + stream 偏序
-  policy:      MemorySchedulePolicy?   # 可选；未指定时采用偏序的确定性拓扑序
+<div class="cal inv"><span class="lbl">时间根不得经"时刻"或"碎片"泄漏进显存侧</span>
+<pre><code>条件：overlap 全关 ∧ 图中不存在 timing_dependent 边
+断言：R_mem ∩ R_time ∩ {种类 == calib 的根} == ∅        # **只对 calib 种类的根断言**
+违反 ⇒ 阻断</code></pre>
+<p><b>为什么只对 <code>calib</code> 断言</b>：显存侧与时间侧的输出量<b>都</b>含源码根、配置根（两侧都从同一个模型算起），
+"两侧 roots 无交集"字面执行<b>必然恒假</b>——一道恒红的门等于没有门。</p>
+<p><b>它抓的规格级缺陷</b>：若把"通信 buffer 的 Free 挂在通信完成事件上"实现成"挂在通信 op 的
+<code>duration</code> 之后的时刻"，则<b>即使 overlap 关闭</b>，Free 时刻的表达式也会带上标定根 ⇒ 门失败。
+正确实现是把 Free 挂在<b>偏序上的后继事件</b>，与 <code>duration</code> 无关。
+这个错误<b>不改变任何字节，只改变时刻的来源</b>，不会被别的门抓到。</p></div>
 
-ResourceRequest:                       # 自包含：时间后端不回读 CoreIR/PlacementPlan
-  target: ExecutionTargetId
-  work:   { flops, special_ops, reduction_ops }   # 分 model / executed 两套
-  traffic:{ memory, transport }
-  pricing:PricingDescriptor            # 含 compute/accum dtype、cost family、基础签名
-  provenance: 逐量携带（见第 2 章）</code></pre>
+<h2 id="c10" data-part="第四部分 · 输出与闭环"><span class="cn">Chapter 10</span>两后端与报告</h2>
 
-<h3>8.4 数据流与逻辑流程</h3>
-<ol class="flow">
-<li>按调度（1F1B / 交错虚拟流水）展开 <code>(stage × microbatch × 节点)</code>；重算节点已在 S3 入图，此处无特例。</li>
-<li>为每个值实例分配 <code>StorageInstanceId</code>：alias 映射到根存储（零分配），
-    inplace 在变更点结束旧值的生命周期，重算再物化使用新的 epoch。</li>
-<li>根据 S3 的释放点偏序生成 <code>Retire</code>/<code>Free</code>；被保存的值通过 <code>Pin</code> 延长生命周期，
-    <b>不改变其字节</b>（需要独立字节的一律建成内部保存值）。</li>
-<li>为每个 <code>BufferContract</code> 按放置结果解析本地字节，并物化为半开区间的申请/释放对。</li>
-<li>生成资源请求：每个量均携带 provenance；<code>modeled</code> 项在此解析常数并<b>校验适用域</b>，越域即按其 <code>out_of_domain</code> 阻断或降级。</li>
-<li>联合预检：所选后端需要的能力是否完整、事件是否不重不漏、偏序是否无环。<b>未通过时不产出任何部分计划。</b></li>
-</ol>
+<h3 id="c10-1">10.1 两个只读后端</h3>
+<p><b>显存后端</b>只消费 <code>MemoryEventView</code>：按事件推进，依据内存池与对齐规则模拟申请释放，
+给出已分配 / 已保留峰值区间与首次失败证据。结束前终审：不得残留未释放的非持久实例。</p>
+<p><b>时间后端</b>只消费 <code>ResourceRequest</code> 与硬件/profile 快照，两级离散事件仿真（段内多流 → 全局调度）。
+定价分级回退：命中兼容实测 → 形状/类型插值 → 已标定族模型 → 理论 roofline；
+<b>每一级都是一个 <code>self_certainty = modeled</code> 的算子</b>，参数不完整时阻断，
+<b>绝不静默降级为零成本或纯带宽模型</b>。</p>
+<div class="cal inv"><span class="lbl">后端的独有不变量：零新事实</span>
+<p>后端<b>不得引入新的 root 种类</b>。roofline 时长 <code>= flops / peak_flops</code> 的两个输入都精确，
+但它经过一个 <code>self_certainty = modeled</code> 的算子 ⇒ 结果是 <code>modeled / reconstructed</code>，
+<b>不是 <code>derived</code></b>。allocator 的池划分/对齐/split 同理。</p>
+<p><b>连带必须纠正一句旧表述</b>："显存链上没有任何一个量是查表得来的"——这句仍成立（确实没查表），
+但必须补：<b>显存链上有大量量是我们对 allocator 的复刻，属 <code>modeled / reconstructed</code> 而非 <code>derived</code>。</b></p></div>
 
-<h2 id="c9"><span class="cn">Chapter 9</span>S6 后端与 S7 报告</h2>
+<h3 id="c10-2">10.2 峰值：上界、下界与它们各自的条件</h3>
+<pre><code>peak_upper := Σ_streams peak_s                                  # 合法的跨交织上界
 
-<h3>9.1 显存后端</h3>
-<p>显存后端只消费 <code>MemoryEventView</code>。核心状态是「当前存活的物理实例集合」。
-它按事件推进，并依据内存池与对齐规则模拟申请和释放，给出已分配/已保留峰值、OOM 判定及首次失败证据。
-结束前执行终审：不得残留未释放的非持久实例，也不得存在尚未完成 lowering 的高层事件。</p>
+peak_lower := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastuse(s)} size_s
+              s 取值范围 = **StorageId**（alias 等价类），不是 TensorId</code></pre>
+<p><code>peak_lower</code> 的论证：任何线性化都必经过 <code>n</code>，届时上式集合中的每个 storage 都已分配且未释放
+⇒ 跨全部交织的合法下界。复杂度 <code>O(节点数 × storage 数)</code>，不是最大团问题。</p>
 
-<h3>9.2 时间后端</h3>
-<p>时间后端只消费 <code>ResourceRequest</code> 与硬件/profile 快照。两级离散事件仿真保持不变
-（段内多流 → 全局调度）。定价采用分级回退链：命中兼容实测 → 形状/类型插值 → 已标定族模型 →
-理论 roofline；每一级都记录 provenance 与 confidence，参数不完整时阻断，<b>绝不静默降级为零成本或纯带宽模型</b>。</p>
+<div class="cal bad"><span class="lbl">但它<b>不是无条件</b>下界，两个条件必须写死</span>
+<p><b>条件一 · alias 等价类必须正确。</b>若两个实际共享存储的值被判成两个 <code>StorageId</code>，
+它们会被<b>各计一次</b> ⇒ <code>peak_lower</code> 偏高 ⇒ 可能产出<b>假的 OOM 断言</b>。
+而 alias 判断恰恰是<b>完全无验证手段</b>的那一格（§5.1）。因此 <code>peak_lower</code> 携带
+<code>certainty = modeled</code>、<code>roots ∋ replication(alias_rules)</code>——<b>它是一个条件下界，
+不是一个定理</b>，报表必须这样标注。</p>
+<p><b>条件二 · 求和只能包含 Free 由结构边决定的 storage。</b>若某 storage 的 <code>lastuse</code> 由
+<code>timing_dependent</code> 边决定，则 <code>⪯</code> 不再是纯结构偏序，"任何线性化都经过 <code>n</code>"的论证失效。
+<b>这类 storage 一律从 <code>peak_lower</code> 的求和中排除</b>（保守，使下界更松，方向正确）。</p></div>
 
-<h3>9.3 报告</h3>
-<div class="cal inv"><span class="lbl">不变量</span>
-<p>两个后端<b>不共同构造</b>报告，由汇总器聚合。报告必须分别统计三类 provenance 的覆盖率，
-并把 <code>assumed</code> 项的依据与偏差方向逐条列出。<b>不允许把未覆盖项藏起来。</b></p></div>
+<div class="cal why"><span class="lbl">为什么必须补下界，哪怕它这么弱</span>
+<p><b>不补的话，本方案永远只能证明"装得下"，永远不能机器断言"会 OOM"。</b>
+<code>ScheduleSpec</code> 声明的那个交织下的峰值<b>不是</b>跨交织下界（真机可能走别的交织），
+把它当下界用会产出<b>假的 OOM 断言</b>——正是"给一个假装确定的答案"。</p>
+<p>而在前提 P-peak 之下，<code>peak_lower</code> 是显存链上<b>唯一</b>能产生"可被真机 OOM 事实证伪的断言"的构件。
+它偏松意味着 <code>undetermined</code> 更常见——形状更差，判据 5 顺向。</p></div>
 
-<h2 id="c10" data-part="第三部分 · 闭环"><span class="cn">Chapter 10</span>阻断与用户闭环</h2>
+<h3 id="c10-3">10.3 <code>oom_verdict : Q3[Bool]</code> 与判定阻碍分解</h3>
+<p>容量本身有 provenance：<code>C_eff = HBM_total − framework_reserve − 池划分开销</code>，
+其中 <code>HBM_total</code> 是 <code>transcribed</code>，后两项是 <code>modeled / reconstructed</code>。所以是<b>区间对区间</b>：</p>
+<pre><code>oom_verdict : Q3[Bool] :=
+  false（装得下）  iff  peak.hi ≤ C_eff.lo
+  true （装不下）  iff  peak.lo &gt;  C_eff.hi
+  undetermined     otherwise，或任一端不可计算</code></pre>
+
+<div class="cal inv"><span class="lbl"><code>undetermined</code> 必须是类型，不能是标签</span>
+<p>强制附带<b>判定阻碍分解</b>：给出最小的量集合 <code>S</code>，使得把 <code>S</code> 中每个量固定到其区间某一端后
+verdict 变确定；逐条列出成员、其 <code>roots</code>、其 <code>evidence.grade</code>、其宽度贡献。</p>
+<p><b>可算性</b>：在固定的 <code>t*</code> 上 <code>peak = Σ_{i∈live(t*)} size_i</code> 是<b>和</b>，宽度可加
+⇒ 按 <code>width(size_i)</code> 降序贪心取前缀即为<b>精确</b>最小集，<code>O(n log n)</code>，不是指数的子集选择。</p>
+<p><b>为什么不是只报一个百分比</b>：百分比回答不了用户的下一个动作。最小集直接说"要回答你的头号问题，
+先去标定这 3 个量"——它把 <code>undetermined</code> 从坏消息变成<b>一张工单</b>。这正是判据 5 想要的：
+<code>undetermined</code> 比二值答案难看，但它是<b>可行动的难看</b>。</p></div>
+
+<div class="cal inv"><span class="lbl">不可绕过性</span>
+<p><code>undetermined</code> <b>不可被 <code>assumed</code> 声明消除</b>：声明一个 <code>assumed</code> 量只能把区间从
+"不可计算"变成"单侧开口"，两者在判定表里同样落进 <code>undetermined</code> 或至多单侧结论。
+<b>没有任何一条补救能把 <code>undetermined</code> 变回 <code>false</code>（装得下）而不真正收紧区间。</b></p>
+<p>并且 <code>Q3[Bool] → Bool</code> 的转换算子<b>不存在</b>：任何需要 <code>Bool</code> 的消费者
+（"自动挑一个装得下的配置"这类）遇 <code>undetermined</code> ⇒ 阻断。</p></div>
+
+<h3 id="c10-4">10.4 <code>VERDICT-WITHDRAW</code>：惩罚挂在头号输出上</h3>
+<p>此前的惩罚形态是"撤点估计"。但报告 schema 中<b>峰值本来就只有区间形态、没有标量形态</b>
+（§1.4 不变量 10）——既然从来没有点估计，"撤点估计"就是一个空动作。惩罚必须改挂头号输出：</p>
+<pre><code>    (abstraction_covered_bytes + declared_semantics_covered_bytes) / peak  &gt; θ_abs
+  ∨ (reconstructed + vendor_documented) / peak                            &gt; θ_evd
+  ∨ timing_dependent 扫描观测范围宽度                                       &gt; θ_TD
+  ⇒ oom_verdict := undetermined（**无论区间落在容量的哪一侧**）
+     且首页打印触发项、其实测比值与当次 Θ 取值</code></pre>
+<p><b>为什么这样比"撤点估计"强</b>：它直接打在用户来这里要的那句话上，而不是打在一个中间产物的呈现形态上。
+注意 <code>θ_abs</code> 的分子是<b>两个人工判断根的并</b>——只算 <code>abstraction</code> 会给
+"声明无 AST 对象的语义"开一条免费通道（§2.4）。</p>
+
+<h3 id="c10-5">10.5 报表首页的强制字段</h3>
+<div class="tw"><table>
+<tr><th class="nw">字段</th><th>定义</th><th class="nw">守恒性</th></tr>
+<tr><td class="nw"><code>oracle 声明</code></td><td>「显存链外部裁判：无。时间链外部裁判：op 级序列与时长。」</td><td>—</td></tr>
+<tr><td class="nw"><code>peak_interval</code></td><td><code>[lo, hi]</code>，两端各自标注是否可计算；<b>不可计算的一端写"不可计算"，禁止填 0/∞</b></td><td>—</td></tr>
+<tr><td class="nw"><code>oom_verdict</code></td><td><code>Q3[Bool]</code>；<code>undetermined</code> 时附判定阻碍分解</td><td>—</td></tr>
+<tr><td class="nw">按 <code>certainty</code> 分解</td><td>三行</td><td><b>划分，守恒</b></td></tr>
+<tr><td class="nw">按 <code>evidence.grade</code> 分解</td><td>三行；<code>reconstructed</code> 占比是首页数字，<b>不可抑制</b></td><td><b>划分，守恒</b></td></tr>
+<tr><td class="nw">按 <code>root</code> 覆盖</td><td>八行</td><td><b>不是划分</b>，禁止饼图</td></tr>
+<tr><td class="nw"><code>unverifiable_coverage</code></td><td>能力边界 E 覆盖的字节占比（<a href="#c14">第 14 章</a>）</td><td>—</td></tr>
+<tr><td class="nw"><code>abstraction_ledger</code></td><td>每条人工判断一行：<code>judgment_id, kind, readability, coverage_bytes, residual_width, 首次引入于哪个模型</code>；
+  <b>残差列禁止打印裸 0</b>，必须写 <code>0（P_test 覆盖 N 点，非证明）</code></td><td>—</td></tr>
+<tr><td class="nw"><code>excluded_from_sweep</code></td><td>退出扫描的字段 + 机器生成的退出原因</td><td>—</td></tr>
+<tr><td class="nw"><code>Θ 清单 + 工具 digest</code></td><td>当次使用的全部阈值取值</td><td>—</td></tr>
+<tr><td class="nw">归因段落标题</td><td>必须是「<b>本报告的峰值由以下量构成</b>」，<b>不得</b>写成「真机峰值由以下量构成」</td><td>schema 约束</td></tr>
+</table></div>
+
+<div class="cal why"><span class="lbl">归因口径的正当性论证（原论证有一根柱子已经倒了）</span>
+<p>倒掉的那根是「活跃集合在真机 allocator dump 里可观测」——在前提 P-oracle 之下这句话为假，
+且它是本口径相对"对增量的贡献"口径的两条论证之一。剩下的三条：</p>
+<p><b>① 守恒性</b>（不受影响）：<code>Σ 各部分 = 报告的那个数</code>，无残差、无重复计数、无基线。
+"对增量的贡献"需要一个基线，基线任意 ⇒ 不可证伪，且不守恒。这一条<b>独立于任何真机数据</b>。</p>
+<p><b>② 可证伪性的对象换掉</b>：从"对真机可证伪"改为<b>"对模型可扰动"</b>——
+<code>∀ i ∈ live(t*)</code>，把 <code>size_i</code> 加 <code>δ</code>，报告峰值必须<b>恰好</b>变化 <code>δ</code>；
+<code>∀ i ∉ live(t*)</code>，变化必须 <code>≤ δ</code>。这是一条机器可检的 property test，
+会因为"归因实现与峰值计算用了两条不同的求值路径"而失败。
+<b>诚实的范围声明</b>：这使口径对<b>归因实现</b>可证伪，<b>不使它对显存模型可证伪</b>。</p>
+<p><b>③ 目的相符</b>：归因的用途是<b>决定去改哪个输入</b>，这是纯内部用途。
+"真机的峰值由哪些量构成"这个问题在前提 P-oracle + P-peak 之下<b>没有人能回答</b>，
+因此把它设成归因的目标本身就是错的。</p></div>
+
+<h2 id="c11"><span class="cn">Chapter 11</span>阻断与用户闭环</h2>
 
 {{SVG:07-unknown-op-loop}}
 
-<h3>10.1 阻断范围（相较 v1 进一步明确）</h3>
+<h3 id="c11-1">11.1 阻断范围</h3>
 <div class="tw"><table>
 <tr><th>情形</th><th>处理</th><th>为什么</th></tr>
 <tr><td class="nw"><b>未注册 Op</b></td><td>阻断 + 生成骨架</td>
-  <td>语义未知时，任何估算都缺乏可验证依据；这种情况通常只在新增 kernel 时出现</td></tr>
-<tr><td class="nw"><b>已注册，含 modeled 量</b></td><td>域内允许执行 + 报告标注；越域按声明阻断或降级</td>
-  <td>标定值是<b>已声明的实测事实</b>，而非猜测</td></tr>
-<tr><td class="nw"><b>已注册，含 assumed 量</b></td><td>允许执行 + 报告标注依据与方向</td>
-  <td>否则第 2 章定义的第三种状态无法得到表达，稀疏模型也无法执行</td></tr>
-<tr><td class="nw">形状/类型无法求解</td><td>阻断</td>
-  <td><code>derived</code> 缺失即不可判定</td></tr>
+  <td>语义未知时，任何估算都缺乏可验证依据</td></tr>
+<tr><td class="nw"><b>不可判定的 guard</b></td><td><code>BLK-DATAGUARD</code> / <code>BLK-UNRECONSTRUCTIBLE</code> / <code>BLK-SEMANTICPOLICY</code></td>
+  <td>四类 guard 各有归属，无"其它"（§4.2）</td></tr>
+<tr><td class="nw"><b>未声明的策略状态源</b></td><td><code>BLK-UNDECLAREDSTATE</code></td>
+  <td>默认拒绝：读任何未声明的模块级可变全局即阻断（§3.4）</td></tr>
+<tr><td class="nw"><b>π₀ 不合法</b></td><td><code>BLK-NOVALIDPI0</code></td><td>方案在该框架上不成立，须人重新裁决，<b>不开豁免</b></td></tr>
+<tr><td class="nw"><b>已注册，含 <code>modeled</code> 量</b></td><td>允许执行；越出域片 ⇒ 阻断</td>
+  <td>域片外没有标定点，残差无来源</td></tr>
+<tr><td class="nw"><b>已注册，含 <code>assumed</code> 量</b></td><td>允许执行 + 报告标注依据与方向；<b>后果是区间必然单侧开口</b></td>
+  <td>否则稀疏模型无法执行；但通道的<b>后果不可被抹平</b>（§2.5 P6）</td></tr>
+<tr><td class="nw">形状/类型无法求解</td><td>阻断</td><td>缺失即不可判定</td></tr>
+<tr><td class="nw"><code>Opaque</code> 被使用</td><td>阻断</td><td>硬阻断，不被"定价"稀释</td></tr>
 </table></div>
-<div class="cal why"><span class="lbl">为什么必须区分未注册与已注册的不确定量</span>
-<p>如果将两者统一归入「不完整就阻断」，会产生两种结果：要么 <code>assumed</code> 无法表达，
-要么为了让仿真继续执行而将 <code>assumed</code> 伪装成 <code>derived</code>。后一种结果不可接受。</p></div>
 
-<h3>10.2 闭环流程</h3>
+<h3 id="c11-2">11.2 闭环流程</h3>
 <ol class="flow">
-<li>发现未绑定调用 → 阻断，并输出：符号、各输入的形状与类型、赋值目标、两个注册域的查找结果。</li>
-<li>生成骨架：<b>只填写可从调用证明的信息</b>（selector、输入、attrs），其余字段全部保留 <code>REQUIRED</code> 占位。</li>
-<li>用户补充完整 → 校验 → 解释（打印该 Op 展开后七个方面的完整语义，供人工复核）。</li>
+<li>发现未绑定调用 → 阻断，输出：符号、各输入形状与类型、赋值目标、三个注册域的查找结果。</li>
+<li>生成骨架：<b>只填写可从调用证明的信息</b>（selector、输入、attrs），
+    其余字段全部保留 <code>REQUIRED</code> 占位；<b><code>origin.readability</code> 由 PE 在此刻写入</b>，用户不可改。</li>
+<li>用户补充完整 → 校验（含值域裁剪、<code>CalibKey</code> 解析）→ 解释（打印九个面的完整语义，供人工复核）。</li>
 <li>快照 digest 更新 → 相关缓存失效 → 重新编译 → 联合预检 → 开始仿真。</li>
 </ol>
 <p>骨架里<b>不含</b>源码文件与行号——那些只出现在诊断输出，避免用户配置与源码位置耦合。</p>
 
-<h2 id="c11"><span class="cn">Chapter 11</span>验收与迁移</h2>
+<h3 id="c11-3">11.3 补救模板必须声明 <code>clean_effect</code></h3>
+<p>前面所有机制治的是<b>当下</b>已知的逃逸路径。<b>下一条补救被加进来时，同样的病会原样复发</b>
+——这在本方案的演进史上已经发生过一次（一个被删掉的"可接受差异"清单，
+换个名字以"豁免通道"的形态装了回来）。所以需要一条<b>全称律</b>。</p>
+<pre><code>洁净度向量（闭集五元，全部机器计算，均不在用户的 *Spec 里）：
+clean(Report) := (
+  c1 = 峰值中 certainty = exact 的字节占比,
+  c2 = |sweep_dims|,
+  c3 = oom_verdict ≠ undetermined : Bool,
+  c4 = −(abstraction_covered_bytes + declared_semantics_covered_bytes),   # 取负，越脏越小
+  c5 = 被独立对照门覆盖的算子占比
+)
 
-<h3>11.1 验收基准必须来自真机</h3>
-<div class="cal bad"><span class="lbl">必须避免的方法论错误</span>
-<p>迁移期间进行新旧双跑是必要的，但<b>不能用旧路径判断正确性</b>。将旧路径作为验收基准，等于把旧路径的已知偏差
-编码成新系统的验收标准。</p>
-<p><b>一个仿真器的正确性定义只能来自被仿真的对象，不能来自它的前一版。</b>
-双跑的正确用途是<b>变更归因</b>（哪些数值发生变化、为什么变化），正确性判定必须以真机实测为准。</p></div>
+L-mono（不可逆脏化律）：对任意补救 r（向输入集增加一条声明）
+    clean( Report(I ∪ {r}) )  ⊑  clean( Report(I) )     逐分量偏序
+    **且至少一个分量严格下降**
 
-<div class="tw"><table>
-<tr><th class="nw">门</th><th>断言</th><th class="nw">性质</th></tr>
-<tr><td class="nw">真机对照</td><td>逐 stage 峰值、逐层驻留、step time 与实测比值；实测数据带指纹校验，不得编辑</td><td><b>唯一正确性判据</b></td></tr>
-<tr><td class="nw">结构不变量</td><td>随层数、微批数按既定倍数变化的结构关系，必须由模型<b>导出</b>，而不是直接写入公式</td><td>正确性</td></tr>
-<tr><td class="nw">轴代入一致</td><td>两个后端对同一符号形状和同一并行度求得的本地元素数与字节数必须一致</td><td>防分歧</td></tr>
-<tr><td class="nw">provenance 闭合</td><td>报告里每个字节可归到三类之一；<code>assumed</code> 项均有依据</td><td>诚实性</td></tr>
-<tr><td class="nw">阻断有效性</td><td>参数化删除任一必填字段 → 必须阻断；显式空值 ≠ 缺失</td><td>安全性</td></tr>
-<tr><td class="nw">后端隔离</td><td>两后端双向 import 禁令；后端不读源码/配置/注册表</td><td>解耦</td></tr>
-<tr><td class="nw">新旧双跑</td><td>逐项分析差异原因，已知设计修正列入可接受差异（accepted delta）</td><td><b>归因，非判据</b></td></tr>
-</table></div>
+G-B0（补救单调性门，机器执行）：
+    每条补救模板在 schema 中必填 clean_effect : Vector[5] of {不变, 下降}，且至少一项为「下降」；
+    CI 对每条模板用**合成 fixture**（一段触发该 BLK-* 的 PySub 片段 + 施加补救）实跑两次报告，
+    断言实测方向与声明一致。合成 fixture 不需要框架源码。</code></pre>
+<div class="cal why"><span class="lbl">为什么是这条，而不是"逐条审查新补救"</span>
+<p>逐条审查是<b>流程</b>；<code>clean_effect</code> 是 <b>schema 必填 + CI 实测</b>，是<b>机制</b>。
+而且它把判据 5 从一句评审口号变成一条可以对<b>未来</b>的补救执行的断言。</p>
+<p><code>G-B0</code> 自身<b>不放行任何东西</b>，它只拒绝"声明与实测不符"的补救模板，因此它不是新逃逸口。</p></div>
 
-<h3>11.2 迁移策略</h3>
-<p>不采用全量重写（数值变化无法归因），也不保留长期双轨（两套事实源必然产生漂移）。
-方案采用<b>适配层 + 按算子族收编 + 双跑归因</b>；每完成一个算子族的迁移，即删除对应的旧分支。</p>
-<div class="tw"><table>
-<tr><th class="nw">阶段</th><th>内容</th><th>该阶段的门</th></tr>
-<tr><td class="nw">1</td><td>语义基础设施：类型系统、组合子库、DSL 编译器、三个注册域</td><td>加载期阻断用例全部通过</td></tr>
-<tr><td class="nw">2</td><td>适配层：将现有语义表转换为新的描述格式，并验证可保持不变的数值；<b>由缺失字段或默认零值产生的结果一律标记为 legacy 假设</b>，未经显式收编不得通过完整性门禁</td><td>真机对照结果不劣化</td></tr>
-<tr><td class="nw">3</td><td>按族收编：视图/类型转换/比较 → 逐元素/归一化 → 矩乘 → 注意力 → MoE → 集合通信 → 融合</td><td>每族收编后真机对照 + 双跑归因</td></tr>
-<tr><td class="nw">4</td><td>CoreIR + BackwardIR + 两个计划层</td><td>不变量校验 + 轴代入一致门</td></tr>
-<tr><td class="nw">5</td><td>后端切换：显存后端改为使用事件视图，时间后端通过适配层复用现有两级仿真</td><td>真机对照成为权威判据</td></tr>
-<tr><td class="nw">6</td><td>开放用户通道：注册、校验、解释、骨架生成</td><td>闭环用例全部通过</td></tr>
-<tr><td class="nw">7</td><td>收口：删除旧分支，只保留兼容 API</td><td>所有门禁均通过</td></tr>
-</table></div>
-
-<h3>11.3 实施前必须量化起点差距</h3>
-<div class="cal honest"><span class="lbl">诚实边界</span>
-<p>「可执行 IR 中不存在 opaque 节点」是目标态的不变量，并非当前状态。启动阶段 2 之前，
-必须先量化并公布起点差距：当前抽取链上有多少调用仍无法绑定语义、级联失败的根因集中在哪些位置，
-以及哪些量在原理上无法从源码获得（例如，融合 kernel 自身输出的形状位于编译产物中，而不在源码中）。
-<b>如果不先量化，何时达到完成标准将无法判断。</b></p></div>
-
-<h2 id="c12"><span class="cn">Chapter 12</span>决策记录与边界</h2>
-
-<h3>12.1 决策记录</h3>
-<div class="tw"><table>
-<tr><th class="nw">#</th><th>决策</th><th>关键理由</th></tr>
-<tr><td class="nw">D1</td><td>结构从框架源码抽取，是唯一结构源</td><td>手写图的失效是静默的；可证伪性优先</td></tr>
-<tr><td class="nw">D2</td><td>Op 语义用纯配置描述，不开放代码插件</td><td>可静态校验、可版本化、用户可扩展</td></tr>
-<tr><td class="nw">D3</td><td>Op 类型拆到原子级（一种类型对应一条形状关系）</td><td>消除代码中的二次分派；避免不同语义共用一条反向规则</td></tr>
-<tr><td class="nw">D4</td><td>三个注册域物理隔离；patch 整条替换 + 版本/hash 门禁</td><td>若由加载顺序决定最终生效项，结果将不可复现</td></tr>
-<tr><td class="nw">D5</td><td>未注册 Op 硬阻断 + 生成骨架</td><td>语义未知时，任何数值都缺乏可验证依据</td></tr>
-<tr><td class="nw">D6</td><td><b>provenance 三分（derived / modeled / assumed）作为全 IR 横切契约；「实测」不是一类知识，只作为 modeled 的常数来源与全链校验手段</b></td><td>两次追问定类：机制在建模范围内吗、机制确定性还是依赖运行期数据。显存因此全部由 derived + modeled 构成，<b>没有查表量</b>；稀疏模型必须有第三态</td></tr>
-<tr><td class="nw">D7</td><td><b>BackwardIR 为独立派生层，重算节点入图</b></td><td>三类节点同构；减少一组契约类并取消一条 lowering 路径；CoreIR 保持 policy-free</td></tr>
-<tr><td class="nw">D8</td><td>四层身份，禁止按名字推断复用</td><td>按名称去重会同时造成少算与多算</td></tr>
-<tr><td class="nw">D9</td><td>dtype 分 storage / compute / accum，编译期求值，不设置回退档</td><td>它是 <code>derived</code>；缺依据即阻断，不默认继承首输入</td></tr>
-<tr><td class="nw">D10</td><td><b>placement 有推导与声明两种输入模式</b></td><td>非规则化切分的框架在原理上推不出来</td></tr>
-<tr><td class="nw">D11</td><td>轴代入只有一份实现</td><td>两份实现必然产生分歧，且现有测试无法发现</td></tr>
-<tr><td class="nw">D12</td><td>两后端只读、互不 import、自包含视图</td><td>后端回读上游会使 profile 复用机制静默失效</td></tr>
-<tr><td class="nw">D13</td><td><b>验收对照物是真机；新旧双跑只做归因</b></td><td>正确性定义只能来自被仿真对象</td></tr>
-</table></div>
-<p>其中 <b>D6 / D7 / D10 / D13</b> 是本版相对 v1 的实质改动，其余决策沿用 v1。</p>
-
-<h3>12.2 非目标</h3>
+<h3 id="c11-4">11.4 结构性复活检测</h3>
+<p>被删掉的口子会以另一个名字回来。这道门断言 schema 中：</p>
 <ul>
-<li>不把自动并行策略搜索器纳入核心（但因此必须有 placement 声明通道，见 D10）。</li>
-<li>配置不执行任意代码，不开放语法扩展或解释器插件。</li>
-<li>基础语义库不保存某型号设备上的实测耗时（那属于标定/profile）。</li>
-<li>不追求一次性删除全部旧路径。</li>
+<li><b>不存在</b>字段或枚举值：<code>numel_only</code> / <code>declared</code> / <code>degrade</code> /
+    <code>legacy</code> / <code>confidence</code> / <code>Unknown</code> / <code>UnresolvedCall</code>；</li>
+<li><b>不存在</b>名为 <code>waiver</code> / <code>exception</code> / <code>override</code> / <code>accepted_*</code> 的字段；</li>
+<li><code>Direction</code> 值域<b>恰为</b> <code>{exact, upper, lower}</code>（无 <code>nominal</code>）；</li>
+<li><code>Root</code> 值域<b>恰为</b>八值；<code>Evidence.grade</code> 值域<b>恰为</b>三值；</li>
+<li><code>RegisteredOp.self_certainty</code> 值域<b>不含</b> <code>exact</code>；</li>
+<li><b>不存在</b> <code>Q3[Bool] → Bool</code> 与 <code>Sample[T] → Q[T]</code> 的转换算子；</li>
+<li>峰值与 step time <b>只有区间形态</b>，无标量形态；<b>不存在</b>任何由使用者输入决定的门限常量；</li>
+<li>补救模板表中每条的 <code>clean_effect</code> <b>至少一项为「下降」</b>。</li>
 </ul>
 
-<h3>12.3 诚实边界</h3>
-<div class="cal honest"><span class="lbl">本设计的能力边界</span>
+<h3 id="c11-5">11.5 已清扫的人工例外条款</h3>
+<p>前提 P-noexc 适用于全部位置。逐条列出曾经存在、现已删除或改写的"最终由人拍板且结果是放行"的条款：</p>
+<div class="tw"><table>
+<tr><th class="nw">#</th><th>条款</th><th>处置</th></tr>
+<tr><td class="nw">1</td><td>反向不同构时的人工裁决通道</td><td><b>删除</b>，代以三类归属（§7.2），三个出口无一是放行</td></tr>
+<tr><td class="nw">2</td><td>新增注册条目"每条必须解释为新算子族，且有责任人"</td><td><b>删除</b>，代以 <code>G-Z1a/b</code>（§6.8）</td></tr>
+<tr><td class="nw">3</td><td><code>direction: nominal</code></td><td><b>删除</b>。它使区间塌成点——两轮评审都没点名的活口子</td></tr>
+<tr><td class="nw">4</td><td>越域"降级 + 人声明方向"</td><td><b>删除</b>。且单侧界的另一端必须显式标"不可计算"，<b>不得默认 0</b></td></tr>
+<tr><td class="nw">5</td><td>时间侧"非单调告警：标注该量区间不可靠"</td><td><b>删除告警形态</b>。告警是标签不是类型；取阻断（P6）。
+  而 makespan 已改 <code>Sample[Float]</code>，<b>不进 P6 射程</b>，两者不冲突</td></tr>
+<tr><td class="nw">6</td><td>双侧扫描得到的 makespan"区间"</td><td><b>改类型</b>为 <code>Sample[Float]</code>：不参与区间算术、不可与容量比较、不进 OOM 链。
+  <b>双侧扫描得到的是样本极值不是界</b>，让非界顶着界的类型流下去是最坏的一种错</td></tr>
+<tr><td class="nw">7</td><td>"PySub 差分测试若不被允许，退化为人工评审"</td><td><b>删除该退路</b>。若不可行 ⇒ PySub 规格<b>没有机器验证手段</b>，写进能力边界</td></tr>
+<tr><td class="nw">8</td><td>改分类表的保障是"评审 + 进快照"</td><td><b>删除"评审"</b>，代以 <code>class_origin</code> + 退出扫描（§3.3）。流程不是机制</td></tr>
+<tr><td class="nw">9</td><td><code>RuntimeInvariant</code>"可评审"</td><td>保留通道，<b>删"可评审"这一保障</b>；受影响字节降 <code>assumed</code> 的后果按 P6 强化</td></tr>
+<tr><td class="nw">10</td><td>trace 对齐的"未匹配 op 忽略清单"</td><td><b>不设</b>。真机有而我们没有的 op 逐条计数并进 step time 区间上界；
+  我们有而真机没有的 op <b>硬失败</b></td></tr>
+<tr><td class="nw">11</td><td>策略交换律对照映射 <code>ψ</code> 的逐 op 例外条目</td><td><b>不设</b>（<code>G-X5</code>）。<code>ψ</code> 只能做两件事：
+  删除带合成标记的节点、按记录的 placement 反解形状。<b>本轮新发现的逃逸口</b>：<code>ψ</code> 是人写的，
+  可被调宽到吃掉真实差异，且这么做<b>使答案形状不变</b>（判据 5 反向失败）</td></tr>
+</table></div>
+
+<h2 id="c12" data-part="第五部分 · 可验证性与工程"><span class="cn">Chapter 12</span>门体系</h2>
+
+<h3 id="c12-1">12.1 元门：先把"门"这个词管住</h3>
+<div class="cal inv"><span class="lbl"><code>G-M1</code> · 门非平凡性元测试</span>
+<p>门表中每一行标为"门"的条目，CI 必须存在<b>至少一个故意注入的规格级缺陷 fixture</b> 使其变红。
+找不到 red fixture 的条目，schema <b>强制改标为"后置条件"</b>，且<b>不得计入任何"我们有 N 道门"的陈述</b>。</p>
+<p>断言 <code>∀ g ∈ gates: |red_fixtures(g)| ≥ 1</code>。它覆盖的风险是<b>"恒真的门制造虚假安全感"这一复发模式本身</b>。</p></div>
+<p>三个类别的准确含义：<b>门</b> = 存在至少一个<b>规格级</b>缺陷会让它失败（不只是实现 bug）；
+<b>后置条件</b> = 它是某个 pass 定义的直接推论，只能抓实现遗漏，<b>不计入验证力度</b>；
+<b>报告项</b> = 必填输出，不作判定。</p>
+
+<h3 id="c12-2">12.2 按 oracle 分组的完整门表</h3>
+<p>前缀本身携带信息：<b>一眼看出这道门拿什么当裁判。</b></p>
+
+<h4>G-P · 装载期（oracle = 快照自身，不需要模型）</h4>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
+<tr><td class="nw"><code>G-P1</code></td><td>redistribute 全域性：placement 格上每一对可达格点都有规则</td>
+  <td>新注册一个产出 <code>Partial(max)</code> 的 op 面而规则表只有 <code>Partial(sum)</code>；新增 mesh 轴而无跨 mesh 规则</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-P2</code></td><td>每个反向模板绑定一个机器可解析的捕获点，否则强制 Tier 2</td>
+  <td>某 op 声明 Tier 1 却指不出可解析的捕获点</td><td class="nw">门</td></tr>
+</table></div>
+
+<h4>G-X · schema 自身</h4>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
+<tr><td class="nw"><code>G-X1</code></td><td>结构性复活检测（§11.4）</td><td>有人把口子加回来</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-X2</code></td><td>标量形态消灭 + 无使用者可设的门限常量</td><td>有人加回 <code>peak: Int</code> 或 <code>config.interval_threshold</code></td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-X3</code></td><td><code>residual_rel</code> 不可声明：由域片内标定点的最大相对残差<b>算出</b>；域片内标定点集非空</td>
+  <td>有人手写 <code>residual_rel: 0.001</code>；或建一个无标定点的域片</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-X4</code></td><td>标定/对照分离（§3.1）</td><td>把真机显存观测改叫"标定报告"再拿去当判据</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-X5</code></td><td><code>ψ</code> 封闭性：无逐 op 例外条目</td><td>为了让策略交换律通过，在 <code>ψ</code> 里加一条"MoE 那块跳过"</td><td class="nw">门</td></tr>
+</table></div>
+
+<h4>G-C / G-D / G-E · 纯静态（oracle = 图自身或框架源码文本）</h4>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
+<tr><td class="nw"><code>G-C1</code></td><td>改写不可逆性：<code>unshard ∘ strip_synth ∘ rewrite(CoreIR,P) ≅ CoreIR</code></td>
+  <td>① 分布式融合把 <code>{AllGather,MatMul}</code> 合成一个节点而未声明可逆分解；
+      ② vocab padding 用<b>改属性</b>实现而不是插 <code>Pad</code> 节点；
+      ③ 精度 pass 用 dtype 字段注入而不是加 Storage</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-C2</code></td><td>重写后全图无 placement 失配</td><td><b>只在实现遗漏时失败</b>；规格级失败已全部上提到 <code>G-P1</code></td><td class="nw"><b>后置条件</b></td></tr>
+<tr><td class="nw"><code>G-C3</code></td><td>策略交换律：<code>∀P∈P_test: PE(Src,·,P) ≅ ψ(rewrite(PE(Src,·,π₀),P))</code></td>
+  <td>任一 pass 产出的 op 多重集 ≠ 源码在该策略下特化的 op 多重集：漏插/多插通信、padding 位置错、
+      重算区未重新执行通信、pass 顺序错、融合选择错</td><td class="nw"><b>门（最强，且不需要 oracle）</b></td></tr>
+<tr><td class="nw"><code>G-D1</code></td><td>反向交叉核对：我们的模板展开 ≅ 框架声明式导数的 op 多重集</td><td>转置写反、少一步、多一步</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-D3</code></td><td>反向类型/守恒自检：<code>shape(grad_out[i]) == shape(in_i)</code></td><td>轴搞错、模板输出个数不符</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-D4</code></td><td>捕获点对照：<code>template_free_vars ∩ forward_values == capture_site_args</code></td>
+  <td>我们的融合 attention 反向只列 <code>{q,k,v,out}</code>，而框架实参含 <code>logsumexp</code>、rng 状态 ⇒ 少列</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-D5</code></td><td>线性性：声明为多重线性的 op，模板中每个输入恰出现一次</td><td>matmul 类模板写成梯度出现两次</td><td class="nw">门（窄）</td></tr>
+<tr><td class="nw"><code>G-E1</code></td><td>pass 幂等 / 前置条件</td><td>改写器有状态残留</td><td class="nw"><b>后置条件</b></td></tr>
+<tr><td class="nw"><code>G-E3</code></td><td>单调性 property test（每个算术原语的声明单调性经随机取样验证）</td><td>声明 <code>increasing</code> 而实际非单调</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-E4</code></td><td>阻断有效性套件：每个 <code>BLK-*</code> 各有触发输入并断言阻断</td><td>某个阻断路径被改坏</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-E5</code></td><td>后端隔离：双向 import 禁令；后端不读源码/配置/注册表</td><td>有人加了回读</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-E6</code></td><td>结构不变量：随层数、微批数变化的结构关系必须由模型<b>导出</b>而非写入公式</td><td>有人硬写了一条 <code>× num_layers</code></td><td class="nw">门</td></tr>
+</table></div>
+
+<h4>G-B · provenance 代数</h4>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
+<tr><td class="nw"><code>G-B0</code></td><td>补救单调性：<code>clean_effect</code> 声明与合成 fixture 实测一致</td><td>新补救模板声明"不变"而实测使某分量上升</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-B1a</code></td><td>抽象残差：<code>readability=FULL</code> 时 shape/arity 在 <code>R_P</code> 与 <code>S_P</code> 上一致，
+  其余各面取凸包作区间</td><td>人声明的语义与源码直接矛盾</td><td class="nw">门（<b>抽样，非证明</b>）</td></tr>
+<tr><td class="nw"><code>G-B3a</code></td><td>通信字节的 <code>replication</code> <b>全覆盖</b>；任一通信节点字节 <code>certainty=exact</code> ⇒ 阻断</td>
+  <td>P4 被绕过</td><td class="nw"><b>后置条件</b>（它是 P4 的直接推论）</td></tr>
+<tr><td class="nw"><code>G-B4</code></td><td>守恒-均匀判据：满足守恒约束且均匀 ⇒ 机器判为完美均衡假设</td><td>把 MoE 负载写成一组均匀数字塞进任一 spec</td><td class="nw">门</td></tr>
+</table></div>
+<p><b>注意 <code>G-B3a</code> 的降级</b>：它<b>是</b> P4 的后置条件——按 <code>G-M1</code> 的口径，
+不存在"P4 实现正确但 <code>G-B3a</code> 失败"的规格级缺陷。降级后，通信插入规则的<b>规格</b>正确性
+仍只由 <code>G-C3</code> 与 op 序列门承担；<code>G-B3a</code> 的作用是抓 P4 的实现遗漏，这仍有价值，
+但<b>不计入验证力度</b>。</p>
+
+<h4>G-T · 真机 op 级 time 记录（唯一的外部 oracle）</h4>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
+<tr><td class="nw"><code>G-T0</code></td><td>留出集分离：对照运行指纹 ∉ <code>CalibrationSet</code> 的指纹集合</td><td>拿标定用的那次跑去做对照（在训练集上测试）</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-T0b</code></td><td>版本一致：对照 trace 的框架/运行时/设备指纹 == 快照 <code>EnvFacts</code></td><td>版本错配</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-T1</code></td><td>op 序列同构：我们预测的 op 身份序列是真机序列的<b>保序子序列</b>；
+  <b>我们有而真机没有的 op ⇒ 硬失败</b>；真机有而我们没有的 ⇒ 逐条计数并进 step time 区间上界</td>
+  <td>漏插/多插通信、重算区通信未重新执行、融合 kernel 选错、精度 cast 缺失、交织顺序错、桶数不符</td>
+  <td class="nw"><b>门（覆盖整条改写链）</b></td></tr>
+<tr><td class="nw"><code>G-T2</code></td><td>逐 op 时长残差在其域片标定残差内</td><td>形状错<b>或</b>成本模型越域（<b>二者不可区分</b>）</td><td class="nw">门（<b>检测器，非归因器</b>）</td></tr>
+<tr><td class="nw"><code>G-T3</code></td><td>端到端 step time 比值</td><td>—（<b>无 band、无阈值</b>）</td><td class="nw">报告项</td></tr>
+<tr><td class="nw"><code>G-N2</code></td><td>桶数 = 真机归约 op 数</td><td><code>bucket_bytes</code> 设错 ⇒ 桶数错</td><td class="nw">门（<b>但与 <code>G-T1</code> 共用 oracle，不独立计数</b>）</td></tr>
+</table></div>
+
+<h4>G-R / G-N / 独门 · 实现、新 spec 与元判据</h4>
+<div class="tw"><table>
+<tr><th class="nw">编号</th><th>断言</th><th class="nw">类别</th></tr>
+<tr><td class="nw"><code>G-R1</code></td><td>SoA 布局：<code>RSS_peak / Q实例数 ≤ 64 B</code>，超过即阻断并报"实现违反 SoA 前提"</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-R2</code>/<code>G-R2b</code></td><td>编译 / 扫描工作量硬上限（以<b>事件·遍</b>这一机器无关工作单位表达，使用者不能靠换机器绕过）</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-R3</code></td><td>pass 确定性：同输入连跑两次，G4 规范序列化<b>逐字节相等</b></td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-R4</code></td><td>扫描升级：残余维度联合扰动使峰值<b>区间与容量区间产生新的相交</b> ⇒ 强制全量 OAT</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-N1</code></td><td>spec 取值域受框架版本约束</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-N3</code></td><td>TD 扫描宽度超 <code>θ_TD</code> ⇒ <code>VERDICT-WITHDRAW</code></td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-N4</code>–<code>G-N7</code></td><td>精度改写四条后置条件（§7.3）</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-L1</code></td><td>分层判据：每层的检查器清单非空</td><td class="nw">门（元）</td></tr>
+<tr><td class="nw"><code>G-M1</code></td><td>门非平凡性</td><td class="nw">门（元）</td></tr>
+<tr><td class="nw"><code>G-Z1a</code></td><td>词汇收敛：<code>k ≥ 3</code> 时 <code>new_lexicon(k) ≤ new_lexicon(k−1)</code></td><td class="nw">门（项目级）</td></tr>
+<tr><td class="nw"><code>G-X6</code></td><td><b>已删除</b>（原"侧表条目可重新推导"）——侧表方案已被"现场调 PE"取代（§3.5）</td><td class="nw">—</td></tr>
+</table></div>
+
+<h3 id="c12-3">12.3 <code>G-M1</code> 自检的结果</h3>
+<div class="cal honest"><span class="lbl">把元门作用在自己身上之后，真门数是多少</span>
+<p>合并后共 <b>31</b> 个条目。<code>G-M1</code> 逐条追问"存在一个<b>规格级</b>缺陷 fixture 使它变红吗"，结果：</p>
 <ul>
-<li><b>融合 kernel 自身输出的保存集</b>：末轴位于编译产物中，而不在源码中。声明通道可以承载该信息；
-    若未提供声明，则标记为 <code>Unknown</code>，并<b>停止给出数值</b>，禁止猜测。</li>
-<li><b>数据依赖量的精确值</b>：MoE 实际负载只能通过 <code>assumed</code> 描述。报告可以说明偏差方向与依据，
-    但不能把它变成精确值。</li>
-<li><b>验证反馈周期</b>：清晰分层的固有代价是，必须等待整条链完成后，才能得到第一个可与现实对照的数值。
-    适配层与按族收编只能缩短这一周期，无法彻底消除——因此阶段 2 的门禁必须使用真机，而非旧路径。</li>
-<li><b>覆盖面</b>：目标态不承诺一次覆盖所有模型族；未覆盖的层类型必须显式阻断，不生成空层结果。</li>
+<li><b>降级为后置条件（3）</b>：<code>G-C2</code>（placement 类型健全——是 <code>Pass_shard</code> 自己的终止条件）、
+    <code>G-E1</code>（pass 幂等）、<code>G-B3a</code>（是 P4 的直接推论）。</li>
+<li><b>不独立计数（1）</b>：<code>G-N2</code> 与 <code>G-T1</code> 共用同一条 trace，是后者的特例投影。</li>
+<li><b>报告项（1）</b>：<code>G-T3</code>。</li>
+<li><b>真门 26</b>，按 oracle 分布：schema 自身 5、图自身或源码文本 10、快照自身 2、
+    真机 op time 4、provenance 代数 3、实现与规模 4、元判据/项目级 3
+    （<code>G-N4..N7</code> 计入"图自身"，<code>G-L1</code>/<code>G-M1</code>/<code>G-Z1a</code> 计入元判据）。</li>
+</ul>
+<p><b>最该看清的一件事</b>：26 道真门里，<b>只有 4 道拿真机数据当裁判，且这 4 道全部只覆盖时间链与改写链</b>。
+显存链的 22 道门全部是自洽性检查——它们能抓实现错、抓规格自相矛盾、抓与源码文本不符，
+<b>抓不到"我们对框架的整体理解是错的"</b>。</p></div>
+
+<h2 id="c13"><span class="cn">Chapter 13</span>规模、预算与实施</h2>
+
+<h3 id="c13-1">13.1 规模对账</h3>
+<p>基准配置（全表唯一基准，DSv3 类）：<code>L=61</code>（3 dense + 58 MoE）、<code>h=7168</code>、
+<code>experts=256</code>、<code>topk=8</code>、<code>seq=4096</code>、<code>mbs=1</code>、<code>mb=32</code>；
+<code>pp=16, vpp=2, tp=8, ep=8</code>；分布式优化器开、全层重算、fp8 开。两列：
+<b>A</b> = MoE 用 grouped GEMM；<b>B</b> = 每 rank 32 个专家逐个展开。
+<b>B 是同一模型的另一个 <code>ImplSpec</code>，不是另一个模型——事件数随实现族选择变动 2.4 倍，
+这本身是必须写进报告的事实。</b></p>
+<div class="tw"><table>
+<tr><th class="nw">#</th><th>量</th><th class="nw">A</th><th class="nw">B</th><th>推导</th></tr>
+<tr><td class="nw">R3</td><td>G0 CoreIR <b>折叠</b>节点</td><td class="nw">8×10²</td><td class="nw">8×10²</td><td><code>RepeatRegion</code> 折叠层与专家</td></tr>
+<tr><td class="nw">R8</td><td>G3 折叠节点（含重算克隆）</td><td class="nw">4.1×10³</td><td class="nw">4.1×10³</td><td>逐层 ×0.9 融合、+15% fp8、×3.3 反向、+15% 主副本、+15% 通信</td></tr>
+<tr><td class="nw">R11</td><td><b>rank 类数</b></td><td class="nw"><b>16</b></td><td class="nw"><b>16</b></td><td>= <code>pp</code>；1F1B 下各 pp 阶段在飞 microbatch 数不同 ⇒ <b>必须逐 pp 阶段实例化</b></td></tr>
+<tr><td class="nw">R12</td><td><b>总事件数 <code>E</code></b></td><td class="nw"><b>7.2×10⁵</b></td><td class="nw"><b>1.75×10⁶</b></td><td>每 rank 类每 microbatch 实例化节点 × <code>mb</code> × <code>R</code></td></tr>
+<tr><td class="nw">R19</td><td>常驻内存（含索引 ×2.5）</td><td class="nw">0.5 GB</td><td class="nw">1.1 GB</td><td>目标 ≤ 2 GB ✓</td></tr>
+<tr><td class="nw">R21</td><td><b>单次编译工作量</b></td><td class="nw"><b>3.6×10⁶</b></td><td class="nw"><b>8.8×10⁶</b></td><td><code>E ×</code> 5 遍（实例化 / liveness×2 / 段内 DES / 报告聚合），单位「事件·遍」</td></tr>
+<tr><td class="nw">R24</td><td>单次编译墙钟（8 核）</td><td class="nw">9 s</td><td class="nw">22 s</td><td>rank 类无共享状态，可切分</td></tr>
+<tr><td class="nw">R26</td><td>扫描迭代数</td><td class="nw">34</td><td class="nw">34</td><td><code>2D + 2</code>，<code>D ≤ 16</code></td></tr>
+<tr><td class="nw">R30</td><td><b>全流程墙钟（8 核，保守速率）</b></td><td class="nw"><b>100 s</b></td><td class="nw"><b>245 s</b></td><td>「配好配置直接出结果」的落点</td></tr>
+</table></div>
+
+<div class="cal bad"><span class="lbl">这张表的四个输入数<b>全部是推的，不是测的</b></span>
+<p>每层原子 op 数、每事件的 <code>Q</code> 实例数、每事件 20 µs、rank 类数 = <code>pp</code>——
+四个数没有一个来自测量，而单次编译工作量与扫描工作量是它们的<b>连乘</b>。
+任一项低估 3 倍，工作量上限就被撞穿（B 列已占扫描上限的 75%，余量很薄）。</p>
+<p><b>最危险的是每事件成本</b>：按"SoA + 编译热循环"给 20 µs，但 allocator 模拟的最坏实现
+（线性扫描找空洞、每次分配遍历空闲链）单事件可到毫秒级——<b>那样整张表作废，而且是三个数量级的作废，不是 3 倍。</b></p>
+<p><b>把它变成数的最小动作</b>：用<b>合成图</b>（10⁶ 个假事件、假 Storage，不涉及任何模型语义）
+对两个后端做一次空转基准，半天成本，把该常数从假设变成测量值。<b>在这件事完成前，
+本表的绝对数值不得用于任何论证。</b></p></div>
+
+<h3 id="c13-2">13.2 三条硬前提（违反则整表作废）</h3>
+<div class="tw"><table>
+<tr><th class="nw">前提</th><th>内容</th><th>违反后果</th></tr>
+<tr><td class="nw">P1</td><td><code>Q</code> 实例与事件记录必须是 <b>SoA 平铺</b>，不得每实例一个宿主对象</td>
+  <td>裸对象最小 48–56 B，带字典数百 B ⇒ <b>25–50 GB</b></td></tr>
+<tr><td class="nw">P2</td><td>实例表示为 <code>(template_id: u32, index_vector: u32×3)</code> = 16 B 上限 ⇒ <b>索引维度 ≤ 3</b></td>
+  <td>需要第 4 个索引维时必须<b>显式扩宽并重算</b>，不许悄悄加</td></tr>
+<tr><td class="nw">P3</td><td>五个热循环必须<b>向量化或编译执行</b>，不能逐事件解释执行</td>
+  <td>每事件成本退化 10–50 倍</td></tr>
+</table></div>
+
+<h3 id="c13-3">13.3 敏感性扫描：削减的大部分来自一个证明，不是启发式</h3>
+<p>朴素做法是逐量 OAT ⇒ <code>2k</code> 次全量重跑。但 <code>k</code> 的构成不是均质的：</p>
+<div class="tw"><table>
+<tr><th class="nw">档</th><th>内容</th><th class="nw"><code>k</code></th><th class="nw">必须逐维？</th><th>依据</th></tr>
+<tr><td class="nw">A</td><td><code>assumed</code> 的数值区间型根（MoE 负载、capacity、稀疏选中数）</td><td class="nw">10–20</td>
+  <td class="nw"><b>否</b>，联合取端点</td><td>已分配显存对字节<b>单调</b>（执行序由调度确定性产出，<b>不依赖任何字节数</b>）</td></tr>
+<tr><td class="nw">B</td><td><code>modeled</code> 的残差根（~90 算子族 + workspace 域片）</td><td class="nw">~100</td>
+  <td class="nw"><b>否</b>，联合取端点</td><td>同上；残差是相对乘性的，字节侧仍单调</td></tr>
+<tr><td class="nw">C</td><td><b>非单调</b>维度：allocator 碎片 / 保留、<code>timing_dependent</code> 通信时长、makespan 的 duration 根</td>
+  <td class="nw">~28</td><td class="nw"><b>是</b></td><td>碎片对字节不单调；<b>Graham 异常</b>使 makespan 对 duration 不单调</td></tr>
+<tr><td class="nw">D</td><td><b>离散选择型</b>（手写 placement 的 axis、drop 策略、实现族替身判断）</td><td class="nw">视情况</td>
+  <td class="nw"><b>不进区间扫描</b></td><td>它们没有 lo/hi，"扫"这个动作对它们无定义 ⇒ 改走<b>离散 what-if 清单</b></td></tr>
+</table></div>
+<p>档 A + B 的联合区间 = <b>2 次 liveness</b>（已含在单次编译的 5 遍里，<b>增量为零</b>），而不是 <code>2×120</code> 次。
+逐根的贡献<b>不需要重跑</b>：<code>span(root) = Σ_{s ∈ live(t*), root ∈ s.roots} (s.hi − s.lo)</code>
+在同一遍 liveness 内即可算出——<b>归因和区间是两件事，把它们混成一件事才导致了 2k 的估计。</b></p>
+
+<div class="cal honest"><span class="lbl">诚实的取舍：三个量的产物形态必须不同</span>
+<p><b>已分配峰值有真正的区间（是界）；保留峰值与 step time 没有区间，只有"top-N 扫描观测到的范围"。</b>
+报告中这三个量必须用<b>不同的产物形态</b>呈现，且 step time 的"区间"这一说法<b>予以撤销</b>。</p>
+<p><b>top-N 截断的失效模式我既检测不到也界定不了</b>：<code>span(root)</code> 在<b>标称</b>配置下计算，
+而某个根可能只在另一个根取 hi 时才变大——<b>用 OAT 的产物来决定 OAT 扫哪些维，是循环论证</b>。
+补偿是三件事：漏报清单进<b>报告正文</b>（不是脚注）、残余维度联合扰动、升级门 <code>G-R4</code>；
+<b>前两件是披露，只有第三件是机制</b>，而它只在"跨越容量"这一个条件下触发。</p></div>
+
+<h3 id="c13-4">13.4 迁移</h3>
+<p>不采用全量重写（数值变化无法归因），也不保留长期双轨（两套事实源必然漂移）。
+采用<b>适配层 + 按算子族收编 + 双跑归因</b>；每完成一族即删除对应旧分支。</p>
+<div class="tw"><table>
+<tr><th class="nw">阶段</th><th>内容</th><th>该阶段的门</th></tr>
+<tr><td class="nw">0</td><td><b>立项前两件事</b>：① AST 探针（语法构件计数 + import 期 monkey-patch 点 / 并行状态访问器读取点 /
+  配置规范化函数规模三张清单 + policy-tainted guard 的数量与按字段分布）；② 合成图空转基准</td>
+  <td>两件事完成前，<b>任何引用探针结果或对账表绝对数值的论证一律无效</b></td></tr>
+<tr><td class="nw">1</td><td>语义基础设施：类型系统、组合子库（含归约类声明）、DSL 编译器、三个注册域</td><td>加载期阻断用例全部通过；<code>G-X1</code>–<code>G-X5</code></td></tr>
+<tr><td class="nw">2</td><td>PE + PySub + π₀；G0 与 policy-free 断言</td><td><code>G-C3</code> 在小模型上通过；PGRO 覆盖率 100%（<b>不足即不得出数</b>）</td></tr>
+<tr><td class="nw">3</td><td>按族收编：视图/类型转换/比较 → 逐元素/归一化 → 矩乘 → 注意力 → MoE → 集合通信 → 融合</td><td>每族收编后 <code>G-D1</code>/<code>G-D3</code>/<code>G-D4</code></td></tr>
+<tr><td class="nw">4</td><td>改写链 G0.5 → G4</td><td>层表的独有不变量检查器全部实现（<code>G-L1</code>）</td></tr>
+<tr><td class="nw">5</td><td>两后端 + 报告</td><td><code>G-T0</code>–<code>G-T2</code>；显存侧只有自洽性检查</td></tr>
+<tr><td class="nw">6</td><td>开放用户通道：注册、校验、解释、骨架生成</td><td>闭环用例 + <code>G-B0</code> 合成 fixture 全通过</td></tr>
+<tr><td class="nw">7</td><td>收口：删除旧分支，只保留兼容 API</td><td><code>G-M1</code> 全表通过</td></tr>
+</table></div>
+<p>阶段 2 的进度度量"新链覆盖 X% 调用"<b>不是正确性门</b>——由于其余全部硬阻断，<code>X</code> 对正确性无影响，
+故从门表移出，重分类为进度度量。含未完成 op 的模型<b>整体阻断，无部分结果</b>。</p>
+
+<h2 id="c14"><span class="cn">Chapter 14</span>决策记录与能力边界</h2>
+
+<h3 id="c14-1">14.1 决策记录</h3>
+<div class="tw"><table>
+<tr><th class="nw">#</th><th>决策</th><th>关键理由</th></tr>
+<tr><td class="nw">D1</td><td>结构从框架源码<b>偏特化</b>得到，是唯一结构源</td><td>手写图的失效是静默的；残差是良定义对象，可比较可 digest</td></tr>
+<tr><td class="nw">D2</td><td>Op 语义用纯配置描述，不开放代码插件</td><td>可静态校验、可版本化、用户可扩展</td></tr>
+<tr><td class="nw">D3</td><td>Op 类型拆到原子级（一种类型一条形状关系）</td><td>消除二次分派；避免不同语义共用一条反向规则</td></tr>
+<tr><td class="nw">D4</td><td>三个注册域物理隔离；patch 整条替换 + hash 门禁</td><td>加载顺序决定结果 = 不可复现</td></tr>
+<tr><td class="nw">D5</td><td>未注册 Op 硬阻断 + 生成骨架</td><td>语义未知时任何数值都缺乏可验证依据</td></tr>
+<tr><td class="nw"><b>D6′</b></td><td><b>provenance 是两条正交轴（<code>certainty</code> × <code>roots</code>），三个旧名降为命名投影</b></td>
+  <td>旧的一维枚举把"注册一条语义"判成事实；且同时造成 roofline 被误判与嗅探门恒假</td></tr>
+<tr><td class="nw"><b>D7′</b></td><td><b>CoreIR 在 π₀ 处偏特化；策略由改写 pass 重新引入，逐 guard 负 PGRO 义务</b></td>
+  <td>policy-free 需要一个可机器判定的支点；PGRO 把端到端的重建义务拆成可归因的局部义务</td></tr>
+<tr><td class="nw"><b>D8′</b></td><td><b>层序：实现选择 / 逻辑融合 / 前向精度前移到反向生成之前</b></td>
+  <td>反向模板逐 op 查表 ⇒ op 集合必须先定稿，否则必须为新节点另建一套对偶</td></tr>
+<tr><td class="nw">D9</td><td>四层身份，禁止按名字推断复用</td><td>按名称去重会同时造成少算与多算</td></tr>
+<tr><td class="nw">D10</td><td>placement 有推导与声明两种输入模式</td><td>非规则化切分的框架在原理上推不出来</td></tr>
+<tr><td class="nw">D11</td><td>轴代入只有一份实现</td><td>两份实现必然分歧，而分歧本身不是信号</td></tr>
+<tr><td class="nw">D12</td><td>两后端只读、互不 import、自包含视图</td><td>后端回读上游会使 profile 复用静默失效</td></tr>
+<tr><td class="nw"><b>D13′</b></td><td><b>时间链以 op 级序列与时长为唯一 oracle；显存链无外部裁判，全部改称自洽性检查</b></td>
+  <td>前提 P-oracle + P-peak 的直接推论。<b>把这件事说清楚，比假装有裁判更有价值</b></td></tr>
+<tr><td class="nw"><b>D14</b></td><td><b>峰值只有区间形态；<code>oom_verdict</code> 是三值，第三值附判定阻碍分解</b></td>
+  <td>无外部裁判之下，点估计与二值判定是不诚实的；三值把坏消息变成工单</td></tr>
+<tr><td class="nw"><b>D15</b></td><td><b>无机器残差来源时取单侧，而不是保持点值</b></td>
+  <td>拒绝伪造宽度是对的，但保持点值会让不可验证的那部分对区间宽度贡献为零
+      ——输出会是一个伪装成区间的点估计，且最易错的方向正是用户最想采信的方向</td></tr>
+</table></div>
+
+<h3 id="c14-2">14.2 能力边界 E</h3>
+<div class="cal bad"><span class="lbl">四处最弱重叠在同一格，因此把它写成一条命名性质，而不是四条散落的自曝</span>
+<pre><code>边界 E：
+  设 U := { 源码不可读的对象 } ∪ { 不改变 op 序列、也不显著改变时长的差异 }
+  对 U 内的一切，本方案提供：
+      (i) 一个不可声明的根、(ii) 一个证据等级、(iii) 一个覆盖字节计数、(iv) 一个 Θ 门
+  **不提供**：任何构造性残差、任何独立对照物、任何证明。
+  报表首页必须打印 U 覆盖的字节占比，字段名 unverifiable_coverage。</code></pre>
+<p><b>凡"源码读不到内部"或"唯一 oracle 覆盖不到"的地方，全部构造性保证同时失效，只剩阈值、抽样与披露。</b>
+这不是四个独立缺陷，是同一条能力边界的四个投影：</p>
+<div class="tw"><table>
+<tr><th class="nw">投影</th><th>内容</th></tr>
+<tr><td class="nw">代数侧</td><td><code>readability = NONE</code> 的那一半（融合 attention 的 workspace 与 captures、
+  MoE dispatcher、通信 kernel、allocator 的池/对齐/split）<b>没有机器残差</b>。
+  <code>G-B1a</code> 需要 PE 读得到源码体，那里读不到</td></tr>
+<tr><td class="nw">门体系侧</td><td><b>改写链有 oracle，存储模型没有 oracle</b>。
+  且 op 身份映射表（真机算子名 ↔ 我们的 <code>semantic_id</code>）本身<b>是又一张人工映射表</b>，
+  它若被调宽，最强的那道门会<b>静默退化为恒真门</b></td></tr>
+<tr><td class="nw">支点侧</td><td><code>canon(·)</code> 太弱则假阻断泛滥、太强则静默放行错误重建，
+  而"规则集是否恰好够用"<b>没有判据</b></td></tr>
+<tr><td class="nw">规模侧</td><td>对账表四个输入数全是推的且结论乘性敏感；
+  top-N 截断用 OAT 的产物决定 OAT 扫哪些维，是<b>循环论证</b></td></tr>
+</table></div>
+<p><b>这条比四条分散的自曝强在</b>：它给出了那一格的<b>边界定义</b>与<b>一个必须打印的数</b>，
+于是"我们在哪里瞎"从散文变成一个可以逐版本比较的指标。</p></div>
+
+<h3 id="c14-3">14.3 其余诚实边界</h3>
+<div class="cal honest"><span class="lbl">本设计明确做不到的事</span>
+<ul>
+<li><b>没有停止条件。</b><code>G-Z1a</code> 是证伪条件（不递减 ⇒ 基本假设被推翻 ⇒ 停止实施），
+    <b>不是</b>完成条件——没有任何 <code>k</code> 使我们能宣布注册工作结束。</li>
+<li><b>alias / in-place / 存储复用判断无验证手段。</b>它既不改变 op 序列、也几乎不改变时长，
+    在唯一的 oracle 上结构性不可见。判错的后果是显存的一阶量，且它是 <code>peak_lower</code> 的前置条件。</li>
+<li><b>liveness 与释放时机无验证手段。</b>调度的 Alloc/Free 语义、allocator 的碎片模型整块处在盲区。</li>
+<li><b>融合 kernel 的 <code>captures</code>（Tier 2）只有惩罚没有验证。</b>
+    "验证力度与风险大小成反比"这个病<b>被降级为一个代价单调的宽区间，未被解决</b>。</li>
+<li><b><code>workspace_bytes</code> 无验证手段。</b>证据源只剩厂商文档/反汇编/显存标定，
+    而显存标定按 <code>G-X4</code> 只能进常数位、不能进 oracle 位。</li>
+<li><b>placement 面的规格错误</b>（区别于实现遗漏）<b>在无对照 trace 的部署下无验证手段</b>；
+    即使有 trace，若错误既不改变通信种类也不改变个数（两轴等长的切错轴），仍看不见。</li>
+<li><b>PE 共模误读</b>中"既不改 op 序列、也不改时长"的那一类（attrs 里的一个数值、某个 storage 的 dtype 判错）：
+    <code>G-C3</code> 因两边共用同一个 PE 而对共模误读<b>结构性免疫</b>，op 序列门只看 op 身份。</li>
+<li><b><code>G-T2</code> 的形状检出是相对标定循环的</b>：时长→形状的推断走的是我们自己的成本模型的逆。
+    若成本模型与形状模型同向偏差，残差可以互相抵消而门通过。</li>
+<li><b>桶的内容</b>（哪些参数进哪个桶）无验证手段——只要桶数对，内容错也过。</li>
+<li><b>覆盖面</b>：不承诺一次覆盖所有模型族；未覆盖的层类型必须显式阻断，不生成空层结果。</li>
 </ul></div>
+
+<div class="cal why"><span class="lbl">为什么把这一章写这么长</span>
+<p>因为在前提 P-oracle + P-peak 之下，<b>这份方案能提供的最有价值的东西，不是"这个数是对的"，
+而是"这个数在哪些地方可能是错的、错了多少、以及要花多少代价才能不错"。</b></p>
+<p>第 2 章的代数、第 12 章的门表、第 10 章的三值判定，全部服务于同一件事：
+把"我们不知道"从一句免责声明，变成一个带类型、带计数、带阈值、能沿着计算链传播到头号输出的<b>对象</b>。</p></div>
 
 <div class="foot">
 <p>图的可编辑源：<code>docs/target-design-v2/diagrams/*.excalidraw</code>（可直接导入 Excalidraw 编辑）。
@@ -694,7 +1658,7 @@ ResourceRequest:                       # 自包含：时间后端不回读 CoreI
 </main>
 
 <script>
-/* 导航当前位置高亮：58 条目录需要它才好用。无外部依赖，尊重 reduced-motion。 */
+/* 导航当前位置高亮：全量目录需要它才好用。无外部依赖，尊重 reduced-motion。 */
 (function(){
   var links = [].slice.call(document.querySelectorAll('nav a[href^="#"]'));
   if(!links.length || !('IntersectionObserver' in window)) return;
@@ -734,3 +1698,10 @@ ResourceRequest:                       # 自包含：时间后端不回读 CoreI
 })();
 </script>
 </div>
+
+
+
+
+
+
+
