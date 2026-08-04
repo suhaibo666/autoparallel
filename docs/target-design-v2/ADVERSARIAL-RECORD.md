@@ -77,7 +77,62 @@ def init(...): _STATE['tp'] = world_size   # 只改字典内容，绑定从未�
 把碎片算进来之后**正好倒过来**（正文 §10.2b）：`reserved = allocated + 碎片`，碎片 ≥ 0
 ⇒ 「会 OOM」可判定（碎片救不回来），「装得下」当且仅当碎片模型有上界。
 
-### 2.6 死掉的论证（结论保留，理由换掉）
+### 2.6 值域裁剪把方案锁死在自己的门下
+
+**曾经的写法**：`RegisteredOp.self_certainty ∈ {modeled, assumed}`，`exact` 不在值域里。
+意图是堵住"注册一条语义就把人的判断变成事实"。
+
+**为什么错**（推理三步，每步都是方案自己的规定）：
+
+1. S1 是算子语义的**唯一**词典 ⇒ 每个张量的 shape/dtype/storage 都由某个 `RegisteredOp` 求值；
+2. 一律不许 `exact` ⇒ 由 P2，**全链没有一个字节是 `exact`**；由 P3 取最弱，**evidence 恒为 `reconstructed`**；
+3. ⇒ `θ_evd` 与 `θ_abs` 对任何小于 1 的取值恒真 ⇒ `VERDICT-WITHDRAW` 恒触发 ⇒ `oom_verdict` 恒 `undetermined`
+   ⇒ **`G-M2` 在方案启动第一天就是红的**。
+
+**病根**：把两类注册项混为一谈。要堵的是"**用一次注册来消化一次阻断**"；
+而 `Reshape` 是工具出厂就带的算术事实，它不消化任何阻断。
+区别机器可判且不可伪造：**`origin.block_code` 是不是 `null`**。
+
+**现在**：`exact` 仅当 `block_code = null ∧ readability = FULL ∧ 单算子粒度`，
+并进 `native_exact_ledger` 参与 digest；§2.4 的 `readability` 分派表也**只作用于
+`block_code ≠ null` 的条目**——出厂 native 语义不背 `abstraction`/`declared_semantics` 根。
+
+### 2.7 P5 兜底的"选侧"曾是一个无机器判据的二选一
+
+**曾经的写法**：`direction := 单侧（按该量对峰值的偏置方向定 upper/lower）`。
+
+**为什么不可执行**：① "偏置方向"二义（"我们给的值偏向哪边" vs "它把峰值推向哪边"），
+两种读法在碎片上结果相反；② 对绝大多数兜底量真值方向本就不唯一
+（fp32 主副本：框架没建 ⇒ 我们是 `upper`；建得更多 ⇒ 我们是 `lower`，两边都能自圆其说）；
+③ `C_eff` 的减项不作用于 peak，规则的自变量不存在；碎片与通信时长非单调，"偏置方向"无定义。
+
+**后果**：实现者对每个兜底量握有一个二选一，而它决定头号输出——全选 `upper` 永远说不出"会 OOM"，
+全选 `lower` 永远说不出"装得下"。**结构性复活检测抓不到它**（不是字段、不是枚举、不是转换算子）。
+
+**现在**：取**使 `oom_verdict` 更难变确定**的那一侧——peak 的加项取 `lower`、`C_eff` 的减项取 `upper`。
+它是唯一一条不需要知道真值方向就能执行的规则。
+
+### 2.8 "碎片标定是决定成败的那一件事"——排他表述是错的
+
+`S_∞`（P5 兜底集）里**任何一个**成员单独就足以使"装得下"不可判，而碎片按字节量级排在
+优化器持久项（16 B/param）、梯度桶、重算副本、`free_policy` liveness 差、梯度值之后。
+原表述会把**标定路线图排错序**。现改为合取式，并把报表首页那行从"碎片未标定时打印"
+改为"`S_∞ ∩ live(t*)` 非空时打印其完整成员清单"。
+
+附带一处自相矛盾：曾写"碎片是 `reconstructed`，按 P5 它有标定点才有来源 ③"
+——而来源 ③ 的前置条件正是 `grade = calibrated`。`evidence.grade` 不是固定属性，是**标定进度条**。
+
+### 2.9 其它被修正的一致性问题
+
+| 问题 | 处置 |
+|---|---|
+| §2.8 曾写「`configured` 是八种根里**唯一允许精确**的那个」 | 又把 `certainty` 写成了 `roots` 的函数（§2.1 的病复发）。改为「唯一一个**其叶子取值本身不承担可证伪义务**的根」 |
+| step time 四处说有区间、一处说撤销 | 取"没有区间"。类型层论证：makespan 是 `Sample[Float]`，而不存在 `Sample→Q` 转换算子 ⇒ step time 在类型上不可能是区间 |
+| 五个 pass（`train_step`/`precision_opt`/`fusion_dist`/`remat`/`sched`）没有 `own_roots` | P4 在它们上无法执行，而它们恰好合成字节量最大的东西。补成覆盖全部九个 pass 的必填表 |
+| `policy(·)` 是闭集外的第九个根名（6 处） | 改为**根上的谓词**：`policy(q) :⟺ ∃p ∈ roots(q): p = configured(f) ∧ class(f) ∈ {Π_extent, Π_impl}`。`Root` 保持八值闭集 |
+| `kind` 枚举不够用 | 补 `partial_residual_site`（`PARTIAL` 未求值站点，正文已要求打 `abstraction` 根却无 kind 可填）、`op_identity_mapping`、`psi_projection`、`canon_ruleset`；并给 `declared_semantics` 也加 kind |
+
+### 2.10 死掉的论证（结论保留，理由换掉）
 
 | 论证 | 为什么死 | 换成什么 |
 |---|---|---|
@@ -169,6 +224,6 @@ P-oracle + P-peak 之后显存链无外部裁判，于是找过四条替代 orac
 |---|---|---|
 | 1 | **AST 探针**（语法构件计数 + 三张清单 + policy-tainted guard 的数量与分布） | 决定 PySub 覆盖率、`PolicyStateBinding` 规模、PGRO 工作量与假阻断风险 |
 | 2 | **合成图空转基准**（10⁶ 假事件，把每事件成本从假设变成测量值） | 规模对账表对它乘性敏感，最坏实现差三个数量级 |
-| 3 | `PolicyStateBinding` 默认拒绝的**假阳性规模**未定量 | 若框架里模块级全局极多，声明表可能膨胀成开集 ⇒ 判据 3 失守 |
+| 3 | `S_∞` 成员的实际字节占比未定量（`unverifiable_coverage` 的首个真实取值） | 若框架里模块级全局极多，声明表可能膨胀成开集 ⇒ 判据 3 失守 |
 
 **在 1、2 完成前，任何引用探针结果或对账表绝对数值的论证一律无效。**
