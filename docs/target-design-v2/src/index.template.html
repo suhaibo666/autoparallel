@@ -1360,8 +1360,8 @@ oom_verdict = false 可判定 ⟺ peak_reserved.hi 可计算 ∧ ∀ r ∈ S_C :
 
 <div class="cal bad"><span class="lbl">"装得下"不可判的原因不止一个，而碎片<b>不是</b>其中最大的</span>
 <p>很容易把这件事收束成一句"碎片标定是决定成败的那一件事"。<b>那句话是错的，而且错得有害</b>——
-它把标定路线图<b>排错了序</b>。<code>S_∞</code> 是一个<b>合取必要条件集</b>，
-碎片只是它的成员之一，且按字节量级排<b>不在前列</b>：</p>
+它把标定路线图<b>排错了序</b>。<code>S_∞</code> 是一个<b>合取必要条件集</b>，而碎片经 P5 来源 ⑤ 有了结构性上界之后<b>根本不在里面</b>。
+真正的成员按字节量级排是这些：</p>
 <div class="tw"><table>
 <tr><th class="nw">序</th><th><code>S_∞</code> 成员</th><th class="nw">字节量级</th><th>为什么 P5 四个来源都不适用</th></tr>
 <tr><td class="nw">1</td><td><b>fp32 主权重 + 主梯度 + 优化器状态</b></td><td class="nw"><b>16 B/param</b></td><td>非抽象模块、非双候选、<code>replication</code> 无标定点、无"无声明上界"</td></tr>
@@ -1371,10 +1371,10 @@ oom_verdict = false 可判定 ⟺ peak_reserved.hi 可计算 ∧ ∀ r ∈ S_C :
 <tr><td class="nw">5</td><td><b>梯度值 + 反向 scratch</b></td><td class="nw">≈ 全部参数字节</td><td>同 1</td></tr>
 <tr><td class="nw">6</td><td>通信 buffer</td><td class="nw">单层激活 × 通信节点数</td><td>根里没有标定根</td></tr>
 <tr><td class="nw">7</td><td>融合 kernel 的 <code>workspace_bytes</code></td><td class="nw">长序列下可达 GB 级</td><td>显存标定只能进常数位、不能进 oracle 位（<code>G-X4</code>）</td></tr>
-<tr><td class="nw">8</td><td>allocator 对齐 / 池划分 / split</td><td class="nw">随实例数线性</td><td><code>readability = NONE</code>，<code>G-B1a</code> 读不到</td></tr>
-<tr><td class="nw">9</td><td><b><code>framework_reserve</code></b></td><td class="nw">GB 级</td><td>属 <code>S_C</code>，<b>走另一条路</b>：它不使 <code>peak.hi</code> 不可算，而使 <code>C_eff.lo</code> 不可算</td></tr>
-<tr><td class="nw">—</td><td><s>碎片</s></td><td class="nw">—</td><td><b>已退出 <code>S_∞</code></b>：它有结构性上界（P5 来源 ⑤），不再落兜底</td></tr>
-<tr><td class="nw">11+</td><td>fp8 低精副本 · <code>amax</code>/<code>scale</code> · <code>PARTIAL</code> 未求值站点 · 被抽象模块的参数与 captures 字节 · loss-scaling 中间量</td><td class="nw">—</td><td>各见其节</td></tr>
+<tr><td class="nw">8</td><td>allocator <b>对齐 / split</b>（<b>不含池划分</b>）</td><td class="nw">随实例数线性</td><td><code>readability = NONE</code>，<code>G-B1a</code> 读不到；且逐次分配的对齐余量无组合上界</td></tr>
+<tr><td class="nw">S_C</td><td><b><code>framework_reserve</code></b></td><td class="nw">GB 级</td><td><b>走另一条路</b>：它不使 <code>peak.hi</code> 不可算，而使 <code>C_eff.lo</code> 不可算。注意这只是<b>值</b>不可算，<code>C_eff</code> 的<b>类型</b>仍是 <code>Q</code>（<code>G-X7</code> 保证）</td></tr>
+<tr><td class="nw">9</td><td>fp8 低精副本 · <code>amax</code>/<code>scale</code> · <code>PARTIAL</code> 未求值站点 · 被抽象模块的参数与 captures 字节 · loss-scaling 中间量</td><td class="nw">—</td><td>各见其节</td></tr>
+<tr><td class="nw">已退出</td><td><s>碎片</s> · <s>allocator 池划分</s></td><td class="nw">—</td><td>二者都有<b>结构性上界</b>（P5 来源 ⑤，由复刻规则 + G4 事件序组合算出）⇒ 不落兜底、不进 <code>S_∞</code>。<b>这正是让 <code>C_eff</code> 保持 <code>Q</code> 的那一步</b></td></tr>
 </table></div>
 <p><b>结论的正确形态</b>：<code>S_∞ ∩ live(t*)</code> 里<b>任何一个</b>成员单独就足以使
 "装得下"不可判；<code>S_C</code> 的成员则从 <code>C_eff</code> 那一侧达到同样效果。
@@ -1680,7 +1680,6 @@ G-B0（补救单调性门，机器执行）：
 <tr><td class="nw"><code>G-M1</code></td><td>门非平凡性</td><td class="nw">门（元）</td></tr>
 <tr><td class="nw"><code>G-M2</code></td><td><b>可用性下限</b>：存在洁净配置 fixture 使 <code>oom_verdict ≠ undetermined</code>（§10.2b）</td><td class="nw">门（元）</td></tr>
 <tr><td class="nw"><code>G-Z1a</code></td><td>词汇收敛：<code>k ≥ 3</code> 时 <code>new_lexicon(k) ≤ new_lexicon(k−1)</code></td><td class="nw">门（项目级）</td></tr>
-<tr><td class="nw"><code>G-X6</code></td><td><b>已删除</b>（原"侧表条目可重新推导"）——侧表方案已被"现场调 PE"取代（§3.5）</td><td class="nw">—</td></tr>
 </table></div>
 
 <h3 id="c12-3">12.3 <code>G-M1</code> 自检的结果</h3>
