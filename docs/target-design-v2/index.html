@@ -852,6 +852,9 @@ P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residu
                     区间由**该声明自身的语义**给出两端——
                     lo = 声明成立时的值；hi = 声明完全不成立时该量的无声明上界。
                     两端均由定义式算出，**不是猜的误差棒**
+                 ⑤ **结构性上界**：由**复刻规则 + G4 事件序**组合算出的上界。
+                    例：碎片 ≤ 活跃分配块数 × 最大对齐/分块粒度。
+                    它不依赖任何扫描、任何标定点，是纯组合量 ⇒ **是界，不是样本**
                **兜底（无一适用时）**：direction := 单侧，**不得保持点值**。选哪一侧**由机器定**：
                  取**使 oom_verdict 更难变确定**的那一侧 ——
                    · 进入 peak 的加项  ⇒ lower（放弃 hi）
@@ -1020,13 +1023,17 @@ dropout 位置不同，则逐面不同 ⇒ 宽度正比于被隐藏的差异 ⇒
 
 <h3 id="c3-3">3.3 策略分类表与 <code>class_origin</code></h3>
 <p>分类表（哪个字段属哪一类、π₀ 取值是什么、<b>谁重新引入它</b>）是<b>工具随框架版本发布的制品</b>，参与 digest。既然有出厂基线，用户的改动就是一个 diff，而 diff 是机器可见的：</p>
+<p><b>因此八份 <code>*Spec</code> 的每一个字段都必须进这张表</b>，各带 <code>class</code> 与<code>class_origin</code> 两列——包括 <code>DistOptSpec</code> 与 <code>PrecisionSpec</code>。表的<b>结构</b>（两列）是机制依赖的东西，具体行内容不是。</p>
 <pre><code>PolicyClassTable.row : { field, class, pi0, reintroducer, class_origin }
 class_origin : tool_shipped | user_override      # 由与出厂表比对得出，**不可填**</code></pre>
 
 <div class="cal bad"><span class="lbl">这一格堵的是"改表"这条逃逸路径</span>
 <p>把某个策略字段从 <code>Π_extent</code> 改判为 <code>Model</code> ⇒ 污点判据不再触发 ⇒ 阻断消失，该量仍精确。前面所有机制对这条路径<b>完全无效</b>，因为改表不产生任何带 <code>abstraction</code> 根的节点，它改的是<b>根的种类</b>。两条后果，都是机制：</p>
 <p><b>(a)</b> <code>class_origin = user_override ∧ class = Model</code> ⇒ 由该字段流出的每个量携带<code>abstraction(policy_reclassification, f@ver)</code> 根 ⇒ 与"注册为原子"落进同一个报表口径、同一道 Θ 门。</p>
-<p><b>(b)</b> <b>扫描维度集合由类别机器导出，<code>Model</code> 不是扫描维度</b>：<code>sweep_dims := {f : class(f) ∈ {Π_extent, Π_impl}} ∪ RematSpec ∪ ScheduleSpec ∪ ImplSpec 的字段</code>。把一个字段改判为 <code>Model</code>，<b>它就从敏感性扫描里消失了</b>，报表的 <code>excluded_from_sweep</code>机器生成一行；同时它进入模型身份 digest，两次运行不再可比。</p>
+<p><b>(b)</b> <b>扫描维度集合由类别机器导出，<code>Model</code> 不是扫描维度</b>。<b>定义式必须是导出式而不是枚举式</b>——枚举式会漏：把它写成
+"<code>Q2 表 ∪ RematSpec ∪ ScheduleSpec ∪ ImplSpec</code>"就漏掉了 <code>DistOptSpec</code> 与<code>PrecisionSpec</code>，而那两份恰好握着字节量最大的两个自由度（<code>free_policy</code> 的几十 GB、<code>master_weights</code> 的 16 B/param）。更糟的是它们<b>也不会出现在 <code>excluded_from_sweep</code> 那一栏</b>（该栏只列"因被改判而退出"的字段）
+⇒ <b>作为自由度在报表上完全不可见</b>。导出式使"新增一份 spec 却忘了加进扫描"这类复发在结构上不可能：<code>sweep_dims := { f : f ∈ 任一 *Spec 的字段, 且 class(f) ∉ {Model, Env} }</code>
+——<b>类型级导出，不是枚举</b>。把一个字段改判为 <code>Model</code>，<b>它就从敏感性扫描里消失了</b>，报表的 <code>excluded_from_sweep</code>机器生成一行；同时它进入模型身份 digest，两次运行不再可比。</p>
 <p><b>为什么不是"禁止改表"</b>：禁止改表等于宣称出厂表永远正确，那是假的（新框架版本、新字段）。允许改、但让改的人<b>失去他来这个工具是为了得到的那个东西</b>（这个旋钮的 what-if），是唯一既不撒谎又满足判据 5 的走法。</p></div>
 
 <h3 id="c3-4">3.4 <code>PolicyStateBinding</code>：策略经函数访问器进入源码时怎么办</h3>
@@ -1455,7 +1462,8 @@ P8 的 property test 无从执行。<b>这一条很容易漏</b>：组合子表�
 <ol>
 <li>S1 是算子语义的<b>唯一</b>词典 ⇒ 每个张量的 shape / dtype / storage 都由某个 <code>RegisteredOp</code> 求值（§4.4 步骤 5）。</li>
 <li>若 <code>RegisteredOp</code> 一律不许 <code>exact</code>，由 P2 ⇒ <b>全链没有一个字节是 <code>exact</code></b>；再由 P3 取最弱 ⇒ <b>全链 <code>evidence.grade</code> 恒为 <code>reconstructed</code></b>。</li>
-<li>⇒ <code>θ_evd</code> 与 <code>θ_abs</code> 对任何小于 1 的取值<b>恒真</b> ⇒ <code>VERDICT-WITHDRAW</code> 恒触发
+<li>又由 §2.4 的分派表（若它字面适用于全部注册项）⇒ 连 <code>Reshape</code> 都背 <code>abstraction</code> 根
+    ⇒ <code>θ_abs</code> 的分子 ≈ <code>peak</code> ⇒ <b>恒真</b> ⇒ <code>VERDICT-WITHDRAW</code> 恒触发
     ⇒ <code>oom_verdict</code> 恒 <code>undetermined</code> ⇒ <b><code>G-M2</code> 在第一天就是红的</b>。</li>
 </ol>
 <p><b>病根是把两类注册项混为一谈。</b>要堵的是"<b>用一次注册来消化一次阻断</b>"——
@@ -1856,6 +1864,16 @@ peak_lower := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastus
   <td>见下面的合取式。<b>不是单条件</b></td></tr>
 </table></div>
 
+<div class="cal bad"><span class="lbl">先解决一个类型问题，否则下面整节都没有对象可谈</span>
+<p><code>oom_verdict</code> 是一次比较：<code>cmp(peak, C_eff)</code>。而<code>C_eff = HBM_total − framework_reserve − 池划分开销</code>，其中<b>池划分开销</b>按 §13.3 属于<b>非单调</b>维度——非单调量的产物是 top-N 扫描得到的<b>样本极值</b>，按 §2.3 的类型定义那就是 <code>Sample[Int]</code>。</p>
+<p>而 <code>Sample</code> 上<b>没有 <code>cmp</code></b>、<b>不进 OOM 链</b>（§2.7 硬规定 ②）。<b>⇒ <code>cmp(peak, C_eff)</code> 在类型上不存在 ⇒ 头号输出没有生产者。</b>连带失效的是 <code>VERDICT-WITHDRAW</code>（唯一落点就是 <code>oom_verdict := undetermined</code>）、
+"用真机 OOM 事实反证 <code>false</code>"（该值不存在）、以及 <code>peak_lower</code> 的全部用途。</p>
+<p><b>解法只能是让 <code>C_eff</code> 恢复成 <code>Q</code>，即给它的两个减项各一个界而不是一个样本。</b>碎片与池划分都有<b>结构性上界</b>（P5 来源 ⑤）：它由 allocator 的池划分规则与 G4 的事件序<b>组合算出</b>，形如「碎片 ≤ 活跃分配块数 × 最大对齐/分块粒度」，<b>不依赖任何扫描、任何标定点</b>。它偏宽 ⇒ <code>undetermined</code> 更常见 ⇒ <b>正是判据 5 要的方向</b>；而档 C 的第一类维度随之从"必须逐维 OAT"变成"已被界覆盖"，扫描维度反而更少。</p>
+<div class="cal inv" style="margin:14px 0 4px"><span class="lbl"><code>G-X7</code> · 比较的操作数类型门</span>
+<p><code>oom_verdict</code> 的两个操作数在 schema 中<b>必须都是 <code>Q[Int]</code></b>；任一为 <code>Sample</code> ⇒ schema 非法，加载期阻断。</p>
+<p><b>为什么要一道门而不是一句约定</b>：这个失效是<b>沿数据流悄悄发生</b>的——
+把某个量改成"扫描观测范围"是一次看起来无害的局部改动，而它会在很远的地方让头号输出<b>静默地失去生产者</b>。类型断言是唯一能在改动点当场拦住它的东西。</p></div></div>
+
 <pre><code>S_∞ := { q : interval(q) 至少一端不可计算 }        # P5 兜底集
 S_C := { framework_reserve, 池划分开销 }           # C_eff 的减项
 
@@ -1876,7 +1894,7 @@ oom_verdict = false 可判定 ⟺ peak_reserved.hi 可计算 ∧ ∀ r ∈ S_C :
 <tr><td class="nw">7</td><td>融合 kernel 的 <code>workspace_bytes</code></td><td class="nw">长序列下可达 GB 级</td><td>显存标定只能进常数位、不能进 oracle 位（<code>G-X4</code>）</td></tr>
 <tr><td class="nw">8</td><td>allocator 对齐 / 池划分 / split</td><td class="nw">随实例数线性</td><td><code>readability = NONE</code>，<code>G-B1a</code> 读不到</td></tr>
 <tr><td class="nw">9</td><td><b><code>framework_reserve</code></b></td><td class="nw">GB 级</td><td>属 <code>S_C</code>，<b>走另一条路</b>：它不使 <code>peak.hi</code> 不可算，而使 <code>C_eff.lo</code> 不可算</td></tr>
-<tr><td class="nw">10</td><td><b>碎片</b></td><td class="nw">—</td><td>本节主角，但排在这里</td></tr>
+<tr><td class="nw">—</td><td><s>碎片</s></td><td class="nw">—</td><td><b>已退出 <code>S_∞</code></b>：它有结构性上界（P5 来源 ⑤），不再落兜底</td></tr>
 <tr><td class="nw">11+</td><td>fp8 低精副本 · <code>amax</code>/<code>scale</code> · <code>PARTIAL</code> 未求值站点 · 被抽象模块的参数与 captures 字节 · loss-scaling 中间量</td><td class="nw">—</td><td>各见其节</td></tr>
 </table></div>
 <p><b>结论的正确形态</b>：<code>S_∞ ∩ live(t*)</code> 里<b>任何一个</b>成员单独就足以使
@@ -1917,12 +1935,16 @@ verdict 变确定；逐条列出成员、其 <code>roots</code>、其 <code>evid
 <h3 id="c10-4">10.4 <code>VERDICT-WITHDRAW</code>：惩罚挂在头号输出上</h3>
 <p>峰值在 schema 中<b>只有区间形态、没有标量形态</b>（§1.4 不变量 10），所以"撤回点估计"这类惩罚是<b>空动作</b>——从来就没有点估计可撤。惩罚必须挂在头号输出上：</p>
 <pre><code>    (abstraction_covered_bytes + declared_semantics_covered_bytes) / peak  &gt; θ_abs
-  ∨ (reconstructed + vendor_documented) / peak                            &gt; θ_evd
   ∨ timing_dependent 扫描观测范围宽度                                       &gt; θ_TD
   ⇒ oom_verdict := undetermined（**无论区间落在容量的哪一侧**）
      且首页打印触发项、其实测比值与当次 Θ 取值</code></pre>
 <p><b>为什么这样比"撤点估计"强</b>：它直接打在用户来这里要的那句话上，而不是打在一个中间产物的呈现形态上。注意 <code>θ_abs</code> 的分子是<b>两个人工判断根的并</b>——只算 <code>abstraction</code> 会给
 "声明无 AST 对象的语义"开一条免费通道（§2.4）。</p>
+
+<div class="cal why"><span class="lbl">这里<b>没有</b>一条"证据等级占比"的阈值，是有意的</span>
+<p>一个自然的补充是再加一条 <code>(reconstructed + vendor_documented) / peak &gt; θ_evd</code>。<b>它必须不存在</b>，因为它是一道<b>恒红</b>的门：</p>
+<p>本方案的显存链<b>大部分由复刻构成</b>——allocator 行为、通信插入规则、分桶算法、重算克隆、精度主副本，全部是 <code>replication</code> 根、<code>evidence.grade = reconstructed</code>。其中重算副本在全层重算下就是<b>全部激活字节</b>。所以该比值对任何小于 1 的阈值<b>恒真</b>。<b>而恒红的门与恒绿的门一样坏</b>——它不携带信息，且会把 <code>VERDICT-WITHDRAW</code> 变成常态，使真正的触发原因（人工判断占比过高）被淹没。</p>
+<p><b>"是复刻"不是病，是这类仿真器的常态；"没有残差来源"才是病。</b>而后者已经由类型层处理：落 P5 兜底 ⇒ 单侧 ⇒ <code>peak.hi</code> 不可计算 ⇒ <code>undetermined</code>，<b>不需要任何阈值</b>。能在类型层消除的阈值就不该归 Rule Θ（§0.2 判据 4 的正确用法）。</p></div>
 
 <h3 id="c10-5">10.5 报表首页的强制字段</h3>
 <div class="tw"><table>
@@ -1937,6 +1959,7 @@ verdict 变确定；逐条列出成员、其 <code>roots</code>、其 <code>evid
 <tr><td class="nw"><code>unverifiable_coverage</code></td><td>能力边界 E 覆盖的字节占比（<a href="#c14">第 14 章</a>）</td><td>—</td></tr>
 <tr><td class="nw"><code>abstraction_ledger</code></td><td>每条人工判断一行：<code>judgment_id, kind, readability, coverage_bytes, residual_width, 首次引入于哪个模型</code>；<b>残差列禁止打印裸 0</b>，必须写 <code>0（P_test 覆盖 N 点，非证明）</code></td><td>—</td></tr>
 <tr><td class="nw"><code>excluded_from_sweep</code></td><td>退出扫描的字段 + 机器生成的退出原因</td><td>—</td></tr>
+<tr><td class="nw"><b>门的三个切分</b></td><td>oracle 在工具之外的门数 / 其中检模型事实的 / 其中相互独立的（§12.3）。<b>不得只印门的总数</b></td><td>—</td></tr>
 <tr><td class="nw"><code>Θ 清单 + 工具 digest</code></td><td>当次使用的全部阈值取值</td><td>—</td></tr>
 <tr><td class="nw">归因段落标题</td><td>必须是「<b>本报告的峰值由以下量构成</b>」，<b>不得</b>写成「真机峰值由以下量构成」</td><td>schema 约束</td></tr>
 </table></div>
@@ -2116,6 +2139,7 @@ G-B0（补救单调性门，机器执行）：
   <td>有人手写 <code>residual_rel: 0.001</code>；或建一个无标定点的域片</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-X4</code></td><td>标定/对照分离（§3.1）</td><td>把真机显存观测改叫"标定报告"再拿去当判据</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-X5</code></td><td><code>ψ</code> 封闭性：无逐 op 例外条目</td><td>为了让策略交换律通过，在 <code>ψ</code> 里加一条"MoE 那块跳过"</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-X7</code></td><td><b>比较的操作数类型</b>：<code>oom_verdict</code> 两端必须都是 <code>Q[Int]</code></td><td>某个减项被改成"扫描观测范围"（<code>Sample</code>）⇒ <code>cmp</code> 在类型上不存在 ⇒ <b>头号输出静默失去生产者</b></td><td class="nw">门</td></tr>
 </table></div>
 
 <h4>G-C / G-D / G-E · 纯静态（oracle = 图自身或框架源码文本）</h4>
@@ -2183,23 +2207,39 @@ G-B0（补救单调性门，机器执行）：
 
 <h3 id="c12-3">12.3 <code>G-M1</code> 自检的结果</h3>
 <div class="cal honest"><span class="lbl">把元门作用在自己身上之后，真门数是多少</span>
-<p>合并后共 <b>44</b> 个条目。<code>G-M1</code> 逐条追问"存在一个<b>规格级</b>缺陷 fixture 使它变红吗"：</p>
+<p>共 <b>45</b> 个条目。<code>G-M1</code> 逐条追问"存在一个<b>规格级</b>缺陷 fixture 使它变红吗"：</p>
 <ul>
 <li><b>降级为后置条件（3）</b>：<code>G-C2</code>（placement 类型健全——是 <code>Pass_shard</code> 自己的终止条件）、<code>G-E1</code>（pass 幂等）、<code>G-B3a</code>（是 P4 的直接推论）。</li>
 <li><b>报告项（1）</b>：<code>G-T3</code>。</li>
-<li><b>真门 40</b>，按 oracle 分布：</li>
+<li><b>真门 41</b>；扣独立性折扣 1（<code>G-T2</code> 与 <code>G-T1</code> 共 oracle）⇒ <b>独立真门 40</b>，按 oracle 分布：</li>
 </ul>
 <div class="tw"><table>
 <tr><th class="nw">oracle</th><th class="nw">道数</th><th>成员</th></tr>
-<tr><td class="nw">schema 自身</td><td class="nw">5</td><td><code>G-X1</code>–<code>G-X5</code></td></tr>
+<tr><td class="nw">schema 自身</td><td class="nw">6</td><td><code>G-X1</code>–<code>G-X5</code> <code>G-X7</code></td></tr>
 <tr><td class="nw">图自身或框架源码文本</td><td class="nw">14</td><td><code>G-C1</code> <code>G-C3</code> <code>G-D1</code> <code>G-D3</code> <code>G-D4</code> <code>G-D5</code> <code>G-E3</code>–<code>G-E6</code> <code>G-N4</code>–<code>G-N7</code></td></tr>
 <tr><td class="nw">快照自身（装载期）</td><td class="nw">3</td><td><code>G-P1</code> <code>G-P2</code> <code>G-N1</code></td></tr>
 <tr><td class="nw"><b>真机 op 级 time</b></td><td class="nw"><b>5</b></td><td><code>G-T0</code> <code>G-T0b</code> <code>G-T1</code> <code>G-T2</code> <code>G-N2</code></td></tr>
 <tr><td class="nw">provenance 代数</td><td class="nw">3</td><td><code>G-B0</code> <code>G-B1a</code> <code>G-B4</code></td></tr>
 <tr><td class="nw">实现与规模</td><td class="nw">6</td><td><code>G-R1</code> <code>G-R2</code> <code>G-R2b</code> <code>G-R3</code> <code>G-R4</code> <code>G-N3</code></td></tr>
 <tr><td class="nw">元判据 / 项目级</td><td class="nw">4</td><td><code>G-L1</code> <code>G-M1</code> <code>G-M2</code> <code>G-Z1a</code></td></tr>
+</table></div></div>
+
+<p><b>但"40 道门"这个数本身就是 <code>G-M1</code> 要消灭的那种虚假安全感的最高形态</b>，除非同时印出下面两个切分。它们必须一起上报表首页：</p>
+
+<div class="tw"><table>
+<tr><th class="nw">切分</th><th class="nw">数</th><th>成员</th></tr>
+<tr><td class="nw"><b>oracle 在工具之外</b></td><td class="nw"><b>5</b></td><td><code>G-T0</code> <code>G-T0b</code> <code>G-T1</code> <code>G-T2</code> <code>G-N2</code>——<b>其余 35 道的裁判都是我们自己写的东西</b>（schema、图、源码文本、快照）</td></tr>
+<tr><td class="nw">其中<b>检模型事实</b>的</td><td class="nw"><b>3</b></td><td><code>G-T1</code> <code>G-T2</code> <code>G-N2</code>——<code>G-T0</code>/<code>G-T0b</code> 检的是 <b>oracle 自身的纯净度</b>（留出、版本），<b>不检任何模型事实</b></td></tr>
+<tr><td class="nw">其中<b>相互独立</b>的</td><td class="nw"><b>2</b></td><td><code>G-T1</code> <code>G-N2</code>（<code>G-T2</code> 与 <code>G-T1</code> 共 oracle）</td></tr>
+<tr><td class="nw" style="border-top:1px solid var(--rule)"><b>检模型事实</b>（含内部对照物）</td><td class="nw">17</td><td><code>G-P1 G-P2 G-C1 G-C3 G-D1 G-D3 G-D4 G-D5 G-E6 G-B1a G-N2 G-N4 G-N5 G-N6 G-N7 G-T1 G-T2</code></td></tr>
+<tr><td class="nw"><b>自律门</b>（防方案自己被改坏）</td><td class="nw">24</td><td>schema 闭集 · 阈值归属 · 资源上限 · oracle 纯净度 · 元判据</td></tr>
 </table></div>
-<p><b>最该看清的一件事</b>：40 道真门里，<b>只有 5 道拿真机数据当裁判，且这 5 道全部只覆盖时间链、改写链与分桶</b>。显存链的 35 道门全部是自洽性检查——它们能抓实现错、抓规格自相矛盾、抓与源码文本不符，<b>抓不到"我们对框架的整体理解是错的"</b>。</p></div>
+
+<div class="cal bad"><span class="lbl">把这三个数并排读，才是这一章的真实结论</span>
+<p><b>整个方案对"模型算得对不对"的外部裁判，只有 2 道相互独立的门</b>（<code>G-T1</code> 与 <code>G-N2</code>），而且它们<b>只看 op 序列</b>——看不见任何字节、任何存储、任何生命周期。</p>
+<p>其余 38 道里，17 道用<b>我们自己写的对照物</b>（源码文本、图自身、快照）检模型事实，
+24 道是<b>自律门</b>——它们防的是"方案被改坏"，不是"模型算错"。自律门有价值，但把它们和外部裁判并进同一个"40 道门"里报出去，就是在制造安全感。</p>
+<p>这也是 <a href="#c14">第 14 章</a>能力边界 E 的门体系侧投影：<b>显存链的 35 道门全部是自洽性检查</b>——能抓实现错、抓规格自相矛盾、抓与源码文本不符，<b>抓不到"我们对框架的整体理解是错的"</b>。</p></div>
 
 <div class="cal why"><span class="lbl">数门的判据：共用 oracle ≠ 是更弱的断言</span>
 <p>很容易把读同一份数据的两道门合并计数。<b>这是错的</b>，反例就在本表里：<code>G-N2</code>（桶数<b>等于</b>真机归约 op 数）与 <code>G-T1</code>（op 序列是真机的<b>保序子序列</b>）读同一条 trace，但分桶欠预测时——我们算出 4 个归约、真机有 6 个——我们的序列<b>仍是</b>合法子序列
