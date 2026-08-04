@@ -1846,15 +1846,36 @@ G-B0（补救单调性门，机器执行）：
 <tr><td class="nw">R30</td><td><b>全流程墙钟（8 核，保守速率）</b></td><td class="nw"><b>100 s</b></td><td class="nw"><b>245 s</b></td><td>「配好配置直接出结果」的落点</td></tr>
 </table></div>
 
-<div class="cal bad"><span class="lbl">这张表的四个输入数<b>全部是推的，不是测的</b></span>
-<p>每层原子 op 数、每事件的 <code>Q</code> 实例数、每事件 20 µs、rank 类数 = <code>pp</code>——
-四个数没有一个来自测量，而单次编译工作量与扫描工作量是它们的<b>连乘</b>。
-任一项低估 3 倍，工作量上限就被撞穿（B 列已占扫描上限的 75%，余量很薄）。</p>
-<p><b>最危险的是每事件成本</b>：按"SoA + 编译热循环"给 20 µs，但 allocator 模拟的最坏实现
-（线性扫描找空洞、每次分配遍历空闲链）单事件可到毫秒级——<b>那样整张表作废，而且是三个数量级的作废，不是 3 倍。</b></p>
-<p><b>把它变成数的最小动作</b>：用<b>合成图</b>（10⁶ 个假事件、假 Storage，不涉及任何模型语义）
-对两个后端做一次空转基准，半天成本，把该常数从假设变成测量值。<b>在这件事完成前，
-本表的绝对数值不得用于任何论证。</b></p></div>
+<div class="cal honest"><span class="lbl">每事件成本已实测；<b>但它揭示的是"单一常数"这个建模方式错了</b></span>
+<div class="tw"><table>
+<tr><th>项</th><th class="nw">原假设</th><th class="nw">实测</th><th class="nw">差</th></tr>
+<tr><td>五个热循环（SoA + numpy 向量化）</td><td class="nw">20 µs/事件</td><td class="nw"><b>0.090</b></td><td class="nw">保守 <b>222×</b></td></tr>
+<tr><td>含 allocator（分桶 free list）</td><td class="nw">20</td><td class="nw"><b>1.502</b></td><td class="nw">保守 <b>13.3×</b></td></tr>
+<tr><td><b>allocator 最坏实现</b>（best-fit 线性扫描）</td><td class="nw">20</td><td class="nw"><b>1294</b></td><td class="nw"><b>差 65×</b></td></tr>
+<tr><td>朴素宿主对象的内存（<code>__slots__</code> 已用）</td><td class="nw">≤ 64 B（<code>G-R1</code>）</td><td class="nw"><b>153 B/事件</b></td><td class="nw"><b>门不通过</b></td></tr>
+</table></div>
+<p><b>成本是双峰的，不是单峰的。</b>四个可向量化的遍各自约 0.02 µs，而 allocator 是
+<b>0.85–1.4 µs（分桶）或 1294 µs（线性扫描）</b>——两者相差 <b>1528 倍</b>。
+把它们平均成一个"每事件成本"，恰好把<b>唯一有风险的那一格</b>藏进了平均值里。</p>
+<p><b>所以对账表必须按遍的种类分开计价</b>：
+<code>工作量 = Σ_可向量化遍 (E × c_vec) + Σ_逐事件遍 (E × c_seq)</code>，
+而 <code>c_seq</code> 只有 allocator 一项。<code>G-R2</code> 的上限也应当对这两类分别设，
+否则"事件·遍"这个单位会把 1294 µs 与 0.02 µs 当成同一种遍来数。</p>
+<p><b>门起了作用</b>：<code>G-R1</code>（<code>RSS/实例数 ≤ 64 B</code>）在朴素实现上<b>实测不通过</b>
+（153 B/事件，且已用 <code>__slots__</code>——不用会更差）。这是本方案第一条被真实数据触发的门。</p>
+<p><b>仍然是推的</b>：每层原子 op 数、每事件的 <code>Q</code> 实例数、rank 类数 = <code>pp</code>。
+本次只测了第四个（也是自曝里"最危险"的那个）。前三个仍需 AST 探针与真实模型配置。</p>
+<p>脚本与原始输出在 <code>docs/target-design-v2/stage0/</code>，可复算。</p></div>
+
+<div class="cal bad"><span class="lbl">其余三个输入数仍然是推的</span>
+<p>每层原子 op 数、每事件的 <code>Q</code> 实例数、rank 类数 = <code>pp</code>——<b>这三个仍无测量</b>，
+而单次编译工作量与扫描工作量是它们与每事件成本的<b>连乘</b>。</p>
+<p>它们各自的获取途径不同：前两个要 <b>AST 探针 + 一份真实模型配置</b>；
+第三个是一条<b>设计断言</b>（"tp/dp/ep rank 结构对称，只需逐 pp 阶段实例化"），
+它在 EP 下<b>严格来说是假的</b>——各 ep rank 的专家负载不同——
+方案用取舍 T1 把它推给 <code>assumed</code> 根的联合上界，那是保守侧、合法、但可能很宽。</p>
+<p><b>在这三个数落地之前，本表的绝对数值仍不得用于任何论证</b>；
+但每事件成本已经不在此列，且它恰好是自曝里被点名"最危险"的那一个。</p></div>
 
 <h3 id="c13-2">13.2 三条硬前提（违反则整表作废）</h3>
 <div class="tw"><table>
@@ -1863,8 +1884,11 @@ G-B0（补救单调性门，机器执行）：
   <td>裸对象最小 48–56 B，带字典数百 B ⇒ <b>25–50 GB</b></td></tr>
 <tr><td class="nw">P2</td><td>实例表示为 <code>(template_id: u32, index_vector: u32×3)</code> = 16 B 上限 ⇒ <b>索引维度 ≤ 3</b></td>
   <td>需要第 4 个索引维时必须<b>显式扩宽并重算</b>，不许悄悄加</td></tr>
-<tr><td class="nw">P3</td><td>五个热循环必须<b>向量化或编译执行</b>，不能逐事件解释执行</td>
-  <td>每事件成本退化 10–50 倍</td></tr>
+<tr><td class="nw">P3a</td><td><b>四个可向量化的遍</b>（实例化 / liveness×2 / 报告聚合）必须走数组化路径</td>
+  <td>实测：向量化 0.09 µs/事件 vs 朴素对象 0.85 µs/事件（<b>约 10×</b>，且内存 153 B/事件 <b>撞穿 <code>G-R1</code></b>）</td></tr>
+<tr><td class="nw">P3b</td><td><b>allocator 模拟不可向量化</b>（free list 状态依赖全部在先事件），必须用<b>分桶 free list</b>，
+  <b>禁止 best-fit 线性扫描</b></td>
+  <td>实测：线性扫描 <b>1294 µs/事件</b> vs 分桶 <b>1.4 µs</b>，<b>1528×</b>。全尺度下前者使单次编译从秒级变成<b>小时级</b></td></tr>
 </table></div>
 
 <h3 id="c13-3">13.3 敏感性扫描：削减的大部分来自一个证明，不是启发式</h3>
