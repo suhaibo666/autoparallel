@@ -132,7 +132,54 @@ def init(...): _STATE['tp'] = world_size   # 只改字典内容，绑定从未�
 | `policy(·)` 是闭集外的第九个根名（6 处） | 改为**根上的谓词**：`policy(q) :⟺ ∃p ∈ roots(q): p = configured(f) ∧ class(f) ∈ {Π_extent, Π_impl}`。`Root` 保持八值闭集 |
 | `kind` 枚举不够用 | 补 `partial_residual_site`（`PARTIAL` 未求值站点，正文已要求打 `abstraction` 根却无 kind 可填）、`op_identity_mapping`、`psi_projection`、`canon_ruleset`；并给 `declared_semantics` 也加 kind |
 
-### 2.10 死掉的论证（结论保留，理由换掉）
+### 2.10 头号输出曾在类型上没有生产者
+
+`oom_verdict` 是 `cmp(peak, C_eff)`。而 `C_eff = HBM_total − framework_reserve − 池划分开销`，
+其中**池划分开销**属非单调维度 ⇒ 其产物是 top-N 扫描的**样本极值** ⇒ 按代数即 `Sample[Int]`。
+而 `Sample` 上**没有 `cmp`**、**不进 OOM 链**。⇒ **比较在类型上不存在。**
+
+连带失效的是：`VERDICT-WITHDRAW`（唯一落点就是 `oom_verdict := undetermined`）、
+"用真机 OOM 事实反证 `false`"（该值不存在）、`peak_lower` 的全部用途、`G-M2`。
+
+**为什么四轮都没人发现**：讨论这个判定点的两处（谁输出 `undetermined`、扫描升级与判定的先后）
+关心的都是**所有权与顺序**，没有人问"**这个比较在类型上合法吗**"。
+
+**现在**：碎片与池划分各获一个**结构性上界**（P5 来源 ⑤：由复刻规则 + G4 事件序组合算出，
+形如「碎片 ≤ 活跃分配块数 × 最大对齐/分块粒度」，不依赖任何扫描与标定）⇒ `C_eff` 恢复为 `Q`。
+加 `G-X7` 把它钉成类型断言——这个失效是沿数据流悄悄发生的，只有类型断言能在改动点当场拦住。
+
+### 2.11 `sweep_dims` 的枚举式定义漏掉了字节量最大的两份 spec
+
+曾写 `sweep_dims := {f ∈ Q2表 : class(f) ∈ {Π_extent, Π_impl}} ∪ RematSpec ∪ ScheduleSpec ∪ ImplSpec`。
+`DistOptSpec` 与 `PrecisionSpec` 是后加的，**不在这个并集里**——而 `free_policy`（几十 GB）与
+`master_weights`（16 B/param，训练态最大持久项）正在其中。更糟的是它们**也不出现在
+`excluded_from_sweep`**（该栏只列"因被改判而退出"的字段）⇒ **作为自由度在报表上完全不可见**。
+
+**现在**：改为类型级导出 `{ f : f ∈ 任一 *Spec 的字段, class(f) ∉ {Model, Env} }`，
+八份 spec 的每个字段都进分类表。"新增一份 spec 却忘了加进扫描"这类复发在结构上不可能。
+
+### 2.12 门数印得不诚实
+
+曾印"40 道真门，其中 5 道拿真机数据当裁判"。这个数**本身**就是 `G-M1` 要消灭的那种虚假安全感：
+5 道里有 2 道（`G-T0`/`G-T0b`）检的是 **oracle 自身的纯净度**（留出、版本），不检任何模型事实；
+`G-T2` 与 `G-T1` 共 oracle。**⇒ 对"模型算得对不对"的外部裁判只有 2 道相互独立的门，且只看 op 序列。**
+
+**现在**：报表首页与 §12.3 强制并印三个切分（外部 oracle 5 / 检模型事实 3 / 相互独立 2），
+再切一刀"检模型事实 17 : 自律门 24"。**不得只印门的总数。**
+
+### 2.13 `θ_evd` 是一道恒红的门
+
+`(reconstructed + vendor_documented) / peak > θ_evd`：显存链大部分由复刻构成
+（allocator、通信插入、分桶、重算克隆、精度主副本），全是 `replication + reconstructed`，
+其中重算副本在全层重算下就是**全部激活字节** ⇒ 该比值对任何小于 1 的阈值**恒真**。
+
+**恒红的门与恒绿的一样坏**——不携带信息，且把 `VERDICT-WITHDRAW` 变成常态，
+使真正的触发原因（人工判断占比过高）被淹没。
+
+**现在**：删除。"是复刻"是这类仿真器的**常态**，"没有残差来源"才是病，
+而后者已由类型层处理（落 P5 兜底 ⇒ 单侧 ⇒ `peak.hi` 不可算 ⇒ `undetermined`），**不需要阈值**。
+
+### 2.14 死掉的论证（结论保留，理由换掉）
 
 | 论证 | 为什么死 | 换成什么 |
 |---|---|---|
