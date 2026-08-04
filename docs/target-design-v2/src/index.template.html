@@ -120,7 +120,7 @@
   <td><b><code>∀f ∈ G0: policy(·) ∉ f.roots</code></b>；<code>digest(G0)</code> 在策略扰动下不变</td>
   <td><b>policy-free 唯一的断言点</b></td></tr>
 <tr><td class="nw"><b>G0.5</b> ImplIR</td><td class="nw"><code>impl_select ∘ fusion_logical ∘ precision_fwd</code></td>
-  <td>每节点 <code>semantic_id ∈</code> S1 注册域；<b>op 集合自此定稿</b></td>
+  <td>每节点 <code>semantic_id ∈</code> S1 注册域；<b>op 集合自此定稿</b>；<b>参数全序 <code>param_order</code> 定稿</b>，且它是 <code>RepeatRegion</code> 展开字典序的函数（进 G0.5 digest）</td>
   <td>反向模板"逐 op 查表"没有定义点</td></tr>
 <tr><td class="nw"><b>G1</b> TrainIR</td><td class="nw"><code>Pass_train_step</code></td>
   <td><code>∀ 可微输入 i: shape(grad_out[i]) == shape(in_i)</code>；每条梯度边恰一 producer</td>
@@ -160,7 +160,7 @@
 <div class="cal honest"><span class="lbl">G0.5 内部三 pass 的固定序，以及它为什么对外原子化</span>
 <p>G0.5 内部固定为 <code>impl_select → fusion_logical → precision_fwd</code>：前向精度要插 quantize 节点，
 而插在哪里依赖实现族的选择（融合 attention 的量化点与非融合的不同）。</p>
-<p>三者合起来对外是<b>一个原子步</b>——只暴露 G0.5 的 digest，不暴露中间态。<b>这是为了不把内部序
+<p>三者合起来对外是<b>一个原子步</b>——只暴露 G0.5 的 digest，不暴露中间态。<b>"原子"仅指两件事</b>：(i) 对外的 digest 粒度；(ii) 层序表中<b>不存在可重排的自由度</b>。它<b>不</b>意味着内部三个 pass 不可单独调用——PGRO 的形式参数 <code>Pass_X</code> 与 <code>G-B1a</code> 的 <code>S_P</code> 构造<b>都必须</b>能单独取到其中某一个；严读成"只能整体调用"会使 <code>attention_backend</code>、<code>*_fusion</code>、精度类字段<b>全部落 <code>BLK-UNRECONSTRUCTIBLE</code></b>。<b>这是为了不把内部序
 误当成可重排的自由度</b>：若把中间态暴露出去，层序表就会多出三个相邻对，而它们之间的顺序
 并不由物理理由决定，而是由"谁先谁后都能跑通、但结果不同"这种最坏的性质决定。</p></div>
 
@@ -349,7 +349,10 @@ P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residu
                  ① G-B1a 抽象残差 hull(S_P, R_P)                        （§2.6）
                  ② 反向双候选 hull(a, b)                                （§7.2）
                  ③ 标定残差 residual_rel                                （grade = calibrated）
-                 ④ **declaration_unverified_bound**：声明量 d 无独立佐证时，
+                 ④ **declaration_unverified_bound**（**仅适用于对世界的声明**：
+                    roots ∩ {abstraction, declared_semantics, assumption} ≠ ∅；
+                    **不适用于 configured** —— 那是对问题的定义，不是对世界的断言）：
+                    声明量 d 无独立佐证时，
                     区间由**该声明自身的语义**给出两端——
                     lo = 声明成立时的值；hi = 声明完全不成立时该量的无声明上界。
                     两端均由定义式算出，**不是猜的误差棒**
@@ -357,11 +360,15 @@ P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residu
                     例：碎片 ≤ 活跃分配块数 × 最大对齐/分块粒度。
                     它不依赖任何扫描、任何标定点，是纯组合量 ⇒ **是界，不是样本**
                **兜底（无一适用时）**：direction := 单侧，**不得保持点值**。选哪一侧**由机器定**：
-                 取**使 oom_verdict 更难变确定**的那一侧 ——
-                   · 进入 peak 的加项  ⇒ lower（放弃 hi）
-                   · C_eff 的减项      ⇒ upper（放弃 C_eff.lo）
+                 **保留能被算出的那一端，放弃算不出的那一端**。
+                 对非负未知量（本方案的兜底量全是非负字节），能算出的是**下确界**
+                   ⇒ direction := lower，interval := [已知下确界, 不可计算]
+                 这条规则**不看该量落在算式的哪一侧**，因而不会因减法翻方向而自相矛盾。
 
 P6  direction  按逐原语单调性声明变换；non_monotone 且该参数非 exact ⇒ BLOCK
+               **该 BLOCK 只适用于算术原语**（它是 G-E3 的对偶：抓"声明 increasing 而实际非单调"
+               的原语库缺陷）。**不适用于 MechanismOp 的输出量** —— allocator 碎片、
+               timing_dependent 通信时长本来就被 §13.3 明列为非单调，字面套用会使"有碎片就阻断"
                certainty = assumed ⇒ direction ∈ {upper, lower}（不得 exact，不存在 nominal）
 
 P7  折叠保根   π₀ 特化模式**禁用一切吸收/幂等化简**；∀ fold 规则 r: roots(r(e)) ⊇ ⋃ roots(子式)
@@ -395,9 +402,19 @@ P8  不可降     不存在使 Prov 任一分量下降的算子。
 全选 <code>upper</code> ⇒ <code>peak.lo</code> 不可计算 ⇒ <b>永远说不出"会 OOM"</b>；
 全选 <code>lower</code> ⇒ <code>peak.hi</code> 不可计算 ⇒ <b>永远说不出"装得下"</b>。
 而结构性复活检测<b>抓不到它</b>：它不是字段、不是枚举值、不是转换算子。</p>
-<p><b>所以规则必须是"取使 <code>oom_verdict</code> 更难变确定的那一侧"</b>：peak 的加项取 <code>lower</code>、
-<code>C_eff</code> 的减项取 <code>upper</code>。它是唯一一条<b>不需要知道真值方向就能执行</b>的规则，
-因而不引入新的自由度；且它与判据 5 同向——省事必然拿不到"装得下"。</p>
+<p><b>所以规则必须是"保留能被算出的那一端"</b>。它是唯一一条<b>不需要知道真值方向就能执行</b>的规则，
+因而不引入新的自由度。本方案的兜底量全是<b>非负字节</b>，能算出的那端就是<b>下确界</b>
+⇒ 一律 <code>direction := lower</code>、<code>interval := [已知下确界, 不可计算]</code>。</p>
+<div class="cal bad" style="margin:14px 0 4px"><span class="lbl">一条看似更聪明、实则自相矛盾的规则</span>
+<p>很容易改成"<b>取使 <code>oom_verdict</code> 更难变确定的那一侧</b>"：peak 的加项取 <code>lower</code>、
+<code>C_eff</code> 的减项取 <code>upper</code>。判据 5 的方向看起来更顺。<b>但它是错的</b>——
+它按"该量落在算式哪一侧"分情况，而<b>减法会翻方向</b>：</p>
+<p><code>C_eff = HBM − 减项</code>。减项取 <code>upper</code> ⇒ 减项的 <code>lo</code> 不可算
+⇒ <code>C_eff.hi = HBM.hi − 减项.lo</code> <b>不可算</b>。而"会 OOM"要的正是
+<code>peak.lo &gt; C_eff.hi</code>。<b>于是两个 verdict 值同时不可达，<code>G-M2</code> 恒红。</b></p>
+<p>"保留能算出的那端"没有这个毛病：减项的下确界是 0（非负）⇒ <code>C_eff.hi = HBM</code> 可算
+⇒ <b>"会 OOM"仍可判定</b>，而"装得下"不可判——这正是 §10.2b 那条不对称，
+现在它是 P5 的<b>推论</b>而不是一条独立断言。</p></div>
 <p><b>这不是把工具做废，而是把标定集变成真正的交付物。</b><code>evidence.grade</code> 从三个词变成一条产品路线：
 标定一个量 ⇒ 它获得来源 ③ 的真实残差 ⇒ 它退出单侧 ⇒ <code>peak.hi</code> 向可计算前进一步。
 判据 5 在此是<b>顺向且构造性</b>的：诚实使用不受罚，省事必然拿不到那句"装得下"。</p></div>
@@ -410,6 +427,7 @@ P8  不可降     不存在使 Prov 任一分量下降的算子。
 <li><b>通信字节嗅探门可满足</b>：<code>Pass_shard</code> 的"失配处插 redistribute"是一个
     <code>self_certainty = modeled</code> 的<b>结构算子</b>，<code>own_roots = {replication(rule)}</code>
     ⇒ 通信字节继承 <code>modeled</code> 与 <code>replication</code> 根，且根里没有标定根。门可满足且非平凡。</li>
+<li><b>成员资格本身也要有区间形态</b>：某个 storage 是否在 <code>t*</code> 存活若不确定，它对 <code>peak</code> 的贡献区间是 <code>[0, size]</code>——两端都可算，<b>不落 P5 兜底</b>。（兜底的"加项/减项"二分对成员资格没有自变量，不写死这一条会留一个无规则的格子。）</li>
 <li><b>显存 ← 时间的耦合自动表达</b>：overlap 开启时 <code>Free</code> 事件的时刻是通信时长的函数
     ⇒ 该 <code>Free</code> 的存在位带标定根 ⇒ 受影响 storage 在峰值时刻的<b>存活成员资格</b>继承标定根。
     "显存 provenance 是时间 provenance 的函数"这件事不需要额外机制。</li>
@@ -425,16 +443,16 @@ P8  不可降     不存在使 Prov 任一分量下降的算子。
 ——而实现者最自然的处理是"字节公式平凡 ⇒ 精确"，那正是 P4 要禁的事。
 下表是<b>必填清单</b>，schema 断言"任何合成节点的存在位必有非空 <code>own_roots</code>"：</p>
 <div class="tw"><table>
-<tr><th class="nw">pass</th><th class="nw"><code>own_roots</code></th><th class="nw"><code>self_certainty</code></th><th>它合成的东西里字节量最大的一项</th></tr>
-<tr><td class="nw"><code>Pass_impl_select</code></td><td class="nw"><code>abstraction(atom_substitution)</code></td><td class="nw"><code>modeled</code></td><td>实现族替身的内部缓冲</td></tr>
-<tr><td class="nw"><code>Pass_fusion_logical</code></td><td class="nw"><code>replication(fusion_rule)</code></td><td class="nw"><code>modeled</code></td><td>融合节点的中间量消除</td></tr>
-<tr><td class="nw"><code>Pass_precision_fwd</code></td><td class="nw"><code>replication(precision_rule)</code></td><td class="nw"><code>modeled</code></td><td>低精副本、<code>amax</code>/<code>scale</code> 缓冲</td></tr>
-<tr><td class="nw"><b><code>Pass_train_step</code></b></td><td class="nw"><code>replication(autograd_rule)</code></td><td class="nw"><code>modeled</code></td><td><b>梯度值 + 反向 scratch ≈ 全部参数字节量级</b></td></tr>
-<tr><td class="nw"><b><code>Pass_precision_opt</code></b></td><td class="nw"><code>replication(master_copy_rule)</code></td><td class="nw"><code>modeled</code></td><td><b>fp32 主权重 + 主梯度 + 优化器状态 = 16 B/param</b></td></tr>
-<tr><td class="nw"><code>Pass_shard</code></td><td class="nw"><code>replication(collective_rule)</code></td><td class="nw"><code>modeled</code></td><td>通信 buffer</td></tr>
-<tr><td class="nw"><b><code>Pass_fusion_dist</code></b></td><td class="nw"><code>replication(dist_fusion_rule)</code></td><td class="nw"><code>modeled</code></td><td>融合后的合并 buffer</td></tr>
-<tr><td class="nw"><b><code>Pass_remat</code></b></td><td class="nw"><code>replication(remat_rule)</code></td><td class="nw"><code>modeled</code></td><td><b>重算副本；全层重算下 = 全部激活字节</b></td></tr>
-<tr><td class="nw"><b><code>Pass_sched</code></b></td><td class="nw"><code>replication(lifetime_rule)</code></td><td class="nw"><code>modeled</code></td><td>Alloc/Free 时刻 ⇒ <code>live(t*)</code> 的<b>成员资格</b></td></tr>
+<tr><th class="nw">pass</th><th class="nw"><code>own_roots</code></th><th class="nw"><code>self_certainty</code></th><th class="nw"><code>own_evidence</code></th><th>它合成的东西里字节量最大的一项</th></tr>
+<tr><td class="nw"><code>Pass_impl_select</code></td><td class="nw"><code>abstraction(atom_substitution)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>实现族替身的内部缓冲</td></tr>
+<tr><td class="nw"><code>Pass_fusion_logical</code></td><td class="nw"><code>replication(fusion_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>融合节点的中间量消除</td></tr>
+<tr><td class="nw"><code>Pass_precision_fwd</code></td><td class="nw"><code>replication(precision_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>低精副本、<code>amax</code>/<code>scale</code> 缓冲</td></tr>
+<tr><td class="nw"><b><code>Pass_train_step</code></b></td><td class="nw"><code>replication(autograd_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td><b>梯度值 + 反向 scratch ≈ 全部参数字节量级</b></td></tr>
+<tr><td class="nw"><b><code>Pass_precision_opt</code></b></td><td class="nw"><code>replication(master_copy_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td><b>fp32 主权重 + 主梯度 + 优化器状态 = 16 B/param</b></td></tr>
+<tr><td class="nw"><code>Pass_shard</code></td><td class="nw"><code>replication(collective_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>通信 buffer</td></tr>
+<tr><td class="nw"><b><code>Pass_fusion_dist</code></b></td><td class="nw"><code>replication(dist_fusion_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>融合后的合并 buffer</td></tr>
+<tr><td class="nw"><b><code>Pass_remat</code></b></td><td class="nw"><code>replication(remat_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td><b>重算副本；全层重算下 = 全部激活字节</b></td></tr>
+<tr><td class="nw"><b><code>Pass_sched</code></b></td><td class="nw"><code>replication(lifetime_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>Alloc/Free 时刻 ⇒ <code>live(t*)</code> 的<b>成员资格</b></td></tr>
 </table></div>
 <p><b>加粗的五个是最容易漏的</b>，而它们恰好合成了字节量最大的东西。特别是 <code>Pass_sched</code>：
 它不合成任何存储，但它决定<b>谁在峰值时刻活着</b>——按 P4，成员资格本身也是一个带 provenance 的判断。</p></div>
@@ -453,7 +471,8 @@ G-B1a（硬阻断）：shape 面 / arity 在 R_P 与 S_P 上不一致 ⇒ **阻�
                 （人声明的语义与源码直接矛盾，这不是抽象，是错误，不该被定价而该被拒）
 
 抽象残差：其余各面逐项取凸包
-  interval(A.q) := hull( S_P.q , R_P.q )   对 q ∈ {激活字节, 临时字节, workspace, flops, 通信字节}</code></pre>
+  interval(A.q) := 区间算术(输入) ⊕ hull( S_P.q , R_P.q )      # **⊕ 叠加，不是赋值**
+                 —— 赋值会吃掉输入自身的区间宽度，违反 P8（只升不降）   对 q ∈ {激活字节, 临时字节, workspace, flops, 通信字节}</code></pre>
 
 <div class="cal why"><span class="lbl">三点必须讲清楚</span>
 <p><b>① 为什么在真实策略 P 处比，而不是在 π₀ 处比两支残差。</b>在 π₀ 处比 <code>then/else</code> 两支是错的——
@@ -524,7 +543,7 @@ dropout 位置不同，则逐面不同 ⇒ 宽度正比于被隐藏的差异 ⇒
 <tr><td class="nw"><b><code>G-B4</code> 守恒-均匀</b></td>
   <td>一组量满足算子声明的守恒约束（如 <code>Σ_experts tokens_e = topk · num_tokens</code>）<b>且取值均匀</b>
       ⇒ 机器判定为"完美均衡假设"：<code>certainty := assumed</code>、<code>direction := lower</code>、
-      <code>roots ∪= {assumption(perfect_balance)}</code>，<b>无论用户把这些数写在哪份 spec 里</b></td>
+      <code>roots ∪= {assumption(perfect_balance)}</code>，<b>无论用户把这些数写在哪份 spec 里</b>。<b><code>lower</code> 是对该量本身的方向声明，不是"只有一端"</b>：峰值对负载不均衡度单调递增 ⇒ <code>lo</code> 端 = 完美均衡（机器判定的这一组值），<b><code>hi</code> 端 = 守恒约束的极值解</b>（全部 token 落一个专家，或 <code>capacity_factor</code> 截断），<b>由定义式算出</b> ⇒ 正是 P5 来源 ④ 的标准形态。两端都有 ⇒ §13.3 档 A/B 的"联合取端点"仍可执行</td>
   <td>均匀分布 + 守恒是"完美均衡"的<b>充要指纹</b>，机器可识别，且它是一个假设而不是一个配置选择</td></tr>
 </table></div>
 <p><b>闭合后的激励</b>：把 MoE 负载写成一个数，得到 <code>assumed / lower</code> ⇒ <code>peak.hi</code> 不可计算
@@ -539,8 +558,8 @@ dropout 位置不同，则逐面不同 ⇒ 宽度正比于被隐藏的差异 ⇒
 <tr><th class="nw">类</th><th>内容</th><th class="nw">谁产出</th><th class="nw">典型根</th></tr>
 <tr><td class="nw">框架源码</td><td><code>SourceAST</code> + <code>framework_ver</code>；含配置规范化函数与配置校验断言</td><td>框架</td><td><code>source</code></td></tr>
 <tr><td class="nw">算子语义</td><td>三个物理隔离注册域的冻结快照（<a href="#c6">第 6 章</a>）</td><td>工具 + 用户</td><td><code>declared_semantics</code> / <code>abstraction</code></td></tr>
-<tr><td class="nw">环境转录</td><td><code>EnvFacts</code>：HBM 容量、设备型号、运行时版本、框架版本</td><td>工具</td><td><code>transcribed</code></td></tr>
-<tr><td class="nw">标定报告</td><td><code>CalibrationSet</code>：域片 + 实测点。<b>是链的输入，不是链的裁判</b></td><td>标定流程</td><td><code>calib</code></td></tr>
+<tr><td class="nw">环境转录</td><td><code>EnvFacts</code>：HBM 容量、设备型号、运行时版本、框架版本。<b>每条必填 <code>verifier : EnvProbe | ⊥</code></b>——<code>⊥</code> ⇒ 该条 <code>self_certainty = modeled</code> 且计入首页 <code>unverified_env_facts</code>；<code>EnvProbe</code> 进快照、其<b>执行结果与转录值一并参与 digest</b>。字段缺失 ⇒ 加载期阻断（"缺失≠空"）</td><td>工具</td><td><code>transcribed</code></td></tr>
+<tr><td class="nw">标定报告</td><td><code>CalibrationSet</code>：域片 + 实测点。<b>是链的输入，不是链的裁判</b>。每条 <code>CalibKey</code> 必填 <code>measured_quantity ∈ {duration, bytes, bandwidth, occupancy}</code>（闭集，缺失即加载期阻断）</td><td>标定流程</td><td><code>calib</code></td></tr>
 <tr><td class="nw">八份 <code>*Spec</code></td><td><code>ModelSpec</code> · <code>ParallelSpec</code> · <code>DistOptSpec</code> · <code>PrecisionSpec</code> · <code>RematSpec</code> · <code>ScheduleSpec</code> · <code>ImplSpec</code> · <code>PlacementAnnotation</code></td><td>使用者</td><td><code>configured</code></td></tr>
 </table></div>
 
@@ -664,6 +683,7 @@ X 是候选 ∧ 被 PE 读取 ∧ 读值流入残差  ⇒  必须在 PolicyState
 <p>现场调 PE 没有这些问题：<b>没有可被手写的中间制品</b>。规则始终留在源码里，谁需要谁去求值。
 代价是同一个规范化函数会被求值多次——这是 PGRO 与 <code>G-C3</code> 本来就需要的能力（在任意策略处跑 PE），
 不构成新增成本。</p>
+<div class="cal bad" style="margin:14px 0"><span class="lbl">现场调 PE 要补两道门，否则它打穿两条既有约束</span><p><b>① 授权闭包被打穿。</b>规范化函数是<b>跨字段</b>的——pass 调它一次就事实上拿得到 <code>tp</code>，而"能力受限视图按字段授权"是层表签名 <code>Pass_X(·, SpecA, SpecB)</code> 为真的前提。且"该函数会读哪些字段"<b>求值前不知道</b>。<b><code>G-E8</code>（授权闭包门）</b>：PE 求值时记录 <code>used_fields</code>（污点机制本来就在记），断言 <code>used_fields ⊆ 该 pass 声明的授权字段集</code>，越权 ⇒ 阻断。免费，且它同时给 <code>sweep_dims</code> 一个真实的载体。</p><p><b>② 规范化函数是普通 Python，可非幂等。</b>同一环境调两次可能给出不同绑定，而 <code>G-R3</code>（pass 确定性）对它<b>恒过</b>——两次跑犯同样的错。<b><code>G-E7</code>（幂等性门）</b>：同环境连调两次，输出绑定<b>逐值相等</b>，不等 ⇒ 阻断并指名该函数。配套：现场调用必须在<b>隔离环境</b>求值（纯函数：环境 → 残差 + 输出绑定，<b>不改入参</b>），按 <code>(anchor, 环境 digest)</code> 记忆化，每次调用进 <code>runtime_pe_ledger</code> 并参与编译产物 digest。</p></div>
 <p>收益仍在：CoreIR 里只有 <code>vocab_size</code>（policy-free ✓），padding 规则来自源码而非人脑（保真度 ✓），
 且该表达式的 <code>roots ∋ policy(tp)</code> 全程可见（provenance ✓）。</p></div>
 
@@ -808,7 +828,7 @@ x = g(y)           # 逻辑值 3，存储 2   ← 同名，但是新值</code></
 <p><code>StorageId</code> 把"这两个值是不是同一块存储"这件事变成一个等价类。这个等价类由 S1 的 <code>storage</code> 面
 （<code>new</code> / <code>alias</code> / <code>inplace</code>）逐算子推出——<b>而 alias 判错既不改变 op 序列、也几乎不改变时长</b>，
 在唯一的 oracle 上结构性不可见。</p>
-<p>后果不止于字节记账：<b><code>peak_lower</code>（§10.2）的正确性直接依赖它</b>。这一条进能力边界。</p></div>
+<p>后果不止于字节记账：<b><code>inf_interleave</code>（§10.2，<code>peak_allocated.lo</code> 的构造）的正确性直接依赖它</b>。这一条进能力边界。</p></div>
 
 <h2 id="c6"><span class="cn">Chapter 6</span>S1 · 算子语义注册域</h2>
 
@@ -955,7 +975,7 @@ P8 的 property test 无从执行。<b>这一条很容易漏</b>：组合子表�
 <li>加载三个注册域的原始文件及框架/运行时版本快照。</li>
 <li>解析 schema（closed schema：未知字段、拼写错误、未知枚举、未知版本全部拒绝）。</li>
 <li>模板展开 → 静态类型检查 → 语义完整性检查（九个面按需齐备；<b>缺失 ≠ 空值</b>）。</li>
-<li><b>值域裁剪校验</b>：<code>RegisteredOp.self_certainty ∉ {exact}</code>；声明 <code>evidence.grade = calibrated</code>
+<li><b>值域裁剪校验</b>：<code>RegisteredOp.self_certainty</code> 取 <code>exact</code> <b>仅当</b> <code>block_code = null ∧ readability = FULL ∧ atomic_scope 单算子</code>（并登记进 <code>native_exact_ledger</code>）；声明 <code>evidence.grade = calibrated</code>
     的，其 <code>CalibKey</code> 必须在 <code>CalibrationSet</code> 快照中<b>解析成功</b>，否则加载期阻断
     （<b>谎称有标定点当场阻断</b>）。</li>
 <li>冲突检测：selector 重复、User 与 Native 冲突、patch 目标不存在或 hash 不匹配 → 阻断。</li>
@@ -1033,7 +1053,7 @@ template 生成。<b>不需要写任何新代码</b>，这是层序改动真正�
 </table></div>
 <pre><code>Tier 1 · derived      captures 的 roots 含 source(framework)
                       **G-D4 生效**：template_free_vars ∩ forward_values == capture_site_args
-Tier 2 · 保守区间      roots ∋ abstraction(captures_declaration@ver)，certainty = modeled
+Tier 2 · 保守区间      roots ∋ declared_semantics(op@ver, kind = captures)，certainty = modeled
                       saved 字节区间 = [0, Σ 该 op 全部前向可见张量字节]      ← P5 来源 ④
 Tier 3 · 阻断          S1 加载期阻断</code></pre>
 <p>Tier 2 的下界取 <code>0</code> 有依据、不是保守过头：融合 attention 反向确实<b>在 kernel 内部重算</b> scores
@@ -1097,7 +1117,7 @@ Tier 3 · 阻断          S1 加载期阻断</code></pre>
   <td>"只改了字段没插 cast"——字段一改就与注册域冲突</td></tr>
 <tr><td class="nw"><code>G-N5</code></td><td><code>Pass_precision_opt</code> 新增的每个节点，其<b>下游可达集不含任何 <code>grad_role</code> 节点</b></td>
   <td><b>"没有第二套反向机制"的机器判据</b></td></tr>
-<tr><td class="nw"><code>G-N6</code></td><td>持久字节守恒：<code>Σ persistent(after) − Σ persistent(before) == Σ bytes(新增 Storage)</code>，逐 Storage 可归因</td>
+<tr><td class="nw"><code>G-N6</code></td><td>持久字节守恒，<b>在 <code>expr</code> 层断言</b>：<code>canon(Σ persistent(after).expr − Σ persistent(before).expr) ≡ canon(Σ bytes(新增 Storage).expr)</code>。<b>不能在值层用 <code>==</code></b>——两边都是 <code>modeled</code>，<code>cmp</code> 返回 <code>Q3[Bool]</code>，按 §2.7 硬规定 ① 消费者<b>恒阻断</b>。<code>≡</code> 是 digest 相等、返回真 <code>Bool</code>，且它抓的正是该门要抓的东西——"搬家 vs 新增"是<b>结构</b>差异，与区间宽度无关</td>
   <td>精度改写把字节"搬家"时的双计/漏计</td></tr>
 <tr><td class="nw"><code>G-N7</code></td><td><b>存在性嗅探</b>：<code>fp8.recipe ≠ none</code> 而图中不存在任何 <code>amax</code> 类 Storage ⇒ <b>阻断</b></td>
   <td>"声明了 fp8 但没建缓冲"的静默漏计</td></tr>
@@ -1254,10 +1274,12 @@ interval:  degree 侧 = [numel/∏degree, numel]        # P5 来源 ④：两端
 
 <div class="cal inv"><span class="lbl">时间根不得经"时刻"或"碎片"泄漏进显存侧</span>
 <pre><code>条件：overlap 全关 ∧ 图中不存在 timing_dependent 边
-断言：R_mem ∩ R_time ∩ {种类 == calib 的根} == ∅        # **只对 calib 种类的根断言**
+断言：R_mem ∩ R_time ∩ { calib(k) : k.measured_quantity == duration } == ∅
 违反 ⇒ 阻断</code></pre>
 <p><b>为什么只对 <code>calib</code> 断言</b>：显存侧与时间侧的输出量<b>都</b>含源码根、配置根（两侧都从同一个模型算起），
 "两侧 roots 无交集"字面执行<b>必然恒假</b>——一道恒红的门等于没有门。</p>
+<p><b>为什么还要再筛 <code>measured_quantity == duration</code></b>：只筛 <code>calib</code> 种类<b>仍然恒假</b>。同一个融合 kernel 的 <code>workspace_bytes</code>（显存侧）与它的时长（时间侧）完全可能由<b>同一次标定跑、同一个域片</b>产出 ⇒ 两侧共享同一个 <code>CalibKey</code>。必须按<b>被标定的物理量</b>再筛一层。</p>
+<p><code>measured_quantity</code> 这个字段是<b>白拿的</b>：它同时把 <code>G-X4</code>「显存类实测量不得占任何门的 oracle 位」从一句人读的约束变成<b>机器谓词</b>——<b>一个字段修两道门</b>。</p>
 <p><b>它抓的规格级缺陷</b>：若把"通信 buffer 的 Free 挂在通信完成事件上"实现成"挂在通信 op 的
 <code>duration</code> 之后的时刻"，则<b>即使 overlap 关闭</b>，Free 时刻的表达式也会带上标定根 ⇒ 门失败。
 正确实现是把 Free 挂在<b>偏序上的后继事件</b>，与 <code>duration</code> 无关。
@@ -1269,7 +1291,7 @@ interval:  degree 侧 = [numel/∏degree, numel]        # P5 来源 ④：两端
 <p><b>显存后端</b>只消费 <code>MemoryEventView</code>：按事件推进，依据内存池与对齐规则模拟申请释放，
 给出已分配 / 已保留峰值区间与首次失败证据。结束前终审：不得残留未释放的非持久实例。</p>
 <p><b>时间后端</b>只消费 <code>ResourceRequest</code> 与硬件/profile 快照，两级离散事件仿真（段内多流 → 全局调度）。
-定价分级回退：命中兼容实测 → 形状/类型插值 → 已标定族模型 → 理论 roofline；
+定价分级回退：命中兼容实测 → 形状/类型插值 → 已标定族模型 → 理论 roofline。<b>注意区分两种失效</b>——roofline 级是「该算子族<b>从未建立过</b>标定域片」时的初始定价（<b>合法</b>，落 P5 兜底单侧）；而「越域」是「<b>有</b>域片但参数落在域片外」（<b>阻断</b>）。把两者压成一条线性回退链，会与 <code>G-X3</code>「域片内标定点集非空」相冲突，使无标定的 roofline 级恒不可达；
 <b>每一级都是一个 <code>self_certainty = modeled</code> 的算子</b>，参数不完整时阻断，
 <b>绝不静默降级为零成本或纯带宽模型</b>。</p>
 <div class="cal inv"><span class="lbl">后端的独有不变量：零新事实</span>
@@ -1281,22 +1303,42 @@ interval:  degree 侧 = [numel/∏degree, numel]        # P5 来源 ④：两端
 属 <code>modeled / reconstructed</code> 而非 <code>derived</code>。</p></div>
 
 <h3 id="c10-2">10.2 峰值：上界、下界与它们各自的条件</h3>
-<pre><code>peak_upper := Σ_streams peak_s                                  # 合法的跨交织上界
+<pre><code># ── 三条**正交**的不确定性轴，先分清，再给合成式 ────────────────────────────
+#   交织轴：真机走哪条线性化      → 跨交织的下确界 / 上确界
+#   字节轴：每个 size 自己的区间   → size.lo / size.hi
+#   时刻轴：t* 随字节端点与时长端点移动 → 四角（§2.7）
 
-peak_lower := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastuse(s)} size_s
-              s 取值范围 = **StorageId**（alias 等价类），不是 TensorId</code></pre>
-<p><code>peak_lower</code> 的论证：任何线性化都必经过 <code>n</code>，届时上式集合中的每个 storage 都已分配且未释放
+# 交织轴（在固定的字节取值与固定的 t* 下）
+inf_interleave  := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastuse(s)} size_s
+                   s 取值范围 = **StorageId**（alias 等价类），不是 TensorId
+sup_interleave  := Σ_streams peak_s
+
+# 合成：先在四角上各取一次，再对三轴取包络
+peak_allocated.lo := min over 四角 :  inf_interleave( size := size.lo )
+peak_allocated.hi := max over 四角 :  sup_interleave( size := size.hi )
+peak_reserved     := peak_allocated ⊕ 碎片 ⊕ 池划分        # 二者有结构性上界（P5 ⑤）
+
+peak_interval     := peak_reserved                          # **对外唯一字段**，其余是中间量</code></pre>
+<p><code>inf_interleave</code> 的论证：任何线性化都必经过 <code>n</code>，届时上式集合中的每个 storage 都已分配且未释放
 ⇒ 跨全部交织的合法下界。复杂度 <code>O(节点数 × storage 数)</code>，不是最大团问题。</p>
+<div class="cal why"><span class="lbl">为什么必须把三条轴分开写</span>
+<p>它们回答的是三个不同的问题：<b>交织轴</b>问"真机会走哪条线性化"、<b>字节轴</b>问"每个量本身有多不确定"、
+<b>时刻轴</b>问"峰值发生在哪一刻"。三者**互不蕴含**——字节全精确时交织轴仍有宽度，
+交织唯一时字节轴仍有宽度。</p>
+<p>不分开写就会出现一类很难发现的错：<b>把交织轴的下确界直接当成对外的 <code>peak.lo</code></b>。
+那是错的——前者是在<b>某一组字节取值</b>下算的，而 <code>peak.lo</code> 要求字节也取 <code>lo</code>、
+且 <code>t*</code> 要在四角上取遍。合成式把这三步显式化，<b>对外只暴露 <code>peak_interval</code> 一个字段</b>。</p></div>
 
 <div class="cal bad"><span class="lbl">但它<b>不是无条件</b>下界，两个条件必须写死</span>
+<div class="cal inv" style="margin:14px 0"><span class="lbl">alias 判定按 P4 必须污染<b>每个 storage 的字节</b>，不止 <code>inf_interleave</code></span><p>alias 等价类决定<b>一个 storage 实例是否存在</b>——这严格落在"存在位下传"的射程内。所以每个 <code>size</code> 都背 <code>replication(alias_rules)</code>，不是只有下界构造背。</p><p><b>连带必须一并接受</b>：修好之后该根的 <code>coverage</code> ≈ 100% ⇒ §10.5"按 root 覆盖八行"退化为"有一行接近满"。所以那张表必须改按 <b><code>replication</code> 的 <code>rule</code> 粒度</b>打印（<code>alias_rules</code> / <code>collective_rule</code> / <code>bucketing_rule</code> …），而不是按根的<b>种类</b>打印。<b>根种类是闭集八值，规则名不是——后者才是"去改哪一条"的粒度。</b></p></div>
 <p><b>条件一 · alias 等价类必须正确。</b>若两个实际共享存储的值被判成两个 <code>StorageId</code>，
-它们会被<b>各计一次</b> ⇒ <code>peak_lower</code> 偏高 ⇒ 可能产出<b>假的 OOM 断言</b>。
-而 alias 判断恰恰是<b>完全无验证手段</b>的那一格（§5.1）。因此 <code>peak_lower</code> 携带
+它们会被<b>各计一次</b> ⇒ <code>inf_interleave</code> 偏高 ⇒ 可能产出<b>假的 OOM 断言</b>。
+而 alias 判断恰恰是<b>完全无验证手段</b>的那一格（§5.1）。因此 <code>inf_interleave</code> 携带
 <code>certainty = modeled</code>、<code>roots ∋ replication(alias_rules)</code>——<b>它是一个条件下界，
 不是一个定理</b>，报表必须这样标注。</p>
 <p><b>条件二 · 求和只能包含 Free 由结构边决定的 storage。</b>若某 storage 的 <code>lastuse</code> 由
 <code>timing_dependent</code> 边决定，则 <code>⪯</code> 不再是纯结构偏序，"任何线性化都经过 <code>n</code>"的论证失效。
-<b>这类 storage 一律从 <code>peak_lower</code> 的求和中排除</b>（保守，使下界更松，方向正确）。</p></div>
+<b>这类 storage 一律从 <code>inf_interleave</code> 的求和中排除</b>（保守，使下界更松，方向正确）。</p></div>
 
 <div class="cal why"><span class="lbl">排除之后还剩多少——它不是一个近乎空的和</span>
 <p>被排除的是"释放时刻取决于通信时长"的那些：overlap 下的通信 buffer、prefetch 中的已 gather 参数、
@@ -1307,13 +1349,13 @@ peak_lower := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastus
 <li><b>激活</b>的 <code>lastuse</code> 是<b>结构依赖</b>（读它的那个反向节点），与时长无关 ⇒ 保留。</li>
 </ul>
 <p>并且参数本体的字节是 <code>source</code> 根、<code>exact</code>、区间为点，
-所以<b><code>peak_lower ≥ Σ 参数字节</code> 无条件成立</b>——这已经是一个非平凡的、
+所以<b><code>inf_interleave ≥ Σ 参数字节</code> 无条件成立</b>——这已经是一个非平凡的、
 可被真机 OOM 事实证伪的断言。<b>排除 <code>timing_dependent</code> 削弱的是精度，不是存在性。</b></p></div>
 
 <div class="cal why"><span class="lbl">为什么必须补下界，哪怕它这么弱</span>
 <p><code>ScheduleSpec</code> 声明的那个交织下的峰值<b>不是</b>跨交织下界（真机可能走别的交织），
 把它当下界用会产出<b>假的 OOM 断言</b>——正是"给一个假装确定的答案"。
-在前提 P-peak 之下，<code>peak_lower</code> 是显存链上<b>唯一</b>能产生"可被真机 OOM 事实证伪的断言"的构件。</p></div>
+在前提 P-peak 之下，<code>peak_allocated.lo</code>（其构造是 <code>inf_interleave</code>）是显存链上<b>唯一</b>能产生"可被真机 OOM 事实证伪的断言"的构件。</p></div>
 
 <h3 id="c10-2b">10.2b 已分配与已保留：一处不对称，它决定了工具能说什么</h3>
 <p>把碎片算进来之后，两个方向<b>不是对称的</b>。这一小节是全篇结论最硬的一处，必须单独讲。</p>
@@ -1325,7 +1367,7 @@ peak_lower := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastus
 <tr><th class="nw">要断言</th><th>需要什么</th><th class="nw">可得吗</th></tr>
 <tr><td class="nw"><b>会 OOM</b>（<code>true</code>）</td>
   <td><code>peak_allocated.lo &gt; C_eff.hi</code>。碎片只增不减，<b>不可能救回来</b>，所以用已分配的下界就够</td>
-  <td><b>可判定</b>：只依赖 <code>peak_lower</code> 与 <code>C_eff.hi</code>，不依赖碎片模型</td></tr>
+  <td><b>可判定</b>：只依赖 <code>peak_allocated.lo</code> 与 <code>C_eff.hi</code>，不依赖碎片模型</td></tr>
 <tr><td class="nw"><b>装得下</b>（<code>false</code>）</td>
   <td><code>peak_reserved.hi ≤ C_eff.lo</code>——<b>两端都要可计算</b></td>
   <td>见下面的合取式。<b>不是单条件</b></td></tr>
@@ -1339,7 +1381,7 @@ peak_lower := max over 节点 n ∈ G4 偏序 :  Σ_{s : def(s) ⪯ n ⪯ lastus
 <p>而 <code>Sample</code> 上<b>没有 <code>cmp</code></b>、<b>不进 OOM 链</b>（§2.7 硬规定 ②）。
 <b>⇒ <code>cmp(peak, C_eff)</code> 在类型上不存在 ⇒ 头号输出没有生产者。</b>
 连带失效的是 <code>VERDICT-WITHDRAW</code>（唯一落点就是 <code>oom_verdict := undetermined</code>）、
-"用真机 OOM 事实反证 <code>false</code>"（该值不存在）、以及 <code>peak_lower</code> 的全部用途。</p>
+"用真机 OOM 事实反证 <code>false</code>"（该值不存在）、以及 <code>peak_allocated.lo</code> 的全部用途。</p>
 <p><b>解法只能是让 <code>C_eff</code> 恢复成 <code>Q</code>，即给它的两个减项各一个界而不是一个样本。</b>
 碎片与池划分都有<b>结构性上界</b>（P5 来源 ⑤）：它由 allocator 的池划分规则与 G4 的事件序<b>组合算出</b>，
 形如「碎片 ≤ 活跃分配块数 × 最大对齐/分块粒度」，<b>不依赖任何扫描、任何标定点</b>。
@@ -1412,8 +1454,24 @@ oom_verdict = false 可判定 ⟺ peak_reserved.hi 可计算 ∧ ∀ r ∈ S_C :
 <div class="cal inv"><span class="lbl"><code>undetermined</code> 必须是类型，不能是标签</span>
 <p>强制附带<b>判定阻碍分解</b>：给出最小的量集合 <code>S</code>，使得把 <code>S</code> 中每个量固定到其区间某一端后
 verdict 变确定；逐条列出成员、其 <code>roots</code>、其 <code>evidence.grade</code>、其宽度贡献。</p>
-<p><b>可算性</b>：在固定的 <code>t*</code> 上 <code>peak = Σ_{i∈live(t*)} size_i</code> 是<b>和</b>，宽度可加
-⇒ 按 <code>width(size_i)</code> 降序贪心取前缀即为<b>精确</b>最小集，<code>O(n log n)</code>，不是指数的子集选择。</p>
+<p><b>它必须分成两段，因为要求用户做的动作不同</b>：</p>
+<div class="tw"><table>
+<tr><th class="nw">段</th><th>内容</th><th class="nw">排序键</th><th>用户要做的</th></tr>
+<tr><td class="nw">第一段</td>
+  <td><b><code>S_∞ ∩ live(t*)</code> 的全集</b>——端点不可计算的量。它们是<b>合取必要条件</b>，
+      <b>没有"最小集"可言，也没有全序</b>（宽度不可计算 ⇒ 不可比较）。输出其基数 <code>blocking_set_size</code></td>
+  <td class="nw"><code>coverage_bytes</code></td>
+  <td><b>去获得一个界</b>（标定、或补一条可算的结构性上界）</td></tr>
+<tr><td class="nw">第二段</td>
+  <td>仅当 <code>S_∞ ∩ live(t*) = ∅</code> 时才有意义：对剩余的<b>可计算宽度</b>跑贪心。
+      此时在固定 <code>t*</code> 上 <code>peak</code> 是和、宽度可加 ⇒ 按 <code>width(size_i)</code>
+      降序取前缀确为<b>精确</b>最小集，<code>O(n log n)</code></td>
+  <td class="nw"><code>width</code></td>
+  <td><b>去收紧一个界</b></td></tr>
+</table></div>
+<p><b>为什么不能合成一段</b>：贪心的"精确"论证前提是<b>宽度可比较</b>。只要有一个量的端点不可计算，
+它的宽度就没有数值，全序不存在，贪心退化为"最小集 = 全集"——一个恒等于全部量的清单没有指导价值，
+而且它会把真正的第二类问题（某个已有界但太宽的量）淹掉。</p>
 <p><b>为什么不是只报一个百分比</b>：百分比回答不了用户的下一个动作。最小集直接说"要回答你的头号问题，
 先去标定这 3 个量"——它把 <code>undetermined</code> 从坏消息变成<b>一张工单</b>。这正是判据 5 想要的：
 <code>undetermined</code> 比二值答案难看，但它是<b>可行动的难看</b>。</p></div>
@@ -1428,13 +1486,33 @@ verdict 变确定；逐条列出成员、其 <code>roots</code>、其 <code>evid
 <h3 id="c10-4">10.4 <code>VERDICT-WITHDRAW</code>：惩罚挂在头号输出上</h3>
 <p>峰值在 schema 中<b>只有区间形态、没有标量形态</b>（§1.4 不变量 10），
 所以"撤回点估计"这类惩罚是<b>空动作</b>——从来就没有点估计可撤。惩罚必须挂在头号输出上：</p>
-<pre><code>    (abstraction_covered_bytes + declared_semantics_covered_bytes) / peak  &gt; θ_abs
-  ∨ timing_dependent 扫描观测范围宽度                                       &gt; θ_TD
+<pre><code># 分子：真正的**并**（逐字节判定"带这两种根之一吗"），不是两个覆盖量相加
+# 分母：与分子同口径的 size.lo 之和 —— **恒可计算**，且比值恒 ∈ [0,1]
+judged := Σ_{i ∈ live(t*) : {abstraction, declared_semantics} ∩ roots(size_i) ≠ ∅} size_i.lo
+base   := Σ_{i ∈ live(t*)} size_i.lo
+
+    judged / base                                 &gt; θ_abs        # 四角上取 max，并打印四角取值
+  ∨ timing_dependent 扫描观测范围宽度               &gt; θ_TD
   ⇒ oom_verdict := undetermined（**无论区间落在容量的哪一侧**）
      且首页打印触发项、其实测比值与当次 Θ 取值</code></pre>
-<p><b>为什么这样比"撤点估计"强</b>：它直接打在用户来这里要的那句话上，而不是打在一个中间产物的呈现形态上。
-注意 <code>θ_abs</code> 的分子是<b>两个人工判断根的并</b>——只算 <code>abstraction</code> 会给
-"声明无 AST 对象的语义"开一条免费通道（§2.4）。</p>
+<p><b>为什么这样比"撤点估计"强</b>：它直接打在用户来这里要的那句话上，而不是打在一个中间产物的呈现形态上。</p>
+
+<div class="cal bad"><span class="lbl">分子与分母各有一个必须写死的细节，否则这道门要么恒真要么不可判</span>
+<p><b>分母不能写裸 <code>peak</code>。</b><code>peak</code> 是区间，且随四角移动。写裸的会有两种后果：
+取 <code>hi</code> 端则它常常<b>不可计算</b>（§10.2b 的 <code>S_∞</code>）⇒ 比值是 <code>Q3</code> 而不是数
+⇒ 需要 <code>Bool</code> 的消费者按 §2.7 硬规定 ① <b>阻断</b>；取 <code>lo</code> 端而分子取别的端，
+则比值失去意义。<b>钉死为分子分母同口径的 <code>size_i.lo</code> 之和</b>：恒可计算、比值恒在 [0,1]、
+四角上取 max 并打印四角取值。</p>
+<p><b>分子必须是"并"，不能是两个覆盖量相加。</b><code>roots</code> 是集合、`⊔ = ∪`、
+且 P8 保证只升不降 ⇒ <b>coverage 沿数据流饱和</b>：同一层里既有被抽象的模块、又有无 AST 的融合
+kernel 时，同一批下游字节会<b>同时</b>带上两种根，被两个 coverage <b>各计一次</b>。
+相加 ⇒ 比值可以 <b>&gt; 1</b> ⇒ 门<b>恒触发</b>。逐字节判"带这两种根之一吗"才是并。</p>
+<p><b>连带</b>：同样的饱和使 <code>abstraction_ledger.coverage_bytes</code> 与首页"按 root 覆盖八行"
+趋近于"每行都接近 100%"、零信息。所以两处都要<b>并列打印第二列</b>
+<code>own_coverage(r) := Σ_{i : r ∈ own_roots(producer(size_i))} size_i</code>——
+只算"这个根是在<b>哪个节点上产生</b>的"，不算它传播到哪。
+<b><code>own_coverage</code> 回答"我该去改哪一个"，<code>coverage</code> 回答"如果它错了最坏波及多大"</b>，
+两个问题都要答，但不能混成一个数。<code>own_roots</code> 是 P1 里已有的概念，零新构件。</p></div>
 
 <div class="cal why"><span class="lbl">这里<b>没有</b>一条"证据等级占比"的阈值，是有意的</span>
 <p>一个自然的补充是再加一条 <code>(reconstructed + vendor_documented) / peak &gt; θ_evd</code>。
@@ -1547,9 +1625,14 @@ G-B0（补救单调性门，机器执行）：
 <li><b>不存在</b>名为 <code>waiver</code> / <code>exception</code> / <code>override</code> / <code>accepted_*</code> 的字段；</li>
 <li><code>Direction</code> 值域<b>恰为</b> <code>{exact, upper, lower}</code>（无 <code>nominal</code>）；</li>
 <li><code>Root</code> 值域<b>恰为</b>八值；<code>Evidence.grade</code> 值域<b>恰为</b>三值；</li>
-<li><code>RegisteredOp.self_certainty</code> 值域<b>不含</b> <code>exact</code>；</li>
+<li><code>RegisteredOp.self_certainty</code> 取 <code>exact</code> 的条目，<b>必须</b>满足
+    <code>block_code = null ∧ readability = FULL ∧ atomic_scope 单算子</code>，
+    且<b>全部</b>出现在 <code>native_exact_ledger</code> 中（该台账参与 digest）；</li>
 <li><b>不存在</b> <code>Q3[Bool] → Bool</code> 与 <code>Sample[T] → Q[T]</code> 的转换算子；</li>
-<li>峰值与 step time <b>只有区间形态</b>，无标量形态；<b>不存在</b>任何由使用者输入决定的门限常量；</li>
+<li><code>oom_verdict</code> 的两个操作数<b>在类型上都是 <code>Q[Int]</code></b>（<code>G-X7</code>）；</li>
+<li><code>CalibKey</code> 必填 <code>measured_quantity</code>；<code>transcribed</code> 每条必填 <code>verifier</code>；</li>
+<li>峰值<b>只有区间形态</b>、step time <b>只有 <code>Sample</code> 形态</b>，二者<b>均无标量形态</b>；
+    <b>不存在</b>任何由使用者输入决定的门限常量；</li>
 <li>补救模板表中每条的 <code>clean_effect</code> <b>至少一项为「下降」</b>。</li>
 </ul>
 
@@ -1598,6 +1681,7 @@ G-B0（补救单调性门，机器执行）：
 <tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
 <tr><td class="nw"><code>G-P1</code></td><td>redistribute 全域性：placement 格上每一对可达格点都有规则</td>
   <td>新注册一个产出 <code>Partial(max)</code> 的 op 面而规则表只有 <code>Partial(sum)</code>；新增 mesh 轴而无跨 mesh 规则</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-P3</code></td><td><b>π₀ 单一来源</b>：<code>∀ b ∈ PolicyStateBinding : b.π₀绑定值 == PolicyClassTable[b.策略字段].pi0</code></td><td>两处各写一份 π₀，其中一处被选成使 guard 走"简单支"的值 ⇒ 残差更小、CoreIR 更小、需 PGRO 的 guard 更少、阻断更少——<b>每个指标都变好</b></td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-P2</code></td><td>每个反向模板绑定一个机器可解析的捕获点，否则强制 Tier 2</td>
   <td>某 op 声明 Tier 1 却指不出可解析的捕获点</td><td class="nw">门</td></tr>
 </table></div>
@@ -1622,7 +1706,7 @@ G-B0（补救单调性门，机器执行）：
       ② vocab padding 用<b>改属性</b>实现而不是插 <code>Pad</code> 节点；
       ③ 精度 pass 用 dtype 字段注入而不是加 Storage</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-C2</code></td><td>重写后全图无 placement 失配</td><td><b>只在实现遗漏时失败</b>；规格级失败已全部上提到 <code>G-P1</code></td><td class="nw"><b>后置条件</b></td></tr>
-<tr><td class="nw"><code>G-C3</code></td><td>策略交换律：<code>∀P∈P_test: PE(Src,·,P) ≅ ψ(rewrite(PE(Src,·,π₀),P))</code></td>
+<tr><td class="nw"><code>G-C3</code></td><td><b>（<code>≅</code> 的定义：无序集合用多重集 hash；<b>带序语义的对象</b>——参数列表、桶划分、事件序——<b>必须用有序 hash</b>，否则对重排序结构性失明）</b><br>策略交换律：<code>∀P∈P_test: PE(Src,·,P) ≅ ψ(rewrite(PE(Src,·,π₀),P))</code></td>
   <td>任一 pass 产出的 op 多重集 ≠ 源码在该策略下特化的 op 多重集：漏插/多插通信、padding 位置错、
       重算区未重新执行通信、pass 顺序错、融合选择错</td><td class="nw"><b>门（最强，且不需要 oracle）</b></td></tr>
 <tr><td class="nw"><code>G-D1</code></td><td>反向交叉核对：我们的模板展开 ≅ 框架声明式导数的 op 多重集</td><td>转置写反、少一步、多一步</td><td class="nw">门</td></tr>
@@ -1634,6 +1718,8 @@ G-B0（补救单调性门，机器执行）：
 <tr><td class="nw"><code>G-E3</code></td><td>单调性 property test（每个算术原语的声明单调性经随机取样验证）</td><td>声明 <code>increasing</code> 而实际非单调</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-E4</code></td><td>阻断有效性套件：每个 <code>BLK-*</code> 各有触发输入并断言阻断</td><td>某个阻断路径被改坏</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-E5</code></td><td>后端隔离：双向 import 禁令；后端不读源码/配置/注册表</td><td>有人加了回读</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-E7</code></td><td>现场调 PE 的<b>幂等性</b>：同环境连调两次，输出绑定逐值相等</td><td>规范化函数非幂等（填默认值时依赖调用次数、或写模块级全局）。<code>G-R3</code> 对它<b>恒过</b>——两次跑犯同样的错</td><td class="nw">门</td></tr>
+<tr><td class="nw"><code>G-E8</code></td><td><b>授权闭包</b>：<code>used_fields ⊆ 该 pass 声明的授权字段集</code></td><td>pass 经规范化函数拿到未授权的策略字段（规范化函数是跨字段的）⇒ 层表签名不再为真</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-E6</code></td><td>结构不变量：随层数、微批数变化的结构关系必须由模型<b>导出</b>而非写入公式</td><td>有人硬写了一条 <code>× num_layers</code></td><td class="nw">门</td></tr>
 </table></div>
 
@@ -1684,44 +1770,44 @@ G-B0（补救单调性门，机器执行）：
 
 <h3 id="c12-3">12.3 <code>G-M1</code> 自检的结果</h3>
 <div class="cal honest"><span class="lbl">把元门作用在自己身上之后，真门数是多少</span>
-<p>共 <b>45</b> 个条目。<code>G-M1</code> 逐条追问"存在一个<b>规格级</b>缺陷 fixture 使它变红吗"：</p>
+<p>共 <b>48</b> 个条目。<code>G-M1</code> 逐条追问"存在一个<b>规格级</b>缺陷 fixture 使它变红吗"：</p>
 <ul>
 <li><b>降级为后置条件（3）</b>：<code>G-C2</code>（placement 类型健全——是 <code>Pass_shard</code> 自己的终止条件）、
     <code>G-E1</code>（pass 幂等）、<code>G-B3a</code>（是 P4 的直接推论）。</li>
 <li><b>报告项（1）</b>：<code>G-T3</code>。</li>
-<li><b>真门 41</b>；扣独立性折扣 1（<code>G-T2</code> 与 <code>G-T1</code> 共 oracle）⇒ <b>独立真门 40</b>，按 oracle 分布：</li>
+<li><b>真门 44</b>；扣独立性折扣 1（<code>G-T2</code> 与 <code>G-T1</code> 共 oracle）⇒ <b>独立真门 43</b>，按 oracle 分布：</li>
 </ul>
 <div class="tw"><table>
 <tr><th class="nw">oracle</th><th class="nw">道数</th><th>成员</th></tr>
 <tr><td class="nw">schema 自身</td><td class="nw">6</td><td><code>G-X1</code>–<code>G-X5</code> <code>G-X7</code></td></tr>
-<tr><td class="nw">图自身或框架源码文本</td><td class="nw">14</td><td><code>G-C1</code> <code>G-C3</code> <code>G-D1</code> <code>G-D3</code> <code>G-D4</code> <code>G-D5</code> <code>G-E3</code>–<code>G-E6</code> <code>G-N4</code>–<code>G-N7</code></td></tr>
-<tr><td class="nw">快照自身（装载期）</td><td class="nw">3</td><td><code>G-P1</code> <code>G-P2</code> <code>G-N1</code></td></tr>
+<tr><td class="nw">图自身或框架源码文本</td><td class="nw">16</td><td><code>G-C1</code> <code>G-C3</code> <code>G-D1</code> <code>G-D3</code> <code>G-D4</code> <code>G-D5</code> <code>G-E3</code>–<code>G-E8</code> <code>G-N4</code>–<code>G-N7</code></td></tr>
+<tr><td class="nw">快照自身（装载期）</td><td class="nw">4</td><td><code>G-P1</code> <code>G-P2</code> <code>G-P3</code> <code>G-N1</code></td></tr>
 <tr><td class="nw"><b>真机 op 级 time</b></td><td class="nw"><b>5</b></td><td><code>G-T0</code> <code>G-T0b</code> <code>G-T1</code> <code>G-T2</code> <code>G-N2</code></td></tr>
 <tr><td class="nw">provenance 代数</td><td class="nw">3</td><td><code>G-B0</code> <code>G-B1a</code> <code>G-B4</code></td></tr>
 <tr><td class="nw">实现与规模</td><td class="nw">6</td><td><code>G-R1</code> <code>G-R2</code> <code>G-R2b</code> <code>G-R3</code> <code>G-R4</code> <code>G-N3</code></td></tr>
 <tr><td class="nw">元判据 / 项目级</td><td class="nw">4</td><td><code>G-L1</code> <code>G-M1</code> <code>G-M2</code> <code>G-Z1a</code></td></tr>
 </table></div></div>
 
-<p><b>但"40 道门"这个数本身就是 <code>G-M1</code> 要消灭的那种虚假安全感的最高形态</b>，
+<p><b>但"44 道门"这个数本身就是 <code>G-M1</code> 要消灭的那种虚假安全感的最高形态</b>，
 除非同时印出下面两个切分。它们必须一起上报表首页：</p>
 
 <div class="tw"><table>
 <tr><th class="nw">切分</th><th class="nw">数</th><th>成员</th></tr>
-<tr><td class="nw"><b>oracle 在工具之外</b></td><td class="nw"><b>5</b></td><td><code>G-T0</code> <code>G-T0b</code> <code>G-T1</code> <code>G-T2</code> <code>G-N2</code>——<b>其余 35 道的裁判都是我们自己写的东西</b>（schema、图、源码文本、快照）</td></tr>
+<tr><td class="nw"><b>oracle 在工具之外</b></td><td class="nw"><b>5</b></td><td><code>G-T0</code> <code>G-T0b</code> <code>G-T1</code> <code>G-T2</code> <code>G-N2</code>——<b>其余 39 道的裁判都是我们自己写的东西</b>（schema、图、源码文本、快照）</td></tr>
 <tr><td class="nw">其中<b>检模型事实</b>的</td><td class="nw"><b>3</b></td><td><code>G-T1</code> <code>G-T2</code> <code>G-N2</code>——<code>G-T0</code>/<code>G-T0b</code> 检的是 <b>oracle 自身的纯净度</b>（留出、版本），<b>不检任何模型事实</b></td></tr>
 <tr><td class="nw">其中<b>相互独立</b>的</td><td class="nw"><b>2</b></td><td><code>G-T1</code> <code>G-N2</code>（<code>G-T2</code> 与 <code>G-T1</code> 共 oracle）</td></tr>
 <tr><td class="nw" style="border-top:1px solid var(--rule)"><b>检模型事实</b>（含内部对照物）</td><td class="nw">17</td><td><code>G-P1 G-P2 G-C1 G-C3 G-D1 G-D3 G-D4 G-D5 G-E6 G-B1a G-N2 G-N4 G-N5 G-N6 G-N7 G-T1 G-T2</code></td></tr>
-<tr><td class="nw"><b>自律门</b>（防方案自己被改坏）</td><td class="nw">24</td><td>schema 闭集 · 阈值归属 · 资源上限 · oracle 纯净度 · 元判据</td></tr>
+<tr><td class="nw"><b>自律门</b>（防方案自己被改坏）</td><td class="nw">27</td><td>schema 闭集 · 阈值归属 · 资源上限 · oracle 纯净度 · 求值纪律（<code>G-E7</code>/<code>G-E8</code>/<code>G-P3</code>）· 元判据</td></tr>
 </table></div>
 
 <div class="cal bad"><span class="lbl">把这三个数并排读，才是这一章的真实结论</span>
 <p><b>整个方案对"模型算得对不对"的外部裁判，只有 2 道相互独立的门</b>（<code>G-T1</code> 与 <code>G-N2</code>），
 而且它们<b>只看 op 序列</b>——看不见任何字节、任何存储、任何生命周期。</p>
-<p>其余 38 道里，17 道用<b>我们自己写的对照物</b>（源码文本、图自身、快照）检模型事实，
-24 道是<b>自律门</b>——它们防的是"方案被改坏"，不是"模型算错"。自律门有价值，
+<p>其余 42 道里，17 道用<b>我们自己写的对照物</b>（源码文本、图自身、快照）检模型事实，
+27 道是<b>自律门</b>——它们防的是"方案被改坏"，不是"模型算错"。自律门有价值，
 但把它们和外部裁判并进同一个"40 道门"里报出去，就是在制造安全感。</p>
 <p>这也是 <a href="#c14">第 14 章</a>能力边界 E 的门体系侧投影：
-<b>显存链的 35 道门全部是自洽性检查</b>——能抓实现错、抓规格自相矛盾、抓与源码文本不符，
+<b>显存链的 39 道门全部是自洽性检查</b>——能抓实现错、抓规格自相矛盾、抓与源码文本不符，
 <b>抓不到"我们对框架的整体理解是错的"</b>。</p></div>
 
 <div class="cal why"><span class="lbl">数门的判据：共用 oracle ≠ 是更弱的断言</span>
@@ -1748,7 +1834,7 @@ G-B0（补救单调性门，机器执行）：
 <tr><td class="nw">R11</td><td><b>rank 类数</b></td><td class="nw"><b>16</b></td><td class="nw"><b>16</b></td><td>= <code>pp</code>；1F1B 下各 pp 阶段在飞 microbatch 数不同 ⇒ <b>必须逐 pp 阶段实例化</b></td></tr>
 <tr><td class="nw">R12</td><td><b>总事件数 <code>E</code></b></td><td class="nw"><b>7.2×10⁵</b></td><td class="nw"><b>1.75×10⁶</b></td><td>每 rank 类每 microbatch 实例化节点 × <code>mb</code> × <code>R</code></td></tr>
 <tr><td class="nw">R19</td><td>常驻内存（含索引 ×2.5）</td><td class="nw">0.5 GB</td><td class="nw">1.1 GB</td><td>目标 ≤ 2 GB ✓</td></tr>
-<tr><td class="nw">R21</td><td><b>单次编译工作量</b></td><td class="nw"><b>3.6×10⁶</b></td><td class="nw"><b>8.8×10⁶</b></td><td><code>E ×</code> 5 遍（实例化 / liveness×2 / 段内 DES / 报告聚合），单位「事件·遍」</td></tr>
+<tr><td class="nw">R21</td><td><b>单次编译工作量</b></td><td class="nw"><b>3.6×10⁶</b></td><td class="nw"><b>8.8×10⁶</b></td><td><code>E ×</code> <b>5 或 7</b> 遍（实例化 / liveness×<b>2 或 4</b> / 段内 DES / 报告聚合），单位「事件·遍」。<b>四角 liveness（§2.7）使 liveness 从 2 次变 4 次</b> ⇒ 7 遍；仅当图中存在 <code>timing_dependent</code> 边<b>且</b> TD 字节占比超过一个进 digest 的工具常量时才取 7，否则退化为 2 角并<b>打印退化事实与该占比</b>（TD 字节占比本就是强制报表行，复用、不新增 Θ）。<b>按 7 遍计，B 列 <code>1.75×10⁶ × 7 = 1.23×10⁷</code> 撞穿 <code>G-R2</code> 的 10⁷ 上限</b>——这正是必须条件化的原因</td></tr>
 <tr><td class="nw">R24</td><td>单次编译墙钟（8 核）</td><td class="nw">9 s</td><td class="nw">22 s</td><td>rank 类无共享状态，可切分</td></tr>
 <tr><td class="nw">R26</td><td>扫描迭代数</td><td class="nw">34</td><td class="nw">34</td><td><code>2D + 2</code>，<code>D ≤ 16</code></td></tr>
 <tr><td class="nw">R30</td><td><b>全流程墙钟（8 核，保守速率）</b></td><td class="nw"><b>100 s</b></td><td class="nw"><b>245 s</b></td><td>「配好配置直接出结果」的落点</td></tr>
@@ -1855,7 +1941,24 @@ G-B0（补救单调性门，机器执行）：
   对 U 内的一切，本方案提供：
       (i) 一个不可声明的根、(ii) 一个证据等级、(iii) 一个覆盖字节计数、(iv) 一个 Θ 门
   **不提供**：任何构造性残差、任何独立对照物、任何证明。
-  报表首页必须打印 U 覆盖的字节占比，字段名 unverifiable_coverage。</code></pre>
+  报表首页必须打印两个数（**不是一个**）：
+      size_unverifiable       := Σ_{i ∈ live(t*) ∩ U} size_i.lo  /  Σ_{i ∈ live(t*)} size_i.lo
+      membership_unverifiable := |{ i : i 的存活成员资格不确定 }| / |live(t*)|</code></pre>
+
+<div class="cal bad"><span class="lbl">`U` 必须是**代数上可判定**的量集，不能是一个反事实差异集</span>
+<p>把 `U` 写成「不改变 op 序列、也不显著改变时长的差异」有三个毛病：
+「显著」是隐藏阈值；反事实差异不是一个可枚举的对象；而且按字面它<b>覆盖全部成员资格通道</b>
+（liveness 判断从不改变 op 序列）⇒ 占比恒 100%，这个数没有信息。</p>
+<p><b>改为三条现成 schema 字段的并集</b>，全部逐量可判定、无阈值：</p>
+<pre><code>U := { q : roots(q) ∩ {declared_semantics, abstraction} ≠ ∅ }
+   ∪ { q : evidence.grade(q) ∈ {reconstructed, vendor_documented} }
+   ∪ { q : own_residual(q) 无机器来源（即 q ∈ S_∞） }</code></pre>
+<p><b>并且必须拆成两个数</b>：字节口径与成员资格口径的分母不同（字节 vs 实例数），
+量纲不同、可行动的方向也不同——前者要去标定一个量，后者要去确定一条生命周期。
+<b>混成一个数会让其中一个永远淹掉另一个。</b></p>
+<p>去重规则明写：<code>U</code> 是<b>量集</b>不是根集，<code>size_i</code> 在分子里<b>只计一次</b>
+（三条子句命中任意一条即入集），因此占比恒 ∈ [0,1]——这与 <code>coverage</code>（非划分、可 &gt; peak）
+是<b>两种不同的口径</b>，不可互换。</p></div>
 <p><b>凡"源码读不到内部"或"唯一 oracle 覆盖不到"的地方，全部构造性保证同时失效，只剩阈值、抽样与披露。</b>
 这不是四个独立缺陷，是同一条能力边界的四个投影：</p>
 <div class="tw"><table>
@@ -1880,7 +1983,7 @@ G-B0（补救单调性门，机器执行）：
 <li><b>没有停止条件。</b><code>G-Z1a</code> 是证伪条件（不递减 ⇒ 基本假设被推翻 ⇒ 停止实施），
     <b>不是</b>完成条件——没有任何 <code>k</code> 使我们能宣布注册工作结束。</li>
 <li><b>alias / in-place / 存储复用判断无验证手段。</b>它既不改变 op 序列、也几乎不改变时长，
-    在唯一的 oracle 上结构性不可见。判错的后果是显存的一阶量，且它是 <code>peak_lower</code> 的前置条件。</li>
+    在唯一的 oracle 上结构性不可见。判错的后果是显存的一阶量，且它是 <code>peak_allocated.lo</code> 的前置条件。</li>
 <li><b>liveness 与释放时机无验证手段。</b>调度的 Alloc/Free 语义、allocator 的碎片模型整块处在盲区。</li>
 <li><b>融合 kernel 的 <code>captures</code>（Tier 2）只有惩罚没有验证。</b>
     "验证力度与风险大小成反比"这个病<b>被降级为一个代价单调的宽区间，未被解决</b>。</li>
