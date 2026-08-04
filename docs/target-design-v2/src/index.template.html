@@ -665,6 +665,13 @@ X 是候选 ∧ 被 PE 读取 ∧ 读值流入残差  ⇒  必须在 PolicyState
 <p>那条会有一类结构性假阳性：框架里模块级全局极多（日志器、常量表、缓存、单例），
 其中大多数<b>在 import 后从不改变</b>。一律要求声明，会把 <code>PolicyStateBinding</code>
 从闭集撑成开集——<b>判据 3（非普适性）随之失守</b>，而一张什么都要声明的表等于没有表。</p>
+<p><b>实测支持这条选择。</b>两个框架的模块级顶层绑定分别是 625 / 989 个，
+其中<b>强可变</b>（存在 <code>global</code> 重绑定）只有 <b>24 / 143</b> 个
+⇒ <code>PolicyStateBinding</code> <b>是闭集，规模完全可枚举</b>，判据 3 不失守。</p>
+<p>而如果把可变性退化成常见的启发式"全大写 = 常量"，
+<b>在其中一个框架上误判率 59.3%</b>（440 个全大写名字里 261 个实际可变）——
+<b>一多半的策略状态源会静默漏标</b>。这正是必须按<b>赋值与变异点</b>判、
+不能按<b>命名</b>判的实测理由。</p>
 <p>上面的三条式判据把闭集画在<b>可变性</b>上而不是<b>存在性</b>上：
 一张 import 后从不被赋值也从不被下标写入的常量表，<b>可证不变</b> ⇒ 不需要声明；
 而 <code>_STATE</code> 那种有变异点的，<b>一定</b>要声明。<b>两边都不靠"我们没看见有人写它"。</b></p></div>
@@ -716,11 +723,29 @@ X 是候选 ∧ 被 PE 读取 ∧ 读值流入残差  ⇒  必须在 PolicyState
 可以被比较、被规范化、被 digest；启发式内联的输出只能被人看。</p>
 <pre><code>PE 的输出 = 残差程序 = CoreIR
 PySub    = 封闭语法子集（进快照、参与 digest）；语法构件超出 ⇒ BLK-SYNTAX
+           **实测规模**：约 61 条构件覆盖框架函数的 100%，47 条覆盖 95%，12 条覆盖 80%
 
 三条纪律（与 §2.5 的 P7 同源）：
   · π₀ 特化模式**禁用一切吸收/幂等化简**（`x*1 → x` 会把 policy root 吃掉）
   · 条件不可判定 ⇒ 立即阻断，**禁止同时保留两条分支**
   · 分叉有 fuel 上限，超限 ⇒ BLK-FUEL；fuel 值**必须进 digest**（否则两次不同 fuel 的运行结果不同而无痕）</code></pre>
+
+<div class="cal honest"><span class="lbl">PySub 的规模已实测，路线在语法层面成立</span>
+<p>对两个真实框架（各 ~1250 个 .py，全量解析成功）做 AST 探针，问"PySub 支持前 N 种最常见构件时，
+能被完整解析的函数占比是多少"：</p>
+<div class="tw"><table>
+<tr><th class="nw">覆盖率</th><th class="nw">仅种子 30 条</th><th class="nw">≥50%</th><th class="nw">≥80%</th><th class="nw">≥95%</th><th class="nw">100%</th></tr>
+<tr><td class="nw">所需构件数 N</td><td class="nw">32.6%</td><td class="nw">3</td><td class="nw">12</td><td class="nw"><b>47</b></td><td class="nw"><b>61</b></td></tr>
+</table></div>
+<p><b>两个框架的曲线形状几乎相同</b>——这是"框架无关"的第一条正面证据。
+PySub 不是"一个小子集"，但它是<b>可枚举、可版本化的表</b>，正是本方案要求的形态。</p>
+<p><b>更重要的是阻断项的性质</b>：模型子图内的"唯一超纲项"排行是
+元组解包（182 个函数）、装饰器（164）、<code>raise</code>（110）、三元（68）、<code>super()</code>（47）——
+<b>没有一项对偏求值器是困难的</b>。真正难的动态特性全在长尾：
+<code>eval</code> 2 个函数、<code>compile</code> 11、<code>locals</code> 2、
+<code>__getattr__</code> 3。<code>getattr</code> 涉及 91 个函数，其中 <b>77 个是常量字符串</b>（可直接求值），
+只有 18 个是动态的。</p>
+<p>数据与脚本：<code>docs/target-design-v2/stage0/PROBE-REPORT.md</code>。</p></div>
 
 {{SVG:04-structure-backward}}
 
@@ -760,6 +785,25 @@ AllReduce 节点，两支<b>不同构</b>，按该判据必须阻断；但这个
 <p>更重要的是：<b>PGRO 是"重建保真度"这个端到端义务在 guard 粒度上的分解</b>——
 它把一个不可归因的整体义务，拆成一组局部、可定位、纯静态可判的义务，
 且每一条都指着一个具体的 pass 和一个具体的策略取值。</p></div>
+
+<div class="cal honest"><span class="lbl">PGRO 的工作量已实测，且实测推翻了一条隐含假设</span>
+<p>模型定义子图内共 <b>758</b> 个策略污染 guard（占子图全部 <code>if</code>/三元的 <b>19.0%</b>）。
+但 PGRO 义务的<b>主体只有其中一部分</b>——按两支的改写类别分：</p>
+<div class="tw"><table>
+<tr><th>类别</th><th class="nw">数</th><th>PGRO 含义</th></tr>
+<tr><td><b><code>call_set_changes</code></b>（两支调用集合不同）</td><td class="nw"><b>421</b></td><td><b>PGRO 义务的主体</b></td></tr>
+<tr><td><code>assign_only</code>（只改变量赋值）</td><td class="nw">153</td><td>多半可直接折叠</td></tr>
+<tr><td><code>assign_only_with_call_delta</code></td><td class="nw">138</td><td>中间形态</td></tr>
+<tr><td><code>same_calls_diff_args</code></td><td class="nw">46</td><td>通常是 <code>Π_extent</code></td></tr>
+</table></div>
+<p><b>分叉不会爆炸</b>：policy-guard 的嵌套深度分布是 <code>0→645, 1→96, 2→16, 3→1</code>——
+<b>85% 零嵌套，最深 3</b>。这对 <code>BLK-FUEL</code> 是正面信号。</p>
+<p><b>但有一条隐含假设被数据推翻</b>：按字段组分，<b>MoE 相关 guard（283）多于并行度（237）</b>，
+而 MoE 的高频字段（<code>moe_layer_freq</code>、<code>moe_layer_pattern</code>、
+<code>moe_token_dispatcher_type</code>、<code>moe_router_load_balancing_type</code>）
+<b>很多是改变结构或改变数学的</b>，按 §3.2 的判据属 <code>Π_semantic</code>。
+⇒ <b><code>Π_semantic</code> 这一类比预想的重要得多，而它恰好是唯一没有 pass 能重建的那一类</b>——
+后果是 MoE 的多数旋钮可能都不在 <code>sweep_dims</code> 里，要 what-if 就得编译两次。</p></div>
 
 <div class="cal honest"><span class="lbl">PGRO 的边界，以及它最大的风险</span>
 <p><b>边界</b>：PGRO 只能证明"pass 重建出的图 ≡ 源码 <code>else</code> 支写的图"。
@@ -1921,9 +1965,8 @@ G-B0（补救单调性门，机器执行）：
 采用<b>适配层 + 按算子族收编 + 双跑归因</b>；每完成一族即删除对应旧分支。</p>
 <div class="tw"><table>
 <tr><th class="nw">阶段</th><th>内容</th><th>该阶段的门</th></tr>
-<tr><td class="nw">0</td><td><b>立项前两件事</b>：① AST 探针（语法构件计数 + import 期 monkey-patch 点 / 并行状态访问器读取点 /
-  配置规范化函数规模三张清单 + policy-tainted guard 的数量与按字段分布）；② 合成图空转基准</td>
-  <td>两件事完成前，<b>任何引用探针结果或对账表绝对数值的论证一律无效</b></td></tr>
+<tr><td class="nw">0</td><td><b>立项前两件事——<span style="color:var(--sd)">均已完成</span></b>：① AST 探针（两个框架各 ~1250 个 .py，全量解析成功）；② 合成图空转基准（10⁶ 级合成事件）。产出在 <code>docs/target-design-v2/stage0/</code>，可复算</td>
+  <td><b>已解除</b>。仍未测的三个数（每层原子 op 数 / 每事件 <code>Q</code> 实例数 / rank 类数）需要一份<b>真实模型配置</b>跑一次实例化，不是纯静态分析能给的</td></tr>
 <tr><td class="nw">1</td><td>语义基础设施：类型系统、组合子库（含归约类声明）、DSL 编译器、三个注册域</td><td>加载期阻断用例全部通过；<code>G-X1</code>–<code>G-X5</code></td></tr>
 <tr><td class="nw">2</td><td>PE + PySub + π₀；G0 与 policy-free 断言</td><td><code>G-C3</code> 在小模型上通过；PGRO 覆盖率 100%（<b>不足即不得出数</b>）</td></tr>
 <tr><td class="nw">3</td><td>按族收编：视图/类型转换/比较 → 逐元素/归一化 → 矩乘 → 注意力 → MoE → 集合通信 → 融合</td><td>每族收编后 <code>G-D1</code>/<code>G-D3</code>/<code>G-D4</code></td></tr>

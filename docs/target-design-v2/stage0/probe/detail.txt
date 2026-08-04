@@ -1,0 +1,284 @@
+#### monkey-patch 逐条 ####
+
+===== mindformers (framework, 37 条) =====
+mindformers/core/callback/build_callback.py                     :79    register_ms_cb()                           root=register_ms_cb     kind=unknown        form=patchfn_call   guarded=False
+mindformers/core/loss/build_loss.py                             :72    register_ms_loss()                         root=register_ms_loss   kind=unknown        form=patchfn_call   guarded=False
+mindformers/core/lr/build_lr.py                                 :100   register_ms_lr()                           root=register_ms_lr     kind=unknown        form=patchfn_call   guarded=False
+mindformers/core/lr/build_lr.py                                 :101   register_mf_lr()                           root=register_mf_lr     kind=unknown        form=patchfn_call   guarded=False
+mindformers/core/metric/build_metric.py                         :67    register_ms_mt()                           root=register_ms_mt     kind=unknown        form=patchfn_call   guarded=False
+mindformers/core/optim/build_optim.py                           :128   register_ms_optim()                        root=register_ms_optim  kind=unknown        form=patchfn_call   guarded=False
+mindformers/core/optim/build_optim.py                           :129   register_mf_optim()                        root=register_mf_optim  kind=unknown        form=patchfn_call   guarded=False
+mindformers/dataset/dataloader/build_dataloader.py              :67    register_ms_dataset_loader()               root=register_ms_datase kind=unknown        form=patchfn_call   guarded=False
+mindformers/dataset/sampler/build_sampler.py                    :67    register_ms_samplers()                     root=register_ms_sample kind=unknown        form=patchfn_call   guarded=False
+mindformers/dataset/transforms/build_transforms.py              :86    register_ms_transforms()                   root=register_ms_transf kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :131   _sym_db.RegisterEnumDescriptor()           root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :195   _sym_db.RegisterEnumDescriptor()           root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1431  _TRAINERSPEC_MODELTYPE.containing_type     root=_TRAINERSPEC_MODEL kind=local_toplevel form=assign         guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1432  _SELFTESTDATA_SAMPLE.containing_type       root=_SELFTESTDATA_SAMP kind=local_toplevel form=assign         guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1435  _MODELPROTO_SENTENCEPIECE.containing_type  root=_MODELPROTO_SENTEN kind=local_toplevel form=assign         guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1436  _MODELPROTO_SENTENCEPIECE_TYPE.containing_ root=_MODELPROTO_SENTEN kind=local_toplevel form=assign         guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1446  _sym_db.RegisterFileDescriptor()           root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1458  _sym_db.RegisterMessage()                  root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1469  _sym_db.RegisterMessage()                  root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1489  _sym_db.RegisterMessage()                  root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1490  _sym_db.RegisterMessage()                  root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1510  _sym_db.RegisterMessage()                  root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1511  _sym_db.RegisterMessage()                  root=_sym_db            kind=unknown        form=patchfn_call   guarded=False
+mindformers/models/sentencepiece_model_pb2.py                   :1514  DESCRIPTOR._options                        root=DESCRIPTOR         kind=local_toplevel form=assign         guarded=False
+mindformers/models/sentencepiece_model_pb2_new.py               :25    DESCRIPTOR._options                        root=DESCRIPTOR         kind=local_toplevel form=assign         guarded=True
+mindformers/models/sentencepiece_model_pb2_new.py               :26    DESCRIPTOR._serialized_options             root=DESCRIPTOR         kind=local_toplevel form=assign         guarded=True
+mindformers/tools/dataset_preprocess/llama/llama_preprocess.py  :261   word_tokenizer.add_bos_token               root=word_tokenizer     kind=local_toplevel form=assign         guarded=True
+mindformers/tools/dataset_preprocess/llama/llama_preprocess.py  :263   word_tokenizer.add_eos_token               root=word_tokenizer     kind=local_toplevel form=assign         guarded=True
+mindformers/tools/logger.py                                     :656   warnings.showwarning                       root=warnings           kind=module         form=assign         guarded=False
+mindformers/trainer/build_trainer.py                            :60    register_mf_trainer()                      root=register_mf_traine kind=unknown        form=patchfn_call   guarded=False
+mindformers/wrapper/build_wrapper.py                            :100   register_ms_wrap()                         root=register_ms_wrap   kind=unknown        form=patchfn_call   guarded=False
+mindformers/wrapper/build_wrapper.py                            :101   register_mf_wrapper()                      root=register_mf_wrappe kind=unknown        form=patchfn_call   guarded=False
+research/llama3_1/llama3_1_preprocess.py                        :209   word_tokenizer.add_bos_token               root=word_tokenizer     kind=local_toplevel form=assign         guarded=True
+research/llama3_1/llama3_1_preprocess.py                        :211   word_tokenizer.add_eos_token               root=word_tokenizer     kind=local_toplevel form=assign         guarded=True
+research/telechat2/telechat_preprocess.py                       :212   args.max_length                            root=args               kind=local_toplevel form=assign         guarded=True
+research/telechat2/telechat_preprocess.py                       :216   args.output_dataset_file                   root=args               kind=local_toplevel form=assign         guarded=True
+research/telechat2/telechat_preprocess.py                       :218   args.output_dataset_file                   root=args               kind=local_toplevel form=assign         guarded=True
+
+===== megatron (framework, 35 条) =====
+megatron/core/__init__.py                                       :54    register_safe_globals()                    root=register_safe_glob kind=name           form=patchfn_call   guarded=True
+megatron/core/__init__.py                                       :58    torch.storage._load_from_bytes             root=torch              kind=module         form=assign         guarded=False
+megatron/core/fusions/fused_indices_converter.py                :24    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_indices_converter.py                :25    triton.autotune                            root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_indices_converter.py                :26    triton.heuristics                          root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_mla_yarn_rope_apply.py              :24    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_mla_yarn_rope_apply.py              :25    triton.autotune                            root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_mla_yarn_rope_apply.py              :26    triton.heuristics                          root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_pad_routing_map.py                  :24    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_pad_routing_map.py                  :25    triton.autotune                            root=triton             kind=module         form=assign         guarded=True
+megatron/core/fusions/fused_pad_routing_map.py                  :26    triton.heuristics                          root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/communication/torch_symm_triton/barrier.py:15    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/communication/torch_symm_triton/collectives.py:16    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/communication/torch_symm_triton/fused_collectives.py:19    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/communication/torch_symm_triton/multimem_asm.py:17    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/communication/torch_symm_triton/utils.py:17    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/communication/torch_symm_triton/variable_collectives.py:26    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/contexts/attention_context/triton/tensor_ops.py:18    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/contexts/dynamic_context.py             :69    torch_memory_saver.hook_mode               root=torch_memory_saver kind=name           form=assign         guarded=True
+megatron/core/inference/contexts/fused_kv_append_kernel.py      :16    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/data_parallel_inference_coordinator.py  :40    faulthandler.register()                    root=faulthandler       kind=module         form=patchfn_call   guarded=False
+megatron/core/inference/data_parallel_inference_coordinator.py  :41    faulthandler.register()                    root=faulthandler       kind=module         form=patchfn_call   guarded=False
+megatron/core/inference/moe/activations.py                      :24    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/moe/metadata.py                         :32    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/moe/permute.py                          :28    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/moe/vllm_fused_moe.py                   :29    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/quantization/mxfp8_quantize.py          :28    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/inference/text_generation_controllers/mtp_utils_triton.py:18    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/ssm/ops/causal_conv1d_triton.py                   :20    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/ssm/ops/mamba_ssm.py                              :26    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/core/tensor_parallel/layers.py                         :775   linear_with_grad_accumulation_and_async_al root=linear_with_grad_a kind=unknown        form=assign         guarded=False
+megatron/core/transformer/custom_layers/batch_invariant_kernels.py:27    triton.jit                                 root=triton             kind=module         form=assign         guarded=True
+megatron/elastification/pretrain_hybrid_flex.py                 :526   train_valid_test_datasets_provider.is_dist root=train_valid_test_d kind=unknown        form=assign         guarded=True
+megatron/elastification/pretrain_hybrid_flex.py                 :555   _mtt.get_megatron_optimizer_config         root=_mtt               kind=module         form=assign         guarded=True
+megatron/training/training.py                                   :231   torch_memory_saver.hook_mode               root=torch_memory_saver kind=name           form=assign         guarded=True
+
+
+#### guard 抽样 (每仓 40 条随机) ####
+
+===== mindformers =====
+allel_core/inference/transformer/multi_latent_attention.py:677   [both_nonempty|assign_only_with_call_delta] 精度
+     test= self.is_fa3_quant_layer
+mindformers/modules/quantizers/auto.py                    :93    [single_sided|assign_only_with_call_delta] 精度
+     test= isinstance(quantization_config, dict)
+mindformers/parallel_core/training_graph/device_matrix.py :83    [ifexp|assign_only] 并行度
+     test= config.context_parallel_size is not None
+mindformers/pynative/base_models/gpt/gpt_layer_specs.py   :210   [both_nonempty|call_set_changes] MoE
+     test= moe_layer_pattern[layer_number] == 1
+mindformers/models/llama/llama_interleave.py              :359   [single_sided|call_set_changes] 融合/实现选择,重算
+     test= parallel_config.recompute.select_recompute and (not self.use_flash_attention)
+mindformers/models/llama/llama_transformer.py             :378   [both_nonempty|call_set_changes] 并行度
+     test= cp > 1
+_core/training_graph/transformer/multi_latent_attention.py:296   [single_sided|assign_only_with_call_delta] 并行度
+     test= self.cp > 1 and self.cp_ds > 1
+mindformers/models/modeling_utils.py                      :305   [single_sided|call_set_changes] 并行度
+     test= parallel_mode in ['semi_auto_parallel'] and pp > 1
+lel_core/training_graph/base_models/gpt/gpt_layer_specs.py:233   [single_sided|call_set_changes] MoE
+     test= len(moe_layer_pattern) != config.num_layers
+mindformers/parallel_core/transformer_config.py           :58    [single_sided|same_calls_diff_args] 精度
+     test= type_str in ms_dtype_mapping
+mindformers/models/llama/llama_layer.py                   :184   [both_nonempty|call_set_changes] 融合/实现选择
+     test= fused_kernel and check_rmsnorm_big_kernel_valid()
+ers/parallel_core/training_graph/transformer/moe/router.py:234   [single_sided|call_set_changes] MoE
+     test= self.force_expert_balance
+parallel_core/inference/base_models/gpt/gpt_layer_specs.py:136   [ifexp|assign_only] 融合/实现选择
+     test= use_flash_attention
+mindformers/models/llama/llama.py                         :298   [both_nonempty|same_calls_diff_args] 调度
+     test= self.fine_grain_interleave or config.rmsnorm_compute_2d
+mindformers/models/llama/llama_transformer.py             :929   [both_nonempty|call_set_changes] MoE
+     test= self.expert_num == 1
+ers/parallel_core/training_graph/tensor_parallel/layers.py:444   [ifexp|assign_only] 并行度
+     test= config.context_parallel_size is not None
+llel_core/training_graph/tensor_parallel/batched_layers.py:361   [ifexp|assign_only] 并行度
+     test= config.data_parallel_size is not None
+mindformers/models/llama/llama_layer.py                   :867   [single_sided|call_set_changes] MoE
+     test= self.use_shared_expert_gating
+mindformers/parallel_core/inference/model_utils.py        :187   [single_sided|call_set_changes] 精度
+     test= isinstance(quant_method, QuantizeMethodBase) and (not isinstance(cell, GroupedMLP))
+mindformers/models/llama/llama_transformer.py             :980   [both_nonempty|same_calls_diff_args] 并行度
+     test= cp > 1
+dformers/parallel_core/training_graph/transformer/utils.py:255   [single_sided|call_set_changes] 重算
+     test= isinstance(self.recompute.select_recompute, dict)
+llel_core/training_graph/tensor_parallel/batched_layers.py:388   [ifexp|assign_only] MoE,并行度
+     test= config.expert_model_parallel_size is not None
+mindformers/models/llama/llama_layer.py                   :310   [both_nonempty|call_set_changes] MoE
+     test= moe_config is not None
+dformers/parallel_core/training_graph/transformer/utils.py:465   [single_sided|call_set_changes] 重算
+     test= isinstance(select_recompute, bool)
+mindformers/models/utils.py                               :448   [both_nonempty|assign_only] MoE
+     test= moe_latent_size is None
+parallel_core/inference/base_models/gpt/gpt_layer_specs.py:283   [single_sided|call_set_changes] MoE
+     test= num_experts is None
+mindformers/parallel_core/transformer_config_utils.py     :504   [single_sided|call_set_changes] 重算
+     test= recompute_key in convert_map
+mindformers/parallel_core/transformer_config_utils.py     :40    [one_side_trivial|call_set_changes] 精度
+     test= isinstance(dtype, bool)
+mindformers/models/llama/llama_layer.py                   :321   [both_nonempty|same_calls_diff_args] MoE
+     test= expert_num > 1
+dformers/parallel_core/training_graph/transformer/utils.py:519   [ifexp|assign_only] 重算
+     test= isinstance(select_recompute, dict)
+mindformers/parallel_core/transformer_config.py           :2218  [single_sided|call_set_changes] 并行度,融合/实现选择
+     test= self.context_parallel_size > 1 and (not self.use_flash_attention)
+mindformers/parallel_core/training_graph/loss_func.py     :303   [single_sided|call_set_changes] 并行度
+     test= _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and dp * stages != device_num
+mindformers/models/llama/llama_interleave.py              :390   [both_nonempty|assign_only_with_call_delta] 并行度
+     test= self.context_parallel > 1
+parallel_core/inference/base_models/gpt/gpt_layer_specs.py:263   [both_nonempty|call_set_changes] MoE
+     test= moe_layer_pattern[layer_number + offset] == 1
+mindformers/models/llama/llama_interleave.py              :328   [both_nonempty|call_set_changes] 并行度
+     test= cp > 1
+dformers/parallel_core/training_graph/transformer/utils.py:400   [single_sided|call_set_changes] 重算
+     test= not is_full_recompute
+mindformers/modules/activation.py                         :1169  [single_sided|call_set_changes] 精度
+     test= w.dtype not in (mstype.float16, mstype.float32)
+dformers/parallel_core/inference/tensor_parallel/layers.py:1103  [single_sided|call_set_changes] 分布式优化器
+     test= reduce_scatter_embeddings
+llel_core/training_graph/tensor_parallel/batched_layers.py:362   [ifexp|assign_only] 并行度
+     test= config.tensor_model_parallel_size is not None
+mindformers/modules/layers.py                             :1245  [both_nonempty|assign_only] 并行度
+     test= parallel_config is not None and parallel_config.context_parallel > 1
+
+===== megatron =====
+megatron/core/models/hybrid/hybrid_block.py               :115   [single_sided|call_set_changes] 精度
+     test= config.params_dtype is not None
+megatron/core/transformer/moe/moe_utils.py                :1530  [single_sided|call_set_changes] MoE
+     test= shared_expert_output is not None
+megatron/core/tensor_parallel/layers.py                   :322   [both_nonempty|assign_only_with_call_delta] 并行度
+     test= self.tp_group.size() > 1
+megatron/core/models/gpt/gpt_layer_specs.py               :679   [one_side_trivial|call_set_changes] MoE
+     test= isinstance(config.moe_layer_freq, list)
+megatron/core/tensor_parallel/layers.py                   :756   [single_sided|call_set_changes] 并行度
+     test= sequence_parallel
+megatron/core/transformer/multi_token_prediction.py       :802   [both_nonempty|call_set_changes] 并行度
+     test= config.pipeline_model_parallel_size > 1
+megatron/core/models/gpt/gpt_layer_specs.py               :525   [single_sided|call_set_changes] 精度
+     test= fp8 is not None
+/core/models/common/embeddings/language_model_embedding.py:139   [both_nonempty|call_set_changes] 并行度
+     test= self.config.sequence_parallel
+ore/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py:572   [single_sided|call_set_changes] 精度
+     test= cutlass.const_expr(problem_mnk[2] * a_dtype.width // 8 % 16 != 0)
+megatron/core/transformer/attention.py                    :1788  [single_sided|assign_only_with_call_delta] 并行度
+     test= self.config.num_query_groups < self.world_size
+megatron/core/transformer/transformer_layer.py            :1368  [single_sided|assign_only_with_call_delta] MoE
+     test= self.config.moe_shared_expert_intermediate_size is not None and (not self.config.moe_shared_expert_overlap)
+megatron/core/transformer/transformer_config.py           :1825  [both_nonempty|same_calls_diff_args] 重算
+     test= self.recompute_method is not None
+megatron/core/transformer/moe/paged_stash.py              :610   [ifexp|assign_only] 精度
+     test= dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu]
+megatron/core/transformer/transformer_config.py           :2684  [single_sided|same_calls_diff_args] MoE
+     test= self.moe_expert_capacity_factor is None or not self.moe_pad_expert_input_to_capacity
+megatron/core/transformer/transformer_config.py           :2336  [single_sided|call_set_changes] 融合/实现选择
+     test= self.fused_single_qkv_rope
+megatron/core/transformer/multi_latent_attention.py       :467   [single_sided|call_set_changes] 重算
+     test= self.recompute_up_proj
+megatron/core/transformer/moe/moe_utils.py                :130   [single_sided|call_set_changes] 融合/实现选择
+     test= not HAVE_TE or fused_moe_aux_loss is None
+megatron/core/transformer/mlp.py                          :270   [both_nonempty|call_set_changes] 融合/实现选择
+     test= self.config.bias_activation_fusion
+megatron/core/tensor_parallel/layers.py                   :308   [both_nonempty|call_set_changes] 分布式优化器
+     test= self.reduce_scatter_embeddings
+megatron/core/transformer/fsdp_dtensor_checkpoint.py      :177   [single_sided|call_set_changes] MoE
+     test= expert_index is not None
+/models/gpt/experimental_attention_variant_module_specs.py:287   [both_nonempty|assign_only_with_call_delta] MoE
+     test= 1 in moe_layer_pattern
+megatron/core/transformer/moe/moe_utils.py                :355   [single_sided|call_set_changes] 融合/实现选择
+     test= not HAVE_TE or fused_permute is None
+megatron/core/transformer/transformer_layer.py            :1248  [single_sided|same_calls_diff_args] MoE
+     test= self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+megatron/core/transformer/moe/token_dispatcher.py         :1100  [single_sided|assign_only_with_call_delta] MoE
+     test= self.moe_expert_rank_capacity_factor is not None
+megatron/core/transformer/transformer_config.py           :2248  [single_sided|call_set_changes] 融合/实现选择
+     test= self.bias_activation_fusion
+megatron/core/transformer/moe/moe_layer.py                :499   [single_sided|assign_only_with_call_delta] MoE
+     test= self.config.moe_latent_size
+tron/core/models/common/language_module/language_module.py:135   [both_nonempty|same_calls_diff_args] 融合/实现选择
+     test= self.config.attention_backend == AttnBackend.unfused
+megatron/core/transformer/transformer_layer.py            :2442  [one_side_trivial|call_set_changes] MoE,重算
+     test= self.moe_layer_recompute
+megatron/core/transformer/transformer_config.py           :1725  [single_sided|call_set_changes] MoE
+     test= self.moe_token_dispatcher_type == 'flex'
+megatron/core/ssm/mamba_context_parallel.py               :304   [single_sided|same_calls_diff_args] 并行度
+     test= self.cp_size == 1
+megatron/core/transformer/moe/token_dispatcher.py         :869   [single_sided|call_set_changes] MoE
+     test= self.shared_experts is not None
+megatron/core/models/multimodal/llava_model.py            :1017  [both_nonempty|call_set_changes] 融合/实现选择
+     test= use_temporal
+megatron/core/transformer/transformer_layer.py            :756   [single_sided|call_set_changes] 融合/实现选择
+     test= using_fused_tp_inference_kernel
+megatron/core/transformer/transformer_config.py           :1758  [single_sided|assign_only] MoE
+     test= self.moe_expert_capacity_factor < 0
+megatron/core/extensions/transformer_engine.py            :2413  [both_nonempty|assign_only_with_call_delta] 并行度
+     test= getattr(sh_ten, 'is_data_parallel_fully_shard', False)
+megatron/core/models/common/model_chunk_schedule_plan.py  :128   [ifexp|assign_only] MoE
+     test= is_moe
+megatron/core/transformer/moe/paged_stash.py              :605   [ifexp|call_set_changes] 精度
+     test= host_tokens_dict is not None and (dtype, hidden_size) in host_tokens_dict
+megatron/core/transformer/moe/token_dispatcher.py         :755   [single_sided|call_set_changes] MoE
+     test= self.num_local_experts > 1 and (not self._local_expert_chunk_sort_is_identity())
+megatron/core/transformer/moe/token_dispatcher.py         :1496  [both_nonempty|assign_only] MoE
+     test= config.moe_deepep_num_sms is None
+megatron/core/transformer/transformer_layer.py            :1374  [both_nonempty|call_set_changes] MoE
+     test= CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
+
+
+#### guard 按 "所在函数是否为配置规范化" 拆分 ####
+mindformers: total=758  配置规范化路径=139  模型构造/前向路径=619
+   前向路径 cls 分布: {'call_set_changes': 311, 'assign_only': 143, 'assign_only_with_call_delta': 131, 'same_calls_diff_args': 34}
+   前向路径 struct 分布: {'both_nonempty': 154, 'single_sided': 318, 'one_side_trivial': 16, 'ifexp': 131}
+   前向路径 所在函数 top12: [('__init__', 206), ('construct', 95), ('shard', 38), ('get_gpt_decoder_block_spec', 18), ('sharding_propagation', 13), ('weight_loader', 12), ('transformer_flops', 7), ('get_moe_module_spec', 7), ('load_checkpoint', 6), ('shard_lora', 6), ('set_recompute_select_layer_index', 6), ('cal_attn', 5)]
+   前向路径 文件 top10:
+      mindformers/parallel_core/training_graph/transformer/utils.py            29
+      mindformers/parallel_core/training_graph/tensor_parallel/batched_layers.py 28
+      mindformers/models/llama/llama_transformer.py                            23
+      mindformers/modules/transformer/moe.py                                   23
+      mindformers/parallel_core/training_graph/tensor_parallel/layers.py       23
+      mindformers/parallel_core/training_graph/base_models/gpt/gpt_model.py    21
+      mindformers/pynative/base_models/gpt/parallelize.py                      19
+      mindformers/models/llama/llama_interleave.py                             15
+      mindformers/models/llama/llama_layer.py                                  15
+      mindformers/parallel_core/inference/tensor_parallel/layers.py            15
+   其中 __init__=206  forward=97  其他=316
+megatron: total=1058  配置规范化路径=182  模型构造/前向路径=876
+   前向路径 cls 分布: {'assign_only': 116, 'same_calls_diff_args': 101, 'call_set_changes': 495, 'assign_only_with_call_delta': 164}
+   前向路径 struct 分布: {'single_sided': 508, 'both_nonempty': 249, 'one_side_trivial': 37, 'ifexp': 82}
+   前向路径 所在函数 top12: [('forward', 129), ('__init__', 109), ('backward', 20), ('get_query_key_value_tensors', 15), ('_make_fused_ops', 15), ('sharded_state_dict', 14), ('_get_fp8_autocast_for_quant_recipe', 13), ('_get_fp8_model_init_for_quant_recipe', 10), ('dispatch', 10), ('_forward_mlp', 10), ('_te_cuda_graph_replay_impl', 9), ('split_te_layernorm_column_parallel_linear', 8)]
+   前向路径 文件 top10:
+      megatron/core/extensions/transformer_engine.py                           87
+      megatron/core/transformer/transformer_layer.py                           69
+      megatron/core/transformer/moe/experts.py                                 51
+      megatron/core/transformer/moe/token_dispatcher.py                        45
+      megatron/core/transformer/moe/moe_layer.py                               36
+      megatron/core/tensor_parallel/layers.py                                  35
+      megatron/core/transformer/cuda_graphs.py                                 32
+      megatron/core/transformer/transformer_block.py                           31
+      megatron/core/transformer/moe/moe_utils.py                               28
+      megatron/core/models/gpt/gpt_layer_specs.py                              26
+   其中 __init__=109  forward=147  其他=620
+
+
+#### call_set_changes 的具体新增/删除调用 top ####
+mindformers (421 条): [('ValueError', 142), ('shard', 37), ('NotImplementedError', 29), ('recompute', 22), ('<expr>()', 20), ('reshape', 20), ('warning', 19), ('layout', 14), ('append', 13), ('isinstance', 12), ('TypeError', 9), ('len', 9), ('info', 8), ('type', 7), ('add_prim_attr', 7), ('get', 6), ('_ulysses_context_layer_a2a', 5), ('flash_attention', 5), ('Layout', 5), ('getattr', 5), ('range', 5), ('Parameter', 5), ('update', 5), ('cast', 5), ('transpose', 5)]
+megatron (641 条): [('ValueError', 146), ('<expr>()', 37), ('append', 33), ('isinstance', 24), ('is_te_min_version', 24), ('warn', 22), ('to', 22), ('RuntimeError', 19), ('len', 17), ('checkpoint', 16), ('setattr', 15), ('size', 15), ('getattr', 14), ('discard_output_and_register_recompute', 14), ('hasattr', 12), ('get_fp8_context', 12), ('set_save_original_input', 11), ('te_checkpoint', 11), ('get_te_version', 10), ('list', 10), ('CheckpointWithoutOutput', 9), ('range', 8), ('cat', 8), ('log_single_rank', 8), ('sum', 8)]
