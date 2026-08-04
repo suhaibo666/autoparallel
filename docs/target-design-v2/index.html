@@ -836,6 +836,12 @@ P2  certainty  certainty(f(x₁..xₙ)) = max( ⊔ᵢ certainty(xᵢ), self_cert
                                 ∧ readability = FULL ∧ atomic_scope 为单算子
                    全部取 exact 的注册项进 native_exact_ledger，参与 digest
                  MechanismOp.self_certainty  ∈ { modeled }            # allocator / roofline / tiling / 通信复刻
+                   且 own_roots ∈ { replication(rule) }（必填 rule 名）
+                      own_evidence.grade ∈ { reconstructed, calibrated }
+               **叶子 Q 的 certainty**：P2 只管 f(x₁..xₙ)。叶子由其根种类定——
+                 source / configured ⇒ exact；calib ⇒ exact（值来自实测点）；
+                 transcribed ⇒ 有 verifier 则 exact，⊥ 则 modeled（§3.1）；
+                 其余根 ⇒ modeled
 
 P3  evidence   evidence(f(...)) = weakest( {evidence(xᵢ)} ∪ {evidence(f)} )
 
@@ -2235,7 +2241,7 @@ G-B0（补救单调性门，机器执行）：
 <tr><th class="nw">编号</th><th>断言</th><th>会因为什么失败</th><th class="nw">类别</th></tr>
 <tr><td class="nw"><code>G-B0</code></td><td>补救单调性：<code>clean_effect</code> 声明与合成 fixture 实测一致</td><td>新补救模板声明"不变"而实测使某分量上升</td><td class="nw">门</td></tr>
 <tr><td class="nw"><code>G-B1a</code></td><td>抽象残差：<code>readability=FULL</code> 时 shape/arity 在 <code>R_P</code> 与 <code>S_P</code> 上一致，其余各面取凸包作区间</td><td>人声明的语义与源码直接矛盾</td><td class="nw">门（<b>抽样，非证明</b>）</td></tr>
-<tr><td class="nw"><code>G-B3a</code></td><td>通信字节的 <code>replication</code> <b>全覆盖</b>；任一通信节点字节 <code>certainty=exact</code> ⇒ 阻断</td>
+<tr><td class="nw"><code>G-B3a</code></td><td><b>由 <code>Pass_shard</code> 合成的</b>通信节点，其字节必须带 <code>replication</code> 根。<b>限定语不可省</b>：模型源码里显式写出的集合通信由 PE 直接读出、不经任何 pass 合成，其 <code>roots = {source, configured}</code> 本就不含 <code>replication</code>——不加限定的"全覆盖"会在这类模型上误红，而 P4 完全正确</td>
   <td>P4 被绕过</td><td class="nw"><b>后置条件</b>（它是 P4 的直接推论）</td></tr>
 <tr><td class="nw"><code>G-B4</code></td><td>守恒-均匀判据：满足守恒约束且均匀 ⇒ 机器判为完美均衡假设</td><td>把 MoE 负载写成一组均匀数字塞进任一 spec</td><td class="nw">门</td></tr>
 </table></div>
@@ -2358,7 +2364,7 @@ G-B0（补救单调性门，机器执行）：
 <tr><td class="nw">D</td><td><b>离散选择型</b>（手写 placement 的 axis、drop 策略、实现族替身判断）</td><td class="nw">视情况</td>
   <td class="nw"><b>不进区间扫描</b></td><td>它们没有 lo/hi，"扫"这个动作对它们无定义 ⇒ 改走<b>离散 what-if 清单</b></td></tr>
 </table></div>
-<p>档 A + B 的联合区间 = <b>2 次 liveness</b>（已含在单次编译的 5 遍里，<b>增量为零</b>），而不是 <code>2×120</code> 次。逐根的贡献<b>不需要重跑</b>：<code>span(root) = Σ_{s ∈ live(t*), root ∈ s.roots} (s.hi − s.lo)</code>在同一遍 liveness 内即可算出——<b>归因和区间是两件事，把它们混成一件事才导致了 2k 的估计。</b></p>
+<p>档 A + B 的联合区间 = <b>2 次 liveness</b>（字节两端）；若图中存在 <code>timing_dependent</code> 边且 TD 字节占比超过工具常量，则按 §2.7 升为<b>四角 4 次</b>。二者都已含在单次编译的遍数里（<b>5 遍或 7 遍</b>，见 §13.1 R21），<b>增量为零</b>。而不是 <code>2×120</code> 次。逐根的贡献<b>不需要重跑</b>：<code>span(root) = Σ_{s ∈ live(t*), root ∈ s.roots} (s.hi − s.lo)</code>在同一遍 liveness 内即可算出——<b>归因和区间是两件事，把它们混成一件事才导致了 2k 的估计。</b></p>
 
 <div class="cal honest"><span class="lbl">诚实的取舍：三个量的产物形态必须不同</span>
 <p><b>已分配峰值有真正的区间（是界）；保留峰值与 step time 没有区间，只有"top-N 扫描观测到的范围"。</b>报告中这三个量必须用<b>不同的产物形态</b>呈现，且 step time 的"区间"这一说法<b>予以撤销</b>。</p>
