@@ -39,7 +39,7 @@ ROW_LABEL = {
 #: 检模型事实（其余为自律门）
 CHECKS_MODEL_FACTS = {
     "G-P1", "G-P2", "G-C1", "G-C3", "G-D1", "G-D3", "G-D4", "G-D5", "G-E6",
-    "G-B1a", "G-N2", "G-N4", "G-N5", "G-N6", "G-N7", "G-T1", "G-T2",
+    "G-B1a", "G-N2", "G-N5", "G-N6", "G-N7", "G-T1", "G-T2",
 }
 
 
