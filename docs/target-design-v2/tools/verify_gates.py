@@ -116,6 +116,16 @@ def main() -> int:
         want(rf'<tr><td class="nw">(?:<b>)?{re.escape(lbl)}(?:</b>)?</td>'
              rf'<td class="nw">(?:<b>)?(\d+)(?:</b>)?</td>', len(v), f"分布·{k}")
 
+    # 三个切分（它们在另一张表里，此前漏检）
+    ext_facts = [g for g in external if g in CHECKS_MODEL_FACTS]
+    ext_indep = [g for g in external if g in indep and g in CHECKS_MODEL_FACTS]
+    want(r"oracle 在工具之外</b></td><td class=\"nw\"><b>(\d+)</b>", len(external), "切分·外部 oracle")
+    want(r"其中<b>检模型事实</b>的</td><td class=\"nw\"><b>(\d+)</b>", len(ext_facts), "切分·外部∩检事实")
+    want(r"其中<b>相互独立</b>的</td><td class=\"nw\"><b>(\d+)</b>", len(ext_indep), "切分·外部∩独立")
+    want(r"<b>检模型事实</b>（含内部对照物）</td><td class=\"nw\">(\d+)</td>", len(facts), "切分·检事实")
+    want(r"<b>自律门</b>（防方案自己被改坏）</td><td class=\"nw\">(\d+)</td>",
+         len(gates) - len(facts), "切分·自律门")
+
     tot = sum(len(v) for v in by_group.values())
     if tot != len(gates):
         errs.append(f"分布之和 {tot} ≠ 真门数 {len(gates)}")
