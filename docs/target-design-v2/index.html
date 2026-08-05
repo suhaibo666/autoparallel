@@ -840,8 +840,11 @@ P2  certainty  certainty(f(x₁..xₙ)) = max( ⊔ᵢ certainty(xᵢ), self_cert
                self_certainty 必填，值域按算子类别裁剪：
                  Primitive.self_certainty    ∈ { exact }              # 工具自带 ~15 个算术原语，闭集
                  RegisteredOp.self_certainty ∈ { exact, modeled, assumed }
-                   其中 exact **仅当** origin.block_code = null（出厂内置，非阻断产生）
-                                ∧ readability = FULL ∧ atomic_scope 为单算子
+                   其中 exact **仅当**
+                       registry_domain = Native   ← **由条目所在的物理目录决定，不可声明**
+                     ∧ origin.block_code = null   （非阻断产生）
+                     ∧ readability = FULL ∧ atomic_scope 为单算子
+                   只看 block_code 不够：它是条目自己的字段，User 域可以主动写 null。
                    全部取 exact 的注册项进 native_exact_ledger，参与 digest
                  MechanismOp.self_certainty  ∈ { modeled }            # allocator / roofline / tiling / 通信复刻
                    且 own_roots ∈ { replication(rule) }（必填 rule 名）
@@ -862,9 +865,11 @@ P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residu
                  ① G-B1a 抽象残差 hull(S_P, R_P)                        （§2.6）
                  ② 反向双候选 hull(a, b)                                （§7.2）
                  ③ 标定残差 residual_rel                                （grade = calibrated）
-                 ④ **declaration_unverified_bound**（**仅适用于对世界的声明**：
-                    roots ∩ {abstraction, declared_semantics, assumption} ≠ ∅；
-                    **不适用于 configured** —— 那是对问题的定义，不是对世界的断言）：
+                 ④ **declaration_unverified_bound**（适用于**一切对世界的断言**：
+                    roots ∩ {abstraction, declared_semantics, assumption, **replication**} ≠ ∅。
+                    复刻规则也是对世界的断言（"框架就是这么做的"），必须在内。
+                    **不适用于 configured** —— 那是对问题的定义，不是对世界的断言；
+                    也不适用于 source / transcribed / calib —— 它们各有自己的证据）：
                     声明量 d 无独立佐证时，
                     区间由**该声明自身的语义**给出两端——
                     lo = 声明成立时的值；hi = 声明完全不成立时该量的无声明上界。
@@ -877,6 +882,13 @@ P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residu
                  对非负未知量（本方案的兜底量全是非负字节），能算出的是**下确界**
                    ⇒ direction := lower，interval := [已知下确界, 不可计算]
                  这条规则**不看该量落在算式的哪一侧**，因而不会因减法翻方向而自相矛盾。
+
+                 **"已知下确界"必须有生产者**：兜底量必填
+                     inf_witness : Expr
+                     schema 断言  roots(inf_witness) ⊆ {source, configured, transcribed}
+                                ∧ certainty(inf_witness) = exact
+                 给不出 inf_witness 者，**interval.lo 也标"不可计算"**（两端皆不可算）。
+                 inf_witness 进 digest，并作为 S_∞ 清单的一列打印。
 
 P6  direction  按逐原语单调性声明变换；non_monotone 且该参数非 exact ⇒ BLOCK
                **该 BLOCK 只适用于算术原语**（它是 G-E3 的对偶：抓"声明 increasing 而实际非单调"
@@ -894,6 +906,16 @@ P8  不可降     不存在使 Prov 任一分量下降的算子。
 <p>一个看似克制的兜底是：<code>evidence.grade ∈ {vendor_documented, reconstructed}</code> 时<code>own_residual</code> 无机器来源 ⇒ <b>不伪造一个数</b> ⇒ 该量的 interval 保持点值。<b>拒绝伪造是对的，保持点值是错的。</b></p>
 <p><b>后果</b>：不可验证的那一部分字节（结构上正是最该被怀疑的那部分：allocator 行为、融合 workspace、通信复刻、分桶规则）对区间宽度的贡献<b>恰好为零</b>。于是"峰值只有区间形态"这条不变量被架空——
 输出是一个<b>伪装成区间的点估计</b>，而且它最容易错的方向（低估）正是用户最想采信的那个方向（"装得下"）。</p>
+<div class="cal bad" style="margin:14px 0"><span class="lbl">"能被算出的那一端"不能是一句形容，必须有生产者</span>
+<p>只写"取可算的那一端"而不规定它由谁产出，等于把一个二选一换成一个<b>连续自由度</b>——
+比原来的毛病更隐蔽。两条读法给出相差数十 GB 的 <code>peak.lo</code>，而没有任何门能判：</p>
+<p><b>读作"可证的下界"</b>：<code>fp32</code> 主副本的 <code>modeled</code> 来源正是
+"框架<b>是否真的建了这块</b>" ⇒ 可证下界是 <b>0</b>，不是 <code>4×numel</code>。梯度桶、重算副本、通信 buffer、workspace 同理 ⇒
+<code>peak.lo ≈ Σ 参数本体字节</code> ⇒ <b>"会 OOM"在任何做了分片的配置上也不可达</b>。</p>
+<p><b>读作"我们算出的那个值"</b>：则显存链上唯一可达的确定结论，由一个<b>不承担可证伪义务、没有宽度、没有证据等级约束的点估计</b>单独决定——
+正是本节要杀的那个病，从区间宽度被赶到了下界端点上。</p>
+<p><b>所以必填 <code>inf_witness</code></b>：它必须是一个由事实根支撑的精确表达式。给不出就两端都标"不可计算"——那是诚实的，且它会在首页 <code>S_∞</code> 清单里显形。</p></div>
+
 <p>所以兜底不是"保持点值"，而是"<b>取单侧</b>"。含义是——我们不知道它的宽度，所以我们不声称它有上界。<code>peak.hi</code> 因此不可计算，<code>oom_verdict</code> 落 <code>undetermined</code>，并由<b>判定阻碍分解</b>（§10.3）逐条列出"要回答你的头号问题，先去标定这几个量"。</p></div>
 
 <div class="cal bad"><span class="lbl">选哪一侧必须由机器定，否则这里是全篇最大的未受控自由度</span>
@@ -931,7 +953,7 @@ P8  不可降     不存在使 Prov 任一分量下降的算子。
 ——而实现者最自然的处理是"字节公式平凡 ⇒ 精确"，那正是 P4 要禁的事。下表是<b>必填清单</b>，schema 断言"任何合成节点的存在位必有非空 <code>own_roots</code>"：</p>
 <div class="tw"><table>
 <tr><th class="nw">pass</th><th class="nw"><code>own_roots</code></th><th class="nw"><code>self_certainty</code></th><th class="nw"><code>own_evidence</code></th><th>它合成的东西里字节量最大的一项</th></tr>
-<tr><td class="nw"><code>Pass_impl_select</code></td><td class="nw"><code>abstraction(atom_substitution)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>实现族替身的内部缓冲</td></tr>
+<tr><td class="nw"><code>Pass_impl_select</code></td><td class="nw"><code>replication(impl_select_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>实现族替身的内部缓冲</td></tr>
 <tr><td class="nw"><code>Pass_fusion_logical</code></td><td class="nw"><code>replication(fusion_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>融合节点的中间量消除</td></tr>
 <tr><td class="nw"><code>Pass_precision_fwd</code></td><td class="nw"><code>replication(precision_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td>低精副本、<code>amax</code>/<code>scale</code> 缓冲</td></tr>
 <tr><td class="nw"><b><code>Pass_train_step</code></b></td><td class="nw"><code>replication(autograd_rule)</code></td><td class="nw"><code>modeled</code></td><td class="nw">reconstructed</td><td><b>梯度值 + 反向 scratch ≈ 全部参数字节量级</b></td></tr>
@@ -1780,7 +1802,9 @@ L=61 时<b>几十 GB</b>，直接决定 OOM 与否。</p>
 <pre><code>DistOptSpec:                                  # Pass_shard 读；Pass_sched 读其 free/prefetch 面
   grad_reduce:
     bucket_bytes:       Q[Int]
-    bucket_order:       {reverse_param_order | param_order | declared}
+    bucket_order:       {reverse_param_order | param_order | explicit_list}
+                        # 第三个取值**不得**命名为 `declared` —— §11.4 的形态黑名单
+                        # 按**名字**禁掉了该 token（它曾是一个万能出口的名字）
     reduce_dtype:       {fp32 | bf16 | fp16 | same_as_param}
     contiguous_buffer:  Bool
     free_policy:        {after_reduce | at_step_end | never}
@@ -1916,7 +1940,12 @@ peak_interval     := peak_reserved                          # **对外唯一字�
 <p>不分开写就会出现一类很难发现的错：<b>把交织轴的下确界直接当成对外的 <code>peak.lo</code></b>。那是错的——前者是在<b>某一组字节取值</b>下算的，而 <code>peak.lo</code> 要求字节也取 <code>lo</code>、且 <code>t*</code> 要在四角上取遍。合成式把这三步显式化，<b>对外只暴露 <code>peak_interval</code> 一个字段</b>。</p></div>
 
 <div class="cal bad"><span class="lbl">但它<b>不是无条件</b>下界，两个条件必须写死</span>
-<div class="cal inv" style="margin:14px 0"><span class="lbl">alias 判定按 P4 必须污染<b>每个 storage 的字节</b>，不止 <code>inf_interleave</code></span><p>alias 等价类决定<b>一个 storage 实例是否存在</b>——这严格落在"存在位下传"的射程内。所以每个 <code>size</code> 都背 <code>replication(alias_rules)</code>，不是只有下界构造背。</p><p><b>连带必须一并接受</b>：修好之后该根的 <code>coverage</code> ≈ 100% ⇒ §10.5"按 root 覆盖八行"退化为"有一行接近满"。所以那张表必须改按 <b><code>replication</code> 的 <code>rule</code> 粒度</b>打印（<code>alias_rules</code> / <code>collective_rule</code> / <code>bucketing_rule</code> …），而不是按根的<b>种类</b>打印。<b>根种类是闭集八值，规则名不是——后者才是"去改哪一条"的粒度。</b></p></div>
+<div class="cal inv" style="margin:14px 0"><span class="lbl">alias 判定按 P4 必须污染<b>每个 storage 的字节</b>，不止 <code>inf_interleave</code></span><p>alias 等价类决定<b>一个 storage 实例是否存在</b>——这严格落在"存在位下传"的射程内。所以每个 <code>size</code> 都背 <code>replication(alias_rules)</code>，不是只有下界构造背。</p>
+<p><b>但只挂根不给界，会把整条链锁死。</b><code>alias_rules</code> 没有标定点 ⇒ 来源③ 不适用；它不是抽象节点、不是反向双候选、也不是组合上界 ⇒ ①②⑤ 都不适用。若来源④ 不覆盖 <code>replication</code>，则<b>每个 <code>size</code> 都落 P5 兜底</b> ⇒ <code>S_∞ ⊇ live(t*)</code> ⇒ <b>"装得下"在任何配置下结构性不可达</b>，而 §10.2b 的 <code>S_∞</code> 成员清单退化成"把 <code>live(t*)</code> 抄一遍"。</p>
+<p><b>所以 alias 走来源④，且它的两端本来就可算</b>：</p>
+<pre><code>lo 端 = 按我们的等价类求和（**最粗划分**：判为 alias 的合并成一块）
+hi 端 = 等价类判定完全不成立时的求和（**最细划分**：每个 TensorId 各占一块）</code></pre>
+<p>两端<b>都由定义式算出</b>；<code>hi</code> 端恰是"alias 全判错"的和，因此是<b>真的界</b>。这也正是 §10.2 里 <code>sup_interleave</code> 该用的划分。</p><p><b>连带必须一并接受</b>：修好之后该根的 <code>coverage</code> ≈ 100% ⇒ §10.5"按 root 覆盖八行"退化为"有一行接近满"。所以那张表必须改按 <b><code>replication</code> 的 <code>rule</code> 粒度</b>打印（<code>alias_rules</code> / <code>collective_rule</code> / <code>bucketing_rule</code> …），而不是按根的<b>种类</b>打印。<b>根种类是闭集八值，规则名不是——后者才是"去改哪一条"的粒度。</b></p></div>
 <p><b>条件一 · alias 等价类必须正确。</b>若两个实际共享存储的值被判成两个 <code>StorageId</code>，它们会被<b>各计一次</b> ⇒ <code>inf_interleave</code> 偏高 ⇒ 可能产出<b>假的 OOM 断言</b>。而 alias 判断恰恰是<b>完全无验证手段</b>的那一格（§5.1）。因此 <code>inf_interleave</code> 携带<code>certainty = modeled</code>、<code>roots ∋ replication(alias_rules)</code>——<b>它是一个条件下界，不是一个定理</b>，报表必须这样标注。</p>
 <p><b>条件二 · 求和只能包含 Free 由结构边决定的 storage。</b>若某 storage 的 <code>lastuse</code> 由<code>timing_dependent</code> 边决定，则 <code>⪯</code> 不再是纯结构偏序，"任何线性化都经过 <code>n</code>"的论证失效。<b>这类 storage 一律从 <code>inf_interleave</code> 的求和中排除</b>（保守，使下界更松，方向正确）。</p></div>
 
