@@ -99,12 +99,18 @@ def main() -> int:
     # ── 断言：正文里印出来的数必须与上面一致 ──────────────────────────────
     errs = []
 
+    CN = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+          "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
     def want(pat: str, val: int, what: str):
         m = re.search(pat, html)
         if not m:
             errs.append(f"正文找不到「{what}」的印数")
-        elif int(m.group(1)) != val:
-            errs.append(f"{what}：正文印 {m.group(1)}，实际 {val}")
+            return
+        raw = m.group(1)
+        got = CN[raw] if raw in CN else int(raw)          # 正文有的地方用中文数字
+        if got != val:
+            errs.append(f"{what}：正文印 {raw}，实际 {val}")
 
     want(r"共 <b>(\d+)</b> 个条目", len(rows), "条目总数")
     want(r"<b>真门 (\d+)</b>", len(gates), "真门数")
@@ -125,6 +131,20 @@ def main() -> int:
     want(r"<b>检模型事实</b>（含内部对照物）</td><td class=\"nw\">(\d+)</td>", len(facts), "切分·检事实")
     want(r"<b>自律门</b>（防方案自己被改坏）</td><td class=\"nw\">(\d+)</td>",
          len(gates) - len(facts), "切分·自律门")
+
+    # §11.4 是 §2.3 的镜像表：值域声明必须与定义一致（历史上错过两次）
+    dom = re.search(r"Evidence\s+:= \{ grade ∈ \{([^}]*)\}", html)
+    if dom:
+        n_grade = len([x for x in re.split(r"&lt;|,", dom.group(1)) if x.strip()])
+        want(r"<code>Evidence\.grade</code> 值域<b>恰为</b><b>?(\S)</b>?值",
+             n_grade, "§11.4 镜像·Evidence.grade")
+    # 首页切分的成员列表里不得出现门表中不存在的编号
+    body = html[html.index('id="c12-3"'):]
+    cited = set(re.findall(r"<code>(G-[\w\d]+)</code>", body[:6000]))
+    known = {g for g, _ in rows}
+    ghost = sorted(cited - known - {"G-M1"})
+    if ghost:
+        errs.append(f"切分成员里出现门表中不存在的编号：{ghost}")
 
     tot = sum(len(v) for v in by_group.values())
     if tot != len(gates):

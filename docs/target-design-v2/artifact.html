@@ -541,6 +541,7 @@ a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
 <div class="cal inv"><span class="lbl">G-L1 · 分层判据</span>
 <p>每一层的输出必须至少绑定一条<b>独有不变量</b>——该不变量在上一层的类型里<b>不可陈述</b>（对象还不存在），在下一层的类型里<b>不再可陈述</b>（对象已被改写）。且每条不变量必须有一个<b>已实现的检查器</b>。</p>
 <p><b>停止条件</b>：若某层的独有不变量集合为空 ⇒ 该层必须与相邻层合并。CI 断言"每层的检查器清单非空"。</p>
+<p><b>它要的是<b>检查器</b>，不是<b>独立真门</b></b>：一条检查器可以是后置条件、也可以是某道门的非独立实例，只要它不落进下面那条准入。（例：G2 的检查器是"桶数 = 真机归约 op 数"——它是 <code>G-T1</code> 的实例、不独立计数，但它<b>不由 <code>Pass_shard</code> 的定义蕴含</b>，因而合格。若把 <code>G-L1</code> 读成"要独立真门"，G2 会因此被判须与 G2.5 合并——那是误读。）</p>
 <p><b>准入（不加这条，停止条件永不可达）</b>：独有不变量<b>不得由产生该层的 pass 的定义直接蕴含</b>。否则每层都自带一条恒真的不变量（"该层的输出等于其定义式"、"每节点的 <code>semantic_id</code>在注册域内"——后者正是 <code>Pass_impl_select</code> 的定义），任意层都能过，判据退化为装饰。这与降级 <code>G-C2</code> 用的是<b>同一把尺子</b>：<b>一个断言若是某算法自己的终止条件，它就不是对该算法的检验。</b></p></div>
 
 <div class="cal why"><span class="lbl">为什么是这条，而不是"按变化频率分层"或"按数据依赖分层"</span>
@@ -876,8 +877,25 @@ P5  interval   interval(f(...)) = 区间算术(f, interval(xᵢ)) ⊕ own_residu
                     也不适用于 source / transcribed / calib —— 它们各有自己的证据）：
                     声明量 d 无独立佐证时，
                     区间由**该声明自身的语义**给出两端——
-                    lo = 声明成立时的值；hi = 声明完全不成立时该量的无声明上界。
-                    两端均由定义式算出，**不是猜的误差棒**
+                    e₁ = 声明成立时的值；e₂ = 声明**不成立**时该量的值
+                    interval := [ min(e₁,e₂), max(e₁,e₂) ]   ← **必须按值排序**
+                    schema 断言 interval.lo ≤ interval.hi
+                    **不排序会给出 lo &gt; hi**：`replication` 是第一个含"该对象**存不存在**"
+                    语义的根（P4 存在位下传）——fp32 主副本规则成立 ⇒ 4×numel，
+                    不成立 ⇒ **主副本根本不存在 ⇒ 0**。此时 cmp 的两条判据
+                    （a.hi &lt; b.lo 与 a.lo ≥ b.hi）**可同时成立** ⇒ oom_verdict
+                    同时是 true 与 false，而 G-X7 只查类型、查不到端点序。
+                    两端均由**该量自身的定义式**算出，**不是猜的误差棒**。
+                    **两条准入，缺一则它是一条零成本逃逸**：
+                      · e₂ 必须是该规则的一个**可枚举备择分支**下的求值结果，
+                        **不得**用"容纳该量的容器的容量"充当（机器可判：
+                        e₂ 的 roots 不得含 transcribed(HBM_total) 一类容量符号）
+                      · 每次使用逐条登记 (量, e₁ 的定义式, e₂ 的定义式) 进
+                        source4_ledger，参与 digest，并在首页与 S_∞ 清单并列
+                    **不加这两条**：external_fragmentation 的最坏值"可达池容量"
+                    正好是一个现成的 e₂ ⇒ 一步填法即可让它退出 S_∞
+                    ⇒ G-M2b 由红变绿、首页清单变短、判定阻碍分解跳过第一段
+                    ⇒ **零成本、四处指标同时变好，判据 5 硬失败**
                  ⑤ **组合上界**：由**复刻规则 + G4 事件序**组合算出，不依赖扫描与标定
                     ⇒ **是界，不是样本**。适用面必须逐项论证，**不是所有 allocator 损失都有它**：
                       · alignment_overhead ≤ 活跃分配块数 × 最大对齐粒度        ✓ 成立
@@ -2094,6 +2112,9 @@ hi 端 = 等价类判定完全不成立时的求和（**最细划分**：每个 
 把某个量改成"扫描观测范围"是一次看起来无害的局部改动，而它会在很远的地方让头号输出<b>静默地失去生产者</b>。类型断言是唯一能在改动点当场拦住它的东西。</p></div></div>
 
 <pre><code>S_∞ := { q : interval(q) 至少一端不可计算 }        # P5 兜底集
+       **定义域是「任何进入 peak_interval 表达式的量」**，不限于 size_i ——
+       .hi 侧的"存活区间取并"把**时长**引进了 peak 的表达式，而按 size_i 的口径
+       时长会被滤掉 ⇒ 首页清单漏掉真正的阻碍，S_∞ ∩ live(t*) 也会假性为空
 S_C := { framework_reserve, pool_carve_out }       # C_eff 的减项（**静态**，与当前分配无关）
 
 peak_reserved.hi 可计算  ⟺  碎片模型有上界  ∧  S_∞ ∩ live(t*) = ∅
@@ -2387,12 +2408,16 @@ G-B0（补救单调性门，机器执行）：
 
 <h3 id="c11-4">11.4 结构性复活检测</h3>
 <p>被删掉的口子会以另一个名字回来。这道门断言 schema 中：</p>
+<div class="cal bad"><span class="lbl">这是一张<b>镜像表</b>，而镜像表会与原件失同步</span>
+<p>下面每一条"值域恰为 N 值"都是对 §2.3 类型定义的<b>手工复述</b>。改一次 §2.3 的值域而忘了改这里，<code>G-X1</code> 就<b>恒红</b> ⇒ 加载期恒阻断；反过来，这里写宽一格而 §2.3 没变，它就<b>恒绿</b>。<b>两个方向都坏，且都不会被别的门发现。</b></p>
+<p><b>所以这些断言必须由 §2.3 的类型定义机器导出</b>，不是手写。在设计文档层面，这落实为一条构建期检查：<b>逐条比对本节的值域声明与 §2.3 的定义，不一致即构建失败</b>。本节其余条目（字段名黑名单、转换算子不存在）无对应原件，保持手写。</p></div>
 <ul>
 <li><b>不存在</b>字段或枚举值：<code>numel_only</code> / <code>declared</code> / <code>degrade</code> /
     <code>legacy</code> / <code>confidence</code> / <code>Unknown</code> / <code>UnresolvedCall</code>；</li>
 <li><b>不存在</b>名为 <code>waiver</code> / <code>exception</code> / <code>override</code> / <code>accepted_*</code> 的字段；</li>
 <li><code>Direction</code> 值域<b>恰为</b> <code>{exact, upper, lower}</code>（无 <code>nominal</code>）；</li>
-<li><code>Root</code> 值域<b>恰为</b>八值；<code>Evidence.grade</code> 值域<b>恰为</b>三值；</li>
+<li><code>Root</code> 值域<b>恰为</b>八值；<code>Evidence.grade</code> 值域<b>恰为</b><b>四</b>值（含 <code>not_applicable</code>，见 §2.3）；</li>
+<li><code>bypass_memo</code> 这个 CI 专用旁路<b>必须存在</b>——没有它，<code>G-E7a</code> 会被同段的记忆化架空成恒绿；它自己也必须在此登记，否则是一条可被悄悄删掉的规定；</li>
 <li><code>RegisteredOp.self_certainty</code> 取 <code>exact</code> 的条目，<b>必须</b>满足<code>block_code = null ∧ readability = FULL ∧ atomic_scope 单算子</code>，且<b>全部</b>出现在 <code>native_exact_ledger</code> 中（该台账参与 digest）；</li>
 <li><b>不存在</b> <code>Q3[Bool] → Bool</code> 与 <code>Sample[T] → Q[T]</code> 的转换算子；</li>
 <li><code>oom_verdict</code> 的两个操作数<b>在类型上都是 <code>Q[Int]</code></b>（<code>G-X7</code>）；</li>
@@ -2578,13 +2603,13 @@ G-B0（补救单调性门，机器执行）：
 <tr><td class="nw">其中<b>检模型事实</b>的</td><td class="nw"><b>3</b></td><td><code>G-T1</code> <code>G-T2</code> <code>G-N2</code>——<code>G-T0</code>/<code>G-T0b</code> 检的是 <b>oracle 自身的纯净度</b>（留出、版本），<b>不检任何模型事实</b>。<b>注意"检事实"与"独立"是两把不同的刀</b>：<code>G-N2</code> 检模型事实，只是不独立</td></tr>
 <tr><td class="nw">其中<b>相互独立</b>的</td><td class="nw"><b>1</b></td><td><b>只有 <code>G-T1</code></b>（<code>G-T2</code> 与它共 oracle，<code>G-N2</code> 是它的实例）</td></tr>
 <tr><td class="nw" style="border-top:1px solid var(--rule)"><b>检模型事实</b>（含内部对照物）</td><td class="nw">16</td><td><code>G-P1 G-P2 G-C1 G-C3 G-D1 G-D3 G-D4 G-D5 G-E6 G-B1a G-N2 G-N5 G-N6 G-N7 G-T1 G-T2</code></td></tr>
-<tr><td class="nw"><b>自律门</b>（防方案自己被改坏）</td><td class="nw">27</td><td>schema 闭集 · 阈值归属 · 资源上限 · oracle 纯净度 · 求值纪律（<code>G-E7</code>/<code>G-E8</code>/<code>G-P3</code>）· 元判据</td></tr>
+<tr><td class="nw"><b>自律门</b>（防方案自己被改坏）</td><td class="nw">27</td><td>schema 闭集 · 阈值归属 · 资源上限 · oracle 纯净度 · 求值纪律（<code>G-E7a</code>/<code>G-E7b</code>/<code>G-E8</code>/<code>G-C3b</code>/<code>G-P3</code>）· 元判据</td></tr>
 </table></div>
 
 <div class="cal bad"><span class="lbl">把这三个数并排读，才是这一章的真实结论</span>
 <p><b>整个方案对"模型算得对不对"的外部裁判，只有 <code>G-T1</code> 一道</b>，而且它<b>只看 op 序列</b>——看不见任何字节、任何存储、任何生命周期。</p>
 <p>这个数曾被印成 2，靠的是把 <code>G-N2</code>（桶数对照）算成独立门。<code>G-T1</code> 加上必建模族正表之后，<code>G-N2</code> 只是它的一个实例。<b>门变强了，而诚实的计数变小了</b>——这两件事同时发生是正常的，把它们混淆才不正常。</p>
-<p>"检模型事实 : 自律"这一刀切在<b>全部 43 道真门</b>上（<b>不是</b>切在扣掉独立性折扣后的 41 道上——两个数不能并排读）：<b>16 : 26</b>。而这 16 道里有 3 道（<code>G-T1</code> <code>G-T2</code> <code>G-N2</code>）的 oracle 是<b>真机 trace</b>，不是"我们自己写的对照物"，所以<b>用自己写的对照物检模型事实的是 13 道</b>。</p>
+<p>"检模型事实 : 自律"这一刀切在<b>全部 43 道真门</b>上（<b>不是</b>切在扣掉独立性折扣后的 41 道上——两个数不能并排读）：<b>16 : 27</b>。而这 16 道里有 3 道（<code>G-T1</code> <code>G-T2</code> <code>G-N2</code>）的 oracle 是<b>真机 trace</b>，不是"我们自己写的对照物"，所以<b>用自己写的对照物检模型事实的是 13 道</b>。</p>
 <p><b>"显存链的门有多少"必须单独数，不能用总数减去外部 oracle 得来</b>：反向对照（<code>G-D1</code> <code>G-D3</code> <code>G-D4</code> <code>G-D5</code>）、规模与实现（<code>G-R1</code>–<code>G-R4</code>）、原语单调性（<code>G-E3</code>）都<b>不是</b>显存链的门。用减法得出的"显存链 38 道"<b>高报了自洽性检查的数量，方向与本章立论正好相反</b>。</p>
 <p><b>这三个数必须由门表机器生成</b>，并断言"各切分之和 == 真门数"、"三个切分互不重叠或显式标注重叠"。<b>手数已经错过两次</b>，而它们是 §10.5 强制上首页的字段——一个自己算错的首页数字，正是 <code>G-M1</code> 要消灭的那种虚假安全感。</p>
 <p>这一节仍是 <a href="#c14">第 14 章</a>能力边界 E 的门体系侧投影：显存链的门<b>全部</b>是自洽性检查——能抓实现错、抓规格自相矛盾、抓与源码文本不符，<b>抓不到"我们对框架的整体理解是错的"</b>。</p></div>
