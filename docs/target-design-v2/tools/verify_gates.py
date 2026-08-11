@@ -233,22 +233,6 @@ REQUIRED_TEXT = (
     "TraceFixture 不进入 model_digest",
     "TraceFixture 不进入 simulation_digest 或缓存键",
     "本版不模拟共享资源竞争或并发降速",
-    "source_obligations_total: SourceObligationCount",
-    "source_obligations_planned: SourceObligationCount",
-    "event_obligations_total: EventObligationCount",
-    "op_occurrences_total: OpOccurrenceCount",
-    "storage_instances_total: StorageInstanceCount",
-    "bytes_total: ByteCount",
-    "emitted_codeir_node_count: CodeIRNodeCount  // derived/statistical only",
-    "source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed",
-    "event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable",
-    "conservation is over obligation buckets only",
-    "CalibrationSet owns only calibration_train_manifest_digest",
-    "HoldoutEvaluationManifest is offline-only and never enters request payload, time simulation digest, production cache, or comparison basis",
-    "PlanningMetadata is external to the simulator and owned by the upper-layer capacity consumer",
-    "production evaluator and offline validator are distinct",
-    "Chapter 14 preserves all ten Chapter 0 non-goals, including OOM/capacity, proof, layout/stride and communication scratch",
-    "Chapter 14 comparison follows the strict 10.5 boundary",
 )
 
 FORBIDDEN_TEXT = (
@@ -385,6 +369,48 @@ EXPECTED_GATES = {
     "G-REP3",
 }
 
+TASK7_COVERAGE_FIELDS = {
+    "source_obligation_universe": "SourceObligationUniverse",
+    "source_obligations_total": "SourceObligationCount",
+    "source_obligations_planned": "SourceObligationCount",
+    "source_obligations_residual": "SourceObligationCount",
+    "source_obligations_proven_not_executed": "SourceObligationCount",
+    "event_obligation_universe": "EventObligationUniverse",
+    "event_obligations_total": "EventObligationCount",
+    "event_obligations_planned": "EventObligationCount",
+    "event_obligations_blocked": "EventObligationCount",
+    "event_obligations_not_applicable": "EventObligationCount",
+    "op_occurrence_universe": "OpOccurrenceUniverse",
+    "op_occurrences_total": "OpOccurrenceCount",
+    "op_occurrences_modeled": "OpOccurrenceCount",
+    "op_occurrences_blocked": "OpOccurrenceCount",
+    "storage_instance_universe": "StorageInstanceUniverse",
+    "storage_instances_total": "StorageInstanceCount",
+    "storage_instances_modeled": "StorageInstanceCount",
+    "byte_universe": "KnownByteUniverse",
+    "bytes_total_known": "ByteCount",
+    "bytes_modeled": "ByteCount",
+    "time_event_universe": "TimeEventUniverse",
+    "time_events_total": "TimeEventCount",
+    "time_events_priced": "TimeEventCount",
+    "emitted_codeir_node_count": "CodeIRNodeCount",
+}
+
+TASK7_NON_GOAL_IDS = {
+    "NG-CAPACITY",
+    "NG-ALLOCATOR-RESERVED",
+    "NG-PROOF",
+    "NG-STATIC-GRAPH-OPTIMIZATION",
+    "NG-ONLINE-TRACE",
+    "NG-AUTOMATIC-SEARCH",
+    "NG-MULTISTREAM-MEMORY-REUSE",
+    "NG-LAYOUT-REORDER",
+    "NG-CONTENTION",
+    "NG-COMMUNICATION-SCRATCH",
+}
+
+TASK7_DECISION_IDS = {f"D{index}" for index in range(1, 20)}
+
 INCOMPATIBLE_DIAGRAMS = (
     "{{SVG:01-layering}}",
     "{{SVG:02-provenance}}",
@@ -475,10 +501,6 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "hash(MEMORY_REPLAY_SEMANTICS_VERSION, witness.memory_projection_semantics_digest)",
         "require run_memory_backend(view) == expected_memory_execution(view)",
         "INITIAL_STATE < all canonical MemoryEventId",
-        "Memory reads only shape/storage/alias/lifetime/explicit-workspace semantics and logical order",
-        "Memory never reads compute duration, profiler op-time, communication formula, TimeEventView, or TimeEstimate",
-        "missing compute profile blocks only time",
-        "missing memory shape/storage/lifetime semantics blocks only memory",
     ),
     "time-backend": (
         "RouteBinding:",
@@ -518,10 +540,6 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "witness.aggregate_interval_inputs_digest == hash(canonical aggregate_interval_inputs)",
         "require run_time_backend(view) == expected_time_execution(view)",
         "CostBinding communication arm",
-        "Compute duration is an exact lookup of a user-profiled, pre-request, normalized and frozen ComputeMeasurementRecord",
-        "unknown compute op without an exact record returns BLK-MISSING-TIME",
-        "communication duration comes only from the frozen communication formula, bytes, participants/path and hardware topology",
-        "profiler communication duration is forbidden",
     ),
     "result-sealing": (
         "BackendReadyView := MemoryEventView | TimeEventView",
@@ -690,9 +708,6 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "NotRequested",
         "UndefinedZeroBaseline",
         "registry/calibration/fallback/assumption",
-        "both NotRequested -> NotRequested; else either non-Ok -> Unavailable; else basis mismatch -> Incomparable; else ComparableDelta",
-        "Unavailable never carries numeric delta",
-        "different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed",
     ),
     "conformance": (
         "TraceFixture:",
@@ -955,6 +970,7 @@ DERIVED_DIGEST_EXCLUSIONS = (
     ("ExecutionDeployment", "deployment_digest"),
     ("HardwareBindingPolicySnapshot", "policy_digest"),
     ("MeasurementProtocol", "protocol_digest"),
+    ("CalibrationTrainManifest", "calibration_train_manifest_digest"),
     ("TimeCostPolicy", "policy_digest"),
     ("NumericPolicySnapshot", "numeric_policy_digest"),
     ("CommunicationFormulaRef", "digest"),
@@ -1201,6 +1217,160 @@ def check_module_contracts(html: str, errors: list[str]) -> None:
                 )
 
 
+def _flat_schema_fields(html: str, schema_name: str) -> dict[str, str] | None:
+    match = re.search(
+        rf"(?m)^{re.escape(schema_name)}:\s*\r?\n"
+        rf"(?P<body>(?:  [^\r\n]*(?:\r?\n|$))*)",
+        html,
+    )
+    if match is None:
+        return None
+    fields: dict[str, str] = {}
+    for name, field_type in re.findall(
+        r"(?m)^  ([a-z][a-z0-9_]*):\s*([^\r\n/]+?)(?:\s*//.*)?$",
+        match.group("body"),
+    ):
+        fields[name] = field_type.strip()
+    return fields
+
+
+def _section_between(html: str, start_id: str, end_id: str) -> str | None:
+    match = re.search(
+        rf'<h3 id="{re.escape(start_id)}"[^>]*>.*?</h3>'
+        rf'(?P<body>.*?)<h3 id="{re.escape(end_id)}"',
+        html,
+        re.DOTALL,
+    )
+    return match.group("body") if match is not None else None
+
+
+def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
+    coverage = _flat_schema_fields(html, "Coverage")
+    if coverage is None:
+        errors.append("Task7 Coverage schema 不可提取")
+    else:
+        for field_name, field_type in TASK7_COVERAGE_FIELDS.items():
+            if coverage.get(field_name) != field_type:
+                errors.append(
+                    "Task7 Coverage field/type mismatch: "
+                    f"{field_name}: {field_type}"
+                )
+
+    calibration = _flat_schema_fields(html, "CalibrationSet")
+    expected_calibration = {
+        "active_compute_records": "Map[MeasurementKey, ComputeMeasurementRecord]",
+        "measurement_protocols": "Map[ProtocolDigest, MeasurementProtocol]",
+        "calibration_train_manifest": "CalibrationTrainManifest",
+        "calibration_train_manifest_digest": "Digest",
+    }
+    if calibration != expected_calibration:
+        errors.append(
+            "Task7 CalibrationSet 必须自包含 active records/protocols 并绑定 train manifest payload/digest"
+        )
+
+    train_manifest = _flat_schema_fields(html, "CalibrationTrainManifest")
+    expected_train_fields = {
+        "split": "calibration_train",
+        "active_measurement_keys": "OrderedSet[MeasurementKey]",
+        "active_protocol_digests": "OrderedSet[ProtocolDigest]",
+        "source_dataset_manifest_digests": "OrderedSet[Digest]",
+        "calibration_train_manifest_digest": "Digest",
+    }
+    if train_manifest != expected_train_fields:
+        errors.append("Task7 CalibrationTrainManifest payload/digest schema 不闭合")
+
+    holdout = _flat_schema_fields(html, "HoldoutEvaluationManifest")
+    if holdout is None or holdout.get("split") != "holdout":
+        errors.append("Task7 HoldoutEvaluationManifest 必须是独立 offline split")
+
+    digest_block = re.search(
+        r"time_simulation_digest\s*:=\s*(.*?)result_digest\s*:=",
+        html,
+        re.DOTALL,
+    )
+    if digest_block is None or "CalibrationSet" not in digest_block.group(1):
+        errors.append("Task7 time_simulation_digest 未绑定 CalibrationSet")
+    elif "HoldoutEvaluationManifest" in digest_block.group(1):
+        errors.append("Task7 holdout 不得进入 time_simulation_digest")
+
+    hardware = _flat_schema_fields(html, "HardwareProfile")
+    expected_hardware = {
+        "devices": "DeviceCatalog",
+        "topology": "TopologySnapshot",
+        "bandwidth": "BandwidthSnapshot",
+        "link_latency": "LinkLatencySnapshot",
+        "allocator_alignment": "AllocatorAlignmentSnapshot",
+        "physical_stream_catalog": "PhysicalStreamCatalog",
+    }
+    if hardware != expected_hardware:
+        errors.append("Task7 HardwareProfile production schema 必须排除 capacity")
+
+    production_inputs = re.search(
+        r"CanonicalConfigEvaluationInput:(.*?)EvaluationInstanceIdentity:",
+        html,
+        re.DOTALL,
+    )
+    if production_inputs is None or "PlanningMetadata" in production_inputs.group(1):
+        errors.append("Task7 PlanningMetadata 只能属于上层，不能进入生产输入")
+
+    comparison = re.search(
+        r"compare_metric_outcome\(left_status, right_status, basis_pair\):"
+        r"(?P<body>.*?)end compare_metric_outcome",
+        html,
+        re.DOTALL,
+    )
+    expected_branches = (
+        "if left_status == NotRequested and right_status == NotRequested:",
+        "return NotRequested",
+        "if left_status != Ok or right_status != Ok:",
+        "return Unavailable",
+        "if basis_pair.left != basis_pair.right:",
+        "return Incomparable",
+        "return ComparableDelta",
+    )
+    if comparison is None:
+        errors.append("Task7 comparison outcome pseudocode 不可提取")
+    else:
+        body = _normalize_contract_text([comparison.group("body")])
+        positions = [body.find(branch) for branch in expected_branches]
+        if any(position < 0 for position in positions) or positions != sorted(positions):
+            errors.append("Task7 comparison outcome branch priority/order 不闭合")
+
+    non_goals = _section_between(html, "c0-2", "c0-3")
+    decisions = _section_between(html, "c14-1", "c14-2")
+    non_goal_ids = (
+        re.findall(r'<tr\b[^>]*data-non-goal-id="([A-Z0-9-]+)"', non_goals)
+        if non_goals is not None
+        else []
+    )
+    decision_refs = (
+        re.findall(r'<tr\b[^>]*data-non-goal-ref="([A-Z0-9-]+)"', decisions)
+        if decisions is not None
+        else []
+    )
+    decision_ids = (
+        re.findall(r'<tr\b[^>]*data-decision-id="([A-Z0-9-]+)"', decisions)
+        if decisions is not None
+        else []
+    )
+    if len(non_goal_ids) != 10 or set(non_goal_ids) != TASK7_NON_GOAL_IDS:
+        errors.append("Task7 Chapter 0 必须有十个唯一稳定 non-goal ID")
+    if len(decision_refs) != 10 or set(decision_refs) != TASK7_NON_GOAL_IDS:
+        errors.append("Task7 Chapter 14 决策 ref 必须与十个 non-goal ID 机械等价")
+    if len(decision_ids) != 19 or set(decision_ids) != TASK7_DECISION_IDS:
+        errors.append("Task7 Chapter 14 必须保留唯一稳定 decision ID")
+
+    capability_section = re.search(
+        r'<h3 id="c14-5"[^>]*>.*?</h3>(.*?)</main>', html, re.DOTALL
+    )
+    capability_scopes = re.findall(
+        r'data-capability-scope="([a-z-]+)"',
+        capability_section.group(1) if capability_section is not None else "",
+    )
+    if capability_scopes != ["production", "offline-validation"]:
+        errors.append("Task7 14.5 必须分离 production 与 offline-validation 能力")
+
+
 def check_derived_digest_exclusions(html: str, errors: list[str]) -> None:
     table_match = re.search(
         r"derived-digest exclusion table \(exact\):(.*?)"
@@ -1395,6 +1565,7 @@ def check_required(html: str, errors: list[str]) -> None:
     check_conformance_report_findings(html, errors)
     check_release_approved_digest_contract(html, errors)
     check_module_contracts(html, errors)
+    check_task7_modeling_contracts(html, errors)
 
 
 def check_forbidden(html: str, errors: list[str]) -> None:

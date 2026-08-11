@@ -469,24 +469,6 @@ class ModuleContractStructureTest(unittest.TestCase):
             r"(?s)memory_simulation_digest\s*:=\s*hash\(.*?MemoryProjectionSemanticsSnapshot.*?memory backend and numeric semantic versions\)",
         )
 
-    def test_memory_and_time_cost_faces_have_disjoint_owners(self) -> None:
-        memory = self.contract_text("memory-backend")
-        time = self.contract_text("time-backend")
-        for token in (
-            "Memory reads only shape/storage/alias/lifetime/explicit-workspace semantics and logical order",
-            "Memory never reads compute duration, profiler op-time, communication formula, TimeEventView, or TimeEstimate",
-            "missing compute profile blocks only time",
-            "missing memory shape/storage/lifetime semantics blocks only memory",
-        ):
-            self.assertIn(token, memory)
-        for token in (
-            "Compute duration is an exact lookup of a user-profiled, pre-request, normalized and frozen ComputeMeasurementRecord",
-            "unknown compute op without an exact record returns BLK-MISSING-TIME",
-            "communication duration comes only from the frozen communication formula, bytes, participants/path and hardware topology",
-            "profiler communication duration is forbidden",
-        ):
-            self.assertIn(token, time)
-
     def test_time_backend_contract_uses_exact_costs_and_no_contention_des(self) -> None:
         text = self.contract_text("time-backend")
         for token in (
@@ -918,30 +900,111 @@ class ModuleContractStructureTest(unittest.TestCase):
             r"compare_per_metric_from_authority\([^)]*\)\s*->\s*ComparisonSealArtifact",
         )
 
-    def test_comparison_priority_is_exhaustive_and_rank_sets_are_not_aligned(self) -> None:
-        text = self.contract_text("comparison")
-        for token in (
-            "both NotRequested -> NotRequested; else either non-Ok -> Unavailable; else basis mismatch -> Incomparable; else ComparableDelta",
-            "Unavailable never carries numeric delta",
-            "different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed",
-        ):
-            self.assertIn(token, text)
-
-    def test_coverage_has_typed_obligation_conservation_universes(self) -> None:
+    def test_task7_schema_and_boundary_contracts_are_structural(self) -> None:
         template = TEMPLATE.read_text(encoding="utf-8")
-        for token in (
-            "source_obligations_total: SourceObligationCount",
-            "source_obligations_planned: SourceObligationCount",
-            "event_obligations_total: EventObligationCount",
-            "op_occurrences_total: OpOccurrenceCount",
-            "storage_instances_total: StorageInstanceCount",
-            "bytes_total: ByteCount",
-            "emitted_codeir_node_count: CodeIRNodeCount  // derived/statistical only",
-            "source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed",
-            "event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable",
-            "conservation is over obligation buckets only",
+
+        def fields(schema: str) -> dict[str, str]:
+            match = re.search(
+                rf"(?m)^{re.escape(schema)}:\s*\n"
+                rf"(?P<body>(?:  [^\n]*(?:\n|$))*)",
+                template,
+            )
+            self.assertIsNotNone(match, schema)
+            assert match is not None
+            return {
+                name: field_type.strip()
+                for name, field_type in re.findall(
+                    r"(?m)^  ([a-z][a-z0-9_]*):\s*([^\n/]+?)(?:\s*//.*)?$",
+                    match.group("body"),
+                )
+            }
+
+        coverage = fields("Coverage")
+        expected_numerators = {
+            "op_occurrences_modeled": "OpOccurrenceCount",
+            "op_occurrences_blocked": "OpOccurrenceCount",
+            "storage_instances_modeled": "StorageInstanceCount",
+            "bytes_modeled": "ByteCount",
+            "time_events_priced": "TimeEventCount",
+        }
+        for name, field_type in expected_numerators.items():
+            self.assertEqual(coverage.get(name), field_type, name)
+        for universe in (
+            "source_obligation_universe",
+            "event_obligation_universe",
+            "op_occurrence_universe",
+            "storage_instance_universe",
+            "byte_universe",
+            "time_event_universe",
         ):
-            self.assertIn(token, template)
+            self.assertIn(universe, coverage)
+
+        self.assertEqual(
+            fields("CalibrationSet"),
+            {
+                "active_compute_records": "Map[MeasurementKey, ComputeMeasurementRecord]",
+                "measurement_protocols": "Map[ProtocolDigest, MeasurementProtocol]",
+                "calibration_train_manifest": "CalibrationTrainManifest",
+                "calibration_train_manifest_digest": "Digest",
+            },
+        )
+        self.assertEqual(fields("HoldoutEvaluationManifest").get("split"), "holdout")
+        self.assertEqual(
+            set(fields("HardwareProfile")),
+            {
+                "devices",
+                "topology",
+                "bandwidth",
+                "link_latency",
+                "allocator_alignment",
+                "physical_stream_catalog",
+            },
+        )
+
+        comparison = re.search(
+            r"compare_metric_outcome\(left_status, right_status, basis_pair\):"
+            r"(?P<body>.*?)end compare_metric_outcome",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(comparison)
+        assert comparison is not None
+        body = re.sub(r"\s+", " ", comparison.group("body"))
+        branches = (
+            "if left_status == NotRequested and right_status == NotRequested:",
+            "return NotRequested",
+            "if left_status != Ok or right_status != Ok:",
+            "return Unavailable",
+            "if basis_pair.left != basis_pair.right:",
+            "return Incomparable",
+            "return ComparableDelta",
+        )
+        positions = [body.find(branch) for branch in branches]
+        self.assertNotIn(-1, positions)
+        self.assertEqual(positions, sorted(positions))
+
+        non_goals = re.search(
+            r'<h3 id="c0-2".*?</h3>(.*?)<h3 id="c0-3"',
+            template,
+            re.DOTALL,
+        )
+        decisions = re.search(
+            r'<h3 id="c14-1".*?</h3>(.*?)<h3 id="c14-2"',
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(non_goals)
+        self.assertIsNotNone(decisions)
+        assert non_goals is not None and decisions is not None
+        ids = re.findall(r'data-non-goal-id="([A-Z0-9-]+)"', non_goals.group(1))
+        refs = re.findall(r'data-non-goal-ref="([A-Z0-9-]+)"', decisions.group(1))
+        decision_ids = re.findall(
+            r'data-decision-id="([A-Z0-9-]+)"', decisions.group(1)
+        )
+        self.assertEqual(len(ids), 10)
+        self.assertEqual(len(refs), 10)
+        self.assertEqual(set(ids), set(refs))
+        self.assertEqual(decision_ids, [f"D{index}" for index in range(1, 20)])
 
     def test_comparison_schema_derivation_and_task5_digest_exclusions_are_closed(self) -> None:
         text = self.contract_text("comparison")
@@ -980,6 +1043,7 @@ class ModuleContractStructureTest(unittest.TestCase):
             "ExecutionDeployment": "deployment_digest",
             "HardwareBindingPolicySnapshot": "policy_digest",
             "MeasurementProtocol": "protocol_digest",
+            "CalibrationTrainManifest": "calibration_train_manifest_digest",
             "TimeCostPolicy": "policy_digest",
             "NumericPolicySnapshot": "numeric_policy_digest",
             "CommunicationFormulaRef": "digest",

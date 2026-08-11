@@ -41,16 +41,16 @@ stream/cost policy 和通信公式快照，本工具回答：</p>
 <h3 id="c0-2">0.2 明确非目标</h3>
 <div class="tw"><table>
 <tr><th>非目标</th><th>本方案的处理</th><th>原因</th></tr>
-<tr><td>“是否装得下”或 OOM 结论</td><td>不输出容量判定；容量与安全余量由上层消费者处理</td><td>产品目标是预测内存峰值，不是容量证明</td></tr>
-<tr><td>allocator reserved 与外部碎片</td><td>只计算 logical allocated peak</td><td>不把 tensor 生命周期与 allocator 池策略混为一体</td></tr>
-<tr><td>形式化正确性证明</td><td>结构门只检查内部契约；真实误差由独立验证集评估</td><td>alias、lifetime、stream 和 duration 都可能存在模型误差</td></tr>
-<tr><td>静态图编译优化</td><td>不增加算子合并、消除、替换或通用图变换</td><td>PyNative 模式以当前源码可见结构为权威</td></tr>
-<tr><td>在线真机回放</td><td>运行时预测不读取 raw trace</td><td>trace 是验证 IR 的测试手段，不是强依赖输入</td></tr>
-<tr><td>自动策略搜索器</td><td>提供单配置求值和多配置比较接口</td><td>搜索器可在外层调用评估内核</td></tr>
-<tr><td>按多 stream 完成时刻推导内存复用</td><td>内存只按确定的逻辑 kernel 顺序重放；无显式同步安全点时延长生命周期</td><td>本版不让未知或模型化 duration 决定 alloc/free 顺序</td></tr>
-<tr><td>layout/stride 引发的隐式重排</td><td><code>transpose/view</code> 视为元数据 alias；只有源码或已注册语义显式 copy 才产生新 storage</td><td>本版不猜测后端是否隐式 contiguous；无法排除物化时阻断内存侧</td></tr>
-<tr><td>共享资源竞争与并发降速</td><td>固定每个事件的 service duration；不同 stream 可重叠但不相互降速</td><td>本版只建模依赖、stream 次序和通信 rendezvous</td></tr>
-<tr><td>通信库内部、随 algorithm 变化的隐式 scratch</td><td>只计算 intent/runtime rule 显式声明的 payload、endpoint、bucket/buffer；发现隐式 scratch 依赖则阻断内存侧</td><td>避免 memory 与 time 各自暗选不同通信算法</td></tr>
+<tr data-non-goal-id="NG-CAPACITY"><td>“是否装得下”或 OOM 结论</td><td>不输出容量判定；容量与安全余量由上层消费者处理</td><td>产品目标是预测内存峰值，不是容量证明</td></tr>
+<tr data-non-goal-id="NG-ALLOCATOR-RESERVED"><td>allocator reserved 与外部碎片</td><td>只计算 logical allocated peak</td><td>不把 tensor 生命周期与 allocator 池策略混为一体</td></tr>
+<tr data-non-goal-id="NG-PROOF"><td>形式化正确性证明</td><td>结构门只检查内部契约；真实误差由独立验证集评估</td><td>alias、lifetime、stream 和 duration 都可能存在模型误差</td></tr>
+<tr data-non-goal-id="NG-STATIC-GRAPH-OPTIMIZATION"><td>静态图编译优化</td><td>不增加算子合并、消除、替换或通用图变换</td><td>PyNative 模式以当前源码可见结构为权威</td></tr>
+<tr data-non-goal-id="NG-ONLINE-TRACE"><td>在线真机回放</td><td>运行时预测不读取 raw trace</td><td>trace 是验证 IR 的测试手段，不是强依赖输入</td></tr>
+<tr data-non-goal-id="NG-AUTOMATIC-SEARCH"><td>自动策略搜索器</td><td>提供单配置求值和多配置比较接口</td><td>搜索器可在外层调用评估内核</td></tr>
+<tr data-non-goal-id="NG-MULTISTREAM-MEMORY-REUSE"><td>按多 stream 完成时刻推导内存复用</td><td>内存只按确定的逻辑 kernel 顺序重放；无显式同步安全点时延长生命周期</td><td>本版不让未知或模型化 duration 决定 alloc/free 顺序</td></tr>
+<tr data-non-goal-id="NG-LAYOUT-REORDER"><td>layout/stride 引发的隐式重排</td><td><code>transpose/view</code> 视为元数据 alias；只有源码或已注册语义显式 copy 才产生新 storage</td><td>本版不猜测后端是否隐式 contiguous；无法排除物化时阻断内存侧</td></tr>
+<tr data-non-goal-id="NG-CONTENTION"><td>共享资源竞争与并发降速</td><td>固定每个事件的 service duration；不同 stream 可重叠但不相互降速</td><td>本版只建模依赖、stream 次序和通信 rendezvous</td></tr>
+<tr data-non-goal-id="NG-COMMUNICATION-SCRATCH"><td>通信库内部、随 algorithm 变化的隐式 scratch</td><td>只计算 intent/runtime rule 显式声明的 payload、endpoint、bucket/buffer；发现隐式 scratch 依赖则阻断内存侧</td><td>避免 memory 与 time 各自暗选不同通信算法</td></tr>
 </table></div>
 
 <h3 id="c0-3">0.3 如何阅读预测值</h3>
@@ -62,7 +62,8 @@ evidence 解释每个量从哪里来；coverage 解释模型覆盖面；assumpti
 <p>相同生产输入摘要必须得到逐事件一致的结果；缺少必需语义时明确阻断受影响后端；
 有对照数据时报告误差，没有对照数据时报告“未评估真机误差”，但不改变预测路径。</p></div>
 
-<p>Comparison boundary: different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed.</p>
+<p>比较边界：memory 与 time 都不跨不同 logical-rank 集合猜测 rank 对齐；rank 集合不同即为
+<code>Incomparable</code>，完整判定见 10.5 节。</p>
 
 <h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体架构与分层</h2>
 
@@ -184,23 +185,39 @@ SemanticValue&lt;T&gt;:
   calibration_domain: Domain | None
 
 Coverage:
+  source_obligation_universe: SourceObligationUniverse
   source_obligations_total: SourceObligationCount
   source_obligations_planned: SourceObligationCount
   source_obligations_residual: SourceObligationCount
   source_obligations_proven_not_executed: SourceObligationCount
+  event_obligation_universe: EventObligationUniverse
   event_obligations_total: EventObligationCount
   event_obligations_planned: EventObligationCount
   event_obligations_blocked: EventObligationCount
   event_obligations_not_applicable: EventObligationCount
+  op_occurrence_universe: OpOccurrenceUniverse
   op_occurrences_total: OpOccurrenceCount
+  op_occurrences_modeled: OpOccurrenceCount
+  op_occurrences_blocked: OpOccurrenceCount
+  storage_instance_universe: StorageInstanceUniverse
   storage_instances_total: StorageInstanceCount
-  bytes_total: ByteCount
+  storage_instances_modeled: StorageInstanceCount
+  byte_universe: KnownByteUniverse
+  bytes_total_known: ByteCount
+  bytes_modeled: ByteCount
+  time_event_universe: TimeEventUniverse
+  time_events_total: TimeEventCount
+  time_events_priced: TimeEventCount
   emitted_codeir_node_count: CodeIRNodeCount  // derived/statistical only
-  quality_by_face
-  missing_faces
-  fallback_counts</code></pre>
+  quality_by_face: QualityByFace
+  missing_faces: MissingFaceSet
+  fallback_counts: FallbackCountMap</code></pre>
 
-<p>source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed; event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable; conservation is over obligation buckets only. Op occurrences, storage instances and bytes each retain their own typed aggregation universe; emitted CodeIR node count is derived/statistical and is never an obligation bucket.</p>
+<p><code>source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed</code>；
+<code>event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable</code>。
+守恒只适用于 obligation 桶。op occurrence、storage instance、known byte 与 time event 分别在各自显式
+universe 内报告 total 与 modeled/blocked/priced 分子，禁止跨 universe 相除；
+<code>emitted_codeir_node_count</code> 仅为派生统计量，不是 obligation 桶。</p>
 
 <p>Coverage 是覆盖事实，不是置信概率。源码 obligation 的分母由当前源码、配置与 rank context 在生成 IR
 之前独立枚举；event obligation 的分母由冻结训练语义规则枚举，二者不得从已生成节点反推。
@@ -280,6 +297,7 @@ result_digest :=
   ExecutionDeployment    -&gt; { deployment_digest }
   HardwareBindingPolicySnapshot -&gt; { policy_digest }
   MeasurementProtocol    -&gt; { protocol_digest }
+  CalibrationTrainManifest -&gt; { calibration_train_manifest_digest }
   TimeCostPolicy         -&gt; { policy_digest }
   NumericPolicySnapshot  -&gt; { numeric_policy_digest }
   CommunicationFormulaRef -&gt; { digest }
@@ -542,7 +560,7 @@ config-indexed 输入进入 <code>RequestSnapshot</code> 的唯一生产入口�
 <tr><td><code>ExecutionScenario</code></td><td>输入 shape/dtype、microbatch occurrence、step 模式与 persistent live-in</td><td>CodeIR / events / SimulationPlanCore</td><td>显式版本化</td></tr>
 <tr><td><code>CompileEnvFacts</code></td><td>framework/runtime/version、source feature flags、静态 import/config facts</td><td>CodeIR</td><td>显式快照</td></tr>
 <tr><td>Registry snapshots</td><td>结构、运行时、内存和时间语义</td><td>各自消费阶段</td><td>内容寻址</td></tr>
-<tr><td><code>HardwareProfile</code></td><td>device、capacity、topology、link latency/bandwidth、alignment</td><td>SimulationPlanCore / projections</td><td>机器与运行时指纹</td></tr>
+<tr data-input-fact="hardware-profile"><td><code>HardwareProfile</code></td><td>device、topology、link latency/bandwidth、alignment、physical stream catalog</td><td>SimulationPlanCore / projections</td><td>机器与运行时指纹；不含容量</td></tr>
 <tr><td><code>ExecutionDeployment</code></td><td>logical rank 到物理 device 的显式规范映射</td><td>SimulationPlanCore</td><td>全覆盖、设备限定且一一映射</td></tr>
 <tr><td><code>HardwareBindingPolicySnapshot</code></td><td>硬件相关 kernel variant 的成本无关唯一 selector</td><td>SimulationPlanCore</td><td>内容寻址、0/多候选阻断</td></tr>
 <tr><td><code>CalibrationSet</code></td><td>用户预采集并冻结的 compute duration records 与 protocol snapshots</td><td>time compute 成本求值</td><td>精确 key、版本、ObservationRef 与 split</td></tr>
@@ -583,18 +601,19 @@ CompileEnvFacts:
   import_resolution_facts
 
 HardwareProfile:
-  devices
-  topology
-  bandwidth
-  link_latency
-  allocator_alignment
-  physical_stream_catalog
+  devices: DeviceCatalog
+  topology: TopologySnapshot
+  bandwidth: BandwidthSnapshot
+  link_latency: LinkLatencySnapshot
+  allocator_alignment: AllocatorAlignmentSnapshot
+  physical_stream_catalog: PhysicalStreamCatalog
 
 PlanningMetadata:
-  capacity information
-  // external to production HardwareProfile and simulator identities
+  device_capacity_bytes: OrderedMap[DeviceId, ByteCount]
+  safety_margin_policy: CapacitySafetyMarginPolicy
+  // upper-layer input only; not a simulator input or identity
 
-PlanningMetadata is external to the simulator and owned by the upper-layer capacity consumer.
+PlanningMetadata 只属于上层容量消费者；生产 evaluator 不接收、不读取也不摘要该对象。
 
 ExecutionDeployment:
   rank_device_map: OrderedMap[LogicalRank, DeviceId]
@@ -615,8 +634,9 @@ HardwareBindingPolicySnapshot:
   policy_digest</code></pre>
 
 <p>模型/workload 字段只存在于 ModelSpec，当前策略字段只存在于 normalized P；不得在两个容器中
-重复声明后再设隐式优先级。物理 machine、设备容量、互联和 allocator 常量单独进入
-<code>HardwareProfile</code>，不得被源码求值器读取。ExecutionDeployment 必须显式覆盖全部 logical rank，
+重复声明后再设隐式优先级。物理 device、互联、allocator alignment 与 stream catalog 单独进入
+<code>HardwareProfile</code>，不得被源码求值器读取；容量只可存在于 evaluator 之外的
+<code>PlanningMetadata</code>。ExecutionDeployment 必须显式覆盖全部 logical rank，
 每个 rank 恰映射到 HardwareProfile 中一个 device；本版禁止多个 logical rank 共置同一 device，因为无
 contention 模型无法解释其性能。映射不完整、重复或引用不存在 device 时以 BLK-CONFIG 阻断两侧。
 <code>LogicalRankContext</code> 只含由 P 派生的逻辑坐标，
@@ -691,19 +711,34 @@ ComputeMeasurementRecord:
   aggregate_member_sample_keys
 
 CalibrationSet:
-  calibration_train_manifest_digest: Digest
-  // production owns only this frozen manifest digest
-
-CalibrationTrainManifest:
   active_compute_records: Map[MeasurementKey, ComputeMeasurementRecord]
   measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]
-  calibration_train_manifest_digest
+  calibration_train_manifest: CalibrationTrainManifest
+  calibration_train_manifest_digest: Digest
+
+CalibrationTrainManifest:
+  split: calibration_train
+  active_measurement_keys: OrderedSet[MeasurementKey]
+  active_protocol_digests: OrderedSet[ProtocolDigest]
+  source_dataset_manifest_digests: OrderedSet[Digest]
+  calibration_train_manifest_digest: Digest
 
 HoldoutEvaluationManifest:
-  holdout records and offline evaluation metadata
+  split: holdout
+  evaluation_records: Map[MeasurementKey, HoldoutMeasurementRecord]
+  measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]
+  evaluation_metadata: HoldoutEvaluationMetadata
 
-CalibrationSet owns only calibration_train_manifest_digest.
-HoldoutEvaluationManifest is offline-only and never enters request payload, time simulation digest, production cache, or comparison basis.
+calibration_train_manifest_digest :=
+  hash(canonical_payload_without_derived_digests(CalibrationTrainManifest))
+
+require CalibrationSet.calibration_train_manifest_digest ==
+        CalibrationSet.calibration_train_manifest.calibration_train_manifest_digest
+require keys(CalibrationSet.active_compute_records) ==
+        CalibrationSet.calibration_train_manifest.active_measurement_keys
+require keys(CalibrationSet.measurement_protocols) ==
+        CalibrationSet.calibration_train_manifest.active_protocol_digests
+require every active record ObservationRef.split == calibration_train
 
 TimeCostPolicy:
   required_measurement_protocol_digest
@@ -745,6 +780,11 @@ MemoryRegistrySnapshot:
   alignment_policy: use HardwareProjectionFacts.allocator_alignment
   priority, specificity
   memory_registry_digest</code></pre>
+
+<p><code>CalibrationSet</code> 自包含生产 lookup 使用的 active compute records 与 protocol snapshots，
+同时携带只描述 train split 的 manifest payload 及其可复算 digest；manifest 的 key 集必须与 active map
+双向相等。<code>HoldoutEvaluationManifest</code> 是独立离线输入，只供误差评估，不能进入生产请求、
+time simulation digest、结果缓存或 comparison basis。</p>
 
 <p><code>CommunicationModelSnapshot</code> 只为单个通信 cohort 计算固定 duration，例如
 P2P 的 <code>path_latency + bytes / bottleneck_bandwidth(path)</code>；collective 使用具名
@@ -2413,7 +2453,9 @@ projection 嵌入 exact measurement+protocol snapshots，或 normalized formula 
 <h2 id="c10" data-part="第四部分 · 输出"><span class="cn">Chapter 10</span>内存、时间后端与报告</h2>
 
 <section class="module-contract" data-module="memory-backend" aria-labelledby="mc-memory-backend">
-<p>Memory reads only shape/storage/alias/lifetime/explicit-workspace semantics and logical order. Memory never reads compute duration, profiler op-time, communication formula, TimeEventView, or TimeEstimate. A missing compute profile blocks only time; missing memory shape/storage/lifetime semantics blocks only memory. Shared CodeIR, RuntimeEventPlan or Core failure blocks both faces.</p>
+<p>内存侧只读取 shape、storage/alias、lifetime、显式 workspace 与逻辑次序语义，不读取 compute duration、
+profiler op-time、通信公式、TimeEventView 或 TimeEstimate。缺 compute profile 只阻断时间侧；缺内存
+shape/storage/lifetime 语义只阻断内存侧；共享 CodeIR、RuntimeEventPlan 或 Core 失败才同时阻断两侧。</p>
 <h3 id="mc-memory-backend">模块契约 · Memory projection 与后端</h3>
 
 <h4 id="mc-memory-backend-boundary">职责边界</h4>
@@ -2606,7 +2648,9 @@ MemoryEstimate:
 coverage、assumptions 与 digests 只存在于外层 Estimate，不允许第二套 metadata。</p>
 
 <section class="module-contract" data-module="time-backend" aria-labelledby="mc-time-backend">
-<p>Compute duration is an exact lookup of a user-profiled, pre-request, normalized and frozen ComputeMeasurementRecord; an unknown compute op without an exact record returns BLK-MISSING-TIME; communication duration comes only from the frozen communication formula, bytes, participants/path and hardware topology; profiler communication duration is forbidden.</p>
+<p>compute duration 只能精确查找用户在请求前采集、规范化并冻结的
+<code>ComputeMeasurementRecord</code>；未知 compute op 无精确记录时返回 <code>BLK-MISSING-TIME</code>。
+通信 duration 只能由冻结公式、bytes、participants/path 与硬件拓扑求得，禁止读取 profiler 通信时长。</p>
 <h3 id="mc-time-backend">模块契约 · Time projection 与后端</h3>
 
 <h4 id="mc-time-backend-boundary">职责边界</h4>
@@ -3293,7 +3337,8 @@ BlockerRecord 才规范派生 ProposedBlocked/Blocked Diagnostic。BackendSealAr
 同形 JSON 升格为合法 artifact。缓存命中也必须在当前 subject 上重走 seal 才能获得新 capability。</p>
 
 <section class="module-contract" data-module="comparison" aria-labelledby="mc-comparison">
-<p>Comparison outcome priority is exhaustive: both NotRequested -&gt; NotRequested; else either non-Ok -&gt; Unavailable; else basis mismatch -&gt; Incomparable; else ComparableDelta. Unavailable never carries numeric delta; different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed.</p>
+<p>比较结果按下述规范伪代码逐分支判定。<code>Unavailable</code> 不携带数值 delta；两侧 logical-rank
+集合不同会形成 basis mismatch，因此 memory 与 time 均为 <code>Incomparable</code>，不猜测 rank 对齐。</p>
 <h3 id="mc-comparison">模块契约 · 同请求封装结果比较</h3>
 
 <h4 id="mc-comparison-boundary">职责边界</h4>
@@ -3365,7 +3410,17 @@ build_comparison_source_authority(
 
 compare_per_metric_from_authority(
   source: ComparisonSourceAuthority
-) -&gt; ComparisonResult</code></pre>
+) -&gt; ComparisonResult
+
+compare_metric_outcome(left_status, right_status, basis_pair):
+  if left_status == NotRequested and right_status == NotRequested:
+    return NotRequested
+  if left_status != Ok or right_status != Ok:
+    return Unavailable
+  if basis_pair.left != basis_pair.right:
+    return Incomparable
+  return ComparableDelta
+end compare_metric_outcome</code></pre>
 <p><code>compare_per_metric_from_authority</code> 只构造未封装 value；10.5 节现行
 <code>build_and_seal_comparison</code> 仍是运行 G-REP2 并产生 <code>ComparisonSealArtifact</code> 的唯一入口，
 不能把 candidate 直接当成已发布比较结果。</p>
@@ -3392,7 +3447,7 @@ Comparable；左 baseline 为零时 relative 分支必须是 <code>UndefinedZero
 </section>
 
 <h3 id="c10-5">10.5 配置比较</h3>
-<p>For both memory and time, different logical-rank sets are Incomparable; no rank alignment is guessed.</p>
+<p>memory 与 time 的 logical-rank 集合只要不同即为 <code>Incomparable</code>；比较器不猜测 rank 对齐。</p>
 <div class="cal inv"><span class="lbl">同口径配置可比较</span>
 <p>可比性逐 metric 判定；memory 不因 time 未请求/阻断而失去合法 delta。只有该 metric 的源码/模型
 workload、硬件口径、相关 registries/cost dataset/policy、resolved fallback/assumption、numeric 与
@@ -5169,27 +5224,31 @@ Tensor/StorageInstance、effect edge、P2P/collective identity、bytes、formula
 
 <h2 id="c14"><span class="cn">Chapter 14</span>决策记录与诚实边界</h2>
 
-<p>The production evaluator and offline validator are distinct. Chapter 14 preserves all ten Chapter 0 non-goals, including OOM/capacity, proof, layout/stride and communication scratch; automatic-search remains a non-goal, and Chapter 14 comparison follows the strict 10.5 boundary.</p>
+<p>生产 evaluator 与离线 validator 是两条独立路径。以下决策以稳定引用逐项对应第 0 章十条非目标，
+比较能力严格沿用 10.5 节边界。</p>
 
 <h3 id="c14-1">14.1 已定决策</h3>
 <div class="tw"><table>
 <tr><th class="nw">决策</th><th>选择</th><th>理由</th></tr>
-<tr><td class="nw">D1</td><td>工程点预测</td><td>输出可用于规划的峰值与时间，不维护证明型旁路</td></tr>
-<tr><td class="nw">D2</td><td>内存按显式 allocation 生命周期</td><td>tensor/storage 的申请释放直接决定 logical peak</td></tr>
-<tr><td class="nw">D3</td><td>不输出容量判断</td><td>容量和安全余量属于上层策略</td></tr>
-<tr><td class="nw">D4</td><td>DES 输出可比较 step time</td><td>event DAG 的主要产品是当前配置 makespan</td></tr>
-<tr><td class="nw">D5</td><td>当前源码、配置与 rank context 逐 rank 生成 RankCodeIR</td><td>符合 trainer 按配置分配 block 的事实，不构造母图或代表 rank</td></tr>
-<tr><td class="nw">D6</td><td>CodeIR 不可变且硬件无关</td><td>代码结构与物理成本分层</td></tr>
-<tr><td class="nw">D7</td><td>训练派生行为用 Event 表达</td><td>重复执行不复制或修改源码结构</td></tr>
-<tr><td class="nw">D8</td><td>Effect 冲突物化为依赖</td><td>RNG、mutation 与 host effect 不只做标签，直接约束执行先后</td></tr>
-<tr><td class="nw">D9</td><td>逐表达式 SemanticValue</td><td>不同语义面的证据质量可以独立变化</td></tr>
-<tr><td class="nw">D10</td><td>待预测 raw trace 仅用于独立测试</td><td>验证 IR 和调度；冻结的用户 compute measurement 仍是时间输入</td></tr>
-<tr><td class="nw">D11</td><td>区分 microbatch/recompute Tensor 与 Storage instance</td><td>并发生命周期不能使用裸逻辑 TensorId</td></tr>
-<tr><td class="nw">D12</td><td>内存按 duration-independent logical kernel order</td><td>本版不考虑多 stream 完成时刻驱动的提前复用</td></tr>
-<tr><td class="nw">D13</td><td>layout/stride 隐式重排为非目标</td><td>transpose/view 不预期重排；无法确认时阻断而不猜 contiguous</td></tr>
-<tr><td class="nw">D14</td><td>P2P/collective 使用全局 progress，资源竞争不建模</td><td>覆盖 PP/CP 通信与 rendezvous，同时保持本版时间机制边界</td></tr>
-<tr><td class="nw">D15</td><td>compute 用 exact user measurement record，communication 用理论公式</td><td>目标 key 无精确记录就阻断，不用插值或 roofline 替代计算算子实测</td></tr>
-<tr><td class="nw">D16</td><td>通信内存只含显式 intent/runtime buffers</td><td>algorithm-dependent 库内部 scratch 未建模；发现依赖时阻断内存侧，不与 time 暗选不同算法</td></tr>
+<tr data-decision-id="D1" data-non-goal-ref="NG-PROOF"><td class="nw">D1</td><td>工程点预测</td><td>输出可用于规划的峰值与时间，不维护证明型旁路</td></tr>
+<tr data-decision-id="D2"><td class="nw">D2</td><td>内存按显式 allocation 生命周期</td><td>tensor/storage 的申请释放直接决定 logical peak</td></tr>
+<tr data-decision-id="D3" data-non-goal-ref="NG-CAPACITY"><td class="nw">D3</td><td>不输出容量判断</td><td>容量和安全余量属于上层 PlanningMetadata</td></tr>
+<tr data-decision-id="D4"><td class="nw">D4</td><td>DES 输出可比较 step time</td><td>event DAG 的主要产品是当前配置 makespan</td></tr>
+<tr data-decision-id="D5"><td class="nw">D5</td><td>当前源码、配置与 rank context 逐 rank 生成 RankCodeIR</td><td>符合 trainer 按配置分配 block 的事实，不构造母图或代表 rank</td></tr>
+<tr data-decision-id="D6"><td class="nw">D6</td><td>CodeIR 不可变且硬件无关</td><td>代码结构与物理成本分层</td></tr>
+<tr data-decision-id="D7"><td class="nw">D7</td><td>训练派生行为用 Event 表达</td><td>重复执行不复制或修改源码结构</td></tr>
+<tr data-decision-id="D8"><td class="nw">D8</td><td>Effect 冲突物化为依赖</td><td>RNG、mutation 与 host effect 不只做标签，直接约束执行先后</td></tr>
+<tr data-decision-id="D9"><td class="nw">D9</td><td>逐表达式 SemanticValue</td><td>不同语义面的证据质量可以独立变化</td></tr>
+<tr data-decision-id="D10" data-non-goal-ref="NG-ONLINE-TRACE"><td class="nw">D10</td><td>待预测 raw trace 仅用于独立测试</td><td>验证 IR 和调度；冻结的用户 compute measurement 仍是时间输入</td></tr>
+<tr data-decision-id="D11"><td class="nw">D11</td><td>区分 microbatch/recompute Tensor 与 Storage instance</td><td>并发生命周期不能使用裸逻辑 TensorId</td></tr>
+<tr data-decision-id="D12" data-non-goal-ref="NG-MULTISTREAM-MEMORY-REUSE"><td class="nw">D12</td><td>内存按 duration-independent logical kernel order</td><td>本版不考虑多 stream 完成时刻驱动的提前复用</td></tr>
+<tr data-decision-id="D13" data-non-goal-ref="NG-LAYOUT-REORDER"><td class="nw">D13</td><td>layout/stride 隐式重排为非目标</td><td>transpose/view 不预期重排；无法确认时阻断而不猜 contiguous</td></tr>
+<tr data-decision-id="D14" data-non-goal-ref="NG-CONTENTION"><td class="nw">D14</td><td>P2P/collective 使用全局 progress，资源竞争不建模</td><td>覆盖 PP/CP 通信与 rendezvous，同时保持本版时间机制边界</td></tr>
+<tr data-decision-id="D15"><td class="nw">D15</td><td>compute 用 exact user measurement record，communication 用理论公式</td><td>目标 key 无精确记录就阻断，不用插值或 roofline 替代计算算子实测</td></tr>
+<tr data-decision-id="D16" data-non-goal-ref="NG-COMMUNICATION-SCRATCH"><td class="nw">D16</td><td>通信内存只含显式 intent/runtime buffers</td><td>algorithm-dependent 库内部 scratch 未建模；发现依赖时阻断内存侧，不与 time 暗选不同算法</td></tr>
+<tr data-decision-id="D17" data-non-goal-ref="NG-ALLOCATOR-RESERVED"><td class="nw">D17</td><td>不模拟 allocator reserved 与外部碎片</td><td>生产内存结果只报告 logical allocated peak；pool 策略不进入仿真器</td></tr>
+<tr data-decision-id="D18" data-non-goal-ref="NG-STATIC-GRAPH-OPTIMIZATION"><td class="nw">D18</td><td>不执行静态图编译优化</td><td>不做融合、消除、替换或通用图重写，保持 PyNative 源码结构权威</td></tr>
+<tr data-decision-id="D19" data-non-goal-ref="NG-AUTOMATIC-SEARCH"><td class="nw">D19</td><td>自动策略搜索位于 evaluator 上层</td><td>内核只提供单配置求值与显式多配置比较</td></tr>
 </table></div>
 
 <h3 id="c14-2">14.2 主要误差来源</h3>
@@ -5230,12 +5289,16 @@ train/holdout 真正独立或样本有代表性。需要更强保证时，采集
 必须由方案外的签名/attestation 信任根背书；没有该信任根时报告明确标为“用户提供的测量事实”。</p></div>
 
 <h3 id="c14-5">14.5 最终能力边界</h3>
-<div class="cal honest"><span class="lbl">本方案最终交付的能力</span>
+<div class="cal honest" data-capability-scope="production"><span class="lbl">生产 evaluator 能力</span>
 <p>给定当前源码、当前配置、完整 rank context/scenario 和必需语义，逐 rank 生成硬件无关且可追溯的
 CodeIR，展开正反向、microbatch、P2P/collective 与 effect-order 完整的训练事件，绑定 exact 用户 compute
 测量和通信公式后输出每卡预测 allocated peak、预测 step time、timeline、关键路径、构成、coverage、
 assumptions 和严格同口径配置差分；结构不完整时明确阻断；
-有独立真机 fixture 时追加 conformance 与误差报告。</p></div>
+生产请求、仿真摘要与结果缓存均不接收 holdout 或 conformance fixture。</p></div>
+
+<div class="cal honest" data-capability-scope="offline-validation"><span class="lbl">离线 validator 能力</span>
+<p>独立消费 HoldoutEvaluationManifest 或 TraceFixture，追加采集适用性、IR/schedule conformance 与误差报告；
+这些离线制品不改变生产 BackendResult，也不成为生产发布前提或比较口径。</p></div>
 
 <div class="cal why"><span class="lbl">为什么这一形态符合多维并行规划</span>
 <p>TP/PP/DP/CP/EP、microbatch、重计算、分桶和预取首先改变逐 rank 源码分支、运行时事件、
