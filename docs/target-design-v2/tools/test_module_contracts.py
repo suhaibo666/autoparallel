@@ -950,6 +950,60 @@ class ModuleContractStructureTest(unittest.TestCase):
         )
         self.assertEqual(fields("HoldoutEvaluationManifest").get("split"), "holdout")
         self.assertEqual(
+            fields("CommonProductionInputs"),
+            {
+                "source_snapshot": "SourceSnapshot",
+                "model_spec": "ModelSpec",
+                "compile_env_facts": "CompileEnvFacts",
+                "structure_registry_snapshot": "StructureRegistrySnapshot",
+                "runtime_registry_snapshot": "RuntimeRegistrySnapshot",
+                "hardware_profile": "HardwareProfile",
+                "hardware_binding_policy_snapshot": "HardwareBindingPolicySnapshot",
+                "blocker_scope_policy_snapshot": "BlockerScopePolicySnapshot",
+                "gate_specification_set_snapshot": "GateSpecificationSet",
+                "gate_specification_set_ref": "GateSpecificationSetRef",
+                "gate_runner_snapshot": "GateRunnerSnapshot",
+                "comparison_schema_snapshot": "ComparisonSchemaSnapshot",
+                "production_policy_snapshots": "ProductionPolicySnapshots",
+            },
+        )
+        self.assertEqual(
+            fields("ComparisonBasis"),
+            {
+                "metric": "memory | time",
+                "metric_basis_schema_digest": "Digest",
+                "source_snapshot_digest": "Digest",
+                "model_architecture_and_workload_digest": "Digest",
+                "logical_rank_id_set": "OrderedSet[LogicalRank]",
+                "relevant_hardware_digest": "Digest",
+                "relevant_registry_and_cost_dataset_digests": "OrderedSet[Digest]",
+                "selected_measurement_protocol_digest": "Digest | NotApplicable",
+                "fallback_policy": "FallbackPolicySnapshot",
+                "assumption_policy": "AssumptionPolicySnapshot",
+                "canonical_resolved_fallbacks_and_assumptions": "CanonicalResolvedFallbacksAndAssumptions",
+                "backend_and_numeric_semantic_versions": "SemanticVersionSet",
+                "masked_config_evaluation_input": "MaskedCanonicalConfigEvaluationInput",
+            },
+        )
+        self.assertEqual(
+            fields("TimeSimulationInputDomain"),
+            {
+                "simulation_core_digest": "Digest",
+                "time_registry_snapshot": "TimeRegistrySnapshot",
+                "calibration_set": "CalibrationSet",
+                "calibration_train_manifest_snapshot": "CalibrationTrainManifest",
+                "communication_model_snapshot": "CommunicationModelSnapshot",
+                "time_cost_policy": "TimeCostPolicy",
+                "cost_bindings": "ExactCostBindings",
+                "stream_bindings": "ExactStreamBindings",
+                "resolved_time_fallbacks_and_assumptions": "CanonicalResolvedFallbacksAndAssumptions",
+                "progress_semantics": "ProgressSemanticsSnapshot",
+                "projection_witness_digest": "Digest",
+                "time_backend_semantic_version": "SemanticVersion",
+                "time_numeric_semantic_version": "SemanticVersion",
+            },
+        )
+        self.assertEqual(
             set(fields("HardwareProfile")),
             {
                 "devices",

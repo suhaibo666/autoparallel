@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from html import unescape
 from html.parser import HTMLParser
 
 
@@ -394,6 +395,104 @@ TASK7_COVERAGE_FIELDS = {
     "time_events_total": "TimeEventCount",
     "time_events_priced": "TimeEventCount",
     "emitted_codeir_node_count": "CodeIRNodeCount",
+}
+
+TASK7_COMMON_PRODUCTION_INPUT_FIELDS = {
+    "source_snapshot": "SourceSnapshot",
+    "model_spec": "ModelSpec",
+    "compile_env_facts": "CompileEnvFacts",
+    "structure_registry_snapshot": "StructureRegistrySnapshot",
+    "runtime_registry_snapshot": "RuntimeRegistrySnapshot",
+    "hardware_profile": "HardwareProfile",
+    "hardware_binding_policy_snapshot": "HardwareBindingPolicySnapshot",
+    "blocker_scope_policy_snapshot": "BlockerScopePolicySnapshot",
+    "gate_specification_set_snapshot": "GateSpecificationSet",
+    "gate_specification_set_ref": "GateSpecificationSetRef",
+    "gate_runner_snapshot": "GateRunnerSnapshot",
+    "comparison_schema_snapshot": "ComparisonSchemaSnapshot",
+    "production_policy_snapshots": "ProductionPolicySnapshots",
+}
+
+TASK7_REQUESTED_BACKEND_INPUT_ARMS = {
+    "MemoryRequested": {
+        "memory_registry_snapshot": "MemoryRegistrySnapshot",
+    },
+    "TimeRequested": {
+        "calibration_set": "CalibrationSet",
+        "calibration_train_manifest_snapshot": "CalibrationTrainManifest",
+        "communication_model_snapshot": "CommunicationModelSnapshot",
+        "time_cost_policy": "TimeCostPolicy",
+    },
+    "NotRequested": {},
+}
+
+TASK7_COMPARISON_BASIS_FIELDS = {
+    "metric": "memory | time",
+    "metric_basis_schema_digest": "Digest",
+    "source_snapshot_digest": "Digest",
+    "model_architecture_and_workload_digest": "Digest",
+    "logical_rank_id_set": "OrderedSet[LogicalRank]",
+    "relevant_hardware_digest": "Digest",
+    "relevant_registry_and_cost_dataset_digests": "OrderedSet[Digest]",
+    "selected_measurement_protocol_digest": "Digest | NotApplicable",
+    "fallback_policy": "FallbackPolicySnapshot",
+    "assumption_policy": "AssumptionPolicySnapshot",
+    "canonical_resolved_fallbacks_and_assumptions": (
+        "CanonicalResolvedFallbacksAndAssumptions"
+    ),
+    "backend_and_numeric_semantic_versions": "SemanticVersionSet",
+    "masked_config_evaluation_input": "MaskedCanonicalConfigEvaluationInput",
+}
+
+TASK7_TIME_SIMULATION_INPUT_FIELDS = {
+    "simulation_core_digest": "Digest",
+    "time_registry_snapshot": "TimeRegistrySnapshot",
+    "calibration_set": "CalibrationSet",
+    "calibration_train_manifest_snapshot": "CalibrationTrainManifest",
+    "communication_model_snapshot": "CommunicationModelSnapshot",
+    "time_cost_policy": "TimeCostPolicy",
+    "cost_bindings": "ExactCostBindings",
+    "stream_bindings": "ExactStreamBindings",
+    "resolved_time_fallbacks_and_assumptions": (
+        "CanonicalResolvedFallbacksAndAssumptions"
+    ),
+    "progress_semantics": "ProgressSemanticsSnapshot",
+    "projection_witness_digest": "Digest",
+    "time_backend_semantic_version": "SemanticVersion",
+    "time_numeric_semantic_version": "SemanticVersion",
+}
+
+TASK7_PRODUCTION_CACHE_ROWS = {
+    "source-parse": (
+        "Source parse",
+        "source digest + parser/evaluator semantic digest + CompileEnvFacts parser subset",
+        "hardware、calibration、fixture",
+    ),
+    "code-ir-lookup": (
+        "CodeIR lookup",
+        "model_input_digest；命中 artifact 必须重验其 model_digest",
+        "HardwareProfile、成本数据、fixture",
+    ),
+    "runtime-event-plan-lookup": (
+        "RuntimeEventPlan lookup",
+        "runtime_input_digest；命中 artifact 必须重验其 runtime_plan_digest",
+        "raw profiler output、硬件成本",
+    ),
+    "simulation-plan-core": (
+        "SimulationPlanCore",
+        "simulation_core_digest",
+        "CalibrationSet、通信公式、backend 请求状态",
+    ),
+    "memory-result": (
+        "Memory result",
+        "(memory_simulation_digest, memory_result_schema_version)",
+        "time projection、NotRequested、验证制品",
+    ),
+    "time-result": (
+        "Time result",
+        "(time_simulation_digest, time_result_schema_version)",
+        "memory projection、NotRequested、验证制品",
+    ),
 }
 
 TASK7_NON_GOAL_IDS = {
@@ -1235,6 +1334,114 @@ def _flat_schema_fields(html: str, schema_name: str) -> dict[str, str] | None:
     return fields
 
 
+def _exact_flat_schema_fields(html: str, schema_name: str) -> dict[str, str] | None:
+    match = re.search(
+        rf"(?m)^{re.escape(schema_name)}:\s*\r?\n"
+        rf"(?P<body>(?:  [^\r\n]+(?:\r?\n|$))*)",
+        html,
+    )
+    if match is None:
+        return None
+    fields: dict[str, str] = {}
+    for line in match.group("body").splitlines():
+        field = re.fullmatch(
+            r"  ([a-z][a-z0-9_]*):\s*(\S(?:.*\S)?)\s*",
+            line,
+        )
+        if field is None or field.group(1) in fields:
+            return None
+        fields[field.group(1)] = unescape(field.group(2))
+    return fields
+
+
+def _requested_backend_input_arms(
+    html: str,
+) -> dict[str, dict[str, str]] | None:
+    definition = re.search(
+        r"RequestedBackendInput\s*:=\s*(?P<body>.*?)"
+        r"RequestedBackendInputMap\s*:=",
+        html,
+        re.DOTALL,
+    )
+    if definition is None:
+        return None
+    body = definition.group("body")
+    arm_pattern = re.compile(
+        r"(?P<tag>MemoryRequested|TimeRequested|NotRequested)"
+        r"(?:\s*\{(?P<fields>[^{}]*)\})?"
+    )
+    matches = list(arm_pattern.finditer(body))
+    if [match.group("tag") for match in matches] != [
+        "MemoryRequested",
+        "TimeRequested",
+        "NotRequested",
+    ]:
+        return None
+    arms: dict[str, dict[str, str]] = {}
+    cursor = 0
+    for match in matches:
+        if re.sub(r"[|\s]", "", body[cursor : match.start()]):
+            return None
+        tag = match.group("tag")
+        if tag in arms:
+            return None
+        fields_text = match.group("fields")
+        if (tag == "NotRequested") != (fields_text is None):
+            return None
+        fields: dict[str, str] = {}
+        field_cursor = 0
+        if fields_text is not None:
+            for field in re.finditer(
+                r"([a-z][a-z0-9_]*):\s*([A-Z][A-Za-z0-9_]*)",
+                fields_text,
+            ):
+                if fields_text[field_cursor : field.start()].strip():
+                    return None
+                name = field.group(1)
+                if name in fields:
+                    return None
+                fields[name] = field.group(2)
+                field_cursor = field.end()
+            if fields_text[field_cursor:].strip():
+                return None
+        arms[tag] = fields
+        cursor = match.end()
+    if re.sub(r"[|\s]", "", body[cursor:]):
+        return None
+    return arms
+
+
+def _production_cache_rows(html: str) -> dict[str, tuple[str, str, str]] | None:
+    section = _section_between(html, "c13-3", "c13-4")
+    if section is None:
+        return None
+    rows: dict[str, tuple[str, str, str]] = {}
+    for match in re.finditer(
+        r"<tr\b(?P<attrs>[^>]*)>(?P<body>.*?)</tr>", section, re.DOTALL
+    ):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", match.group("body"), re.DOTALL)
+        if not cells:
+            continue
+        cache_id_match = re.search(
+            r'\bdata-cache-id="([a-z0-9-]+)"', match.group("attrs")
+        )
+        if cache_id_match is None or len(cells) != 3:
+            return None
+        cache_id = cache_id_match.group(1)
+        if cache_id in rows:
+            return None
+        normalized_cells = tuple(
+            re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", cell))).strip()
+            for cell in cells
+        )
+        rows[cache_id] = (
+            normalized_cells[0],
+            normalized_cells[1],
+            normalized_cells[2],
+        )
+    return rows
+
+
 def _section_between(html: str, start_id: str, end_id: str) -> str | None:
     match = re.search(
         rf'<h3 id="{re.escape(start_id)}"[^>]*>.*?</h3>'
@@ -1246,6 +1453,35 @@ def _section_between(html: str, start_id: str, end_id: str) -> str | None:
 
 
 def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
+    common_inputs = _exact_flat_schema_fields(html, "CommonProductionInputs")
+    if common_inputs != TASK7_COMMON_PRODUCTION_INPUT_FIELDS:
+        errors.append("Task7 CommonProductionInputs exact schema 不闭合")
+
+    requested_arms = _requested_backend_input_arms(html)
+    if requested_arms != TASK7_REQUESTED_BACKEND_INPUT_ARMS:
+        errors.append("Task7 RequestedBackendInput exact union 不闭合")
+
+    comparison_basis = _exact_flat_schema_fields(html, "ComparisonBasis")
+    if comparison_basis != TASK7_COMPARISON_BASIS_FIELDS:
+        errors.append("Task7 ComparisonBasis exact schema 不闭合")
+
+    time_input_domain = _exact_flat_schema_fields(html, "TimeSimulationInputDomain")
+    if time_input_domain != TASK7_TIME_SIMULATION_INPUT_FIELDS:
+        errors.append("Task7 TimeSimulationInputDomain exact schema 不闭合")
+    time_digest = re.search(
+        r"time_simulation_digest\s*:=\s*(?P<body>.*?)result_digest\s*:=",
+        html,
+        re.DOTALL,
+    )
+    if time_digest is None or _normalize_contract_text(
+        [time_digest.group("body")]
+    ) != "hash(canonical(TimeSimulationInputDomain))":
+        errors.append("Task7 time_simulation_digest 必须只哈希 exact input domain")
+
+    cache_rows = _production_cache_rows(html)
+    if cache_rows != TASK7_PRODUCTION_CACHE_ROWS:
+        errors.append("Task7 production cache exact schema 不闭合")
+
     coverage = _flat_schema_fields(html, "Coverage")
     if coverage is None:
         errors.append("Task7 Coverage schema 不可提取")
@@ -1282,16 +1518,6 @@ def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
     holdout = _flat_schema_fields(html, "HoldoutEvaluationManifest")
     if holdout is None or holdout.get("split") != "holdout":
         errors.append("Task7 HoldoutEvaluationManifest 必须是独立 offline split")
-
-    digest_block = re.search(
-        r"time_simulation_digest\s*:=\s*(.*?)result_digest\s*:=",
-        html,
-        re.DOTALL,
-    )
-    if digest_block is None or "CalibrationSet" not in digest_block.group(1):
-        errors.append("Task7 time_simulation_digest 未绑定 CalibrationSet")
-    elif "HoldoutEvaluationManifest" in digest_block.group(1):
-        errors.append("Task7 holdout 不得进入 time_simulation_digest")
 
     hardware = _flat_schema_fields(html, "HardwareProfile")
     expected_hardware = {
@@ -1390,8 +1616,6 @@ def check_task7_behavioral_contracts(html: str, errors: list[str]) -> None:
     )
     if request_input is None or any(token not in request_text for token in request_tokens):
         errors.append("Task7 TimeRequested 未携带独立 train manifest authority input")
-    if "HoldoutEvaluationManifest" in request_text:
-        errors.append("Task7 holdout 不得进入 RequestSnapshot backend payload")
 
     request_builder = re.search(
         r"build_request_snapshot gate specification equations:"
@@ -1490,17 +1714,11 @@ def check_task7_behavioral_contracts(html: str, errors: list[str]) -> None:
         html,
         re.DOTALL,
     )
-    basis_text = (
-        _normalize_contract_text([comparison_basis.group("body")])
-        if comparison_basis is not None
-        else ""
-    )
     if comparison_basis is None or re.search(
-        r"(?m)^\s*logical_rank_id_set\s*$", comparison_basis.group("body")
+        r"(?m)^\s*logical_rank_id_set:\s*OrderedSet\[LogicalRank\]\s*$",
+        comparison_basis.group("body"),
     ) is None:
         errors.append("Task7 ComparisonBasis 缺少 logical_rank_id_set world boundary")
-    if "HoldoutEvaluationManifest" in basis_text:
-        errors.append("Task7 holdout 不得进入 ComparisonBasis")
 
     coverage_section = re.search(
         r"Coverage:\s*(?P<body>.*?)<h3 id=\"c2-4\"",
@@ -1516,26 +1734,6 @@ def check_task7_behavioral_contracts(html: str, errors: list[str]) -> None:
         equation not in coverage_text for equation in coverage_equations
     ):
         errors.append("Task7 Coverage obligation conservation equations 不闭合")
-
-    time_digest = re.search(
-        r"time_simulation_digest\s*:=\s*(?P<body>.*?)result_digest\s*:=",
-        html,
-        re.DOTALL,
-    )
-    if time_digest is None or "HoldoutEvaluationManifest" in time_digest.group("body"):
-        errors.append("Task7 holdout 不得进入 time_simulation_digest")
-
-    cache_section = _section_between(html, "c13-3", "c13-4") or ""
-    cache_key_cells = [
-        cells[1]
-        for row in re.findall(r"<tr>(.*?)</tr>", cache_section, re.DOTALL)
-        if len(cells := re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)) == 3
-    ]
-    if not cache_key_cells or any(
-        "HoldoutEvaluationManifest" in cell for cell in cache_key_cells
-    ):
-        errors.append("Task7 holdout 不得进入 production cache key")
-
 
 def check_derived_digest_exclusions(html: str, errors: list[str]) -> None:
     table_match = re.search(

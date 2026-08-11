@@ -178,8 +178,8 @@ class VerifyGatesContractTest(unittest.TestCase):
             ),
             (
                 "train manifest authority field",
-                "calibration_train_manifest_snapshot: CalibrationTrainManifest",
-                "calibration_train_manifest_snapshot: Digest",
+                "      calibration_train_manifest_snapshot: CalibrationTrainManifest",
+                "      calibration_train_manifest_snapshot: Digest",
                 "TimeRequested 未携带独立 train manifest",
             ),
             (
@@ -192,7 +192,7 @@ class VerifyGatesContractTest(unittest.TestCase):
                 "train manifest moved to common inputs",
                 "comparison_schema_snapshot: ComparisonSchemaSnapshot",
                 "comparison_schema_snapshot: ComparisonSchemaSnapshot\n  calibration_train_manifest_snapshot: CalibrationTrainManifest",
-                "CommonProductionInputs 混入 backend-specific field",
+                "CommonProductionInputs exact schema",
             ),
             (
                 "active record closure",
@@ -214,8 +214,8 @@ class VerifyGatesContractTest(unittest.TestCase):
             ),
             (
                 "comparison world boundary",
-                "  logical_rank_id_set\n",
-                "  world_size_only\n",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n",
+                "  world_size_only: Count\n",
                 "logical_rank_id_set world boundary",
             ),
             (
@@ -256,27 +256,28 @@ class VerifyGatesContractTest(unittest.TestCase):
             ),
             (
                 "holdout in request payload",
-                "calibration_train_manifest_snapshot: CalibrationTrainManifest",
-                "calibration_train_manifest_snapshot: CalibrationTrainManifest\n      holdout_manifest: HoldoutEvaluationManifest",
-                "holdout 不得进入 RequestSnapshot",
+                "      calibration_train_manifest_snapshot: CalibrationTrainManifest",
+                "      calibration_train_manifest_snapshot: CalibrationTrainManifest\n"
+                "      holdout_manifest: HoldoutEvaluationManifest",
+                "RequestedBackendInput exact union",
             ),
             (
                 "holdout in time digest",
-                "hash(simulation_core_digest, time registry, CalibrationSet,",
-                "hash(simulation_core_digest, time registry, CalibrationSet, HoldoutEvaluationManifest,",
-                "holdout 不得进入 time_simulation_digest",
+                "  projection_witness_digest: Digest\n",
+                "  projection_witness_digest: Digest\n  holdout_manifest_digest: Digest\n",
+                "TimeSimulationInputDomain exact schema",
             ),
             (
                 "holdout in comparison basis",
-                "  logical_rank_id_set\n",
-                "  logical_rank_id_set\n  holdout_manifest: HoldoutEvaluationManifest\n",
-                "holdout 不得进入 ComparisonBasis",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n  holdout_manifest: HoldoutEvaluationManifest\n",
+                "ComparisonBasis exact schema",
             ),
             (
                 "holdout in cache key",
-                "<tr><td>Time result</td><td>(time_simulation_digest, time_result_schema_version)</td>",
-                "<tr><td>Time result</td><td>(time_simulation_digest, time_result_schema_version, HoldoutEvaluationManifest)</td>",
-                "holdout 不得进入 production cache key",
+                "<tr data-cache-id=\"time-result\"><td>Time result</td><td>(time_simulation_digest, time_result_schema_version)</td>",
+                "<tr data-cache-id=\"time-result\"><td>Time result</td><td>(time_simulation_digest, time_result_schema_version, HoldoutEvaluationManifest)</td>",
+                "production cache exact schema",
             ),
             (
                 "non-goal id",
@@ -295,6 +296,74 @@ class VerifyGatesContractTest(unittest.TestCase):
                 'data-decision-id="D18"',
                 'data-decision-id="D17"',
                 "唯一稳定 decision ID",
+            ),
+        )
+        for label, original, replacement, expected_error in mutations:
+            with self.subTest(label=label):
+                self.assertEqual(template.count(original), 1, original)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+    def test_task7_production_domains_reject_holdout_alias_fields_structurally(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        mutations = (
+            (
+                "common holdout alias",
+                "  comparison_schema_snapshot: ComparisonSchemaSnapshot\n",
+                "  comparison_schema_snapshot: ComparisonSchemaSnapshot\n"
+                "  holdout_manifest: Digest\n",
+                "CommonProductionInputs exact schema",
+            ),
+            (
+                "common holdout digest alias",
+                "  comparison_schema_snapshot: ComparisonSchemaSnapshot\n",
+                "  comparison_schema_snapshot: ComparisonSchemaSnapshot\n"
+                "  holdout_manifest_digest: Digest\n",
+                "CommonProductionInputs exact schema",
+            ),
+            (
+                "memory request extra payload",
+                "    memory_registry_snapshot: MemoryRegistrySnapshot }",
+                "    memory_registry_snapshot: MemoryRegistrySnapshot\n"
+                "    evaluation_manifest_digest: Digest }",
+                "RequestedBackendInput exact union",
+            ),
+            (
+                "not-requested payload",
+                "  | NotRequested\n\nRequestedBackendInputMap :=",
+                "  | NotRequested { evaluation_manifest_digest: Digest }\n\n"
+                "RequestedBackendInputMap :=",
+                "RequestedBackendInput exact union",
+            ),
+            (
+                "comparison alias",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n"
+                "  evaluation_manifest_digest: Digest\n",
+                "ComparisonBasis exact schema",
+            ),
+            (
+                "time digest alias",
+                "  projection_witness_digest: Digest\n",
+                "  projection_witness_digest: Digest\n"
+                "  evaluation_manifest_digest: Digest\n",
+                "TimeSimulationInputDomain exact schema",
+            ),
+            (
+                "time digest bypasses domain",
+                "hash(canonical(TimeSimulationInputDomain))",
+                "hash(canonical(TimeSimulationInputDomain, evaluation_manifest_digest))",
+                "time_simulation_digest 必须只哈希 exact input domain",
+            ),
+            (
+                "cache alias",
+                "(time_simulation_digest, time_result_schema_version)",
+                "(time_simulation_digest, time_result_schema_version, evaluation_manifest_digest)",
+                "production cache exact schema",
             ),
         )
         for label, original, replacement, expected_error in mutations:

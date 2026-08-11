@@ -264,14 +264,23 @@ memory_simulation_digest :=
        memory projection/identity semantics,
        memory backend and numeric semantic versions)
 
+TimeSimulationInputDomain:
+  simulation_core_digest: Digest
+  time_registry_snapshot: TimeRegistrySnapshot
+  calibration_set: CalibrationSet
+  calibration_train_manifest_snapshot: CalibrationTrainManifest
+  communication_model_snapshot: CommunicationModelSnapshot
+  time_cost_policy: TimeCostPolicy
+  cost_bindings: ExactCostBindings
+  stream_bindings: ExactStreamBindings
+  resolved_time_fallbacks_and_assumptions: CanonicalResolvedFallbacksAndAssumptions
+  progress_semantics: ProgressSemanticsSnapshot
+  projection_witness_digest: Digest
+  time_backend_semantic_version: SemanticVersion
+  time_numeric_semantic_version: SemanticVersion
+
 time_simulation_digest :=
-  hash(simulation_core_digest, time registry, CalibrationSet,
-       CalibrationTrainManifest,
-       CommunicationModelSnapshot, TimeCostPolicy,
-       exact CostBindings, StreamBindings,
-       resolved time fallbacks/assumptions, progress semantics,
-       projection_witness_digest,
-       time backend and numeric semantic versions)
+  hash(canonical(TimeSimulationInputDomain))
 
 result_digest :=
   hash(canonical_payload_without_derived_digests(Estimate))</code></pre>
@@ -486,7 +495,7 @@ CommonProductionInputs:
   gate_specification_set_ref: GateSpecificationSetRef
   gate_runner_snapshot: GateRunnerSnapshot
   comparison_schema_snapshot: ComparisonSchemaSnapshot
-  production_policy_snapshots
+  production_policy_snapshots: ProductionPolicySnapshots
 
 RequestSnapshotBuildResult :=
   Ready { request_snapshot: RequestSnapshot }
@@ -3521,21 +3530,24 @@ MemoryDelta:
 TimeDelta := ScalarDelta&lt;Nanoseconds&gt;
 
 ComparisonBasis:
-  metric
-  metric_basis_schema_digest
-  source_snapshot_digest
-  model_architecture_and_workload_digest
-  logical_rank_id_set
-  relevant_hardware_digest
-  relevant_registry_and_cost_dataset_digests
-  selected_measurement_protocol_digest | NotApplicable
-  fallback_policy, assumption_policy
-  canonical_resolved_fallbacks_and_assumptions
-  backend_and_numeric_semantic_versions
-  masked_config_evaluation_input :=
-    canonicalize(replace comparison_axes and their schema-declared
-                 cross-field deterministic derivation closure in the entire
-                 CanonicalConfigEvaluationInput with AXIS_SENTINEL)
+  metric: memory | time
+  metric_basis_schema_digest: Digest
+  source_snapshot_digest: Digest
+  model_architecture_and_workload_digest: Digest
+  logical_rank_id_set: OrderedSet[LogicalRank]
+  relevant_hardware_digest: Digest
+  relevant_registry_and_cost_dataset_digests: OrderedSet[Digest]
+  selected_measurement_protocol_digest: Digest | NotApplicable
+  fallback_policy: FallbackPolicySnapshot
+  assumption_policy: AssumptionPolicySnapshot
+  canonical_resolved_fallbacks_and_assumptions: CanonicalResolvedFallbacksAndAssumptions
+  backend_and_numeric_semantic_versions: SemanticVersionSet
+  masked_config_evaluation_input: MaskedCanonicalConfigEvaluationInput
+
+masked_config_evaluation_input :=
+  canonicalize(replace comparison_axes and their schema-declared
+               cross-field deterministic derivation closure in the entire
+               CanonicalConfigEvaluationInput with AXIS_SENTINEL)
 
 comparison_basis_digest :=
   hash(canonical_payload_without_derived_digests(ComparisonBasis))
@@ -5216,12 +5228,12 @@ EvaluationInstanceIdentity；循环变量 P 或外层 map key 都不是 artifact
 <h3 id="c13-3">13.3 缓存分层</h3>
 <div class="tw"><table>
 <tr><th>缓存</th><th>最小键</th><th>不得包含</th></tr>
-<tr><td>Source parse</td><td>source digest + parser/evaluator semantic digest + CompileEnvFacts parser subset</td><td>hardware、calibration、fixture</td></tr>
-<tr><td>CodeIR lookup</td><td>model_input_digest；命中 artifact 必须重验其 model_digest</td><td>HardwareProfile、成本数据、fixture</td></tr>
-<tr><td>RuntimeEventPlan lookup</td><td>runtime_input_digest；命中 artifact 必须重验其 runtime_plan_digest</td><td>raw profiler output、硬件成本</td></tr>
-<tr><td>SimulationPlanCore</td><td>simulation_core_digest</td><td>CalibrationSet、通信公式、backend 请求状态</td></tr>
-<tr><td>Memory result</td><td>(memory_simulation_digest, memory_result_schema_version)</td><td>time projection、NotRequested、验证制品</td></tr>
-<tr><td>Time result</td><td>(time_simulation_digest, time_result_schema_version)</td><td>memory projection、NotRequested、验证制品</td></tr>
+<tr data-cache-id="source-parse"><td>Source parse</td><td>source digest + parser/evaluator semantic digest + CompileEnvFacts parser subset</td><td>hardware、calibration、fixture</td></tr>
+<tr data-cache-id="code-ir-lookup"><td>CodeIR lookup</td><td>model_input_digest；命中 artifact 必须重验其 model_digest</td><td>HardwareProfile、成本数据、fixture</td></tr>
+<tr data-cache-id="runtime-event-plan-lookup"><td>RuntimeEventPlan lookup</td><td>runtime_input_digest；命中 artifact 必须重验其 runtime_plan_digest</td><td>raw profiler output、硬件成本</td></tr>
+<tr data-cache-id="simulation-plan-core"><td>SimulationPlanCore</td><td>simulation_core_digest</td><td>CalibrationSet、通信公式、backend 请求状态</td></tr>
+<tr data-cache-id="memory-result"><td>Memory result</td><td>(memory_simulation_digest, memory_result_schema_version)</td><td>time projection、NotRequested、验证制品</td></tr>
+<tr data-cache-id="time-result"><td>Time result</td><td>(time_simulation_digest, time_result_schema_version)</td><td>memory projection、NotRequested、验证制品</td></tr>
 </table></div>
 
 <p>缓存命中不得跳过结构门。任何读取字段必须进入相应层级摘要，避免跨硬件、跨配置或跨注册版本静默复用。
