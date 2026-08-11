@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src", "index.template.html")
+HANDOFF = os.path.join(os.path.dirname(HERE), "HANDOFF.md")
 
 REQUIRED_TEXT = (
     "目标方案设计 v4.2",
@@ -88,7 +89,7 @@ REQUIRED_TEXT = (
     "SimulationPlan",
     "SimulationPlanCore",
     "ProjectionResult",
-    "Opaque capabilities ConformanceTrustRootCapability, ReleaseApprovalTrustRootCapability and ValidatedMeasurementSessionCapability are non-serializable, own no derived digest and therefore have no exclusion-table row",
+    "Opaque capabilities ConformanceDeploymentProfile, ConformanceTrustRootCapability, ReleaseApprovalTrustRootCapability and ValidatedMeasurementSessionCapability are non-serializable, own no derived digest and therefore have no exclusion-table row",
     "ExecutionDeployment",
     "HardwareProjectionFacts",
     "HardwareBindingPolicySnapshot",
@@ -203,7 +204,7 @@ REQUIRED_TEXT = (
     "BLK-EVENT-SEMANTICS",
     "BLK-AMBIGUOUS-COST",
     "BLK-NUMERIC-RANGE",
-    "ConformanceReport",
+    "AttestedConformanceReport",
     "GateManifestEntry",
     "GateStage",
     "GateInvocationId",
@@ -576,7 +577,7 @@ TASK8_MODULE_ROWS = {
     "time-backend": ("L3", "构造时间视图并执行 DES", "TimeEventView, StepTimeEstimate", "build_time_projection_candidate; run_time_backend", "无"),
     "result-sealing": ("L4", "生成并封装后端结果", "BackendSealArtifact", "run_backend_build_candidate_and_seal", "gate-system, memory-backend, plan-projection, time-backend"),
     "comparison": ("L4", "同口径配置比较", "ComparisonResult", "derive_comparison_basis_pair; build_comparison_source_authority; compare_per_metric_from_authority", "gate-system, result-sealing"),
-    "conformance": ("离线", "离线对照与发布门", "ConformanceReport", "run_conformance; apply_release_policy", "comparison, gate-system, result-sealing"),
+    "conformance": ("离线", "可选离线对照与加固发布门", "BasicOfflineReportArtifact, AttestedConformanceSealArtifact", "run_basic_offline_conformance; run_attested_release_conformance; apply_release_policy", "comparison, gate-system, result-sealing"),
 }
 TASK8_ARCHITECTURE_NODES = {
     "layered-module-architecture": {
@@ -622,6 +623,571 @@ TASK8_PLAN_AUTHORITATIVE_CONTRACT_REFS = (
     "ProjectionResult<MemoryEventView>",
     "ProjectionResult<TimeEventView>",
 )
+
+CONFORMANCE_LOCAL_BLOCKS = {
+    ("scope", "shared"),
+    ("scope", "deployment"),
+    ("profile", "basic-offline"),
+    ("profile", "attested-release"),
+}
+CONFORMANCE_BASIC_TYPES = (
+    "BasicOfflineConformanceAuthority",
+    "BasicOfflineExecutionRecord",
+    "BasicOfflineExecutionLedger",
+    "BasicOfflineReport",
+    "BasicOfflineReportArtifact",
+    "BasicOfflineRunResult",
+)
+CONFORMANCE_BASIC_CONTENT_TYPES = CONFORMANCE_BASIC_TYPES[:-1]
+CONFORMANCE_BASIC_FORBIDDEN = (
+    r"trust[_ -]?(?:store|root)",
+    r"measured[_ -]?(?:execution[_ -]?)?environment",
+    r"(?:^|[^A-Za-z0-9])session(?:$|[^A-Za-z0-9])",
+    r"nonce",
+    r"time[_ -]?window",
+    r"attestation",
+    r"signature",
+    r"ApprovedDigestSet",
+    r"seal",
+    r"approval",
+    r"ReleasePolicy",
+    r"ReleaseDecision",
+    r"apply_release_policy",
+    r"derive_approved_digest_set",
+)
+CONFORMANCE_SHARED_TYPES = (
+    "TraceFixture",
+    "FixtureBinding",
+    "FixtureSet",
+    "ValidationPolicy",
+    "VerifierRunner",
+    "ConformanceFinding",
+    "ObservedClauseOutput",
+    "ConformanceObservedOutput",
+)
+CONFORMANCE_OWNER_INVENTORY = {
+    ("scope", "shared"): CONFORMANCE_SHARED_TYPES,
+    ("scope", "deployment"): ("ConformanceDeploymentProfile",),
+    ("profile", "basic-offline"): CONFORMANCE_BASIC_TYPES,
+    ("profile", "attested-release"): (
+        "TrustStoreSnapshot",
+        "RunnerAttestationPolicy",
+        "TrustStoreSnapshotRef",
+        "RunnerAttestationPolicyRef",
+        "ConformanceTrustRootCapability",
+        "MeasuredExecutionEnvironment",
+        "ValidatedMeasurementSessionCapability",
+        "AttestedConformanceInvocationAuthority",
+        "RunnerAttestation",
+        "AttestedConformanceExecutionRecord",
+        "AttestedConformanceExecutionLedger",
+        "ApprovedDigestSet",
+        "ReleaseApprovalStoreSnapshot",
+        "ReleaseApprovalTrustRootCapability",
+        "ReleaseApprovalAuthority",
+        "ReleaseApprovalArtifact",
+        "AttestedConformanceReport",
+        "ReleasePolicy",
+        "AttestedConformanceSealArtifact",
+        "AttestedConformanceRunResult",
+        "ReleaseBlockReason",
+        "ReleaseDecision",
+        "ReleasePolicyApplicationResult",
+    ),
+}
+CONFORMANCE_ATTESTED_ONLY_RULES = (
+    "measured_payload_digest == policy.expected_execution_environment_digest",
+    "atomically consumed exactly once",
+    "verify_measurer_identity_and_freshness_evidence(",
+    "verify_signature(",
+    "release_trust_root := profile.release_trust_root",
+    "trust_root := profile.conformance_trust_root",
+)
+CONFORMANCE_ATTESTED_SECURITY_RULES = (
+    "negative fixture: no execution but forged all-pass",
+    "negative fixture: forged runner attestation",
+    "negative fixture: forged ApprovedDigestSet",
+    "negative fixture: tampered execution record or observed output",
+    "negative fixture: valid signature plus failing observed output cannot be sealed with forged pass",
+    "negative fixture: release approval wrong signature scheme",
+    "negative fixture: unsupported release approval signature scheme",
+    "negative fixture: release approval self-owned approver key",
+    "negative fixture: release approval wrong store snapshot",
+    "negative fixture: release approval unsupported signature scheme",
+    "negative fixture: release approval substituted policy",
+    "negative fixture: wrong runner attestation trust store",
+    "negative fixture: unsupported runner attestation signature scheme",
+    "negative fixture: tampered runner execution environment",
+    "negative fixture: runner self-owned attestation key",
+    "negative fixture: release artifact from different conformance trust root",
+    "negative fixture: old invocation digest plus substituted policy or trust-store reference",
+    "negative fixture: replay valid measurement envelope from another execution session",
+    "negative fixture: change only measurer identity or freshness evidence while retaining old envelope digest",
+)
+CONFORMANCE_BASIC_CLOSURE_RULES = (
+    "require record.fixture_ref == record_key",
+    "require record.target_invocation_id == binding.target_invocation_id",
+    "require record.target_clause_id == binding.target_clause_id",
+    "require record.fixture_digest == binding.fixture.fixture_digest",
+    "require record.observed_clause_output == observed_clause_outputs[record_key]",
+    'require record.evaluation_input_digest == hash("basic-offline-record-input/v1", authority.basic_offline_authority_digest, canonical(binding), binding.fixture_binding_digest)',
+    'require record.basic_offline_execution_record_digest == hash("basic-offline-record/v1",',
+    "require ledger.expected_binding_domain == keys(authority.fixture_set.bindings)",
+    "require keys(ledger.execution_records) == ledger.expected_binding_domain",
+    "require ledger.basic_offline_authority_digest == authority.basic_offline_authority_digest",
+    "require ledger.subject_digest == authority.production_subject.subject_digest",
+    "require ledger.fixture_set_digest == authority.fixture_set.fixture_set_digest",
+    "require ledger.validation_policy_digest == authority.validation_policy.validation_policy_digest",
+    "require ledger.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest",
+    "require ledger.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest",
+    "require ledger.observed_output == observed",
+    'require ledger.basic_offline_execution_ledger_digest == hash("basic-offline-ledger/v1",',
+    "require report.production_subject == authority.production_subject",
+    "require report.subject_digest == authority.production_subject.subject_digest",
+    "require report.basic_offline_authority_digest == authority.basic_offline_authority_digest",
+    "require report.observed_output_digest == observed.observed_output_digest",
+    "require report.fixture_set_digest == authority.fixture_set.fixture_set_digest",
+    "require report.validation_policy_digest == authority.validation_policy.validation_policy_digest",
+    "require report.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest",
+    "require report.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest",
+    "require report.basic_offline_execution_ledger_digest == ledger.basic_offline_execution_ledger_digest",
+    "require report.offline_verdict == derived_offline_verdict",
+    "require report.findings == observed.findings",
+    'require report.basic_offline_report_digest == hash("basic-offline-report/v1",',
+    "require artifact.authority == authority",
+    "require artifact.observed_output == observed",
+    "require artifact.execution_ledger == ledger",
+    "require artifact.report == report",
+    "require artifact.basic_offline_report_artifact_digest == hash(",
+    "recompute every Basic artifact nested digest before Completed",
+    "return Completed iff every Basic closure equation holds; otherwise InternalViolation",
+)
+CONFORMANCE_BASIC_ALGORITHM_LINES = tuple(
+    """  recompute authority and every nested content digest before any binding
+  require authority.basic_offline_authority_digest == hash("basic-offline-authority/v1",
+    canonical_payload_without_derived_digests(authority))
+  require authority.gate_manifest.subject_digest == authority.production_subject.subject_digest
+  require keys(authority.fixture_set.bindings) is the exact expected binding domain
+  for every (record_key, binding) in authority.fixture_set.bindings:
+    execute binding exactly once and build record: BasicOfflineExecutionRecord
+    require record.fixture_ref == record_key
+    require record.target_invocation_id == binding.target_invocation_id
+    require record.target_clause_id == binding.target_clause_id
+    require record.fixture_digest == binding.fixture.fixture_digest
+    require record.evaluation_input_digest == hash("basic-offline-record-input/v1",
+      authority.basic_offline_authority_digest,
+      canonical(binding), binding.fixture_binding_digest)
+    require record.observed_clause_output == observed_clause_outputs[record_key]
+    require record.basic_offline_execution_record_digest == hash("basic-offline-record/v1",
+      canonical_payload_without_derived_digests(record))
+  observed := ConformanceObservedOutput(observed_clause_outputs, findings, coverage_gaps)
+  ledger := BasicOfflineExecutionLedger(authority identity fields,
+    execution_records, observed, keys(authority.fixture_set.bindings))
+  require ledger.expected_binding_domain == keys(authority.fixture_set.bindings)
+  require keys(ledger.execution_records) == ledger.expected_binding_domain
+  require ledger.basic_offline_authority_digest == authority.basic_offline_authority_digest
+  require ledger.subject_digest == authority.production_subject.subject_digest
+  require ledger.fixture_set_digest == authority.fixture_set.fixture_set_digest
+  require ledger.validation_policy_digest == authority.validation_policy.validation_policy_digest
+  require ledger.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest
+  require ledger.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest
+  require ledger.observed_output == observed
+  require ledger.basic_offline_execution_ledger_digest == hash("basic-offline-ledger/v1",
+    canonical_payload_without_derived_digests(ledger))
+  (derived_findings, derived_offline_verdict) := derive_conformance_findings_and_verdict(
+    authority.validation_policy, observed,
+    exact_evidence_or_coverage_gaps(authority, observed, ledger))
+  report := BasicOfflineReport(authority/observed/ledger identity fields,
+    derived_offline_verdict, derived_findings)
+  require report.production_subject == authority.production_subject
+  require report.subject_digest == authority.production_subject.subject_digest
+  require report.basic_offline_authority_digest == authority.basic_offline_authority_digest
+  require report.observed_output_digest == observed.observed_output_digest
+  require report.fixture_set_digest == authority.fixture_set.fixture_set_digest
+  require report.validation_policy_digest == authority.validation_policy.validation_policy_digest
+  require report.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest
+  require report.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest
+  require report.basic_offline_execution_ledger_digest == ledger.basic_offline_execution_ledger_digest
+  require report.offline_verdict == derived_offline_verdict
+  require report.findings == observed.findings
+  require report.basic_offline_report_digest == hash("basic-offline-report/v1",
+    canonical_payload_without_derived_digests(report))
+  artifact := BasicOfflineReportArtifact(authority, observed, ledger, report)
+  require artifact.authority == authority
+  require artifact.observed_output == observed
+  require artifact.execution_ledger == ledger
+  require artifact.report == report
+  recompute every Basic artifact nested digest before Completed
+  require artifact.basic_offline_report_artifact_digest == hash(
+    "basic-offline-report-artifact/v1",
+    canonical_payload_without_derived_digests(artifact))
+  content hashes prove identity/integrity only, not runner authenticity
+  return Completed iff every Basic closure equation holds; otherwise InternalViolation""".splitlines()
+)
+CONFORMANCE_RELEASE_FIRST_OPERATION_LINES = tuple(
+    """  conformance_trust_root := profile.conformance_trust_root
+  release_trust_root := profile.release_trust_root
+  recompute artifact and every nested invocation/report/ledger/attestation/environment digest
+  approval_authority := approval.authority
+  approved := approval_authority.approved
+  recompute approval_authority.store_snapshot and every nested ApprovedDigestSet value
+  require approval_authority.store_snapshot.release_approval_store_snapshot_digest ==
+    hash(canonical_payload_without_derived_digests(approval_authority.store_snapshot))
+  recompute policy.release_policy_digest
+  require policy.release_policy_digest ==
+    hash(canonical_payload_without_derived_digests(policy))
+  recompute approval_authority.release_approval_authority_digest
+  require approval_authority.release_approval_authority_digest ==
+    hash(canonical_payload_without_derived_digests(approval_authority))
+  recompute approval.release_approval_artifact_digest
+  require approval.release_approval_artifact_digest ==
+    hash(canonical_payload_without_derived_digests(approval))
+  subject_digest := artifact.invocation_authority.production_subject.subject_digest
+  derived_approved := derive_approved_digest_set(artifact, policy)
+  approved_mismatches := canonical_schema_path_diff(approved, derived_approved)
+  require canonical(approved) == canonical(approval_authority.approved)
+  require derived_approved == derive_approved_digest_set(artifact, policy)
+  require every stored nested digest equals its own enclosing payload recomputation; no approved/derived cross-equality
+  require all equations above execute before resolving either profile trust root key material, verifying any signature or reading verdict""".splitlines()
+)
+CONFORMANCE_RELEASE_AFTER_OPERATION_LINES = tuple(
+    """apply_release_policy equations after first operation:
+  (current_conformance_store, current_conformance_policy) :=
+    resolve_conformance_trust_root(conformance_trust_root)
+  require conformance_trust_root was issued by deployment/verifier configuration and
+          cannot be constructed by request deserialization, fixture, artifact,
+          approval store or approval artifact
+  require current_conformance_store.key_registry_digest ==
+    hash(canonical current_conformance_store.trusted_key_material_by_id)
+  require current_conformance_store.trust_store_snapshot_digest ==
+    hash(canonical_payload_without_derived_digests(current_conformance_store))
+  require current_conformance_policy.runner_attestation_policy_digest ==
+    hash(canonical_payload_without_derived_digests(current_conformance_policy))
+  require canonical(current_conformance_store) ==
+          canonical(conformance_trust_root.expected_trust_store_snapshot)
+  require canonical(current_conformance_policy) ==
+          canonical(conformance_trust_root.expected_runner_attestation_policy)
+  require artifact.invocation_authority.trust_store_snapshot_ref.trust_store_snapshot_digest ==
+          current_conformance_store.trust_store_snapshot_digest ==
+          conformance_trust_root.expected_trust_store_snapshot_digest
+  require artifact.invocation_authority.runner_attestation_policy_ref.runner_attestation_policy_digest ==
+          current_conformance_policy.runner_attestation_policy_digest ==
+          conformance_trust_root.expected_runner_attestation_policy_digest
+  require current_conformance_policy.trust_store_snapshot_digest ==
+          current_conformance_store.trust_store_snapshot_digest
+  require current_conformance_policy.supported_signature_schemes ==
+          current_conformance_store.supported_signature_schemes
+  require current_conformance_policy.attestation_signature_scheme in
+          current_conformance_policy.supported_signature_schemes
+  require artifact.measured_environment.conformance_invocation_digest ==
+          artifact.runner_attestation.conformance_invocation_digest ==
+          artifact.execution_ledger.conformance_invocation_digest ==
+          artifact.report.conformance_invocation_digest ==
+          artifact.invocation_authority.conformance_invocation_digest
+  require artifact.measured_environment.verifier_runner_digest ==
+          artifact.runner_attestation.verifier_runner_digest ==
+          artifact.execution_ledger.verifier_runner_digest ==
+          artifact.report.verifier_runner_digest ==
+          artifact.invocation_authority.verifier_runner.verifier_runner_digest
+  require artifact.measured_environment.executable_artifact_digest ==
+          artifact.runner_attestation.executable_artifact_digest ==
+          artifact.invocation_authority.verifier_runner.executable_artifact_digest
+  require artifact.runner_attestation.measured_execution_environment_digest ==
+          artifact.execution_ledger.measured_execution_environment_digest ==
+          artifact.report.measured_execution_environment_digest ==
+          artifact.measured_environment.measured_execution_environment_digest
+  require artifact.runner_attestation.observed_output_digest ==
+          artifact.execution_ledger.observed_output_digest ==
+          artifact.report.observed_output_digest
+  require artifact.execution_ledger.subject_digest ==
+          artifact.report.subject_digest ==
+          artifact.invocation_authority.production_subject.subject_digest
+  require artifact.execution_ledger.fixture_set_digest ==
+          artifact.report.fixture_set_digest ==
+          artifact.invocation_authority.fixture_set.fixture_set_digest
+  require artifact.execution_ledger.validation_policy_digest ==
+          artifact.report.validation_policy_digest ==
+          artifact.invocation_authority.validation_policy.validation_policy_digest
+  require artifact.execution_ledger.gate_manifest_digest ==
+          artifact.report.gate_manifest_digest ==
+          artifact.invocation_authority.gate_manifest.gate_manifest_digest
+  require artifact.execution_ledger.runner_attestation_digest ==
+          artifact.report.runner_attestation_digest ==
+          artifact.runner_attestation.runner_attestation_digest
+  require artifact.report.conformance_execution_ledger_digest ==
+          artifact.execution_ledger.conformance_execution_ledger_digest
+  require artifact.report.production_subject ==
+          artifact.invocation_authority.production_subject
+  require artifact.execution_ledger.observed_output_digest ==
+          artifact.execution_ledger.observed_output.observed_output_digest
+  require artifact.report.findings ==
+          artifact.execution_ledger.observed_output.findings
+  require current_conformance_policy.trusted_attestation_key_id in
+          current_conformance_store.trusted_key_material_by_id; otherwise InternalViolation
+  current_conformance_trusted_key_material :=
+    current_conformance_store.trusted_key_material_by_id[
+      current_conformance_policy.trusted_attestation_key_id]
+  require artifact.runner_attestation.trusted_attestation_key_id ==
+          current_conformance_policy.trusted_attestation_key_id
+  require artifact.runner_attestation.attestation_signature_scheme ==
+          current_conformance_policy.attestation_signature_scheme
+  require current_conformance_policy.attestation_signature_scheme in
+          current_conformance_store.supported_signature_schemes
+  current_measurement_evidence_message := canonical_tuple(
+    artifact.measured_environment.conformance_invocation_digest,
+    artifact.measured_environment.verifier_runner_digest,
+    artifact.measured_environment.executable_artifact_digest,
+    artifact.measured_environment.execution_session_id,
+    artifact.measured_environment.process_identity,
+    artifact.measured_environment.container_identity,
+    artifact.measured_environment.verifier_nonce,
+    artifact.measured_environment.execution_time_window,
+    canonical(artifact.measured_environment.measured_environment_payload))
+  require verify_measurer_identity_and_freshness_evidence(
+    conformance_trust_root.measurement_session_authority,
+    current_measurement_evidence_message,
+    artifact.measured_environment.measurer_identity_and_freshness_evidence)
+  current_measured_payload_digest :=
+    hash(canonical artifact.measured_environment.measured_environment_payload)
+  require current_measured_payload_digest ==
+          current_conformance_policy.expected_execution_environment_digest
+  require conformance_trust_root.measurement_session_authority.has_terminal_consumption_receipt(
+    terminal_consumption_receipt_key(artifact.measured_environment))
+  current_conformance_signed_message := canonical_tuple(
+    artifact.runner_attestation.measured_execution_environment_digest,
+    artifact.runner_attestation.executable_artifact_digest,
+    artifact.runner_attestation.trusted_attestation_key_id,
+    artifact.runner_attestation.attestation_signature_scheme,
+    artifact.runner_attestation.conformance_invocation_digest,
+    artifact.runner_attestation.observed_output_digest,
+    artifact.runner_attestation.verifier_runner_digest)
+  require artifact.runner_attestation.signed_message ==
+          current_conformance_signed_message
+  require verify_signature(current_conformance_trusted_key_material,
+    current_conformance_policy.attestation_signature_scheme,
+    current_conformance_signed_message, artifact.runner_attestation.signature)
+  reverify sealed runner attestation under current profile root without consuming a measurement session or nonce
+  root := resolve_release_approval_trust_root(release_trust_root)
+  require release_trust_root was issued by deployment/verifier configuration and
+          cannot be constructed by request deserialization, fixture, policy,
+          approval store or approval artifact
+  require root.expected_release_policy_digest == policy.release_policy_digest
+  require canonical(root.expected_release_policy) == canonical(policy)
+  require root.expected_release_approval_store_snapshot_digest ==
+          approval_authority.store_snapshot.release_approval_store_snapshot_digest
+  require canonical(root.expected_release_approval_store_snapshot) ==
+          canonical(approval_authority.store_snapshot)
+  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:
+    return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }
+  require approval_authority.store_snapshot.approved_by_subject[subject_digest] == approved
+  require approval_authority.trusted_approver_key_id ==
+          policy.trusted_approver_key_id
+  require approval_authority.approval_signature_scheme == policy.approval_signature_scheme
+  require policy.approval_signature_scheme in
+          root.supported_release_approval_signature_schemes
+  require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation
+  trusted_approver_public_key_material :=
+    root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]
+  release_approval_signed_message := canonical_tuple(
+    root.expected_release_policy_digest,
+    root.expected_release_approval_store_snapshot_digest,
+    policy.trusted_approver_key_id, policy.approval_signature_scheme,
+    canonical(approved))
+  require approval_authority.signed_message == release_approval_signed_message
+  require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)
+  verify release approval signature only with external-root public key material
+  if approved_mismatches is NonEmpty:
+    return Completed { decision: ReleaseBlocked { subject_digest, reasons:
+      map(approved_mismatches, path -> ApprovedDigestMismatch(path)) } }
+  require approved == derived_approved
+  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path
+  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields
+  return Completed { decision }""".splitlines()
+)
+CONFORMANCE_RELEASE_APPLY_LINES = (
+    CONFORMANCE_RELEASE_FIRST_OPERATION_LINES
+    + CONFORMANCE_RELEASE_AFTER_OPERATION_LINES
+)
+CONFORMANCE_CALLABLE_INVENTORY = {
+    ("scope", "shared"): ("derive_conformance_findings_and_verdict",),
+    ("scope", "deployment"): (),
+    ("profile", "basic-offline"): ("run_basic_offline_conformance",),
+    ("profile", "attested-release"): (
+        "run_attested_release_conformance",
+        "apply_release_policy",
+        "validate_and_seal_attested_conformance",
+        "validate_and_consume_measurement_envelope",
+        "derive_attested_conformance_report",
+        "derive_approved_digest_set",
+    ),
+}
+CONFORMANCE_ATTESTED_AUTHORITY_FIELDS = {
+    "production_subject": "ProductionSubject",
+    "fixture_set": "FixtureSet",
+    "validation_policy": "ValidationPolicy",
+    "gate_manifest": "GateManifest",
+    "verifier_runner": "VerifierRunner",
+    "trust_store_snapshot_ref": "TrustStoreSnapshotRef",
+    "runner_attestation_policy_ref": "RunnerAttestationPolicyRef",
+    "conformance_invocation_digest": "Digest",
+}
+CONFORMANCE_RELEASE_APPROVAL_AUTHORITY_FIELDS = {
+    "store_snapshot": "ReleaseApprovalStoreSnapshot",
+    "approved": "ApprovedDigestSet",
+    "trusted_approver_key_id": "ApproverKeyId",
+    "approval_signature_scheme": "SignatureScheme",
+    "signed_message": "CanonicalMessage",
+    "release_approval_authority_digest": "Digest",
+}
+CONFORMANCE_ATTESTED_SEAL_ARTIFACT_FIELDS = {
+    "invocation_authority": "AttestedConformanceInvocationAuthority",
+    "measured_environment": "MeasuredExecutionEnvironment",
+    "report": "AttestedConformanceReport",
+    "execution_ledger": "AttestedConformanceExecutionLedger",
+    "runner_attestation": "RunnerAttestation",
+    "conformance_seal_artifact_digest": "Digest",
+}
+CONFORMANCE_RELEASE_RESULT_TYPES = (
+    "ReleaseDecision",
+    "AttestedConformanceSealArtifact",
+    "ReleasePolicyApplicationResult",
+)
+CONFORMANCE_ATTESTED_REQUIRED = (
+    "AttestedConformanceInvocationAuthority:",
+    "AttestedConformanceExecutionRecord:",
+    "AttestedConformanceExecutionLedger:",
+    "AttestedConformanceReport:",
+    "AttestedConformanceSealArtifact:",
+    "AttestedConformanceRunResult :=",
+    'profile_schema_id := "attested-release/v1"',
+    'hash("attested-conformance-authority/v1",',
+    'hash("attested-conformance-record/v1",',
+    'hash("attested-conformance-ledger/v1",',
+    'hash("attested-conformance-report/v1",',
+    'hash("attested-conformance-seal-artifact/v1",',
+    "run_attested_release_conformance( authority: AttestedConformanceInvocationAuthority, profile: AttestedReleaseConformance, measured_environment: MeasuredExecutionEnvironment ) -> AttestedConformanceRunResult",
+    "trust_root := profile.conformance_trust_root",
+    "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+    "release_trust_root := profile.release_trust_root",
+    "ValidatedMeasurementSessionCapability:",
+    "validate_and_consume_measurement_envelope(",
+    "validate_and_seal_attested_conformance(",
+    "ApprovedDigestSet:",
+    "atomically consumed exactly once",
+    "verify_signature(",
+    "negative fixture: forged runner attestation",
+    "negative fixture: forged ApprovedDigestSet",
+    "negative fixture: replay valid measurement envelope from another execution session",
+    "negative fixture: release approval self-owned approver key",
+    "新建 AttestedConformanceInvocationAuthority",
+    "fresh measured session",
+    "完整重新执行",
+)
+
+TASK9_PRODUCTION_OWNER_FIELDS = {
+    "EvaluationInstanceIdentity": {
+        "request_digest": "Digest",
+        "config_ref": "ConfigRef",
+        "normalized_config_digest": "Digest",
+        "config_input_digest": "Digest",
+        "evaluation_instance_digest": "Digest",
+    },
+    "ProductionSubject": {
+        "build_artifact_content_digest": "Digest",
+        "evaluator_and_registry_digests": "OrderedSet[Digest]",
+        "production_policy_digests": "OrderedSet[Digest]",
+        "backend_semantics_digests": "OrderedMap[memory | time, Digest]",
+        "subject_digest": "Digest",
+    },
+    "Estimate<T>": {
+        "value": "T",
+        "evidence": "[EvidenceTag]",
+        "coverage": "Coverage",
+        "assumptions": "[Assumption]",
+        "model_digest": "Digest",
+        "runtime_plan_digest": "Digest",
+        "simulation_digest": "BackendSpecificDigest",
+        "estimate_context_digest": "Digest",
+        "result_digest": "Digest",
+    },
+    "EstimateCandidate<T>": {
+        "estimate": "Estimate<T>",
+        "backend_execution_witness": "MemoryExecutionWitness | TimeExecutionWitness",
+        "estimate_candidate_digest": "Digest",
+    },
+    "BackendResultCandidate<T>": {
+        "backend": "memory | time",
+        "source_authority_digest": "Digest",
+        "value_gate_authority_digest": "Digest",
+        "pre_seal_gate_execution_ledger_digest": "Digest",
+        "branch": "BackendResultBranch<T>",
+        "backend_result_candidate_digest": "Digest",
+    },
+    "BackendResultSourceAuthority<V>": {
+        "projection_bundle_authority": "ProjectionBundleAuthority",
+        "backend": "memory | time",
+        "source_projection_result": "ProjectionResult<V>",
+        "source_projection_digest": "Digest",
+        "projection_gate_ledger": "GateExecutionLedger",
+        "source_authority_digest": "Digest",
+    },
+    "BackendValueGateAuthority<T,V>": {
+        "source_authority": "BackendResultSourceAuthority<V>",
+        "value_subject": "BackendValueSubject<T>",
+        "value_gate_authority_digest": "Digest",
+    },
+    "BackendSealAuthority<T,V>": {
+        "value_gate_authority": "BackendValueGateAuthority<T,V>",
+        "pre_seal_gate_ledger": "GateExecutionLedger",
+        "backend_seal_authority_digest": "Digest",
+    },
+    "BackendSealArtifact<T,V>": {
+        "request_digest": "Digest",
+        "evaluation_instance_digest": "Digest",
+        "backend": "memory | time",
+        "seal_authority": "BackendSealAuthority<T,V>",
+        "result_candidate": "BackendResultCandidate<T>",
+        "sealed_gate_ledger": "GateExecutionLedger",
+        "result": "BackendResult<T>",
+        "backend_seal_artifact_digest": "Digest",
+    },
+    "ComparisonResult": {
+        "comparison_axes": "CanonicalSchemaPathSet",
+        "memory": "MetricComparison<MemoryDelta>",
+        "time": "MetricComparison<TimeDelta>",
+    },
+    "ComparisonArmAuthority": {
+        "config_ref": "ConfigRef",
+        "evaluation_identity": "EvaluationInstanceIdentity",
+        "projection_bundle_authority_digest": "Digest",
+        "seal_artifacts": "OrderedMap[memory | time, BackendSealArtifact]",
+    },
+    "ComparisonSourceAuthority": {
+        "request_snapshot": "RequestSnapshot",
+        "left_arm": "ComparisonArmAuthority",
+        "right_arm": "ComparisonArmAuthority",
+        "canonical_comparison_basis_pairs": "OrderedMap[memory | time, ComparisonBasisPair]",
+        "production_validation_context": "ProductionValidationContext",
+        "gate_manifest": "GateManifest",
+        "comparison_source_authority_digest": "Digest",
+    },
+    "ComparisonResultCandidate": {
+        "source_authority_digest": "Digest",
+        "value": "ComparisonResult",
+        "comparison_result_candidate_digest": "Digest",
+    },
+    "ComparisonSealArtifact": {
+        "seal_authority": "ComparisonSealAuthority",
+        "comparison_gate_ledger": "GateExecutionLedger",
+        "result": "ComparisonResult",
+        "comparison_seal_artifact_digest": "Digest",
+    },
+    "ComparisonSealAuthority": {
+        "source_authority": "ComparisonSourceAuthority",
+        "result_candidate": "ComparisonResultCandidate",
+        "comparison_seal_authority_digest": "Digest",
+    },
+}
 
 MODULE_CONTRACT_SUBSECTIONS = {
     "职责边界",
@@ -945,11 +1511,12 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "FixtureSet:",
         "ConformanceFinding:",
         "ApprovedDigestSet:",
-        "ConformanceReport",
+        "AttestedConformanceReport",
         "ReleaseDecision",
-        "run_conformance( authority: ConformanceInvocationAuthority, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ConformanceRunResult",
-        "apply_release_policy( artifact: ConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, release_trust_root: ReleaseApprovalTrustRootCapability ) -> ReleaseDecision",
-        "derive_approved_digest_set( artifact: ConformanceSealArtifact, policy: ReleasePolicy ) -> ApprovedDigestSet",
+        "run_basic_offline_conformance( authority: BasicOfflineConformanceAuthority ) -> BasicOfflineRunResult",
+        "run_attested_release_conformance( authority: AttestedConformanceInvocationAuthority, profile: AttestedReleaseConformance, measured_environment: MeasuredExecutionEnvironment ) -> AttestedConformanceRunResult",
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+        "derive_approved_digest_set( artifact: AttestedConformanceSealArtifact, policy: ReleasePolicy ) -> ApprovedDigestSet",
         "derive_approved_digest_set fields:",
         "subject_digest := recompute artifact.invocation_authority.production_subject.subject_digest",
         "fixture_set_digest := recompute artifact.invocation_authority.fixture_set.fixture_set_digest",
@@ -963,7 +1530,8 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "release_policy_digest := recompute policy.release_policy_digest",
         "derived_approved := derive_approved_digest_set(artifact, policy)",
         "require approved == derived_approved",
-        "require approved == derive_approved_digest_set(artifact, policy)",
+        "approved_mismatches := canonical_schema_path_diff(approved, derived_approved)",
+        "map(approved_mismatches, path -> ApprovedDigestMismatch(path))",
         "all ten approved digest fields",
         "positive fixture",
         "negative-boundary fixture",
@@ -990,21 +1558,21 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "runner_attestation_policy_digest := hash(canonical_payload_without_derived_digests(RunnerAttestationPolicy))",
         "RunnerAttestation:",
         "signed_message := canonical_tuple( measured_execution_environment_digest, executable_artifact_digest, trusted_attestation_key_id, attestation_signature_scheme, conformance_invocation_digest, observed_output_digest, verifier_runner_digest)",
-        "ConformanceExecutionRecord:",
-        "ConformanceExecutionLedger:",
+        "AttestedConformanceExecutionRecord:",
+        "AttestedConformanceExecutionLedger:",
         "conformance_execution_record_digest :=",
-        "ConformanceRunResult := Completed { artifact: ConformanceSealArtifact } | InternalViolation { violation: InternalContractViolation }",
-        "conformance_seal_artifact_digest := hash(canonical_payload_without_derived_digests(ConformanceSealArtifact))",
+        "AttestedConformanceRunResult := Completed { artifact: AttestedConformanceSealArtifact } | InternalViolation { violation: InternalContractViolation }",
+        'hash("attested-conformance-seal-artifact/v1", canonical_payload_without_derived_digests(AttestedConformanceSealArtifact))',
         "runner crash, schema failure, digest failure or conservation failure",
         "complete, valid execution",
         "record.fixture_ref == record_key",
         "record.target_invocation_id == binding.target_invocation_id",
         "record.target_clause_id == binding.target_clause_id",
-        "ConformanceInvocationAuthority:",
+        "AttestedConformanceInvocationAuthority:",
         "conformance_invocation_digest :=",
-        "fixture_digest evaluation_input_digest := hash(authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest) observed_clause_output_digest",
+        'evaluation_input_digest := hash("attested-conformance-record-input/v1", authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest) observed_clause_output: ObservedClauseOutput',
         "ConformanceObservedOutput:",
-        "ConformanceObservedOutput: execution_records: OrderedMap<FixtureRef, ConformanceExecutionRecord> findings: OrderedMap<FindingId, ConformanceFinding> coverage_gaps: OrderedSet<GateClauseId> observed_output_digest := hash(canonical execution_records, findings, coverage_gaps)",
+        "ConformanceObservedOutput: observed_clause_outputs: OrderedMap<FixtureRef, ObservedClauseOutput> findings: OrderedMap<FindingId, ConformanceFinding> coverage_gaps: OrderedSet<GateClauseId> observed_output_digest := hash(canonical observed_clause_outputs, findings, coverage_gaps)",
         "ledger.observed_output_digest == report.observed_output_digest == attestation.observed_output_digest",
         "verifier_runner_digest := hash(canonical_payload_without_derived_digests(VerifierRunner))",
         "trust_store_snapshot_ref: TrustStoreSnapshotRef",
@@ -1029,7 +1597,7 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "measured_execution_environment_digest := hash(canonical_payload_without_derived_digests(MeasuredExecutionEnvironment))",
         "ValidatedMeasurementSessionCapability:",
         "opaque call-scoped, non-serializable and non-transferable capability",
-        "validate_and_consume_measurement_envelope( authority: ConformanceInvocationAuthority, runner: VerifierRunner, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ValidatedMeasurementSessionCapability | InternalContractViolation",
+        "validate_and_consume_measurement_envelope( authority: AttestedConformanceInvocationAuthority, runner: VerifierRunner, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ValidatedMeasurementSessionCapability | InternalContractViolation",
         "(store, policy) := resolve_conformance_trust_root(trust_root)",
         "authority.trust_store_snapshot_ref.trust_store_snapshot_digest == store.trust_store_snapshot_digest",
         "authority.runner_attestation_policy_ref.runner_attestation_policy_digest == policy.runner_attestation_policy_digest",
@@ -1042,7 +1610,9 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "measured_environment.verifier_runner_digest == runner.verifier_runner_digest",
         "measured_environment.executable_artifact_digest == runner.executable_artifact_digest",
         "current_execution_session_context() == canonical_tuple(measured_environment.execution_session_id, measured_environment.process_identity, measured_environment.container_identity)",
-        "measured_environment.verifier_nonce is active, bound to this exact invocation/runner/executable/session/time-window tuple, and atomically consumed exactly once",
+        "terminal_consumption_receipt_key( environment: MeasuredExecutionEnvironment ) := canonical_tuple( environment.verifier_nonce, environment.conformance_invocation_digest, environment.verifier_runner_digest, environment.executable_artifact_digest, environment.execution_session_id, environment.process_identity, environment.container_identity, environment.execution_time_window, environment.measured_execution_environment_digest)",
+        "atomically consumed exactly once while persisting a terminal receipt under that exact key",
+        "session.nonce_consumption_receipt proves the terminal registry contains exact terminal_consumption_receipt_key(measured_environment)",
         "verify_measurer_identity_and_freshness_evidence(",
         "measured_payload_digest := hash(canonical measured_environment.measured_environment_payload)",
         "measured_payload_digest == policy.expected_execution_environment_digest",
@@ -1053,8 +1623,8 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "attestation.executable_artifact_digest == runner.executable_artifact_digest",
         "attestation.trusted_attestation_key_id == policy.trusted_attestation_key_id",
         "attestation.attestation_signature_scheme == policy.attestation_signature_scheme",
-        "validate_and_seal_conformance( authority: ConformanceInvocationAuthority, trust_root: ConformanceTrustRootCapability, session: ValidatedMeasurementSessionCapability, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, attestation: RunnerAttestation ) -> ConformanceRunResult",
-        "validate_and_seal_conformance first operation:",
+        "validate_and_seal_attested_conformance( authority: AttestedConformanceInvocationAuthority, trust_root: ConformanceTrustRootCapability, session: ValidatedMeasurementSessionCapability, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, attestation: RunnerAttestation ) -> AttestedConformanceRunResult",
+        "validate_and_seal_attested_conformance first operation:",
         "recompute authority.production_subject.subject_digest",
         "recompute every authority.fixture_set binding, nested fixture and fixture_set_digest",
         "recompute authority.validation_policy.validation_policy_digest",
@@ -1063,12 +1633,12 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "recompute authority.verifier_runner.verifier_runner_digest",
         "recompute authority.conformance_invocation_digest only after all nested recomputations",
         "negative fixture: old invocation digest plus substituted policy or trust-store reference",
-        "derive_conformance_report( authority: ConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, attestation: RunnerAttestation ) -> ConformanceReport",
-        "ConformanceReport.findings: OrderedMap<FindingId, ConformanceFinding>",
+        "derive_attested_conformance_report( authority: AttestedConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, attestation: RunnerAttestation ) -> AttestedConformanceReport",
+        "AttestedConformanceReport.findings: OrderedMap<FindingId, ConformanceFinding>",
         "report.findings == observed.findings",
-        "failure_findings := policy_classified_failure_findings(authority.validation_policy, observed.findings)",
+        "failure_findings := policy_classified_failure_findings(validation_policy, findings)",
         "verdict := fail iff failure_findings is non-empty",
-        "else insufficient iff exact_evidence_or_coverage_gaps(authority, observed, ledger) is non-empty",
+        "else insufficient iff exact_evidence_gaps or observed.coverage_gaps is non-empty",
         "else pass",
         "execute -> observed -> runner attestation -> ledger -> derived report -> seal",
         "negative fixture: valid signature plus failing observed output cannot be sealed with forged pass",
@@ -1080,13 +1650,14 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "supported_release_approval_signature_schemes: OrderedSet<SignatureScheme>",
         "trusted_approver_public_key_material_by_id: OrderedMap<ApproverKeyId, TrustedPublicKeyMaterial>",
         "cannot be constructed by request deserialization, fixture, policy, approval store or approval artifact",
+        "release_trust_root := profile.release_trust_root",
         "apply_release_policy first operation:",
         "recompute artifact and every nested invocation/report/ledger/attestation/environment digest",
         "recompute approval_authority.store_snapshot and every nested ApprovedDigestSet value",
         "recompute policy.release_policy_digest",
         "recompute approval_authority.release_approval_authority_digest",
         "recompute approval.release_approval_artifact_digest",
-        "before resolving release_trust_root key material, verifying signature or reading verdict",
+        "before resolving either profile trust root key material, verifying any signature or reading verdict",
         "root := resolve_release_approval_trust_root(release_trust_root)",
         "root.expected_release_policy_digest == policy.release_policy_digest",
         "canonical(root.expected_release_policy) == canonical(policy)",
@@ -1096,7 +1667,7 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "policy.approval_signature_scheme in root.supported_release_approval_signature_schemes",
         "trusted_approver_public_key_material := root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]",
         "release_approval_signed_message := canonical_tuple(",
-        "canonical(derived_approved)",
+        "canonical(approved)",
         "verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)",
         "negative fixture: release approval wrong signature scheme",
         "negative fixture: unsupported release approval signature scheme",
@@ -1125,12 +1696,12 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
 MODULE_CONTRACT_REQUIRED_OCCURRENCES = {
     "conformance": {
         "supported_signature_schemes: OrderedSet<SignatureScheme>": 2,
-        "expected_execution_environment_digest": 4,
+        "expected_execution_environment_digest": 5,
         "trusted_attestation_key_id, attestation_signature_scheme": 2,
-        "trust_store_snapshot_digest": 15,
-        "cannot be constructed by request deserialization": 5,
+        "trust_store_snapshot_digest": 21,
+        "cannot be constructed by request deserialization": 6,
         "protected_environment_measurer": 1,
-        "(store, policy) := resolve_conformance_trust_root(trust_root)": 2,
+        "(store, policy) := resolve_conformance_trust_root(trust_root)": 3,
         "authority.trust_store_snapshot_ref.trust_store_snapshot_digest == store.trust_store_snapshot_digest": 2,
         "authority.runner_attestation_policy_ref.runner_attestation_policy_digest == policy.runner_attestation_policy_digest": 2,
         "policy.attestation_signature_scheme in store.supported_signature_schemes": 2,
@@ -1141,11 +1712,11 @@ MODULE_CONTRACT_REQUIRED_OCCURRENCES = {
         "measured_environment.verifier_runner_digest == runner.verifier_runner_digest": 2,
         "measured_environment.executable_artifact_digest == runner.executable_artifact_digest": 2,
         "current_execution_session_context() == canonical_tuple(measured_environment.execution_session_id, measured_environment.process_identity, measured_environment.container_identity)": 2,
-        "verify_measurer_identity_and_freshness_evidence(": 2,
+        "verify_measurer_identity_and_freshness_evidence(": 3,
         "measured_payload_digest := hash(canonical measured_environment.measured_environment_payload)": 2,
         "measured_payload_digest == policy.expected_execution_environment_digest": 2,
-        "measurer_identity_and_freshness_evidence": 6,
-        "session.measured_execution_environment_digest": 3,
+        "measurer_identity_and_freshness_evidence": 8,
+        "session.measured_execution_environment_digest": 4,
     },
 }
 
@@ -1173,11 +1744,11 @@ MODULE_CONTRACT_FORBIDDEN_TEXT = {
     "conformance": (
         "positive_fixture_refs",
         "negative_boundary_fixture_refs",
-        "validate_and_seal_conformance( authority: ConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, report: ConformanceReport",
-        "apply_release_policy( report: ConformanceReport",
-        "run_conformance( subject: ProductionSubject",
-        "apply_release_policy( artifact: ConformanceSealArtifact, approved: ApprovedDigestSet",
-        "apply_release_policy( artifact: ConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy ) -> ReleaseDecision",
+        "validate_and_seal_attested_conformance( authority: AttestedConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, report: AttestedConformanceReport",
+        "apply_release_policy( report: AttestedConformanceReport",
+        "run_attested_release_conformance( subject: ProductionSubject",
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, approved: ApprovedDigestSet",
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy ) -> ReleaseDecision",
         "verify_signature(runner.trusted_attestation_key_id, runner.attestation_signature_scheme",
         "VerifierRunner: runner_id, runner_version, executable_artifact_digest trusted_attestation_key_id, attestation_signature_scheme",
         "measured_execution_environment_digest := hash(canonical measured_environment_payload)",
@@ -1251,19 +1822,24 @@ DERIVED_DIGEST_EXCLUSIONS = (
     ("FixtureSet", "fixture_set_digest"),
     ("ValidationPolicy", "validation_policy_digest"),
     ("VerifierRunner", "verifier_runner_digest"),
+    ("BasicOfflineConformanceAuthority", "basic_offline_authority_digest"),
+    ("BasicOfflineExecutionRecord", "basic_offline_execution_record_digest"),
+    ("BasicOfflineExecutionLedger", "basic_offline_execution_ledger_digest"),
+    ("BasicOfflineReport", "basic_offline_report_digest"),
+    ("BasicOfflineReportArtifact", "basic_offline_report_artifact_digest"),
     ("TrustStoreSnapshot", "trust_store_snapshot_digest"),
     ("RunnerAttestationPolicy", "runner_attestation_policy_digest"),
     ("MeasuredExecutionEnvironment", "measured_execution_environment_digest"),
-    ("ConformanceInvocationAuthority", "conformance_invocation_digest"),
+    ("AttestedConformanceInvocationAuthority", "conformance_invocation_digest"),
     ("RunnerAttestation", "runner_attestation_digest"),
-    ("ConformanceExecutionRecord", "conformance_execution_record_digest"),
+    ("AttestedConformanceExecutionRecord", "conformance_execution_record_digest"),
     ("ConformanceObservedOutput", "observed_output_digest"),
-    ("ConformanceExecutionLedger", "conformance_execution_ledger_digest"),
+    ("AttestedConformanceExecutionLedger", "conformance_execution_ledger_digest"),
     ("ReleaseApprovalStoreSnapshot", "release_approval_store_snapshot_digest"),
     ("ReleaseApprovalAuthority", "release_approval_authority_digest"),
     ("ReleaseApprovalArtifact", "release_approval_artifact_digest"),
-    ("ConformanceSealArtifact", "conformance_seal_artifact_digest"),
-    ("ConformanceReport", "conformance_report_digest"),
+    ("AttestedConformanceSealArtifact", "conformance_seal_artifact_digest"),
+    ("AttestedConformanceReport", "conformance_report_digest"),
     ("ReleasePolicy", "release_policy_digest"),
     ("Estimate", "result_digest"),
 )
@@ -1336,6 +1912,78 @@ class _ModuleContractParser(HTMLParser):
             if self.section_depth == 0:
                 self.contracts.append(self.current)
                 self.current = None
+
+
+class _ConformanceLocalBlockParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.conformance_depth: int | None = None
+        self.active: dict[str, object] | None = None
+        self.blocks: list[dict[str, object]] = []
+        self.outside_parts: list[str] = []
+        self.malformed = False
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.depth += 1
+        attr_map = {name: value or "" for name, value in attrs}
+        markers = [
+            ("scope", attr_map["data-conformance-scope"])
+            for _ in [0]
+            if "data-conformance-scope" in attr_map
+        ] + [
+            ("profile", attr_map["data-conformance-profile"])
+            for _ in [0]
+            if "data-conformance-profile" in attr_map
+        ]
+        if (
+            tag == "section"
+            and "module-contract" in attr_map.get("class", "").split()
+            and attr_map.get("data-module") == "conformance"
+        ):
+            if self.conformance_depth is not None:
+                self.malformed = True
+            self.conformance_depth = self.depth
+
+        if markers and (self.conformance_depth is None or tag != "div"):
+            self.malformed = True
+        if self.conformance_depth is None:
+            return
+        if len(markers) > 1 or (markers and self.active is not None):
+            self.malformed = True
+        if len(markers) == 1:
+            kind, value = markers[0]
+            self.active = {
+                "kind": kind,
+                "value": value,
+                "tag": tag,
+                "depth": self.depth,
+                "text_parts": [],
+            }
+
+    def handle_data(self, data: str) -> None:
+        if self.active is not None:
+            parts = self.active["text_parts"]
+            assert isinstance(parts, list)
+            parts.append(data)
+        elif self.conformance_depth is not None:
+            self.outside_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if (
+            self.active is not None
+            and self.active["tag"] == tag
+            and self.active["depth"] == self.depth
+        ):
+            self.blocks.append(self.active)
+            self.active = None
+        if tag == "section" and self.conformance_depth == self.depth:
+            if self.active is not None:
+                self.malformed = True
+            self.conformance_depth = None
+        self.depth -= 1
 
 
 def _normalize_contract_text(parts: list[str]) -> str:
@@ -1483,6 +2131,82 @@ def _exact_flat_schema_fields(html: str, schema_name: str) -> dict[str, str] | N
         if field is None or field.group(1) in fields:
             return None
         fields[field.group(1)] = unescape(field.group(2))
+    return fields
+
+
+def _task9_owner_block(document_text: str, schema_name: str) -> str | None:
+    owner_pattern = re.escape(schema_name)
+    if "<" not in schema_name:
+        owner_pattern += r"(?:<[^>\r\n]+>)?"
+    match = re.search(
+        rf"(?m)(?:^|>){owner_pattern}:[ \t]*\r?\n"
+        rf"(?P<body>(?:[ \t]+[^\r\n]*(?:\r?\n|$))*)",
+        document_text,
+    )
+    return match.group("body") if match is not None else None
+
+
+def _task9_strip_line_comments(contract_text: str) -> str:
+    return re.sub(r"(?m)//[^\r\n]*$", "", contract_text)
+
+
+def _task9_owner_assignments(
+    document_text: str, schema_name: str
+) -> tuple[tuple[str, str], ...] | None:
+    body = _task9_owner_block(document_text, schema_name)
+    if body is None:
+        return None
+    lines = _task9_strip_line_comments(body).splitlines()
+    assignments: list[tuple[str, str]] = []
+    current_name: str | None = None
+    current_rhs: list[str] = []
+
+    def finish_assignment() -> None:
+        nonlocal current_name, current_rhs
+        if current_name is not None:
+            assignments.append(
+                (current_name, _normalize_contract_text(current_rhs))
+            )
+        current_name = None
+        current_rhs = []
+
+    for line in lines:
+        assignment = re.fullmatch(
+            r"  ([a-z][a-z0-9_]*)[ \t]*:=[ \t]*(.*)", line
+        )
+        if assignment is not None:
+            finish_assignment()
+            current_name = assignment.group(1)
+            current_rhs = [assignment.group(2)]
+            continue
+        if current_name is not None and line.startswith("    "):
+            current_rhs.append(line.strip())
+            continue
+        finish_assignment()
+    finish_assignment()
+    return tuple(assignments)
+
+
+def _task9_exact_owner_fields(
+    document_text: str, schema_name: str
+) -> dict[str, str] | None:
+    body = _task9_owner_block(document_text, schema_name)
+    if body is None:
+        return None
+    fields: dict[str, str] = {}
+    for line in body.splitlines():
+        if re.fullmatch(r"\s*//.*", line):
+            continue
+        if re.fullmatch(r"  [a-z][a-z0-9_]*\s*:=.*", line):
+            continue
+        if line.startswith("    "):
+            continue
+        field = re.fullmatch(
+            r"  ([a-z][a-z0-9_]*):\s*(\S(?:.*\S)?)\s*", line
+        )
+        if field is None or field.group(1) in fields:
+            return None
+        fields[field.group(1)] = field.group(2)
     return fields
 
 
@@ -1750,6 +2474,154 @@ def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
     )
     if capability_scopes != ["production", "offline-validation"]:
         errors.append("Task7 14.5 必须分离 production 与 offline-validation 能力")
+
+
+def check_task9_production_identity_isolation(
+    html: str, errors: list[str]
+) -> None:
+    document_text = unescape(html)
+    normalized_document = _normalize_contract_text([document_text])
+    release_result_union = "|".join(
+        re.escape(result_type) for result_type in CONFORMANCE_RELEASE_RESULT_TYPES
+    )
+    basic_to_release_flow = re.compile(
+        r"(?ms)(?:^|>)[A-Za-z][A-Za-z0-9_]*[ \t]*(?::=[ \t]*)?\("
+        r"[^)]*\bBasicOfflineReportArtifact\b[^)]*\)[ \t]*->[ \t]*(?:"
+        + release_result_union
+        + r")\b"
+    )
+    if basic_to_release_flow.search(document_text):
+        errors.append("Basic artifact to release type-flow is forbidden")
+
+    production_subject_block = _task9_owner_block(document_text, "ProductionSubject")
+    if production_subject_block is None or re.search(
+        r"(?m)^  subject_digest := hash\(all four constituent fields in schema order\)"
+        r"[ \t]*(?:\r?\n)?\Z",
+        production_subject_block,
+    ) is None:
+        errors.append("ProductionSubject subject_digest exact equation mismatch")
+
+    conformance_digest_owners = {
+        owner
+        for owners in CONFORMANCE_OWNER_INVENTORY.values()
+        for owner in owners
+    }
+    shared_type_union = "|".join(
+        re.escape(type_name) for type_name in CONFORMANCE_SHARED_TYPES
+    )
+    shared_alias_union = "|".join(
+        re.escape(
+            re.sub(r"(?<!^)(?=[A-Z])", "_", type_name).lower()
+        )
+        for type_name in CONFORMANCE_SHARED_TYPES
+    )
+    production_conformance_field = re.compile(
+        r"(?im)^[ \t]+(?:conformance|attested|basic_offline|release_approval|"
+        r"release_policy)[a-z0-9_]*[ \t]*:(?!=)|^[ \t]+(?:"
+        + shared_alias_union
+        + r")(?:_digest|_ref)?[ \t]*:(?!=)|\b(?:"
+        r"ConformanceDeploymentProfile|BasicOfflineReport|"
+        r"BasicOfflineReportArtifact|AttestedConformanceReport|"
+        r"AttestedConformanceSealArtifact|AttestedConformanceRunResult|"
+        r"ReleasePolicyApplicationResult|ConformanceTrustRootCapability|"
+        r"ReleaseApprovalTrustRootCapability|"
+        r"ValidatedMeasurementSessionCapability|"
+        + shared_type_union
+        + r")\b"
+    )
+    for owner, _ in DERIVED_DIGEST_EXCLUSIONS:
+        if owner in conformance_digest_owners:
+            continue
+        owner_block = _task9_owner_block(document_text, owner)
+        if owner_block is not None and production_conformance_field.search(owner_block):
+            errors.append(
+                f"production owner conformance isolation mismatch: {owner}"
+            )
+    for owner, expected_fields in TASK9_PRODUCTION_OWNER_FIELDS.items():
+        definitions = re.findall(
+            rf"(?m)(?:^|>){re.escape(owner)}:[ \t]*$", document_text
+        )
+        actual_fields = _task9_exact_owner_fields(document_text, owner)
+        if len(definitions) != 1 or actual_fields != expected_fields:
+            errors.append(f"Task9 {owner} exact production schema mismatch")
+
+    digest_section = re.search(
+        r'<h3 id="c2-4"[^>]*>.*?</h3>.*?'
+        r'<pre><code>(?P<body>.*?)</code></pre>',
+        html,
+        re.DOTALL,
+    )
+    digest_text = unescape(digest_section.group("body") if digest_section else "")
+    formulas = (
+        (
+            "model_input_digest",
+            "model_digest",
+            "hash(SourceSnapshot, ModelSpec, normalized config P, LogicalRankContextSet, code-relevant ExecutionScenario bindings, CompileEnvFacts, PySub/evaluator/descriptor/dispatch semantics, source-obligation and canonical-ID/order rules, structure semantic registry)",
+        ),
+        (
+            "model_digest",
+            "runtime_input_digest",
+            "hash(model_input_digest, canonical_payload_without_derived_digests(CodeIR))",
+        ),
+        (
+            "runtime_input_digest",
+            "runtime_plan_digest",
+            "hash(model_digest, ExecutionScenario, runtime semantic registry, runtime expander/EventId/order semantic version)",
+        ),
+        (
+            "runtime_plan_digest",
+            "simulation_core_digest",
+            "hash(runtime_input_digest, canonical_payload_without_derived_digests(RuntimeEventPlan))",
+        ),
+        (
+            "simulation_core_digest",
+            "memory_simulation_digest",
+            "hash(runtime_plan_digest, HardwareProfile, ExecutionDeployment, HardwareBindingPolicySnapshot, binding semantics, canonical_payload_without_derived_digests(SimulationPlanCore))",
+        ),
+        (
+            "memory_simulation_digest",
+            "TimeSimulationInputDomain:",
+            "hash(simulation_core_digest, memory registry, StorageBindings, WorkspaceBindings, MemoryProjectionSemanticsSnapshot, resolved memory fallbacks/assumptions, logical-order semantics, memory projection/identity semantics, memory backend and numeric semantic versions)",
+        ),
+        (
+            "time_simulation_digest",
+            "result_digest",
+            "hash(canonical(TimeSimulationInputDomain))",
+        ),
+    )
+    for owner, next_owner, expected in formulas:
+        match = re.search(
+            rf"(?ms)^{re.escape(owner)}\s*:=\s*(?P<body>.*?)"
+            rf"(?=^{re.escape(next_owner)}\s*(?::=|$))",
+            digest_text,
+        )
+        actual = _normalize_contract_text([match.group("body")]) if match else ""
+        if actual != expected:
+            errors.append(f"Task9 production digest exact input closure mismatch: {owner}")
+    result_match = re.search(
+        r"(?ms)^result_digest\s*:=\s*(?P<body>.*)$", digest_text
+    )
+    if (
+        result_match is None
+        or _normalize_contract_text([result_match.group("body")])
+        != "hash(canonical_payload_without_derived_digests(Estimate))"
+    ):
+        errors.append("Task9 production digest exact input closure mismatch: result_digest")
+
+    backend_result = re.search(
+        r"(?ms)^BackendResult<T>\s*:=\s*(?P<body>.*?)^SemanticValue<T>:",
+        document_text,
+    )
+    expected_backend_result = (
+        "Ok { estimate: Estimate<T> } | Blocked { diagnostics: "
+        "NonEmpty[Diagnostic] } | NotRequested"
+    )
+    if (
+        backend_result is None
+        or _normalize_contract_text([backend_result.group("body")])
+        != expected_backend_result
+    ):
+        errors.append("Task9 BackendResult exact three-arm production union mismatch")
 
 
 def check_task7_behavioral_contracts(html: str, errors: list[str]) -> None:
@@ -2029,23 +2901,1038 @@ def check_product_gate_staging(html: str, errors: list[str]) -> None:
             )
 
 
-def check_conformance_trust_boundary(html: str, errors: list[str]) -> None:
-    parser = _ModuleContractParser()
+def _conformance_local_texts(
+    html: str, errors: list[str]
+) -> dict[tuple[str, str], str]:
+    parser = _ConformanceLocalBlockParser()
     parser.feed(html)
-    matches = []
-    for contract in parser.contracts:
-        attrs = contract["attrs"]
-        assert isinstance(attrs, dict)
-        if attrs.get("data-module") == "conformance":
-            matches.append(contract)
-    if len(matches) != 1:
-        return
-    text_parts = matches[0]["text_parts"]
-    assert isinstance(text_parts, list)
-    local_text = _normalize_contract_text(text_parts)
+    parser.close()
+    if parser.active is not None or parser.conformance_depth is not None:
+        parser.malformed = True
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for block in parser.blocks:
+        key = (str(block["kind"]), str(block["value"]))
+        parts = block["text_parts"]
+        assert isinstance(parts, list)
+        grouped.setdefault(key, []).append(_normalize_contract_text(parts))
+    actual = set(grouped)
+    if parser.malformed or actual != CONFORMANCE_LOCAL_BLOCKS:
+        errors.append(
+            "conformance local blocks must be exact shared/deployment/basic-offline/attested-release"
+        )
+    return {key: " ".join(parts) for key, parts in grouped.items()}
+
+
+def _conformance_local_raw_texts(html: str) -> dict[tuple[str, str], str]:
+    parser = _ConformanceLocalBlockParser()
+    parser.feed(html)
+    parser.close()
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for block in parser.blocks:
+        key = (str(block["kind"]), str(block["value"]))
+        parts = block["text_parts"]
+        assert isinstance(parts, list)
+        grouped.setdefault(key, []).append("".join(parts))
+    return {key: "\n".join(parts) for key, parts in grouped.items()}
+
+
+def _conformance_outside_local_text(html: str) -> str:
+    parser = _ConformanceLocalBlockParser()
+    parser.feed(html)
+    parser.close()
+    return _normalize_contract_text(parser.outside_parts)
+
+
+def check_conformance_deployment_profiles(html: str, errors: list[str]) -> None:
+    local = _conformance_local_texts(html, errors)
+    raw_local = _conformance_local_raw_texts(html)
+    outside_local = _conformance_outside_local_text(html)
+    parsed_inventory: dict[tuple[str, str], tuple[str, ...]] = {}
+    for key, raw_text in raw_local.items():
+        parsed_inventory[key] = tuple(
+            re.findall(
+                r"(?m)^([A-Z][A-Za-z0-9_]*)\s*(?::=|:)", raw_text
+            )
+        )
+    if parsed_inventory != CONFORMANCE_OWNER_INVENTORY:
+        errors.append("conformance owner inventory must exactly match every local block")
+
+    parsed_callables: dict[tuple[str, str], tuple[str, ...]] = {}
+
+    def parse_callable_names(raw_text: str) -> tuple[str, ...]:
+        names: list[str] = []
+        lines = raw_text.splitlines()
+        for index, line in enumerate(lines):
+            start = re.match(r"^([a-z][a-z0-9_]*)\s*\(", line)
+            if start is None:
+                continue
+            name = start.group(1)
+            same_line_tail = line[start.end() :]
+            if re.search(r"\)\s*->", same_line_tail):
+                names.append(name)
+                continue
+            if re.search(r"\)\s*:=", same_line_tail):
+                continue
+            for continuation in lines[index + 1 :]:
+                close = re.match(r"^\)\s*(->|:=)", continuation)
+                if close is None:
+                    continue
+                if close.group(1) == "->":
+                    names.append(name)
+                break
+        return tuple(names)
+
+    for key, raw_text in raw_local.items():
+        parsed_callables[key] = parse_callable_names(raw_text)
+    if parsed_callables != CONFORMANCE_CALLABLE_INVENTORY:
+        errors.append("whole conformance callable owner inventory mismatch")
+    export_lines = sorted(
+        line.strip()
+        for raw_text in raw_local.values()
+        for line in raw_text.splitlines()
+        if re.search(r"(?i)\b(?:export(?:ed)?|alias)\b", line)
+    )
+    expected_export_lines = sorted(
+        [
+            "public exported ports (exact):",
+            "public exported ports (exact):",
+            "internal non-exported ports:",
+        ]
+    )
+    if export_lines != expected_export_lines or re.search(
+        r"(?i)\b(?:export(?:ed)?|alias)\b", outside_local
+    ):
+        errors.append("whole conformance exported port inventory mismatch")
+
+    profile_specific_owners = tuple(
+        owner
+        for key, owners in CONFORMANCE_OWNER_INVENTORY.items()
+        if key != ("scope", "shared")
+        for owner in owners
+    )
+    outside_identifiers = profile_specific_owners + (
+        "run_basic_offline_conformance",
+        "run_attested_release_conformance",
+        "apply_release_policy",
+        "validate_and_seal_attested_conformance",
+        "validate_and_consume_measurement_envelope",
+        "derive_attested_conformance_report",
+        "derive_approved_digest_set",
+    )
+    if any(
+        re.search(rf"\b{re.escape(identifier)}\b", outside_local)
+        for identifier in outside_identifiers
+    ) or any(rule in outside_local for rule in CONFORMANCE_ATTESTED_ONLY_RULES):
+        errors.append("conformance profile-specific declaration outside local block")
+
+    document_text = unescape(html)
+    normalized_document = _normalize_contract_text([document_text])
+    conformance_section = re.search(
+        r'<section\b[^>]*data-module="conformance"[^>]*>.*?</section>',
+        document_text,
+        re.DOTALL,
+    )
+    if conformance_section is None:
+        errors.append("conformance module is not globally extractable")
+        outside_document = document_text
+    else:
+        outside_document = (
+            document_text[: conformance_section.start()]
+            + document_text[conformance_section.end() :]
+        )
+    outside_callable_names = re.findall(
+        r"(?m)(?:^|>)([a-z][a-z0-9_]*)\s*\([^\r\n]*?\)\s*->",
+        outside_document,
+    )
+    if any(
+        re.search(r"(?i)basic|attested|conformance|release", name)
+        for name in outside_callable_names
+    ):
+        errors.append("conformance declaration outside module")
+    for owners in CONFORMANCE_OWNER_INVENTORY.values():
+        for owner in owners:
+            definitions = re.findall(
+                rf"(?m)(?:^|>){re.escape(owner)}\s*(?::=|:)", document_text
+            )
+            if len(definitions) != 1:
+                errors.append(
+                    f"global conformance owner uniqueness mismatch: {owner}"
+                )
+    unknown_profile_declarations = re.findall(
+        r"(?m)(?:^|>)([A-Z][A-Za-z0-9_]*Conformance)\s*(?::=|:)",
+        document_text,
+    )
+    if unknown_profile_declarations:
+        errors.append("closed conformance profile declaration set mismatch")
+    profile_union_definitions = re.findall(
+        r"(?m)(?:^|>)([A-Z][A-Za-z0-9_]*Profile)\s*:=", document_text
+    )
+    conformance_profile_aliases = re.findall(
+        r"(?m)(?:^|>)([A-Z][A-Za-z0-9_]*)[ \t]*:=[ \t]*[^\r\n]*"
+        r"(?:ConformanceDeploymentProfile|BasicOfflineConformance|"
+        r"AttestedReleaseConformance)",
+        document_text,
+    )
+    if (
+        profile_union_definitions != ["ConformanceDeploymentProfile"]
+        or conformance_profile_aliases
+        or document_text.count("ConformanceDeploymentProfile :=") != 1
+        or document_text.count(
+            "default_conformance_deployment_profile := BasicOfflineConformance"
+        )
+        != 1
+    ):
+        errors.append("closed conformance profile definition inventory mismatch")
+
+    deployment = local.get(("scope", "deployment"), "")
+    union_match = re.search(
+        r"ConformanceDeploymentProfile\s*:=\s*(.*?)\s*"
+        r"default_conformance_deployment_profile\s*:=",
+        deployment,
+    )
+    exact_union_body = re.compile(
+        r"BasicOfflineConformance\s*\|\s*AttestedReleaseConformance\s*\{\s*"
+        r"conformance_trust_root:\s*ConformanceTrustRootCapability\s*"
+        r"release_trust_root:\s*ReleaseApprovalTrustRootCapability\s*\}"
+    )
+    if union_match is None or exact_union_body.fullmatch(union_match.group(1)) is None:
+        errors.append("conformance deployment profile union must have exact two arms")
+    for token in (
+        "default_conformance_deployment_profile := BasicOfflineConformance",
+        "non-serializable",
+        "owns no digest",
+        "never a RequestSnapshot field",
+        "without both protected capabilities -> InternalContractViolation",
+        "never silently downgrade",
+    ):
+        if token not in deployment:
+            errors.append(f"conformance deployment profile missing contract: {token}")
+    if re.search(r"\bDisabled\b|Optional\s*<|None\s*\|", deployment):
+        errors.append("conformance deployment profile must not add disabled/nullable arms")
+
+    shared = local.get(("scope", "shared"), "")
+    whole_local = " ".join(local.values())
+    for type_name in CONFORMANCE_SHARED_TYPES:
+        definition = f"{type_name}:"
+        if shared.count(definition) != 1 or whole_local.count(definition) != 1:
+            errors.append(f"conformance shared type must have one shared owner: {type_name}")
+    heavy_owners = CONFORMANCE_OWNER_INVENTORY[("profile", "attested-release")]
+    if re.search(r"\b(?:BasicOffline|AttestedConformance)\w*", shared) or any(
+        re.search(rf"\b{re.escape(owner)}\b", shared) for owner in heavy_owners
+    ):
+        errors.append("conformance shared block references a profile-specific type")
+    for token in (
+        "derive_conformance_findings_and_verdict(",
+        "deterministic finding/verdict rules:",
+        "observed_clause_outputs: OrderedMap<FixtureRef, ObservedClauseOutput>",
+    ):
+        if shared.count(token) != 1 or whole_local.count(token) < 1:
+            errors.append(f"conformance shared block missing single authority: {token}")
+
+    basic = local.get(("profile", "basic-offline"), "")
+    raw_basic = raw_local.get(("profile", "basic-offline"), "")
+    for type_name in CONFORMANCE_BASIC_TYPES:
+        if f"{type_name}:" not in basic and f"{type_name} :=" not in basic:
+            errors.append(f"basic-offline block missing concrete type: {type_name}")
+    for token in (
+        'profile_schema_id := "basic-offline/v1"',
+        'hash("basic-offline-authority/v1",',
+        'hash("basic-offline-record/v1",',
+        'hash("basic-offline-ledger/v1",',
+        'hash("basic-offline-report/v1",',
+        'hash("basic-offline-report-artifact/v1",',
+        "run_basic_offline_conformance( authority: BasicOfflineConformanceAuthority ) -> BasicOfflineRunResult",
+        "offline_verdict: pass | fail | insufficient",
+        "identity/integrity only, not runner authenticity",
+    ):
+        if token not in basic:
+            errors.append(f"basic-offline block missing contract: {token}")
+    if basic.count('profile_schema_id := "basic-offline/v1"') != 5:
+        errors.append("basic-offline every digest-owning concrete schema must bind profile_schema_id")
+    for forbidden_pattern in CONFORMANCE_BASIC_FORBIDDEN:
+        if re.search(forbidden_pattern, basic, re.IGNORECASE):
+            errors.append(
+                "basic-offline block contains attested/release token: "
+                f"{forbidden_pattern}"
+            )
+    if any(re.search(rf"\b{re.escape(owner)}\b", basic) for owner in heavy_owners):
+        errors.append("basic-offline block references an Attested owner")
+    basic_result = re.search(
+        r"BasicOfflineRunResult\s*:=\s*(.*?)\s*public exported ports \(exact\):",
+        basic,
+    )
+    if (
+        basic_result is None
+        or basic_result.group(1)
+        != "Completed { artifact: BasicOfflineReportArtifact } | InternalViolation { violation: InternalContractViolation }"
+    ):
+        errors.append("BasicOfflineRunResult exact two-arm union mismatch")
+    basic_content_exclusions = {
+        owner
+        for owner, _ in DERIVED_DIGEST_EXCLUSIONS
+        if owner.startswith("BasicOffline")
+    }
+    basic_content_boundary = (
+        "Basic 五种 content-addressed payload 的 own digest 只使用 "
+        "basic-offline/v1 schema 与各自 basic-offline-*/v1 hash domain；"
+        "BasicOfflineRunResult 是无 own digest、无 profile_schema_id field 的 "
+        "transport union"
+    )
+    if not (
+        basic.count(basic_content_boundary) == 1
+        and basic_result is not None
+        and basic_result.group(1)
+        == "Completed { artifact: BasicOfflineReportArtifact } | InternalViolation { violation: InternalContractViolation }"
+        and basic.count('profile_schema_id := "basic-offline/v1"') == 5
+        and basic_content_exclusions == set(CONFORMANCE_BASIC_CONTENT_TYPES)
+        and "BasicOfflineRunResult" not in basic_content_exclusions
+    ):
+        errors.append(
+            "Basic content-addressed payload and transport result boundary mismatch"
+        )
+    basic_algorithm_match = re.search(
+        r"(?ms)^run_basic_offline_conformance equations:[ \t]*$\n"
+        r"(?P<body>.*?"
+        r"^  return Completed iff every Basic closure equation holds; otherwise InternalViolation[ \t]*$)",
+        raw_basic,
+    )
+    raw_basic_algorithm = (
+        basic_algorithm_match.group("body") if basic_algorithm_match else ""
+    )
+    basic_algorithm = _normalize_contract_text([raw_basic_algorithm])
+    basic_algorithm_lines = tuple(
+        line.rstrip()
+        for line in raw_basic_algorithm.splitlines()
+        if line.strip()
+    )
+    if basic_algorithm_lines != CONFORMANCE_BASIC_ALGORITHM_LINES:
+        errors.append("conformance basic closed control grammar mismatch")
+    for token in CONFORMANCE_BASIC_CLOSURE_RULES:
+        statement_head = token
+        if "hash(" in token and ", " in token:
+            statement_head = token.split(", ", 1)[0] + ","
+        canonical_statement_count = len(
+            re.findall(
+                rf"(?m)^[ \t]*{re.escape(statement_head)}", raw_basic_algorithm
+            )
+        )
+        if token not in basic_algorithm or canonical_statement_count != 1:
+            errors.append(
+                f"module-contract conformance basic closure missing: {token}"
+            )
+
+    attested = local.get(("profile", "attested-release"), "")
+    raw_attested = raw_local.get(("profile", "attested-release"), "")
+    for token in CONFORMANCE_ATTESTED_REQUIRED:
+        if token not in attested:
+            errors.append(f"attested-release block missing contract: {token}")
+    for owner, next_owner in (
+        ("AttestedConformanceInvocationAuthority", "RunnerAttestation"),
+        ("AttestedConformanceReport", "ReleasePolicy"),
+        ("AttestedConformanceSealArtifact", "AttestedConformanceRunResult"),
+    ):
+        owner_schema = re.search(
+            rf"{owner}:\s*(.*?)\s*{next_owner}(?::|\s*:=)",
+            attested,
+        )
+        if (
+            owner_schema is None
+            or owner_schema.group(1).count(
+                'profile_schema_id := "attested-release/v1"'
+            )
+            != 1
+        ):
+            errors.append(
+                f"attested {owner} schema must bind profile_schema_id exactly once"
+            )
+    if (
+        _task9_exact_owner_fields(
+            raw_attested, "AttestedConformanceInvocationAuthority"
+        )
+        != CONFORMANCE_ATTESTED_AUTHORITY_FIELDS
+    ):
+        errors.append("AttestedConformanceInvocationAuthority exact schema mismatch")
+    if (
+        _task9_exact_owner_fields(raw_attested, "ReleaseApprovalAuthority")
+        != CONFORMANCE_RELEASE_APPROVAL_AUTHORITY_FIELDS
+    ):
+        errors.append("ReleaseApprovalAuthority exact schema mismatch")
+    release_approval_authority_schema = _normalize_contract_text(
+        [_task9_owner_block(raw_attested, "ReleaseApprovalAuthority") or ""]
+    )
+    expected_release_schema_signed_message = (
+        "signed_message := canonical_tuple( "
+        "approved.release_policy_digest, "
+        "store_snapshot.release_approval_store_snapshot_digest, "
+        "trusted_approver_key_id, approval_signature_scheme, canonical(approved))"
+    )
+    if (
+        release_approval_authority_schema.count(
+            expected_release_schema_signed_message
+        )
+        != 1
+    ):
+        errors.append("release approval signed-message approved binding mismatch")
+    if (
+        _task9_exact_owner_fields(raw_attested, "AttestedConformanceSealArtifact")
+        != CONFORMANCE_ATTESTED_SEAL_ARTIFACT_FIELDS
+    ):
+        errors.append("AttestedConformanceSealArtifact exact schema mismatch")
+    if re.search(
+        r"(?:ConformanceArtifact|BasicOfflineReportArtifact)\s*[,)]\s*"
+        r"approval:",
+        attested,
+    ):
+        errors.append("apply_release_policy accepts a Basic/common artifact")
+    approved_match = re.search(
+        r"ApprovedDigestSet:\s*(.*?)\s*ReleaseApprovalStoreSnapshot:",
+        attested,
+    )
+    expected_approved_fields = [
+        "subject_digest",
+        "fixture_set_digest",
+        "validation_policy_digest",
+        "gate_manifest_digest",
+        "verifier_runner_digest",
+        "runner_attestation_digest",
+        "conformance_execution_ledger_digest",
+        "conformance_report_digest",
+        "conformance_seal_artifact_digest",
+        "release_policy_digest",
+    ]
+    approved_raw = re.search(
+        r"(?ms)^ApprovedDigestSet:\s*$\n(?P<body>.*?)"
+        r"^ReleaseApprovalStoreSnapshot:\s*$",
+        raw_local.get(("profile", "attested-release"), ""),
+    )
+    approved_fields = [
+        line.strip()
+        for line in (approved_raw.group("body") if approved_raw else "").splitlines()
+        if line.strip()
+    ]
+    if approved_fields != expected_approved_fields:
+        errors.append("Attested ApprovedDigestSet exact ten-field schema mismatch")
+
+    authority_assignments = _task9_owner_assignments(
+        raw_attested, "AttestedConformanceInvocationAuthority"
+    )
+    authority_validator = re.search(
+        r"validate_and_seal_attested_conformance first operation:\s*"
+        r"(?P<body>.*?)\s*validate_and_seal_attested_conformance equations after first operation:",
+        attested,
+    )
+    expected_authority_assignments = (
+        ("profile_schema_id", '"attested-release/v1"'),
+        (
+            "conformance_invocation_digest",
+            'hash("attested-conformance-authority/v1", '
+            "canonical_payload_without_derived_digests("
+            "AttestedConformanceInvocationAuthority))",
+        ),
+    )
+    validator_authority_hashes = re.findall(
+        r'hash\("([^"]+)",\s*canonical_payload_without_derived_digests\('
+        r"(authority)\)\)",
+        authority_validator.group("body") if authority_validator else "",
+    )
+    if authority_assignments != expected_authority_assignments or validator_authority_hashes != [
+        ("attested-conformance-authority/v1", "authority")
+    ]:
+        errors.append("Attested authority schema/validator domain equality mismatch")
+    record_assignments = _task9_owner_assignments(
+        raw_attested, "AttestedConformanceExecutionRecord"
+    )
+    attested_algorithms = attested[
+        attested.find("run_attested_release_conformance equations:") :
+    ]
+    expected_record_assignments = (
+        (
+            "evaluation_input_digest",
+            'hash("attested-conformance-record-input/v1", '
+            "authority.conformance_invocation_digest, "
+            "session.measured_execution_environment_digest, canonical(binding), "
+            "binding.fixture_binding_digest)",
+        ),
+        (
+            "conformance_execution_record_digest",
+            'hash("attested-conformance-record/v1", '
+            "canonical_payload_without_derived_digests("
+            "AttestedConformanceExecutionRecord))",
+        ),
+    )
+    record_algorithm_hashes = re.findall(
+        r'evaluation_input_digest := hash\("([^"]+)",\s*'
+        r"(authority\.conformance_invocation_digest, "
+        r"session\.measured_execution_environment_digest, canonical\(binding\), "
+        r"binding\.fixture_binding_digest)\)",
+        attested_algorithms,
+    )
+    expected_record_hash = (
+        "attested-conformance-record-input/v1",
+        "authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest",
+    )
+    if record_assignments != expected_record_assignments or record_algorithm_hashes != [
+        expected_record_hash,
+        expected_record_hash,
+    ]:
+        errors.append("Attested record-input three-site normalized equality mismatch")
+
+    authority_accesses = set(
+        re.findall(r"(?<![A-Za-z0-9_.])authority\.([a-z][a-z0-9_]*)", attested)
+    )
+    if not authority_accesses.issubset(CONFORMANCE_ATTESTED_AUTHORITY_FIELDS):
+        errors.append("caller-owned Attested trust fallback is forbidden")
+    approval_authority_accesses = set(
+        re.findall(r"\bapproval_authority\.([a-z][a-z0-9_]*)", attested)
+    )
+    if not approval_authority_accesses.issubset(
+        CONFORMANCE_RELEASE_APPROVAL_AUTHORITY_FIELDS
+    ):
+        errors.append("caller-owned release approval key fallback is forbidden")
+    approval_accesses = set(re.findall(r"\bapproval\.([a-z][a-z0-9_]*)", attested))
+    if not approval_accesses.issubset(
+        {"authority", "signature", "release_approval_artifact_digest"}
+    ):
+        errors.append("caller-owned release approval key fallback is forbidden")
+    if (
+        attested.count(
+            "trusted_key_material := store.trusted_key_material_by_id[policy.trusted_attestation_key_id]"
+        )
+        != 2
+        or len(re.findall(r"\btrusted_key_material\s*:=", attested)) != 2
+    ):
+        errors.append("caller-owned Attested trust fallback is forbidden")
+    if (
+        attested.count(
+            "trusted_approver_public_key_material := root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]"
+        )
+        != 1
+        or len(
+            re.findall(r"\btrusted_approver_public_key_material\s*:=", attested)
+        )
+        != 1
+    ):
+        errors.append("caller-owned release approval key fallback is forbidden")
+
+    security_source_counts = {
+        "trust_root := profile.conformance_trust_root": 1,
+        "conformance_trust_root := profile.conformance_trust_root": 1,
+        "release_trust_root := profile.release_trust_root": 1,
+        "(store, policy) := resolve_conformance_trust_root(trust_root)": 3,
+        "(current_conformance_store, current_conformance_policy) := resolve_conformance_trust_root(conformance_trust_root)": 1,
+        "root := resolve_release_approval_trust_root(release_trust_root)": 1,
+        "session := validate_and_consume_measurement_envelope(": 1,
+        "measured_environment := session.measured_environment": 1,
+    }
+    security_assignment_counts = {
+        r"(?<![A-Za-z0-9_])trust_root\s*:=": 1,
+        r"(?<![A-Za-z0-9_])conformance_trust_root\s*:=": 1,
+        r"(?<![A-Za-z0-9_])release_trust_root\s*:=": 1,
+        r"(?<![A-Za-z0-9_])root\s*:=": 1,
+        r"(?<![A-Za-z0-9_])session\s*:=": 1,
+        r"(?<![A-Za-z0-9_])measured_environment\s*:=": 1,
+        r"(?<![A-Za-z0-9_])store\s*:=": 0,
+        r"(?<![A-Za-z0-9_])policy\s*:=": 0,
+    }
+    security_sources_valid = all(
+        len(re.findall(rf"(?<![A-Za-z0-9_]){re.escape(token)}", attested))
+        == count
+        for token, count in security_source_counts.items()
+    ) and all(
+        len(re.findall(pattern, attested)) == count
+        for pattern, count in security_assignment_counts.items()
+    )
+    if security_sources_valid:
+        trust_root_position = attested.index(
+            "trust_root := profile.conformance_trust_root"
+        )
+        store_positions = [
+            match.start()
+            for match in re.finditer(
+                re.escape(
+                    "(store, policy) := resolve_conformance_trust_root(trust_root)"
+                ),
+                attested,
+            )
+        ]
+        session_position = attested.index(
+            "session := validate_and_consume_measurement_envelope("
+        )
+        measured_position = attested.index(
+            "measured_environment := session.measured_environment"
+        )
+        release_root_position = attested.index(
+            "release_trust_root := profile.release_trust_root"
+        )
+        conformance_release_root_position = attested.index(
+            "conformance_trust_root := profile.conformance_trust_root"
+        )
+        conformance_release_resolve_position = attested.index(
+            "(current_conformance_store, current_conformance_policy) := "
+            "resolve_conformance_trust_root(conformance_trust_root)"
+        )
+        root_position = attested.index(
+            "root := resolve_release_approval_trust_root(release_trust_root)"
+        )
+        security_sources_valid = (
+            all(trust_root_position < position for position in store_positions)
+            and store_positions[0] < session_position < measured_position
+            and conformance_release_root_position
+            < conformance_release_resolve_position
+            < root_position
+            and release_root_position < root_position
+        )
+    if not security_sources_valid:
+        errors.append("Attested security variable source/dominance mismatch")
+
+    run_algorithm_match = re.search(
+        r"(?ms)^run_attested_release_conformance equations:\s*$\n"
+        r"(?P<body>.*?)"
+        r"(?=^validate_and_consume_measurement_envelope equations, in this exact order)",
+        raw_attested,
+    )
+    run_algorithm = _normalize_contract_text(
+        [run_algorithm_match.group("body") if run_algorithm_match else ""]
+    )
+    run_root_flow_tokens = (
+        "trust_root := profile.conformance_trust_root",
+        "(store, policy) := resolve_conformance_trust_root(trust_root)",
+        "session := validate_and_consume_measurement_envelope( authority, runner, trust_root, measured_environment)",
+        "return validate_and_seal_attested_conformance( authority, trust_root, session, observed, ledger, attestation)",
+    )
+    if not (
+        run_algorithm_match is not None
+        and all(run_algorithm.count(token) == 1 for token in run_root_flow_tokens)
+        and [run_algorithm.index(token) for token in run_root_flow_tokens]
+        == sorted(run_algorithm.index(token) for token in run_root_flow_tokens)
+        and "profile.release_trust_root" not in run_algorithm
+    ):
+        errors.append("Attested conformance root source-to-sink flow mismatch")
+
+    release_result = re.search(
+        r"ReleasePolicyApplicationResult\s*:=\s*(.*?)\s*"
+        r"AttestedConformanceReport\.findings:",
+        attested,
+    )
+    if (
+        release_result is None
+        or release_result.group(1)
+        != "Completed { decision: ReleaseDecision } | InternalViolation { violation: InternalContractViolation }"
+    ):
+        errors.append("ReleasePolicyApplicationResult exact two-arm union mismatch")
+
+    attested_result = re.search(
+        r"AttestedConformanceRunResult\s*:=\s*(.*?)\s*ReleaseBlockReason\s*:=",
+        attested,
+    )
+    if (
+        attested_result is None
+        or attested_result.group(1)
+        != "Completed { artifact: AttestedConformanceSealArtifact } | InternalViolation { violation: InternalContractViolation }"
+    ):
+        errors.append("AttestedConformanceRunResult exact two-arm union mismatch")
+    release_decision = re.search(
+        r"ReleaseDecision\s*:=\s*(.*?)\s*ReleasePolicyApplicationResult\s*:=",
+        attested,
+    )
+    if (
+        release_decision is None
+        or release_decision.group(1)
+        != "ReleaseAllowed { subject_digest, approved: ApprovedDigestSet } | ReleaseBlocked { subject_digest, reasons: NonEmpty<ReleaseBlockReason> }"
+    ):
+        errors.append("ReleaseDecision exact two-arm union mismatch")
+
+    basic_public = re.search(
+        r"public exported ports \(exact\):\s*(.*?)\s*"
+        r"run_basic_offline_conformance equations:",
+        basic,
+    )
+    expected_basic_public = (
+        "run_basic_offline_conformance( authority: "
+        "BasicOfflineConformanceAuthority ) -> BasicOfflineRunResult"
+    )
+    attested_public = re.search(
+        r"public exported ports \(exact\):\s*(.*?)\s*"
+        r"internal non-exported ports:",
+        attested,
+    )
+    expected_attested_public = (
+        "run_attested_release_conformance( authority: "
+        "AttestedConformanceInvocationAuthority, profile: "
+        "AttestedReleaseConformance, measured_environment: "
+        "MeasuredExecutionEnvironment ) -> AttestedConformanceRunResult "
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, "
+        "approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: "
+        "AttestedReleaseConformance ) -> ReleasePolicyApplicationResult"
+    )
+    if (
+        basic_public is None
+        or basic_public.group(1) != expected_basic_public
+        or attested_public is None
+        or attested_public.group(1) != expected_attested_public
+    ):
+        errors.append("conformance exact three public conformance ports mismatch")
+    for public_signature in (
+        expected_basic_public,
+        "run_attested_release_conformance( authority: "
+        "AttestedConformanceInvocationAuthority, profile: "
+        "AttestedReleaseConformance, measured_environment: "
+        "MeasuredExecutionEnvironment ) -> AttestedConformanceRunResult",
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, "
+        "approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: "
+        "AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+    ):
+        if normalized_document.count(public_signature) != 1:
+            errors.append("whole conformance exported port inventory mismatch")
+
+    internal_ports = re.search(
+        r"internal non-exported ports:\s*(.*?)\s*"
+        r"derive_approved_digest_set fields:",
+        attested,
+    )
+    internal_names = re.findall(
+        r"\b([a-z][a-z0-9_]*)\(.*?\)\s*->",
+        internal_ports.group(1) if internal_ports else "",
+    )
+    if internal_names != [
+        "validate_and_seal_attested_conformance",
+        "validate_and_consume_measurement_envelope",
+        "derive_attested_conformance_report",
+        "derive_approved_digest_set",
+    ]:
+        errors.append("conformance internal non-exported port inventory mismatch")
+
+    apply_signature = (
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, "
+        "approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: "
+        "AttestedReleaseConformance ) -> ReleasePolicyApplicationResult"
+    )
+    if (whole_local + " " + outside_local).count(apply_signature) != 1:
+        errors.append("conformance unique exact Attested apply_release_policy mismatch")
+
+    membership_counts = {
+        "require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation": 2,
+        "if subject_digest not in approval_authority.store_snapshot.approved_by_subject: return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }": 1,
+        "require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation": 1,
+    }
+    if any(attested.count(token) != count for token, count in membership_counts.items()):
+        errors.append("conformance map lookup membership closure mismatch")
+
+    attestation_membership = (
+        "require policy.trusted_attestation_key_id in "
+        "store.trusted_key_material_by_id; otherwise InternalViolation"
+    )
+    attestation_lookup = (
+        "trusted_key_material := "
+        "store.trusted_key_material_by_id[policy.trusted_attestation_key_id]"
+    )
+    approval_key_membership = (
+        "require policy.trusted_approver_key_id in "
+        "root.trusted_approver_public_key_material_by_id; otherwise InternalViolation"
+    )
+    approval_key_lookup = (
+        "trusted_approver_public_key_material := "
+        "root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]"
+    )
+    approval_subject_membership = (
+        "if subject_digest not in "
+        "approval_authority.store_snapshot.approved_by_subject:"
+    )
+    approval_subject_lookup = (
+        "require approval_authority.store_snapshot."
+        "approved_by_subject[subject_digest] == approved"
+    )
+
+    def token_positions(token: str) -> list[int]:
+        return [match.start() for match in re.finditer(re.escape(token), attested)]
+
+    attestation_memberships = token_positions(attestation_membership)
+    attestation_lookups = token_positions(attestation_lookup)
+    approval_key_memberships = token_positions(approval_key_membership)
+    approval_key_lookups = token_positions(approval_key_lookup)
+    approval_subject_memberships = token_positions(approval_subject_membership)
+    approval_subject_lookups = token_positions(approval_subject_lookup)
+    if not (
+        len(attestation_memberships) == len(attestation_lookups) == 2
+        and all(
+            membership < lookup
+            for membership, lookup in zip(
+                attestation_memberships, attestation_lookups, strict=True
+            )
+        )
+        and len(approval_key_memberships) == len(approval_key_lookups) == 1
+        and approval_key_memberships[0] < approval_key_lookups[0]
+        and len(approval_subject_memberships) == len(approval_subject_lookups) == 1
+        and approval_subject_memberships[0] < approval_subject_lookups[0]
+    ):
+        errors.append("map lookup membership dominance mismatch")
+    approval_missing_branch = (
+        "if subject_digest not in approval_authority.store_snapshot.approved_by_subject: "
+        "return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }"
+    )
+    if attested.count(approval_missing_branch) != 1 or re.search(
+        r"if subject_digest not in approval_authority\.store_snapshot\.approved_by_subject:.*?ReleaseAllowed",
+        attested,
+    ):
+        errors.append("ApprovalMissing unique blocked branch mismatch")
+
+    raw_apply_match = re.search(
+        r"(?ms)^apply_release_policy first operation:\s*$\n"
+        r"(?P<body>.*?)"
+        r"(?=^  any failed recomputation, root, scheme, key-membership or signature equation)",
+        raw_attested,
+    )
+    raw_apply = raw_apply_match.group("body") if raw_apply_match else ""
+    apply_algorithm = _normalize_contract_text([raw_apply])
+    apply_after_marker = "apply_release_policy equations after first operation:"
+    apply_after_index = raw_apply.find(apply_after_marker)
+    raw_apply_first_operation = (
+        raw_apply[:apply_after_index] if apply_after_index >= 0 else ""
+    )
+    apply_first_operation_lines = tuple(
+        line.rstrip()
+        for line in raw_apply_first_operation.splitlines()
+        if line.strip()
+    )
+    apply_lines = tuple(
+        line.rstrip() for line in raw_apply.splitlines() if line.strip()
+    )
+    independent_recomputation_tokens = (
+        "require canonical(approved) == canonical(approval_authority.approved)",
+        "require derived_approved == derive_approved_digest_set(artifact, policy)",
+        "require every stored nested digest equals its own enclosing payload recomputation; no approved/derived cross-equality",
+    )
+    late_approved_equality = (
+        "require all ten ApprovedDigestSet fields are byte-equal only on this "
+        "authenticated empty-diff path"
+    )
+    independent_recomputation_valid = (
+        apply_after_index >= 0
+        and apply_first_operation_lines
+        == CONFORMANCE_RELEASE_FIRST_OPERATION_LINES
+        and all(
+            _normalize_contract_text([raw_apply_first_operation]).count(token) == 1
+            for token in independent_recomputation_tokens
+        )
+        and re.search(
+            r"(?im)^[ \t]*require .*every one of the ten ApprovedDigestSet fields "
+            r"equals the recomputed value above[ \t]*$",
+            raw_apply_first_operation,
+        )
+        is None
+        and apply_algorithm.count(late_approved_equality) == 1
+    )
+    if not independent_recomputation_valid:
+        errors.append("release approval independent recomputation boundary mismatch")
+
+    expected_apply_signed_message = (
+        "release_approval_signed_message := canonical_tuple( "
+        "root.expected_release_policy_digest, "
+        "root.expected_release_approval_store_snapshot_digest, "
+        "policy.trusted_approver_key_id, policy.approval_signature_scheme, "
+        "canonical(approved))"
+    )
+    current_closure_start_line = (
+        "  require current_conformance_store.key_registry_digest =="
+    )
+    current_closure_end_line = (
+        "          artifact.execution_ledger.observed_output.findings"
+    )
+    expected_current_closure_start = CONFORMANCE_RELEASE_AFTER_OPERATION_LINES.index(
+        current_closure_start_line
+    )
+    expected_current_closure_end = CONFORMANCE_RELEASE_AFTER_OPERATION_LINES.index(
+        current_closure_end_line
+    )
+    expected_current_closure_lines = CONFORMANCE_RELEASE_AFTER_OPERATION_LINES[
+        expected_current_closure_start : expected_current_closure_end + 1
+    ]
+    raw_current_closure_match = re.search(
+        r"(?ms)^  require current_conformance_store\.key_registry_digest ==\s*$\n"
+        r"(?P<body>.*?)"
+        r"(?=^  require current_conformance_policy\.trusted_attestation_key_id in\s*$)",
+        raw_apply,
+    )
+    actual_current_closure_lines = tuple(
+        line.rstrip()
+        for line in (
+            (current_closure_start_line + "\n" + raw_current_closure_match.group("body"))
+            if raw_current_closure_match
+            else ""
+        ).splitlines()
+        if line.strip()
+    )
+    if actual_current_closure_lines != expected_current_closure_lines:
+        errors.append("release current conformance closure mismatch")
+
+    current_conformance_root_tokens = (
+        "conformance_trust_root := profile.conformance_trust_root",
+        "(current_conformance_store, current_conformance_policy) := "
+        "resolve_conformance_trust_root(conformance_trust_root)",
+        "require current_conformance_policy.trusted_attestation_key_id in "
+        "current_conformance_store.trusted_key_material_by_id; otherwise "
+        "InternalViolation",
+        "current_conformance_trusted_key_material := "
+        "current_conformance_store.trusted_key_material_by_id[ "
+        "current_conformance_policy.trusted_attestation_key_id]",
+        "require verify_measurer_identity_and_freshness_evidence( "
+        "conformance_trust_root.measurement_session_authority, "
+        "current_measurement_evidence_message, artifact.measured_environment."
+        "measurer_identity_and_freshness_evidence)",
+        "require conformance_trust_root.measurement_session_authority."
+        "has_terminal_consumption_receipt( terminal_consumption_receipt_key("
+        "artifact.measured_environment))",
+        "current_conformance_signed_message := canonical_tuple( "
+        "artifact.runner_attestation.measured_execution_environment_digest, "
+        "artifact.runner_attestation.executable_artifact_digest, artifact."
+        "runner_attestation.trusted_attestation_key_id, artifact.runner_attestation."
+        "attestation_signature_scheme, artifact.runner_attestation."
+        "conformance_invocation_digest, artifact.runner_attestation."
+        "observed_output_digest, artifact.runner_attestation.verifier_runner_digest)",
+        "require verify_signature(current_conformance_trusted_key_material, "
+        "current_conformance_policy.attestation_signature_scheme, "
+        "current_conformance_signed_message, artifact.runner_attestation.signature)",
+        "reverify sealed runner attestation under current profile root without "
+        "consuming a measurement session or nonce",
+    )
+    current_conformance_positions = [
+        apply_algorithm.find(token) for token in current_conformance_root_tokens
+    ]
+    if not (
+        all(position >= 0 for position in current_conformance_positions)
+        and current_conformance_positions == sorted(current_conformance_positions)
+        and len(set(current_conformance_positions))
+        == len(current_conformance_positions)
+        and all(
+            apply_algorithm.count(token) == 1
+            for token in current_conformance_root_tokens
+        )
+    ):
+        errors.append("release current conformance root revalidation mismatch")
+    receipt_formula_tokens = (
+        "terminal_consumption_receipt_key( environment: MeasuredExecutionEnvironment ) := "
+        "canonical_tuple( environment.verifier_nonce, environment.conformance_invocation_digest, "
+        "environment.verifier_runner_digest, environment.executable_artifact_digest, "
+        "environment.execution_session_id, environment.process_identity, "
+        "environment.container_identity, environment.execution_time_window, "
+        "environment.measured_execution_environment_digest)",
+        "terminal_consumption_receipt_key_value := "
+        "terminal_consumption_receipt_key(measured_environment)",
+        "atomically consumed exactly once while persisting a terminal receipt under that exact key",
+        "session.nonce_consumption_receipt proves the terminal registry contains exact "
+        "terminal_consumption_receipt_key(measured_environment)",
+        "has_terminal_consumption_receipt( terminal_consumption_receipt_key("
+        "artifact.measured_environment))",
+    )
+    receipt_positions = [attested.find(token) for token in receipt_formula_tokens]
+    if not (
+        all(position >= 0 for position in receipt_positions)
+        and receipt_positions == sorted(receipt_positions)
+        and all(attested.count(token) == 1 for token in receipt_formula_tokens)
+    ):
+        errors.append("terminal receipt production/seal/query closure mismatch")
+    apply_tokens = (
+        current_conformance_root_tokens[0],
+        "release_trust_root := profile.release_trust_root",
+        "derived_approved := derive_approved_digest_set(artifact, policy)",
+        "approved_mismatches := canonical_schema_path_diff(approved, derived_approved)",
+        *independent_recomputation_tokens,
+        apply_after_marker,
+        *current_conformance_root_tokens[1:],
+        "root := resolve_release_approval_trust_root(release_trust_root)",
+        approval_subject_membership,
+        approval_subject_lookup,
+        approval_key_membership,
+        approval_key_lookup,
+        expected_apply_signed_message,
+        "require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)",
+        "if approved_mismatches is NonEmpty:",
+        "require approved == derived_approved",
+        late_approved_equality,
+        "decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields",
+        "return Completed { decision }",
+    )
+    apply_positions = [apply_algorithm.find(token) for token in apply_tokens]
+    exact_mismatch_guard = re.findall(
+        r"(?m)^  if approved_mismatches is NonEmpty:[ \t]*$", raw_apply
+    )
+    exact_mismatch_return = re.findall(
+        r"(?m)^    return Completed \{ decision: ReleaseBlocked \{ subject_digest, reasons:[ \t]*$\n"
+        r"^      map\(approved_mismatches, path -> ApprovedDigestMismatch\(path\)\) \} \}[ \t]*$",
+        raw_apply,
+    )
+    exact_missing_branch = re.findall(
+        r"(?m)^  if subject_digest not in approval_authority\.store_snapshot\.approved_by_subject:[ \t]*$\n"
+        r"^    return Completed \{ decision: ReleaseBlocked \{ subject_digest, reasons: \{ApprovalMissing\} \} \}[ \t]*$",
+        raw_apply,
+    )
+    actual_return_statements = tuple(
+        line.strip()
+        for line in raw_apply.splitlines()
+        if re.match(r"^[ \t]+return\b", line)
+    )
+    expected_return_statements = (
+        "return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }",
+        "return Completed { decision: ReleaseBlocked { subject_digest, reasons:",
+        "return Completed { decision }",
+    )
+    signature_to_mismatch_is_closed = re.search(
+        r"(?m)^  verify release approval signature only with external-root public key material[ \t]*$\n"
+        r"^  if approved_mismatches is NonEmpty:[ \t]*$",
+        raw_apply,
+    ) is not None
+    release_control_valid = (
+        raw_apply_match is not None
+        and all(position >= 0 for position in apply_positions)
+        and apply_positions == sorted(apply_positions)
+        and len(set(apply_positions)) == len(apply_positions)
+        and len(exact_mismatch_guard) == 1
+        and len(exact_mismatch_return) == 1
+        and len(exact_missing_branch) == 1
+        and apply_lines == CONFORMANCE_RELEASE_APPLY_LINES
+        and actual_return_statements == expected_return_statements
+        and signature_to_mismatch_is_closed
+        and "ReleaseAllowed" not in apply_algorithm
+        and apply_algorithm.count(
+            "decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields"
+        )
+        == 1
+        and apply_algorithm.count("return Completed { decision }") == 1
+    )
+    if not release_control_valid:
+        errors.append("release decision authenticated control-flow mismatch")
+    if apply_algorithm.count(expected_apply_signed_message) != 1:
+        errors.append("release approval signed-message approved binding mismatch")
+    if len(exact_mismatch_guard) != 1 or len(exact_mismatch_return) != 1:
+        errors.append("ApprovedDigestMismatch reachable blocked branch mismatch")
+
+    if any(
+        attested.count(rule) != 1 or outside_local.count(rule) != 0
+        for rule in CONFORMANCE_ATTESTED_SECURITY_RULES
+    ):
+        errors.append("Attested security rule inventory mismatch")
+
+    chapter_12_4 = _section_between(html, "c12-4", "c12-5")
+    chapter_12_4_text = _normalize_contract_text([unescape(chapter_12_4 or "")])
+    if chapter_12_4_text.count(
+        "apply_release_policy(..., profile: AttestedReleaseConformance) -> ReleasePolicyApplicationResult"
+    ) != 1:
+        errors.append("Chapter 12.4 release result wrapper mismatch")
+    if re.search(
+        r"(?:ConformanceArtifact\s*:=|BasicOfflineReportArtifact\s*->\s*"
+        r"AttestedConformanceSealArtifact)",
+        whole_local,
+    ):
+        errors.append("conformance profiles must not expose a common artifact or upgrade path")
+
+
+def check_conformance_trust_boundary(html: str, errors: list[str]) -> None:
+    local_text = _conformance_local_texts(html, []).get(
+        ("profile", "attested-release"), ""
+    )
 
     authority_match = re.search(
-        r"ConformanceInvocationAuthority:\s*(.*?)\s*RunnerAttestation:",
+        r"AttestedConformanceInvocationAuthority:\s*(.*?)\s*RunnerAttestation:",
         local_text,
         re.DOTALL,
     )
@@ -2059,12 +3946,12 @@ def check_conformance_trust_boundary(html: str, errors: list[str]) -> None:
         ):
             if forbidden_field in authority_schema:
                 errors.append(
-                    "ConformanceInvocationAuthority must hold only external-root refs: "
+                    "AttestedConformanceInvocationAuthority must hold only external-root refs: "
                     f"{forbidden_field}"
                 )
 
-    first_marker = "validate_and_seal_conformance first operation:"
-    after_marker = "validate_and_seal_conformance equations after first operation:"
+    first_marker = "validate_and_seal_attested_conformance first operation:"
+    after_marker = "validate_and_seal_attested_conformance equations after first operation:"
     first_index = local_text.find(first_marker)
     after_index = local_text.find(after_marker, first_index + 1)
     first_operation_tokens = (
@@ -2077,13 +3964,13 @@ def check_conformance_trust_boundary(html: str, errors: list[str]) -> None:
         "recompute authority.conformance_invocation_digest only after all nested recomputations",
     )
     if first_index < 0 or after_index < 0:
-        errors.append("validate_and_seal_conformance first-operation boundary is missing")
+        errors.append("validate_and_seal_attested_conformance first-operation boundary is missing")
     else:
         for token in first_operation_tokens:
             token_index = local_text.find(token, first_index, after_index)
             if token_index < 0:
                 errors.append(
-                    "validate_and_seal_conformance first operation missing nested "
+                    "validate_and_seal_attested_conformance first operation missing nested "
                     f"recomputation: {token}"
                 )
     if (
@@ -2096,15 +3983,18 @@ def check_conformance_trust_boundary(html: str, errors: list[str]) -> None:
 
 
 def check_conformance_report_findings(html: str, errors: list[str]) -> None:
+    attested = _conformance_local_texts(html, []).get(
+        ("profile", "attested-release"), ""
+    )
     exact_schema = re.compile(
-        r"ConformanceReport:\s*.*?"
+        r"AttestedConformanceReport:\s*.*?"
         r"verdict:\s*pass\s*\|\s*fail\s*\|\s*insufficient\s*"
-        r"findings:\s*OrderedMap&lt;FindingId,\s*ConformanceFinding&gt;",
+        r"findings:\s*OrderedMap<FindingId,\s*ConformanceFinding>",
         re.DOTALL,
     )
-    if exact_schema.search(html) is None:
+    if exact_schema.search(attested) is None:
         errors.append(
-            "ConformanceReport.findings 必须与 observed output 同型："
+            "AttestedConformanceReport.findings 必须与 observed output 同型："
             "OrderedMap<FindingId, ConformanceFinding>"
         )
 
@@ -2118,9 +4008,12 @@ def check_release_approved_digest_contract(html: str, errors: list[str]) -> None
                 f"{match.group(0)}"
             )
 
+    attested = _conformance_local_texts(html, []).get(
+        ("profile", "attested-release"), ""
+    )
     release_policy = re.search(
         r"ReleasePolicy:\s*.*?release_policy_digest\s*:=",
-        html,
+        attested,
         re.DOTALL,
     )
     if release_policy is None or not re.search(
@@ -2151,12 +4044,14 @@ def check_required(html: str, errors: list[str]) -> None:
             errors.append(f"缺少 v4.2 必需契约：{text}")
     check_derived_digest_exclusions(html, errors)
     check_product_gate_staging(html, errors)
+    check_conformance_deployment_profiles(html, errors)
     check_conformance_trust_boundary(html, errors)
     check_conformance_report_findings(html, errors)
     check_release_approved_digest_contract(html, errors)
     check_module_contracts(html, errors)
     check_task7_modeling_contracts(html, errors)
     check_task7_behavioral_contracts(html, errors)
+    check_task9_production_identity_isolation(html, errors)
 
 
 def check_forbidden(html: str, errors: list[str]) -> None:
@@ -2205,6 +4100,124 @@ def check_diagrams(html: str, errors: list[str]) -> None:
     if tuple(diagram_id for diagram_id, _ in figures) != TASK8_DIAGRAM_IDS:
         errors.append("Task8 authoritative diagram ID/order 不闭合")
     sources = dict(figures)
+    result_source = unescape(sources.get("result-gate-comparison", ""))
+    result_participants = re.findall(
+        r"(?m)^  participant ([A-Za-z][A-Za-z0-9_]*) as ([^\r\n]+)$",
+        result_source,
+    )
+    expected_result_participants = [
+        ("PB", "ProjectionBundleBuild"),
+        ("SA", "BackendResultSourceAuthority"),
+        ("BE", "Backend"),
+        ("VA", "BackendValueGateAuthority"),
+        ("GL", "GateManifest and GateExecutionLedger"),
+        ("RC", "BackendResultCandidate"),
+        ("BA", "BackendSealArtifact"),
+        ("ARM", "ComparisonArmAuthority"),
+        ("CS", "ComparisonSourceAuthority"),
+        ("CC", "ComparisonResultCandidate"),
+        ("CA", "ComparisonSealArtifact"),
+        ("BO", "Basic offline validator"),
+        ("AR", "Attested release validator"),
+    ]
+    result_profile_match = re.search(
+        r"(?ms)^  opt OfflineConformanceRequested[ \t]*$\n"
+        r"^    alt BasicOfflineConformance \(default\)[ \t]*$\n"
+        r"(?P<body>.*?)"
+        r"^    end[ \t]*$\n"
+        r"^  end[ \t]*$",
+        result_source,
+    )
+    result_profile_lines = [
+        line.rstrip()
+        for line in (
+            result_profile_match.group("body") if result_profile_match else ""
+        ).splitlines()
+        if line.strip()
+    ]
+    expected_result_profile_lines = [
+        "      BO->>GL: exact subject manifest fixtures policy and runner",
+        "      GL-->>BO: clause observations and GateExecutionLedger",
+        "      BO->>BO: construct BasicOfflineReportArtifact",
+        "    else AttestedReleaseConformance",
+        "      AR->>GL: same fixtures plus protected measured session",
+        "      GL-->>AR: clause observations and GateExecutionLedger",
+        "      AR->>AR: construct AttestedConformanceSealArtifact",
+        "      AR->>AR: apply_release_policy with current profile roots",
+    ]
+    result_sequence_lines = tuple(
+        line.rstrip()
+        for line in result_source.splitlines()
+        if line.strip() and not line.startswith("%%{init:")
+    )
+    expected_result_sequence_lines = (
+        "sequenceDiagram",
+        "  participant PB as ProjectionBundleBuild",
+        "  participant SA as BackendResultSourceAuthority",
+        "  participant BE as Backend",
+        "  participant VA as BackendValueGateAuthority",
+        "  participant GL as GateManifest and GateExecutionLedger",
+        "  participant RC as BackendResultCandidate",
+        "  participant BA as BackendSealArtifact",
+        "  participant ARM as ComparisonArmAuthority",
+        "  participant CS as ComparisonSourceAuthority",
+        "  participant CC as ComparisonResultCandidate",
+        "  participant CA as ComparisonSealArtifact",
+        "  participant BO as Basic offline validator",
+        "  participant AR as Attested release validator",
+        "  PB->>SA: exact ProjectionResult and projection ledger",
+        "  alt Ready",
+        "    SA->>BE: immutable Ready view",
+        "    BE-->>VA: EstimateCandidate and witness",
+        "  else Blocked or NotRequested",
+        "    SA->>VA: matching non-value branch",
+        "  end",
+        "  VA->>GL: exact backend-value clauses",
+        "  GL-->>VA: pre-seal ledger prefix",
+        "  VA->>RC: assemble bound branch",
+        "  Note right of RC: candidate remains internal until seal",
+        "  RC->>GL: result-seal clauses",
+        "  GL-->>BA: sealed ledger and BackendResult",
+        "  opt ComparisonRequest",
+        "    BA->>ARM: exact comparison arms",
+        "    ARM->>CS: identities and ComparisonBasisPair",
+        "    CS->>CC: compare per metric",
+        "    CC->>GL: G-REP2 clauses",
+        "    GL-->>CA: sealed ComparisonResult",
+        "  end",
+        "  opt OfflineConformanceRequested",
+        "    alt BasicOfflineConformance (default)",
+        "      BO->>GL: exact subject manifest fixtures policy and runner",
+        "      GL-->>BO: clause observations and GateExecutionLedger",
+        "      BO->>BO: construct BasicOfflineReportArtifact",
+        "    else AttestedReleaseConformance",
+        "      AR->>GL: same fixtures plus protected measured session",
+        "      GL-->>AR: clause observations and GateExecutionLedger",
+        "      AR->>AR: construct AttestedConformanceSealArtifact",
+        "      AR->>AR: apply_release_policy with current profile roots",
+        "    end",
+        "  end",
+        "  Note over BO,AR: optional offline sidecars excluded from production digests",
+    )
+    if result_sequence_lines != expected_result_sequence_lines:
+        errors.append("Task9 Figure 10 exact sequence structure mismatch")
+    if (
+        not re.search(r"(?m)^sequenceDiagram\s*$", result_source)
+        or result_participants != expected_result_participants
+        or result_profile_match is None
+        or result_profile_lines != expected_result_profile_lines
+        or result_source.count("opt OfflineConformanceRequested") != 1
+        or "opt BasicOfflineConformance" in result_source
+        or "opt AttestedReleaseConformance" in result_source
+        or result_source.count(
+            "Note over BO,AR: optional offline sidecars excluded from production digests"
+        )
+        != 1
+    ):
+        errors.append(
+            "Task9 Figure 10 exact mutually-exclusive profile ownership mismatch"
+        )
+
     architecture_edges: dict[str, set[tuple[str, str, str]]] = {}
     for diagram_id in TASK8_ARCHITECTURE_DIAGRAM_IDS:
         source = unescape(sources.get(diagram_id, ""))
@@ -2501,9 +4514,139 @@ def check_diagrams(html: str, errors: list[str]) -> None:
         errors.append("Task8 memory blocker scope mismatch")
 
 
+def check_handoff_conformance_sync(markdown: str, errors: list[str]) -> None:
+    rows = re.findall(
+        r"(?m)^\| `conformance` / `mc-conformance` \| (?P<body>[^|]*)\|$",
+        markdown,
+    )
+    required_row_tokens = (
+        "BasicOfflineReportArtifact",
+        "AttestedConformanceSealArtifact",
+        "run_basic_offline_conformance(...)",
+        "run_attested_release_conformance(...)",
+        "apply_release_policy(...)",
+    )
+    if len(rows) != 1 or any(rows[0].count(token) != 1 for token in required_row_tokens):
+        errors.append("HANDOFF conformance module locator/profile ports 不闭合")
+
+    section_match = re.search(
+        r"(?ms)^## 6\. conformance\s*$\n(?P<body>.*?)(?=^## 7\. )",
+        markdown,
+    )
+    if section_match is None:
+        errors.append("HANDOFF conformance section 不可结构化提取")
+        return
+    section = section_match.group("body")
+    headings = re.findall(r"(?m)^### (6\.[1-4]) ([^\r\n]+)$", section)
+    if headings != [
+        ("6.1", "部署 profile 闭包与共享事实"),
+        ("6.2", "BasicOfflineConformance"),
+        ("6.3", "AttestedReleaseConformance"),
+        ("6.4", "判定、批准与隔离"),
+    ]:
+        errors.append("HANDOFF conformance profile subsections 不闭合")
+
+    union_match = re.search(
+        r"(?ms)^ConformanceDeploymentProfile :=\s*\n"
+        r"(?P<body>.*?)^default_conformance_deployment_profile := "
+        r"BasicOfflineConformance\s*$",
+        section,
+    )
+    exact_union = re.compile(
+        r"\s*BasicOfflineConformance\s*\n"
+        r"\s*\| AttestedReleaseConformance \{\s*\n"
+        r"\s*conformance_trust_root: ConformanceTrustRootCapability,\s*\n"
+        r"\s*release_trust_root: ReleaseApprovalTrustRootCapability\s*\n"
+        r"\s*\}\s*\n?"
+    )
+    if union_match is None or exact_union.fullmatch(union_match.group("body")) is None:
+        errors.append("HANDOFF conformance deployment union must have exact two arms/default")
+
+    basic_match = re.search(
+        r"(?ms)^### 6\.2 BasicOfflineConformance\s*$\n"
+        r"(?P<body>.*?)(?=^### 6\.3 )",
+        section,
+    )
+    attested_match = re.search(
+        r"(?ms)^### 6\.3 AttestedReleaseConformance\s*$\n"
+        r"(?P<body>.*?)(?=^### 6\.4 )",
+        section,
+    )
+    basic = re.sub(r"\s+", " ", basic_match.group("body") if basic_match else "")
+    attested = re.sub(r"\s+", " ", attested_match.group("body") if attested_match else "")
+    required_basic = (
+        "run_basic_offline_conformance( authority: BasicOfflineConformanceAuthority ) -> BasicOfflineRunResult",
+        'profile_schema_id="basic-offline/v1"',
+        "BasicOfflineReportArtifact",
+        "offline_verdict",
+        "identity/integrity",
+        "不能授权发布",
+    )
+    if basic_match is None or any(token not in basic for token in required_basic):
+        errors.append("HANDOFF BasicOffline profile boundary 不闭合")
+    handoff_basic_boundary = (
+        "前五种是 content-addressed payload，使用 "
+        '`profile_schema_id="basic-offline/v1"` 与彼此独立的 '
+        "`basic-offline-*/v1` hash domain；`BasicOfflineRunResult` 只是无 own "
+        "digest、无 profile field 的 transport union"
+    )
+    if basic.count(handoff_basic_boundary) != 1:
+        errors.append("HANDOFF BasicOffline payload/result boundary mismatch")
+    if re.search(
+        r"(?i)trust[_ -]?(?:root|store)|measured[_ -]?environment|"
+        r"(?:^|[^A-Za-z0-9])session(?:$|[^A-Za-z0-9])|nonce|attestation|signature|ApprovedDigestSet|"
+        r"Release(?:Policy|Decision)|apply_release_policy|seal",
+        basic,
+    ):
+        errors.append("HANDOFF BasicOffline profile contains attested/release capability")
+
+    required_attested = (
+        "run_attested_release_conformance( authority: AttestedConformanceInvocationAuthority, profile: AttestedReleaseConformance, measured_environment: MeasuredExecutionEnvironment ) -> AttestedConformanceRunResult",
+        "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+        "ReleasePolicyApplicationResult := Completed { decision: ReleaseDecision } | InternalViolation { violation: InternalContractViolation }",
+        'profile_schema_id="attested-release/v1"',
+        "fresh measured session",
+        "已消费 nonce",
+        "完整重跑",
+        "internal/non-exported",
+    )
+    if attested_match is None or any(token not in attested for token in required_attested):
+        errors.append("HANDOFF AttestedRelease profile boundary 不闭合")
+    if "BasicOfflineReportArtifact" in attested or "ConformanceArtifact" in attested:
+        errors.append("HANDOFF Attested release accepts Basic/common artifact")
+
+    handoff_figure_boundary = (
+        "Figure 10 先以 OfflineConformanceRequested opt 表达整个离线 sidecar 可选，"
+        "其内再以 Basic(default)/Attested 单一 alt 表达 profile 互斥"
+    )
+    handoff_current_root_tokens = (
+        "profile.conformance_trust_root",
+        "逐字匹配 artifact authority 的 trust-store/policy refs",
+        "current-root nonce registry",
+        "measured-execution-environment digest",
+        "重验 seal 内 runner attestation",
+        "不再次消费 measurement session/nonce",
+        "另一 conformance domain 产生的 seal",
+    )
+    if section.count(handoff_figure_boundary) != 1:
+        errors.append("HANDOFF Figure 10 profile ownership boundary mismatch")
+    normalized_section = re.sub(r"\s+", " ", section)
+    if any(token not in normalized_section for token in handoff_current_root_tokens):
+        errors.append("HANDOFF current conformance root release boundary mismatch")
+
+    for isolation_token in (
+        "verdict 不改变生产 BackendResult",
+        "生产摘要也不反向依赖报告",
+    ):
+        if isolation_token not in section:
+            errors.append(f"HANDOFF conformance isolation missing: {isolation_token}")
+
+
 def main() -> int:
     with open(SRC, encoding="utf-8") as source:
         html = source.read()
+    with open(HANDOFF, encoding="utf-8") as handoff_source:
+        handoff = handoff_source.read()
 
     errors: list[str] = []
     check_required(html, errors)
@@ -2511,6 +4654,7 @@ def main() -> int:
     check_chapters(html, errors)
     check_gates(html, errors)
     check_diagrams(html, errors)
+    check_handoff_conformance_sync(handoff, errors)
 
     gates = parse_gates(html)
     print(f"v4.2 必需契约 {len(REQUIRED_TEXT)} 项")

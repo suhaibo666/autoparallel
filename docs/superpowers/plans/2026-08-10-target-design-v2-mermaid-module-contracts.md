@@ -257,7 +257,53 @@ apply_release_policy(artifact: ConformanceSealArtifact, approval: ReleaseApprova
 ## Final Acceptance Criteria
 
 - [x] 十张承重架构/流程图全部由模板中的 Mermaid 源生成，两个 HTML 内联静态 SVG，无活动 Excalidraw/SVG legacy 依赖。
-- [x] 九个模块均有可定位的结构化契约说明，核心结构、接口、结果联合、阻断与不变量闭合。
+- [x] 十个模块均有可定位的结构化契约说明，核心结构、接口、结果联合、阻断与不变量闭合。
 - [x] compute 时间严格来自用户采集的 exact record；communication 时间严格来自冻结理论公式；P2P/PP/CP 通信被建模；本轮明确不建模资源竞争与跨流 allocator 复用竞争。
-- [ ] `index.html` 与 `artifact.html` 已通过离线、自包含、可访问性、浅/深色、窄屏横滚、打印 CSS 和双构建确定性自动检查；仅受管理员策略阻断的 live-browser 人工视觉抽查未完成。
+- [x] `index.html` 与 `artifact.html` 已通过离线、自包含、可访问性、浅/深色、窄屏横滚、打印 CSS 和双构建确定性自动检查；受管理员策略限制的 live-browser 人工抽查不作为本次离线交付阻断项。
 - [x] 全量 verifier、单元测试、SVG 安全校验与三路只读审查均无未处置 Critical/High 问题。
+
+## 2026-08-11 Review Reconciliation
+
+### Task 7: Close the core modeling and comparison contracts
+
+**Files:**
+- Modify: `docs/target-design-v2/src/index.template.html`
+- Modify: `docs/target-design-v2/tools/test_module_contracts.py`
+- Modify: `docs/target-design-v2/tools/test_verify_gates.py`
+- Modify: `docs/target-design-v2/tools/verify_gates.py`
+
+- [x] Add failing behavioral verifier cases for compute-profile versus communication-formula cost ownership, memory/time face independence, comparison outcome priority, typed Coverage conservation, split-specific calibration manifests, capacity exclusion, and Chapter 0/14 boundary equivalence.
+- [x] Make those cases fail against the committed `ea07e95` baseline with zero test errors.
+- [x] Apply the minimal normative changes specified in design §12.1–§12.2.
+- [x] Run the focused tests and standalone verifier to GREEN (`70/70` contract tests; `212` required / `110` forbidden / `18/18` gates; final scoped review APPROVED at `af6096f`).
+
+### Task 8: Replace artifact flows with layered module architecture
+
+**Files:**
+- Modify: `docs/target-design-v2/src/index.template.html`
+- Modify: `docs/target-design-v2/HANDOFF.md`
+- Modify: `docs/target-design-v2/tools/test_build_doc.py`
+- Modify: `docs/target-design-v2/tools/test_module_contracts.py`
+- Modify: `docs/target-design-v2/tools/test_verify_gates.py`
+- Modify: `docs/target-design-v2/tools/verify_gates.py`
+
+- [x] Add failing tests requiring the two architecture views to use module/layer abstractions, disallow artifact-only architecture nodes, and require a tenth `plan-projection` module contract.
+- [x] Make those cases fail before changing the Mermaid source.
+- [x] Replace figures 1 and 7 without changing the total figure count; preserve the other eight behavioral views.
+- [x] Add the plan/projection module boundary, authoritative type references, typed ports, result branches, dependency DAG, blocker scope and invariants; synchronize HANDOFF.
+- [x] Render all Mermaid figures with the pinned renderer and run focused tests to GREEN (`80/80` module/verifier; `35/35` Mermaid/build; `10/10` pinned CLI renders; final two-reviewer APPROVED at `f69890b`).
+
+### Task 9: Make conformance hardening an optional deployment profile
+
+**Files:**
+- Modify: `docs/target-design-v2/src/index.template.html`
+- Modify: `docs/target-design-v2/HANDOFF.md`
+- Modify: `docs/target-design-v2/tools/test_module_contracts.py`
+- Modify: `docs/target-design-v2/tools/test_verify_gates.py`
+- Modify: `docs/target-design-v2/tools/verify_gates.py`
+
+- [x] Add failing cases proving BasicOfflineConformance cannot authorize release and AttestedReleaseConformance alone owns trust roots/session replay protection.
+- [x] Make those cases fail on the mandatory-hardened baseline with zero test errors.
+- [x] Add the closed profile union and profile-specific interfaces while keeping both profiles outside production Memory/Time inputs, digests, caches, and comparison basis.
+- [x] Run focused, full, build determinism, SVG safety, and standalone verifier checks; regenerate `index.html` and `artifact.html` twice and require byte-stable output (`149/149` full discover, `66/66` verifier, `35/35` Mermaid/build, `212/110/18` standalone).
+- [x] Perform a final source-faithful review of the seven findings and the two architecture views; final consistency review: `0 Critical / 0 High / 0 Important`, `APPROVED`.

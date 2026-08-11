@@ -123,6 +123,2079 @@ def replace_in_module(
 
 
 class VerifyGatesContractTest(unittest.TestCase):
+    def test_task9_round9_figure10_wraps_profiles_in_optional_sidecar(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        handoff = (ROOT / "HANDOFF.md").read_text(encoding="utf-8")
+        wrapped = (
+            "  opt OfflineConformanceRequested\n"
+            "    alt BasicOfflineConformance (default)\n"
+            "      BO-&gt;&gt;GL: exact subject manifest fixtures policy and runner\n"
+            "      GL--&gt;&gt;BO: clause observations and GateExecutionLedger\n"
+            "      BO-&gt;&gt;BO: construct BasicOfflineReportArtifact\n"
+            "    else AttestedReleaseConformance\n"
+            "      AR-&gt;&gt;GL: same fixtures plus protected measured session\n"
+            "      GL--&gt;&gt;AR: clause observations and GateExecutionLedger\n"
+            "      AR-&gt;&gt;AR: construct AttestedConformanceSealArtifact\n"
+            "      AR-&gt;&gt;AR: apply_release_policy with current profile roots\n"
+            "    end\n"
+            "  end"
+        )
+        self.assertEqual(template.count(wrapped), 1)
+        handoff_boundary = (
+            "Figure 10 先以 OfflineConformanceRequested opt 表达整个离线 sidecar 可选，"
+            "其内再以 Basic(default)/Attested 单一 alt 表达 profile 互斥"
+        )
+        self.assertEqual(handoff.count(handoff_boundary), 1)
+
+        unwrapped = "\n".join(
+            line[2:] if line.startswith("  ") else line
+            for line in wrapped.splitlines()[1:-1]
+        )
+        errors = validate(template.replace(wrapped, unwrapped, 1))
+        self.assertTrue(
+            any("Task9 Figure 10 exact sequence structure" in error for error in errors),
+            errors,
+        )
+        stale_handoff = handoff.replace(
+            handoff_boundary,
+            "Figure 10 直接以 Basic(default)/Attested alt 表达 profile",
+            1,
+        )
+        handoff_errors: list[str] = []
+        verify_gates.check_handoff_conformance_sync(stale_handoff, handoff_errors)
+        self.assertTrue(
+            any("HANDOFF Figure 10 profile ownership boundary" in error for error in handoff_errors),
+            handoff_errors,
+        )
+
+    def test_task9_round9_release_revalidates_complete_conformance_closure(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        closure_tokens = (
+            "  require current_conformance_store.key_registry_digest ==\n"
+            "    hash(canonical current_conformance_store.trusted_key_material_by_id)",
+            "  require current_conformance_store.trust_store_snapshot_digest ==\n"
+            "    hash(canonical_payload_without_derived_digests(current_conformance_store))",
+            "  require current_conformance_policy.runner_attestation_policy_digest ==\n"
+            "    hash(canonical_payload_without_derived_digests(current_conformance_policy))",
+            "  require current_conformance_policy.trust_store_snapshot_digest ==\n"
+            "          current_conformance_store.trust_store_snapshot_digest",
+            "  require current_conformance_policy.supported_signature_schemes ==\n"
+            "          current_conformance_store.supported_signature_schemes",
+            "  require current_conformance_policy.attestation_signature_scheme in\n"
+            "          current_conformance_policy.supported_signature_schemes",
+            "  require artifact.measured_environment.conformance_invocation_digest ==\n"
+            "          artifact.runner_attestation.conformance_invocation_digest ==\n"
+            "          artifact.execution_ledger.conformance_invocation_digest ==\n"
+            "          artifact.report.conformance_invocation_digest ==\n"
+            "          artifact.invocation_authority.conformance_invocation_digest",
+            "  require artifact.measured_environment.verifier_runner_digest ==\n"
+            "          artifact.runner_attestation.verifier_runner_digest ==\n"
+            "          artifact.execution_ledger.verifier_runner_digest ==\n"
+            "          artifact.report.verifier_runner_digest ==\n"
+            "          artifact.invocation_authority.verifier_runner.verifier_runner_digest",
+            "  require artifact.measured_environment.executable_artifact_digest ==\n"
+            "          artifact.runner_attestation.executable_artifact_digest ==\n"
+            "          artifact.invocation_authority.verifier_runner.executable_artifact_digest",
+            "  require artifact.runner_attestation.measured_execution_environment_digest ==\n"
+            "          artifact.execution_ledger.measured_execution_environment_digest ==\n"
+            "          artifact.report.measured_execution_environment_digest ==\n"
+            "          artifact.measured_environment.measured_execution_environment_digest",
+            "  require artifact.runner_attestation.observed_output_digest ==\n"
+            "          artifact.execution_ledger.observed_output_digest ==\n"
+            "          artifact.report.observed_output_digest",
+            "  require artifact.execution_ledger.subject_digest ==\n"
+            "          artifact.report.subject_digest ==\n"
+            "          artifact.invocation_authority.production_subject.subject_digest",
+            "  require artifact.execution_ledger.fixture_set_digest ==\n"
+            "          artifact.report.fixture_set_digest ==\n"
+            "          artifact.invocation_authority.fixture_set.fixture_set_digest",
+            "  require artifact.execution_ledger.validation_policy_digest ==\n"
+            "          artifact.report.validation_policy_digest ==\n"
+            "          artifact.invocation_authority.validation_policy.validation_policy_digest",
+            "  require artifact.execution_ledger.gate_manifest_digest ==\n"
+            "          artifact.report.gate_manifest_digest ==\n"
+            "          artifact.invocation_authority.gate_manifest.gate_manifest_digest",
+            "  require artifact.execution_ledger.runner_attestation_digest ==\n"
+            "          artifact.report.runner_attestation_digest ==\n"
+            "          artifact.runner_attestation.runner_attestation_digest",
+            "  require artifact.report.conformance_execution_ledger_digest ==\n"
+            "          artifact.execution_ledger.conformance_execution_ledger_digest",
+            "  require artifact.report.production_subject ==\n"
+            "          artifact.invocation_authority.production_subject",
+            "  require artifact.execution_ledger.observed_output_digest ==\n"
+            "          artifact.execution_ledger.observed_output.observed_output_digest",
+            "  require artifact.report.findings ==\n"
+            "          artifact.execution_ledger.observed_output.findings",
+        )
+        for token in closure_tokens:
+            self.assertEqual(template.count(token), 1, token)
+
+        mutations = (
+            (closure_tokens[0], closure_tokens[0].replace("current_conformance_store.trusted_key_material_by_id", "approval_authority.store_snapshot.approved_by_subject")),
+            (closure_tokens[4], closure_tokens[4].replace("current_conformance_store.supported_signature_schemes", "root.supported_release_approval_signature_schemes")),
+            (closure_tokens[6], closure_tokens[6].replace("artifact.invocation_authority.conformance_invocation_digest", "approval_authority.release_approval_authority_digest")),
+            (closure_tokens[8], closure_tokens[8].replace("artifact.invocation_authority.verifier_runner.executable_artifact_digest", "artifact.report.conformance_report_digest")),
+            (closure_tokens[10], closure_tokens[10].replace("artifact.report.observed_output_digest", "artifact.report.conformance_report_digest")),
+            (closure_tokens[19], closure_tokens[19].replace("artifact.execution_ledger.observed_output.findings", "artifact.report.findings")),
+        )
+        for original, replacement in mutations:
+            with self.subTest(mutation=replacement.splitlines()[-1].strip()):
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any("release current conformance closure mismatch" in error for error in errors),
+                    errors,
+                )
+
+    def test_task9_round9_terminal_receipt_has_one_formula_at_all_three_stages(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        formula = (
+            "terminal_consumption_receipt_key(\n"
+            "  environment: MeasuredExecutionEnvironment\n"
+            ") := canonical_tuple(\n"
+            "  environment.verifier_nonce, environment.conformance_invocation_digest,\n"
+            "  environment.verifier_runner_digest, environment.executable_artifact_digest,\n"
+            "  environment.execution_session_id, environment.process_identity,\n"
+            "  environment.container_identity, environment.execution_time_window,\n"
+            "  environment.measured_execution_environment_digest)"
+        )
+        producer = (
+            "  terminal_consumption_receipt_key_value :=\n"
+            "    terminal_consumption_receipt_key(measured_environment)\n"
+            "  require measured_environment.verifier_nonce is active, bound to this exact key,\n"
+            "    and atomically consumed exactly once while persisting a terminal receipt under that exact key"
+        )
+        seal = (
+            "  require session.nonce_consumption_receipt proves the terminal registry contains exact\n"
+            "    terminal_consumption_receipt_key(measured_environment)"
+        )
+        query = (
+            "  require conformance_trust_root.measurement_session_authority.has_terminal_consumption_receipt(\n"
+            "    terminal_consumption_receipt_key(artifact.measured_environment))"
+        )
+        for token in (formula, producer, seal, query):
+            self.assertEqual(template.count(token), 1, token)
+
+        mutations = (
+            (formula, formula.replace("environment.measured_execution_environment_digest", "environment.verifier_runner_digest")),
+            (producer, producer.replace("terminal_consumption_receipt_key(measured_environment)", "canonical(measured_environment.verifier_nonce)")),
+            (seal, seal.replace("terminal_consumption_receipt_key(measured_environment)", "canonical(measured_environment.verifier_nonce)")),
+            (query, query.replace("terminal_consumption_receipt_key(artifact.measured_environment)", "canonical(artifact.measured_environment.verifier_nonce)")),
+        )
+        for original, replacement in mutations:
+            errors = validate(template.replace(original, replacement, 1))
+            self.assertTrue(
+                any("terminal receipt production/seal/query closure mismatch" in error for error in errors),
+                errors,
+            )
+
+    def test_task9_round9_current_root_resolve_mutations_are_total_failures(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        resolve = (
+            "  (current_conformance_store, current_conformance_policy) :=\n"
+            "    resolve_conformance_trust_root(conformance_trust_root)"
+        )
+        self.assertEqual(template.count(resolve), 1)
+        for replacement in (
+            resolve.replace("current_conformance_store", "aliased_store", 1),
+            "  current conformance root resolution deleted",
+        ):
+            mutated = template.replace(resolve, replacement, 1)
+            errors = validate(mutated)
+            self.assertTrue(
+                any(
+                    "Attested security variable source/dominance mismatch" in error
+                    for error in errors
+                ),
+                errors,
+            )
+
+    def test_task9_round8_basic_payload_owners_exclude_transport_result(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        handoff = (ROOT / "HANDOFF.md").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        template_boundary = (
+            "Basic 五种 content-addressed payload 的 own digest 只使用 "
+            "basic-offline/v1 schema 与各自 basic-offline-*/v1 hash domain；"
+            "BasicOfflineRunResult 是无 own digest、无 profile_schema_id field 的 "
+            "transport union"
+        )
+        handoff_boundary = (
+            "前五种是 content-addressed payload，使用 "
+            '`profile_schema_id="basic-offline/v1"` 与彼此独立的 '
+            "`basic-offline-*/v1` hash domain；`BasicOfflineRunResult` 只是无 own "
+            "digest、无 profile field 的 transport union"
+        )
+        self.assertEqual(template.count(template_boundary), 1)
+        self.assertEqual(handoff.count(handoff_boundary), 1)
+
+        result_union = (
+            "BasicOfflineRunResult :=\n"
+            "  Completed { artifact: BasicOfflineReportArtifact }\n"
+            "  | InternalViolation { violation: InternalContractViolation }"
+        )
+        self.assertEqual(template.count(result_union), 1)
+        for extra in (
+            '  profile_schema_id := "basic-offline/v1"\n',
+            "  basic_offline_run_result_digest := hash(result)\n",
+        ):
+            with self.subTest(extra=extra.strip()):
+                mutated = template.replace(
+                    result_union,
+                    result_union.replace(
+                        "  Completed", extra + "  Completed", 1
+                    ),
+                    1,
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        "Basic content-addressed payload and transport result boundary"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+        stale_template = template.replace(
+            "Basic 五种 content-addressed payload", "Basic 六种 concrete type 与 own digest", 1
+        )
+        stale_errors = validate(stale_template)
+        self.assertTrue(
+            any(
+                "Basic content-addressed payload and transport result boundary" in error
+                for error in stale_errors
+            ),
+            stale_errors,
+        )
+        stale_handoff = handoff.replace("前五种是 content-addressed payload", "六种均有 own digest", 1)
+        handoff_errors: list[str] = []
+        verify_gates.check_handoff_conformance_sync(stale_handoff, handoff_errors)
+        self.assertTrue(
+            any("BasicOffline payload/result boundary" in error for error in handoff_errors),
+            handoff_errors,
+        )
+
+    def test_task9_round8_figure10_profiles_are_mutually_exclusive_and_own_artifacts(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        handoff = (ROOT / "HANDOFF.md").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        figure = re.search(
+            r'<figure\b[^>]*data-diagram-id="result-gate-comparison"[^>]*>.*?'
+            r'<pre class="mermaid-source"><code>(?P<body>.*?)</code></pre>',
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(figure)
+        assert figure is not None
+        source = unescape(figure.group("body"))
+        profile_branch = (
+            "    alt BasicOfflineConformance (default)\n"
+            "      BO->>GL: exact subject manifest fixtures policy and runner\n"
+            "      GL-->>BO: clause observations and GateExecutionLedger\n"
+            "      BO->>BO: construct BasicOfflineReportArtifact\n"
+            "    else AttestedReleaseConformance\n"
+            "      AR->>GL: same fixtures plus protected measured session\n"
+            "      GL-->>AR: clause observations and GateExecutionLedger\n"
+            "      AR->>AR: construct AttestedConformanceSealArtifact\n"
+            "      AR->>AR: apply_release_policy with current profile roots\n"
+            "    end"
+        )
+        self.assertEqual(source.count(profile_branch), 1)
+        self.assertNotIn("opt BasicOfflineConformance", source)
+        self.assertNotIn("opt AttestedReleaseConformance", source)
+        self.assertIn(
+            "Figure 10 先以 OfflineConformanceRequested opt 表达整个离线 sidecar 可选，其内再以 Basic(default)/Attested 单一 alt 表达 profile 互斥",
+            handoff,
+        )
+
+        for original, replacement in (
+            ("    alt BasicOfflineConformance (default)", "    opt BasicOfflineConformance (default)"),
+            ("    else AttestedReleaseConformance", "    end\n    opt AttestedReleaseConformance"),
+            (
+                "GL--&gt;&gt;BO: clause observations and GateExecutionLedger",
+                "GL--&gt;&gt;BO: BasicOfflineReportArtifact",
+            ),
+            (
+                "BO-&gt;&gt;BO: construct BasicOfflineReportArtifact",
+                "GL-&gt;&gt;BO: construct BasicOfflineReportArtifact",
+            ),
+            (
+                "GL--&gt;&gt;AR: clause observations and GateExecutionLedger",
+                "GL--&gt;&gt;AR: AttestedConformanceSealArtifact",
+            ),
+        ):
+            with self.subTest(mutation=original):
+                mutated = template.replace(original, replacement, 1)
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        "Task9 Figure 10 exact mutually-exclusive profile ownership"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_task9_round8_figure10_full_sequence_structure_is_exact(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        profile_branch = (
+            "  opt OfflineConformanceRequested\n"
+            "    alt BasicOfflineConformance (default)\n"
+            "      BO-&gt;&gt;GL: exact subject manifest fixtures policy and runner\n"
+            "      GL--&gt;&gt;BO: clause observations and GateExecutionLedger\n"
+            "      BO-&gt;&gt;BO: construct BasicOfflineReportArtifact\n"
+            "    else AttestedReleaseConformance\n"
+            "      AR-&gt;&gt;GL: same fixtures plus protected measured session\n"
+            "      GL--&gt;&gt;AR: clause observations and GateExecutionLedger\n"
+            "      AR-&gt;&gt;AR: construct AttestedConformanceSealArtifact\n"
+            "      AR-&gt;&gt;AR: apply_release_policy with current profile roots\n"
+            "    end\n"
+            "  end"
+        )
+        self.assertEqual(template.count(profile_branch), 1)
+        mutations = (
+            ("  alt Ready", "  opt Ready"),
+            ("    BE--&gt;&gt;VA: EstimateCandidate and witness", "    BE-&gt;&gt;VA: EstimateCandidate and witness"),
+            (profile_branch, profile_branch + "\n" + profile_branch),
+            (
+                "  participant PB as ProjectionBundleBuild",
+                "  participant X1 as Rogue\n  participant PB as ProjectionBundleBuild",
+            ),
+            (
+                "  participant PB as ProjectionBundleBuild",
+                "  participant rogue as Rogue\n  participant PB as ProjectionBundleBuild",
+            ),
+        )
+        for original, replacement in mutations:
+            with self.subTest(mutation=replacement.splitlines()[0]):
+                mutated = template.replace(original, replacement, 1)
+                self.assertNotEqual(mutated, template)
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        "Task9 Figure 10 exact sequence structure" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_task9_round8_attested_root_flow_call_actuals_are_exact(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        consume_call = (
+            "  session := validate_and_consume_measurement_envelope(\n"
+            "    authority, runner, trust_root, measured_environment)"
+        )
+        seal_call = (
+            "  return validate_and_seal_attested_conformance(\n"
+            "    authority, trust_root, session, observed, ledger, attestation)"
+        )
+        for original in (consume_call, seal_call):
+            self.assertEqual(template.count(original), 1)
+            mutated = template.replace(
+                original, original.replace("trust_root", "profile.release_trust_root"), 1
+            )
+            errors = validate(mutated)
+            self.assertTrue(
+                any("Attested conformance root source-to-sink flow mismatch" in error for error in errors),
+                errors,
+            )
+
+    def test_task9_round8_terminal_receipt_binds_exact_measurement_envelope(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        receipt_binding = (
+            "terminal_consumption_receipt_key(\n"
+            "  environment: MeasuredExecutionEnvironment\n"
+            ") := canonical_tuple(\n"
+            "  environment.verifier_nonce, environment.conformance_invocation_digest,\n"
+            "  environment.verifier_runner_digest, environment.executable_artifact_digest,\n"
+            "  environment.execution_session_id, environment.process_identity,\n"
+            "  environment.container_identity, environment.execution_time_window,\n"
+            "  environment.measured_execution_environment_digest)"
+        )
+        self.assertEqual(template.count(receipt_binding), 1)
+        for replacement in (
+            receipt_binding.replace(
+                "  environment.container_identity, environment.execution_time_window,\n"
+                "  environment.measured_execution_environment_digest)",
+                "  environment.container_identity, environment.execution_time_window)",
+            ),
+            receipt_binding.replace(
+                "environment.measured_execution_environment_digest",
+                "environment.verifier_runner_digest",
+                1,
+            ),
+        ):
+            mutated = template.replace(receipt_binding, replacement, 1)
+            self.assertNotEqual(mutated, template)
+            errors = validate(mutated)
+            self.assertTrue(
+                any("terminal receipt production/seal/query closure mismatch" in error for error in errors),
+                errors,
+            )
+
+    def test_task9_round8_release_revalidates_artifact_under_current_conformance_root(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        required = (
+            "  conformance_trust_root := profile.conformance_trust_root",
+            "  (current_conformance_store, current_conformance_policy) :=\n"
+            "    resolve_conformance_trust_root(conformance_trust_root)",
+            "  require artifact.invocation_authority.trust_store_snapshot_ref.trust_store_snapshot_digest ==\n"
+            "          current_conformance_store.trust_store_snapshot_digest ==\n"
+            "          conformance_trust_root.expected_trust_store_snapshot_digest",
+            "  require artifact.invocation_authority.runner_attestation_policy_ref.runner_attestation_policy_digest ==\n"
+            "          current_conformance_policy.runner_attestation_policy_digest ==\n"
+            "          conformance_trust_root.expected_runner_attestation_policy_digest",
+            "  current_conformance_trusted_key_material :=\n"
+            "    current_conformance_store.trusted_key_material_by_id[\n"
+            "      current_conformance_policy.trusted_attestation_key_id]",
+            "  current_conformance_signed_message := canonical_tuple(\n"
+            "    artifact.runner_attestation.measured_execution_environment_digest,",
+            "  require verify_measurer_identity_and_freshness_evidence(\n"
+            "    conformance_trust_root.measurement_session_authority,\n"
+            "    current_measurement_evidence_message,\n"
+            "    artifact.measured_environment.measurer_identity_and_freshness_evidence)",
+            "  require conformance_trust_root.measurement_session_authority.has_terminal_consumption_receipt(\n"
+            "    terminal_consumption_receipt_key(artifact.measured_environment))",
+            "  require verify_signature(current_conformance_trusted_key_material,\n"
+            "    current_conformance_policy.attestation_signature_scheme,\n"
+            "    current_conformance_signed_message, artifact.runner_attestation.signature)",
+            "  reverify sealed runner attestation under current profile root without consuming a measurement session or nonce",
+        )
+        for token in required:
+            self.assertEqual(template.count(token), 1, token)
+
+        mutations = (
+            (
+                required[0],
+                "  conformance_trust_root := artifact.invocation_authority.trust_root",
+            ),
+            (
+                required[2],
+                required[2].replace(
+                    "conformance_trust_root.expected_trust_store_snapshot_digest",
+                    "release_trust_root.expected_trust_store_snapshot_digest",
+                ),
+            ),
+            (
+                required[4],
+                "  current_conformance_trusted_key_material :=\n"
+                "    artifact.runner_attestation.self_owned_key_material",
+            ),
+            (
+                required[9],
+                "  consume artifact measurement session and nonce again",
+            ),
+            (
+                required[6],
+                required[6].replace(
+                    "conformance_trust_root.measurement_session_authority",
+                    "release_trust_root.measurement_session_authority",
+                ),
+            ),
+        )
+        for original, replacement in mutations:
+            with self.subTest(mutation=original.splitlines()[0]):
+                mutated = template.replace(original, replacement, 1)
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        marker in error
+                        for error in errors
+                        for marker in (
+                            "release current conformance root revalidation mismatch",
+                            "release current conformance closure mismatch",
+                        )
+                    ),
+                    errors,
+                )
+
+    def test_task9_round7_release_pre_authentication_block_is_closed(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        anchor = (
+            "  require derived_approved == derive_approved_digest_set(artifact, policy)\n"
+        )
+        self.assertEqual(template.count(anchor), 1)
+        for injected_statement in (
+            "  require canonical(approved) == canonical(derived_approved)\n",
+            "  require approved.subject_digest == derived_approved.subject_digest\n",
+            "  approved_alias := derived_approved\n",
+        ):
+            with self.subTest(statement=injected_statement.strip()):
+                mutated = template.replace(
+                    anchor, anchor + injected_statement, 1
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        "release approval independent recomputation boundary"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_task9_round7_attested_owner_assignments_are_exact_and_single(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        authority_assignment = (
+            "  conformance_invocation_digest :=\n"
+            '    hash("attested-conformance-authority/v1",\n'
+            "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))\n"
+        )
+        self.assertEqual(template.count(authority_assignment), 1)
+        authority_mutations = (
+            authority_assignment
+            + "  conformance_invocation_digest := wrong_authority_digest\n",
+            authority_assignment
+            + "  unknown_authority_digest := wrong_authority_digest\n",
+            (
+                "  conformance_invocation_digest := wrong_authority_digest\n"
+                "  shadow_invocation_digest :=\n"
+                '    hash("attested-conformance-authority/v1",\n'
+                "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))\n"
+            ),
+        )
+        for replacement in authority_mutations:
+            with self.subTest(authority=replacement.splitlines()[-1]):
+                mutated = template.replace(authority_assignment, replacement, 1)
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        "Attested authority schema/validator domain equality"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+        record_assignment = (
+            '  evaluation_input_digest := hash("attested-conformance-record-input/v1",\n'
+            "    authority.conformance_invocation_digest,\n"
+            "    session.measured_execution_environment_digest,\n"
+            "    canonical(binding), binding.fixture_binding_digest)\n"
+        )
+        self.assertEqual(template.count(record_assignment), 1)
+        record_mutations = (
+            record_assignment
+            + "  evaluation_input_digest := wrong_record_input_digest\n",
+            record_assignment
+            + "  unknown_record_input_digest := wrong_record_input_digest\n",
+            (
+                "  evaluation_input_digest := wrong_record_input_digest\n"
+                '  shadow_evaluation_input_digest := hash("attested-conformance-record-input/v1",\n'
+                "    authority.conformance_invocation_digest,\n"
+                "    session.measured_execution_environment_digest,\n"
+                "    canonical(binding), binding.fixture_binding_digest)\n"
+            ),
+        )
+        for replacement in record_mutations:
+            with self.subTest(record=replacement.splitlines()[-1]):
+                mutated = template.replace(record_assignment, replacement, 1)
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        "Attested record-input three-site normalized equality"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_task9_round7_basic_run_control_grammar_is_closed(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        record_rule = "    require record.fixture_ref == record_key\n"
+        self.assertEqual(template.count(record_rule), 1)
+        hidden_rule = template.replace(
+            record_rule,
+            "    if false:\n      require record.fixture_ref == record_key\n",
+            1,
+        )
+        loop_anchor = (
+            "  for every (record_key, binding) in authority.fixture_set.bindings:\n"
+        )
+        duplicate_loop = template.replace(loop_anchor, loop_anchor + loop_anchor, 1)
+        terminal_anchor = (
+            "  observed := ConformanceObservedOutput(observed_clause_outputs, findings, coverage_gaps)\n"
+        )
+        extra_terminal = template.replace(
+            terminal_anchor,
+            "  return InternalViolation { violation: SyntheticBasicStop }\n"
+            + terminal_anchor,
+            1,
+        )
+        for mutated in (hidden_rule, duplicate_loop, extra_terminal):
+            errors = validate(mutated)
+            self.assertTrue(
+                any("conformance basic closed control grammar" in error for error in errors),
+                errors,
+            )
+
+    def test_task9_round7_release_apply_statement_sequence_is_closed(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        signature_requirement = (
+            "  require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)\n"
+        )
+        self.assertEqual(template.count(signature_requirement), 1)
+        false_after_signature = template.replace(
+            signature_requirement,
+            signature_requirement + "  require false\n",
+            1,
+        )
+        root_assignment = (
+            "  root := resolve_release_approval_trust_root(release_trust_root)\n"
+        )
+        self.assertEqual(template.count(root_assignment), 1)
+        unknown_assignment = template.replace(
+            root_assignment,
+            root_assignment + "  synthetic_release_alias := approved\n",
+            1,
+        )
+        for mutated in (false_after_signature, unknown_assignment):
+            errors = validate(mutated)
+            self.assertTrue(
+                any("release decision authenticated control-flow" in error for error in errors),
+                errors,
+            )
+
+    def test_task9_round6_approved_and_derived_sets_remain_independent_until_authenticated_diff(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        independent_closure = (
+            "  require canonical(approved) == canonical(approval_authority.approved)\n"
+            "  require derived_approved == derive_approved_digest_set(artifact, policy)\n"
+            "  require every stored nested digest equals its own enclosing payload recomputation; no approved/derived cross-equality\n"
+        )
+        authenticated_equality = (
+            "  if approved_mismatches is NonEmpty:\n"
+            "    return Completed { decision: ReleaseBlocked { subject_digest, reasons:\n"
+            "      map(approved_mismatches, path -&gt; ApprovedDigestMismatch(path)) } }\n"
+            "  require approved == derived_approved\n"
+            "  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path\n"
+        )
+        self.assertEqual(template.count(independent_closure), 1)
+        self.assertEqual(template.count(authenticated_equality), 1)
+
+        early_cross_equality = template.replace(
+            independent_closure,
+            independent_closure
+            + "  require every one of the ten ApprovedDigestSet fields equals the recomputed value above\n",
+            1,
+        )
+        early_errors = validate(early_cross_equality)
+        self.assertTrue(
+            any("release approval independent recomputation boundary" in error for error in early_errors),
+            early_errors,
+        )
+
+        missing_late_equality = template.replace(
+            authenticated_equality,
+            authenticated_equality.replace(
+                "  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path\n",
+                "",
+            ),
+            1,
+        )
+        late_errors = validate(missing_late_equality)
+        self.assertTrue(
+            any("release approval independent recomputation boundary" in error for error in late_errors),
+            late_errors,
+        )
+
+    def test_task9_round6_rejects_owner_comments_and_post_algorithm_basic_decoys(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        authority_formula = (
+            '    hash("attested-conformance-authority/v1",\n'
+            "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))"
+        )
+        self.assertEqual(template.count(authority_formula), 1)
+        authority_comment_decoy = template.replace(
+            authority_formula,
+            '    digest("wrong-authority-domain/v1",\n'
+            "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))\n"
+            '    // Schema evidence: hash("attested-conformance-authority/v1", '
+            "canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))",
+            1,
+        )
+        authority_errors = validate(authority_comment_decoy)
+        self.assertTrue(
+            any("Attested authority schema/validator domain equality" in error for error in authority_errors),
+            authority_errors,
+        )
+
+        record_formula = (
+            '  evaluation_input_digest := hash("attested-conformance-record-input/v1",\n'
+            "    authority.conformance_invocation_digest,\n"
+            "    session.measured_execution_environment_digest,\n"
+            "    canonical(binding), binding.fixture_binding_digest)"
+        )
+        self.assertEqual(template.count(record_formula), 1)
+        record_comment_decoy = template.replace(
+            record_formula,
+            record_formula.replace(" := hash(", " := digest(").replace(
+                '"attested-conformance-record-input/v1"', '"wrong-record-domain/v1"'
+            )
+            + '\n    // Schema evidence: evaluation_input_digest := hash("attested-conformance-record-input/v1", '
+            + "authority.conformance_invocation_digest, session.measured_execution_environment_digest, "
+            + "canonical(binding), binding.fixture_binding_digest)",
+            1,
+        )
+        record_errors = validate(record_comment_decoy)
+        self.assertTrue(
+            any("Attested record-input three-site normalized equality" in error for error in record_errors),
+            record_errors,
+        )
+
+        basic_rule = "    require record.fixture_ref == record_key\n"
+        basic_end = (
+            "  return Completed iff every Basic closure equation holds; otherwise InternalViolation</code></pre>"
+        )
+        self.assertEqual(template.count(basic_rule), 1)
+        self.assertEqual(template.count(basic_end), 1)
+        post_algorithm_decoy = template.replace(
+            basic_rule,
+            "    demand record.fixture_ref == record_key\n",
+            1,
+        ).replace(
+            basic_end,
+            basic_end + "\n<p><code>require record.fixture_ref == record_key</code></p>",
+            1,
+        )
+        basic_errors = validate(post_algorithm_decoy)
+        self.assertTrue(
+            any("require record.fixture_ref == record_key" in error and "conformance basic closure" in error for error in basic_errors),
+            basic_errors,
+        )
+
+    def test_task9_round6_rejects_shared_offline_types_and_extra_release_terminals(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        projection_header = "ProjectionBundleAuthority:\n"
+        self.assertEqual(template.count(projection_header), 1)
+        for field in (
+            "trace_fixture: TraceFixture",
+            "observed_output: ConformanceObservedOutput",
+            "fixture_set_digest: Digest",
+            "validation_policy_ref: ValidationPolicyRef",
+        ):
+            with self.subTest(field=field):
+                mutated = template.replace(
+                    projection_header, projection_header + f"  {field}\n", 1
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any("production owner conformance isolation" in error for error in errors),
+                    errors,
+                )
+
+        signature_success = (
+            "  verify release approval signature only with external-root public key material\n"
+        )
+        self.assertEqual(template.count(signature_success), 1)
+        extra_terminal = template.replace(
+            signature_success,
+            signature_success
+            + "  return InternalViolation { violation: SyntheticAlwaysStop }\n",
+            1,
+        )
+        terminal_errors = validate(extra_terminal)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in terminal_errors),
+            terminal_errors,
+        )
+
+    def test_task9_round5_release_signature_authenticates_submitted_approved_set(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        schema_tuple = (
+            "  signed_message := canonical_tuple(\n"
+            "    approved.release_policy_digest,\n"
+            "    store_snapshot.release_approval_store_snapshot_digest,\n"
+            "    trusted_approver_key_id, approval_signature_scheme, canonical(approved))"
+        )
+        apply_tuple = (
+            "  release_approval_signed_message := canonical_tuple(\n"
+            "    root.expected_release_policy_digest,\n"
+            "    root.expected_release_approval_store_snapshot_digest,\n"
+            "    policy.trusted_approver_key_id, policy.approval_signature_scheme,\n"
+            "    canonical(approved))"
+        )
+        self.assertEqual(template.count(schema_tuple), 1)
+        self.assertEqual(template.count(apply_tuple), 1)
+
+        schema_derived = template.replace(
+            schema_tuple,
+            schema_tuple.replace("canonical(approved)", "canonical(derived_approved)"),
+            1,
+        )
+        schema_errors = validate(schema_derived)
+        self.assertTrue(
+            any("release approval signed-message approved binding" in error for error in schema_errors),
+            schema_errors,
+        )
+
+        apply_derived = template.replace(
+            apply_tuple,
+            apply_tuple.replace("canonical(approved)", "canonical(derived_approved)"),
+            1,
+        )
+        apply_errors = validate(apply_derived)
+        self.assertTrue(
+            any("release approval signed-message approved binding" in error for error in apply_errors),
+            apply_errors,
+        )
+
+        signed_before_mismatch = (
+            "  require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)\n"
+            "  verify release approval signature only with external-root public key material\n"
+            "  if approved_mismatches is NonEmpty:\n"
+        )
+        self.assertEqual(template.count(signed_before_mismatch), 1)
+
+    def test_task9_round4_rejects_basic_to_release_type_flows_and_seal_schema_swaps(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        type_flows = (
+            "adapt(payload: BasicOfflineReportArtifact) -&gt; ReleaseDecision",
+            "NeutralBridge := (BasicOfflineReportArtifact) -&gt; AttestedConformanceSealArtifact",
+            "translate(payload: BasicOfflineReportArtifact) -&gt; ReleasePolicyApplicationResult",
+        )
+        for declaration in type_flows:
+            with self.subTest(type_flow=declaration):
+                mutated = template.replace(
+                    "</main>", f"<pre><code>{declaration}</code></pre>\n</main>", 1
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any("Basic artifact to release type-flow" in error for error in errors),
+                    errors,
+                )
+
+        swapped_report = template.replace(
+            "  report: AttestedConformanceReport\n",
+            "  report: BasicOfflineReportArtifact\n",
+            1,
+        )
+        swapped_errors = validate(swapped_report)
+        self.assertTrue(
+            any("AttestedConformanceSealArtifact exact schema" in error for error in swapped_errors),
+            swapped_errors,
+        )
+
+        seal_digest = (
+            '    hash("attested-conformance-seal-artifact/v1",\n'
+            "      canonical_payload_without_derived_digests(AttestedConformanceSealArtifact))"
+        )
+        self.assertEqual(template.count(seal_digest), 1)
+        post_digest_field = template.replace(
+            seal_digest,
+            seal_digest + "\n  basic_report: BasicOfflineReportArtifact",
+            1,
+        )
+        post_digest_errors = validate(post_digest_field)
+        self.assertTrue(
+            any("AttestedConformanceSealArtifact exact schema" in error for error in post_digest_errors),
+            post_digest_errors,
+        )
+
+    def test_task9_round4_security_variable_sources_and_map_membership_dominate(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        source_mutations = (
+            (
+                "  (store, policy) := resolve_conformance_trust_root(trust_root)\n",
+                "  (store, policy) := resolve_conformance_trust_root(trust_root)\n"
+                "  store := authority.fixture_set\n",
+            ),
+            (
+                "  trust_root := profile.conformance_trust_root\n",
+                "  trust_root := profile.conformance_trust_root\n"
+                "  trust_root := authority.fixture_set\n",
+            ),
+            (
+                "  root := resolve_release_approval_trust_root(release_trust_root)\n",
+                "  root := resolve_release_approval_trust_root(release_trust_root)\n"
+                "  root := approval_authority.store_snapshot\n",
+            ),
+            (
+                "  session := validate_and_consume_measurement_envelope(\n",
+                "  session := authority.fixture_set\n"
+                "  session := validate_and_consume_measurement_envelope(\n",
+            ),
+            (
+                "  measured_environment := session.measured_environment\n",
+                "  measured_environment := approval_authority.store_snapshot\n"
+                "  measured_environment := session.measured_environment\n",
+            ),
+        )
+        for original, replacement in source_mutations:
+            with self.subTest(source=original.strip()):
+                self.assertGreaterEqual(template.count(original), 1)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any("Attested security variable source/dominance" in error for error in errors),
+                    errors,
+                )
+
+        attestation_membership = (
+            "  require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation\n"
+            "  trusted_key_material := store.trusted_key_material_by_id[policy.trusted_attestation_key_id]\n"
+        )
+        self.assertEqual(template.count(attestation_membership), 1)
+        reordered_attestation = template.replace(
+            attestation_membership,
+            "  trusted_key_material := store.trusted_key_material_by_id[policy.trusted_attestation_key_id]\n"
+            "  require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation\n",
+            1,
+        )
+        attestation_errors = validate(reordered_attestation)
+        self.assertTrue(
+            any("map lookup membership dominance" in error for error in attestation_errors),
+            attestation_errors,
+        )
+
+        approval_membership = (
+            "  require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation\n"
+            "  trusted_approver_public_key_material :=\n"
+            "    root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]\n"
+        )
+        self.assertEqual(template.count(approval_membership), 1)
+        reordered_approval = template.replace(
+            approval_membership,
+            "  trusted_approver_public_key_material :=\n"
+            "    root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]\n"
+            "  require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation\n",
+            1,
+        )
+        approval_errors = validate(reordered_approval)
+        self.assertTrue(
+            any("map lookup membership dominance" in error for error in approval_errors),
+            approval_errors,
+        )
+
+    def test_task9_round4_release_control_flow_and_production_subject_digest_are_exact(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        missing_branch = (
+            "  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:\n"
+            "    return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }\n"
+            "  require approval_authority.store_snapshot.approved_by_subject[subject_digest] == approved\n"
+        )
+        self.assertEqual(template.count(missing_branch), 1)
+        lookup_first = template.replace(
+            missing_branch,
+            "  require approval_authority.store_snapshot.approved_by_subject[subject_digest] == approved\n"
+            "  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:\n"
+            "    return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }\n",
+            1,
+        )
+        lookup_errors = validate(lookup_first)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in lookup_errors),
+            lookup_errors,
+        )
+
+        explicit_allow = template.replace(
+            "  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:\n",
+            "  return Completed { decision: ReleaseAllowed { subject_digest, approved } }\n"
+            "  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:\n",
+            1,
+        )
+        explicit_allow_errors = validate(explicit_allow)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in explicit_allow_errors),
+            explicit_allow_errors,
+        )
+
+        missing_to_allow = template.replace(
+            "    return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }\n",
+            "    return Completed { decision: ReleaseAllowed { subject_digest, approved } }\n",
+            1,
+        )
+        missing_to_allow_errors = validate(missing_to_allow)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in missing_to_allow_errors),
+            missing_to_allow_errors,
+        )
+
+        versioned_decision = (
+            "  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields\n"
+        )
+        self.assertEqual(template.count(versioned_decision), 1)
+        direct_allow = template.replace(
+            versioned_decision,
+            "  decision := ReleaseAllowed { subject_digest, approved }\n"
+            + versioned_decision,
+            1,
+        )
+        direct_allow_errors = validate(direct_allow)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in direct_allow_errors),
+            direct_allow_errors,
+        )
+
+        subject_digest = "  subject_digest := hash(all four constituent fields in schema order)\n"
+        self.assertEqual(template.count(subject_digest), 1)
+        digest_extension = template.replace(
+            subject_digest,
+            subject_digest + "    + hash(canonical ConformanceDeploymentProfile)\n",
+            1,
+        )
+        digest_errors = validate(digest_extension)
+        self.assertTrue(
+            any("ProductionSubject subject_digest exact equation" in error for error in digest_errors),
+            digest_errors,
+        )
+
+    def test_task9_round4_rejects_profile_prose_decoys_and_isolates_all_production_owners(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        authority_schema_formula = (
+            'hash("attested-conformance-authority/v1",\n'
+            "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))"
+        )
+        self.assertEqual(template.count(authority_schema_formula), 1)
+        authority_decoy = template.replace(
+            authority_schema_formula,
+            'digest("wrong-authority-domain/v1",\n'
+            "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))",
+            1,
+        ).replace(
+            "RunnerAttestation:\n",
+            "Schema evidence: " + authority_schema_formula.replace("\n", " ") + "\n\n"
+            "RunnerAttestation:\n",
+            1,
+        )
+        authority_decoy_errors = validate(authority_decoy)
+        self.assertTrue(
+            any("Attested authority schema/validator domain equality" in error for error in authority_decoy_errors),
+            authority_decoy_errors,
+        )
+
+        record_schema_formula = (
+            '  evaluation_input_digest := hash("attested-conformance-record-input/v1",\n'
+            "    authority.conformance_invocation_digest,\n"
+            "    session.measured_execution_environment_digest,\n"
+            "    canonical(binding), binding.fixture_binding_digest)"
+        )
+        self.assertEqual(template.count(record_schema_formula), 1)
+        record_decoy = template.replace(
+            record_schema_formula,
+            record_schema_formula.replace(" := hash(", " := digest(").replace(
+                '"attested-conformance-record-input/v1"', '"wrong-record-domain/v1"'
+            ),
+            1,
+        ).replace(
+            "derive_approved_digest_set fields:\n",
+            "Schema evidence: "
+            + record_schema_formula.strip().replace("\n", " ")
+            + "\n\nderive_approved_digest_set fields:\n",
+            1,
+        )
+        record_decoy_errors = validate(record_decoy)
+        self.assertTrue(
+            any("Attested record-input three-site normalized equality" in error for error in record_decoy_errors),
+            record_decoy_errors,
+        )
+
+        basic_rule = "require record.fixture_ref == record_key"
+        basic_tail = (
+            "return Completed iff every Basic closure equation holds; otherwise InternalViolation"
+        )
+        self.assertEqual(template.count(basic_rule), 1)
+        basic_decoy = template.replace(basic_rule, "demand record.fixture_ref == record_key", 1).replace(
+            basic_tail,
+            basic_tail + "\nprose evidence: " + basic_rule,
+            1,
+        )
+        basic_decoy_errors = validate(basic_decoy)
+        self.assertTrue(
+            any(basic_rule in error and "conformance basic closure" in error for error in basic_decoy_errors),
+            basic_decoy_errors,
+        )
+
+        for owner, field in (
+            ("ProjectionBundleAuthority", "release_profile: ConformanceDeploymentProfile"),
+            ("GateManifest", "attested_seal: AttestedConformanceSealArtifact"),
+        ):
+            with self.subTest(production_owner=owner):
+                header = f"{owner}:\n"
+                self.assertEqual(template.count(header), 1)
+                mutated = template.replace(header, header + f"  {field}\n", 1)
+                errors = validate(mutated)
+                self.assertTrue(
+                    any("production owner conformance isolation" in error for error in errors),
+                    errors,
+                )
+
+    def test_task9_round3_rejects_export_aliases(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        derive_tail = "  release_policy_digest := recompute policy.release_policy_digest"
+        self.assertEqual(template.count(derive_tail), 1)
+        exported_alias = template.replace(
+            derive_tail,
+            derive_tail
+            + "\npublic exported alias: seal_attested := "
+            + "validate_and_seal_attested_conformance",
+            1,
+        )
+        alias_errors = validate(exported_alias)
+        self.assertTrue(
+            any("whole conformance exported port inventory" in error for error in alias_errors),
+            alias_errors,
+        )
+
+    def test_task9_round3_rejects_profile_union_extensions(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        extended_profile = (
+            "ExtendedConformanceProfile := "
+            "ConformanceDeploymentProfile | UnknownProfile"
+        )
+        outside_extension = template.replace(
+            "</main>", f"<pre><code>{extended_profile}</code></pre>\n</main>", 1
+        )
+        extension_errors = validate(outside_extension)
+        self.assertTrue(
+            any("closed conformance profile definition inventory" in error for error in extension_errors),
+            extension_errors,
+        )
+
+    def test_task9_round2_whole_section_port_union_and_global_owner_closure(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        attested_result = (
+            "AttestedConformanceRunResult :=\n"
+            "  Completed { artifact: AttestedConformanceSealArtifact }\n"
+            "  | InternalViolation { violation: InternalContractViolation }"
+        )
+        self.assertEqual(template.count(attested_result), 1)
+        extra_arm = template.replace(
+            attested_result,
+            attested_result + "\n  | BasicAccepted { artifact: BasicOfflineReportArtifact }",
+            1,
+        )
+        extra_arm_errors = validate(extra_arm)
+        self.assertTrue(
+            any("AttestedConformanceRunResult exact two-arm union" in error for error in extra_arm_errors),
+            extra_arm_errors,
+        )
+
+        release_decision = (
+            "ReleaseDecision :=\n"
+            "  ReleaseAllowed { subject_digest, approved: ApprovedDigestSet }\n"
+            "  | ReleaseBlocked { subject_digest, reasons: NonEmpty&lt;ReleaseBlockReason&gt; }"
+        )
+        self.assertEqual(template.count(release_decision), 1)
+        release_extra_arm = template.replace(
+            release_decision,
+            release_decision + "\n  | Deferred { subject_digest }",
+            1,
+        )
+        release_extra_errors = validate(release_extra_arm)
+        self.assertTrue(
+            any("ReleaseDecision exact two-arm union" in error for error in release_extra_errors),
+            release_extra_errors,
+        )
+
+        basic_tail = (
+            "return Completed iff every Basic closure equation holds; "
+            "otherwise InternalViolation"
+        )
+        alias_in_marker = template.replace(
+            basic_tail,
+            basic_tail
+            + "\nupgrade_basic_for_release(payload: Bytes) -&gt; Bytes",
+            1,
+        )
+        alias_in_marker_errors = validate(alias_in_marker)
+        self.assertTrue(
+            any("whole conformance callable owner inventory" in error for error in alias_in_marker_errors),
+            alias_in_marker_errors,
+        )
+
+        outside_declarations = (
+            (
+                "ReleasePolicyApplicationResult :=\n"
+                "  Completed { decision: ReleaseDecision }\n"
+                "  | InternalViolation { violation: InternalContractViolation }",
+                "global conformance owner uniqueness",
+            ),
+            (
+                "upgrade_basic_for_release(payload: Bytes) -&gt; Bytes",
+                "conformance declaration outside module",
+            ),
+            (
+                "ExperimentalConformance := BasicOfflineConformance",
+                "closed conformance profile declaration set",
+            ),
+        )
+        for declaration, expected_error in outside_declarations:
+            with self.subTest(declaration=declaration):
+                mutated = template.replace(
+                    "</main>", f"<pre><code>{declaration}</code></pre>\n</main>", 1
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+    def test_task9_round2_schema_extent_trust_dataflow_and_missing_approval(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        post_digest_mutations = (
+            (
+                "  subject_digest := hash(all four constituent fields in schema order)\n",
+                "  subject_digest := hash(all four constituent fields in schema order)\n"
+                "  conformance_profile: ConformanceDeploymentProfile\n",
+                "ProductionSubject exact production schema",
+            ),
+            (
+                "    hash(canonical_payload_without_derived_digests(BackendSealArtifact))\n",
+                "    hash(canonical_payload_without_derived_digests(BackendSealArtifact))\n"
+                "  basic_report: BasicOfflineReportArtifact\n",
+                "BackendSealArtifact<T,V> exact production schema",
+            ),
+            (
+                "           ComparisonResultCandidate))\n",
+                "           ComparisonResultCandidate))\n"
+                "  conformance_profile: ConformanceDeploymentProfile\n",
+                "ComparisonResultCandidate exact production schema",
+            ),
+            (
+                "    hash(canonical_payload_without_derived_digests(ComparisonSealArtifact))\n",
+                "    hash(canonical_payload_without_derived_digests(ComparisonSealArtifact))\n"
+                "  attested_seal: AttestedConformanceSealArtifact\n",
+                "ComparisonSealArtifact exact production schema",
+            ),
+        )
+        for original, replacement, expected_error in post_digest_mutations:
+            with self.subTest(schema=expected_error):
+                self.assertEqual(template.count(original), 1)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+        additional_production_owners = (
+            "EvaluationInstanceIdentity",
+            "EstimateCandidate&lt;T&gt;",
+            "BackendResultCandidate&lt;T&gt;",
+            "BackendResultSourceAuthority&lt;V&gt;",
+            "BackendValueGateAuthority&lt;T,V&gt;",
+            "BackendSealAuthority&lt;T,V&gt;",
+            "ComparisonArmAuthority",
+            "ComparisonSourceAuthority",
+            "ComparisonSealAuthority",
+        )
+        for owner in additional_production_owners:
+            with self.subTest(production_owner=owner):
+                header = f"{owner}:\n"
+                self.assertEqual(template.count(header), 1)
+                mutated = template.replace(
+                    header,
+                    header + "  conformance_profile: ConformanceDeploymentProfile\n",
+                    1,
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any(
+                        f"{unescape(owner)} exact production schema" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+        authority_fallback = template.replace(
+            "  runner_attestation_policy_ref: RunnerAttestationPolicyRef\n",
+            "  runner_attestation_policy_ref: RunnerAttestationPolicyRef\n"
+            "  fallback_trust_store: TrustStoreSnapshot\n"
+            "  fallback_runner_policy: RunnerAttestationPolicy\n",
+            1,
+        )
+        authority_fallback_errors = validate(authority_fallback)
+        self.assertTrue(
+            any("AttestedConformanceInvocationAuthority exact schema" in error for error in authority_fallback_errors),
+            authority_fallback_errors,
+        )
+
+        fallback_dataflow = template.replace(
+            "  (store, policy) := resolve_conformance_trust_root(trust_root)\n",
+            "  (store, policy) := resolve_conformance_trust_root(trust_root)\n"
+            "  if store is None: store := authority.fallback_trust_store\n"
+            "  if policy is None: policy := authority.fallback_runner_policy\n",
+            1,
+        )
+        fallback_dataflow_errors = validate(fallback_dataflow)
+        self.assertTrue(
+            any("caller-owned Attested trust fallback" in error for error in fallback_dataflow_errors),
+            fallback_dataflow_errors,
+        )
+
+        approval_fallback = template.replace(
+            "  approved: ApprovedDigestSet\n",
+            "  approved: ApprovedDigestSet\n"
+            "  fallback_key_material: TrustedPublicKeyMaterial\n",
+            1,
+        )
+        approval_fallback_errors = validate(approval_fallback)
+        self.assertTrue(
+            any("ReleaseApprovalAuthority exact schema" in error for error in approval_fallback_errors),
+            approval_fallback_errors,
+        )
+
+        key_assignment = (
+            "  trusted_approver_public_key_material :=\n"
+            "    root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]\n"
+        )
+        self.assertEqual(template.count(key_assignment), 1)
+        fallback_key = template.replace(
+            key_assignment,
+            key_assignment
+            + "  if trusted_approver_public_key_material is None:\n"
+            + "    trusted_approver_public_key_material := approval.fallback_key_material\n",
+            1,
+        )
+        fallback_key_errors = validate(fallback_key)
+        self.assertTrue(
+            any("caller-owned release approval key fallback" in error for error in fallback_key_errors),
+            fallback_key_errors,
+        )
+
+        missing_branch = (
+            "  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:\n"
+            "    return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }\n"
+        )
+        self.assertEqual(template.count(missing_branch), 1)
+        missing_override = template.replace(
+            missing_branch,
+            missing_branch
+            + "  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:\n"
+            + "    return Completed { decision: ReleaseAllowed { subject_digest, approved } }\n",
+            1,
+        )
+        missing_override_errors = validate(missing_override)
+        self.assertTrue(
+            any("ApprovalMissing unique blocked branch" in error for error in missing_override_errors),
+            missing_override_errors,
+        )
+
+    def test_task9_round2_release_digest_mismatch_is_reachable_and_chapter_syncs(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+
+        mismatch_declaration = (
+            "  derived_approved := derive_approved_digest_set(artifact, policy)\n"
+            "  approved_mismatches := canonical_schema_path_diff(approved, derived_approved)\n"
+        )
+        authenticated_branch = (
+            "  require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)\n"
+            "  verify release approval signature only with external-root public key material\n"
+            "  if approved_mismatches is NonEmpty:\n"
+            "    return Completed { decision: ReleaseBlocked { subject_digest, reasons:\n"
+            "      map(approved_mismatches, path -&gt; ApprovedDigestMismatch(path)) } }\n"
+            "  require approved == derived_approved\n"
+            "  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path\n"
+            "  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields\n"
+        )
+        self.assertEqual(template.count(mismatch_declaration), 1)
+        self.assertEqual(template.count(authenticated_branch), 1)
+        removed_branch = template.replace(
+            authenticated_branch,
+            "  require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)\n"
+            "  verify release approval signature only with external-root public key material\n"
+            "  require approved == derived_approved\n"
+            "  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path\n"
+            "  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields\n",
+            1,
+        )
+        removed_errors = validate(removed_branch)
+        self.assertTrue(
+            any("ApprovedDigestMismatch reachable blocked branch" in error for error in removed_errors),
+            removed_errors,
+        )
+
+        early_return = template.replace(
+            mismatch_declaration,
+            mismatch_declaration
+            + "  if approved_mismatches is NonEmpty:\n"
+            + "    return Completed { decision: ReleaseBlocked { subject_digest, reasons:\n"
+            + "      map(approved_mismatches, path -&gt; ApprovedDigestMismatch(path)) } }\n",
+            1,
+        ).replace(
+            authenticated_branch,
+            "  require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)\n"
+            "  verify release approval signature only with external-root public key material\n"
+            "  require approved == derived_approved\n"
+            "  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path\n"
+            "  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields\n",
+            1,
+        )
+        stale_errors = validate(early_return)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in stale_errors),
+            stale_errors,
+        )
+
+        false_guard = template.replace(
+            "  if approved_mismatches is NonEmpty:\n",
+            "  if False and approved_mismatches is NonEmpty:\n",
+            1,
+        ).replace(
+            "  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields\n",
+            "  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields\n"
+            "  invariant evidence: if approved_mismatches is NonEmpty:\n",
+            1,
+        )
+        false_guard_errors = validate(false_guard)
+        self.assertTrue(
+            any("release decision authenticated control-flow" in error for error in false_guard_errors),
+            false_guard_errors,
+        )
+
+        chapter_12_4 = verify_gates._section_between(template, "c12-4", "c12-5")
+        self.assertIsNotNone(chapter_12_4)
+        self.assertEqual(
+            chapter_12_4.count("-&gt; ReleasePolicyApplicationResult"), 1
+        )
+        stale_chapter = template.replace(
+            "  -&gt; ReleasePolicyApplicationResult</code></pre>",
+            "  -&gt; ReleaseDecision</code></pre>",
+            1,
+        )
+        stale_chapter_errors = validate(stale_chapter)
+        self.assertTrue(
+            any("Chapter 12.4 release result wrapper" in error for error in stale_chapter_errors),
+            stale_chapter_errors,
+        )
+
+    def test_task9_round2_domain_basic_security_and_handoff_inventories(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        domain_mutations = (
+            (
+                'hash("attested-conformance-authority/v1",\n'
+                "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))",
+                'hash("wrong-authority-domain/v1",\n'
+                "      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))",
+                "Attested authority schema/validator domain equality",
+            ),
+            (
+                'evaluation_input_digest := hash("attested-conformance-record-input/v1",\n'
+                "    authority.conformance_invocation_digest,",
+                'evaluation_input_digest := hash("wrong-record-domain/v1",\n'
+                "    authority.conformance_invocation_digest,",
+                "Attested record-input three-site normalized equality",
+            ),
+        )
+        for original, replacement, expected_error in domain_mutations:
+            with self.subTest(domain=expected_error):
+                self.assertEqual(template.count(original), 1)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+        basic_closure_rules = (
+            "require record.fixture_ref == record_key",
+            "require record.target_invocation_id == binding.target_invocation_id",
+            "require record.target_clause_id == binding.target_clause_id",
+            "require record.fixture_digest == binding.fixture.fixture_digest",
+            "require record.observed_clause_output == observed_clause_outputs[record_key]",
+            "require record.basic_offline_execution_record_digest == hash(\"basic-offline-record/v1\",",
+            "require ledger.expected_binding_domain == keys(authority.fixture_set.bindings)",
+            "require keys(ledger.execution_records) == ledger.expected_binding_domain",
+            "require ledger.basic_offline_authority_digest == authority.basic_offline_authority_digest",
+            "require ledger.subject_digest == authority.production_subject.subject_digest",
+            "require ledger.fixture_set_digest == authority.fixture_set.fixture_set_digest",
+            "require ledger.validation_policy_digest == authority.validation_policy.validation_policy_digest",
+            "require ledger.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest",
+            "require ledger.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest",
+            "require ledger.observed_output == observed",
+            "require ledger.basic_offline_execution_ledger_digest == hash(\"basic-offline-ledger/v1\",",
+            "require report.production_subject == authority.production_subject",
+            "require report.subject_digest == authority.production_subject.subject_digest",
+            "require report.basic_offline_authority_digest == authority.basic_offline_authority_digest",
+            "require report.observed_output_digest == observed.observed_output_digest",
+            "require report.fixture_set_digest == authority.fixture_set.fixture_set_digest",
+            "require report.validation_policy_digest == authority.validation_policy.validation_policy_digest",
+            "require report.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest",
+            "require report.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest",
+            "require report.basic_offline_execution_ledger_digest == ledger.basic_offline_execution_ledger_digest",
+            "require report.offline_verdict == derived_offline_verdict",
+            "require report.findings == observed.findings",
+            "require report.basic_offline_report_digest == hash(\"basic-offline-report/v1\",",
+            "require artifact.authority == authority",
+            "require artifact.observed_output == observed",
+            "require artifact.execution_ledger == ledger",
+            "require artifact.report == report",
+            "require artifact.basic_offline_report_artifact_digest == hash(",
+        )
+        for rule in basic_closure_rules:
+            with self.subTest(basic_rule=rule):
+                self.assertIn(rule, template)
+                errors = validate(template.replace(rule, "REMOVED_BASIC_RULE", 1))
+                self.assertTrue(
+                    any(rule in error and "conformance basic closure" in error for error in errors),
+                    errors,
+                )
+
+        rehost_rule = "negative fixture: release approval substituted policy"
+        self.assertEqual(template.count(rehost_rule), 1)
+        removed = replace_in_module(
+            template, "conformance", rehost_rule, "REHOSTED_SECURITY_RULE"
+        )
+        conformance = module_section_match(removed, "conformance")
+        rehosted = (
+            removed[: conformance.start()]
+            + conformance.group("open")
+            + conformance.group("body")
+            + f"<p>{rehost_rule}</p>"
+            + conformance.group("close")
+            + removed[conformance.end() :]
+        )
+        rehosted_errors = validate(rehosted)
+        self.assertTrue(
+            any("Attested security rule inventory" in error for error in rehosted_errors),
+            rehosted_errors,
+        )
+
+        handoff = (ROOT / "HANDOFF.md").read_text(encoding="utf-8")
+        basic_signature = (
+            "run_basic_offline_conformance(\n"
+            "  authority: BasicOfflineConformanceAuthority\n"
+            ") -> BasicOfflineRunResult"
+        )
+        self.assertEqual(handoff.count(basic_signature), 1)
+        mutated_handoff = handoff.replace(
+            basic_signature,
+            basic_signature + "\nsession: Bytes",
+            1,
+        )
+        handoff_errors: list[str] = []
+        verify_gates.check_handoff_conformance_sync(mutated_handoff, handoff_errors)
+        self.assertTrue(
+            any("BasicOffline profile contains attested/release capability" in error for error in handoff_errors),
+            handoff_errors,
+        )
+
+    def test_task9_round1_domain_tags_and_basic_closure_are_explicit(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        local_errors: list[str] = []
+        local = verify_gates._conformance_local_texts(template, local_errors)
+        self.assertEqual(local_errors, [])
+        attested = local[("profile", "attested-release")]
+        basic = local[("profile", "basic-offline")]
+
+        authority_formula = (
+            'hash("attested-conformance-authority/v1", '
+            "canonical_payload_without_derived_digests(authority))"
+        )
+        record_input_formula = (
+            'evaluation_input_digest := hash("attested-conformance-record-input/v1", '
+            "authority.conformance_invocation_digest, "
+            "session.measured_execution_environment_digest, canonical(binding), "
+            "binding.fixture_binding_digest)"
+        )
+        self.assertEqual(attested.count(authority_formula), 1)
+        self.assertEqual(attested.count(record_input_formula), 3)
+
+        basic_closure_tokens = (
+            "require record.fixture_ref == record_key",
+            "require record.target_invocation_id == binding.target_invocation_id",
+            "require record.target_clause_id == binding.target_clause_id",
+            "require record.fixture_digest == binding.fixture.fixture_digest",
+            'record.evaluation_input_digest == hash("basic-offline-record-input/v1", authority.basic_offline_authority_digest, canonical(binding), binding.fixture_binding_digest)',
+            "require ledger.expected_binding_domain == keys(authority.fixture_set.bindings)",
+            "require keys(ledger.execution_records) == ledger.expected_binding_domain",
+            "require ledger.basic_offline_authority_digest == authority.basic_offline_authority_digest",
+            "require ledger.observed_output == observed",
+            "require report.production_subject == authority.production_subject",
+            "require report.offline_verdict == derived_offline_verdict",
+            "require report.findings == observed.findings",
+            "require artifact.authority == authority",
+            "require artifact.observed_output == observed",
+            "require artifact.execution_ledger == ledger",
+            "require artifact.report == report",
+            "recompute every Basic artifact nested digest before Completed",
+            "return Completed iff every Basic closure equation holds; otherwise InternalViolation",
+        )
+        for token in basic_closure_tokens:
+            with self.subTest(token=token):
+                self.assertIn(token, basic)
+
+        expected_owner_inventory = {
+            ("scope", "shared"): (
+                "TraceFixture",
+                "FixtureBinding",
+                "FixtureSet",
+                "ValidationPolicy",
+                "VerifierRunner",
+                "ConformanceFinding",
+                "ObservedClauseOutput",
+                "ConformanceObservedOutput",
+            ),
+            ("scope", "deployment"): ("ConformanceDeploymentProfile",),
+            ("profile", "basic-offline"): (
+                "BasicOfflineConformanceAuthority",
+                "BasicOfflineExecutionRecord",
+                "BasicOfflineExecutionLedger",
+                "BasicOfflineReport",
+                "BasicOfflineReportArtifact",
+                "BasicOfflineRunResult",
+            ),
+            ("profile", "attested-release"): (
+                "TrustStoreSnapshot",
+                "RunnerAttestationPolicy",
+                "TrustStoreSnapshotRef",
+                "RunnerAttestationPolicyRef",
+                "ConformanceTrustRootCapability",
+                "MeasuredExecutionEnvironment",
+                "ValidatedMeasurementSessionCapability",
+                "AttestedConformanceInvocationAuthority",
+                "RunnerAttestation",
+                "AttestedConformanceExecutionRecord",
+                "AttestedConformanceExecutionLedger",
+                "ApprovedDigestSet",
+                "ReleaseApprovalStoreSnapshot",
+                "ReleaseApprovalTrustRootCapability",
+                "ReleaseApprovalAuthority",
+                "ReleaseApprovalArtifact",
+                "AttestedConformanceReport",
+                "ReleasePolicy",
+                "AttestedConformanceSealArtifact",
+                "AttestedConformanceRunResult",
+                "ReleaseBlockReason",
+                "ReleaseDecision",
+                "ReleasePolicyApplicationResult",
+            ),
+        }
+        self.assertEqual(
+            getattr(verify_gates, "CONFORMANCE_OWNER_INVENTORY", {}),
+            expected_owner_inventory,
+        )
+
+        attested_boundary_tokens = (
+            "ReleasePolicyApplicationResult := Completed { decision: ReleaseDecision } | InternalViolation { violation: InternalContractViolation }",
+            "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+            "public exported ports (exact):",
+            "internal non-exported ports:",
+            "require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation",
+            "if subject_digest not in approval_authority.store_snapshot.approved_by_subject: return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }",
+            "require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation",
+        )
+        for token in attested_boundary_tokens:
+            with self.subTest(attested_boundary=token):
+                self.assertIn(token, attested)
+
+    def test_task9_round1_rejects_unmarked_ports_extra_result_arms_and_owner_fields(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        basic_publish = template.replace(
+            "BasicOfflineRunResult :=\n"
+            "  Completed { artifact: BasicOfflineReportArtifact }\n"
+            "  | InternalViolation { violation: InternalContractViolation }",
+            "BasicOfflineRunResult :=\n"
+            "  Completed { artifact: BasicOfflineReportArtifact }\n"
+            "  | InternalViolation { violation: InternalContractViolation }\n"
+            "  | PublishAuthorized { subject_digest: Digest }",
+            1,
+        )
+        publish_errors = validate(basic_publish)
+        self.assertTrue(
+            any("BasicOfflineRunResult exact two-arm union" in error for error in publish_errors),
+            publish_errors,
+        )
+
+        release_result_arm = (
+            "ReleasePolicyApplicationResult :=\n"
+            "  Completed { decision: ReleaseDecision }\n"
+            "  | InternalViolation { violation: InternalContractViolation }"
+        )
+        self.assertEqual(template.count(release_result_arm), 1)
+        release_publish = template.replace(
+            release_result_arm,
+            release_result_arm + "\n  | PublishAuthorized { subject_digest: Digest }",
+            1,
+        )
+        release_publish_errors = validate(release_publish)
+        self.assertTrue(
+            any("ReleasePolicyApplicationResult exact two-arm union" in error for error in release_publish_errors),
+            release_publish_errors,
+        )
+
+        naked_session = template.replace(
+            "BasicOfflineConformanceAuthority:\n",
+            "BasicOfflineConformanceAuthority:\n  session: Bytes\n",
+            1,
+        )
+        naked_session_errors = validate(naked_session)
+        self.assertTrue(
+            any("basic-offline block contains attested/release token" in error for error in naked_session_errors),
+            naked_session_errors,
+        )
+
+        shared_heavy = template.replace(
+            "ConformanceObservedOutput:\n",
+            "ConformanceObservedOutput:\n"
+            "  runner_attestation_ref: RunnerAttestation\n",
+            1,
+        )
+        shared_heavy_errors = validate(shared_heavy)
+        self.assertTrue(
+            any("shared block references a profile-specific type" in error for error in shared_heavy_errors),
+            shared_heavy_errors,
+        )
+
+        conformance = module_section_match(template, "conformance")
+        unmarked_overload = (
+            "<pre><code>apply_release_policy(\n"
+            "  artifact: BasicOfflineReportArtifact,\n"
+            "  approval: ReleaseApprovalArtifact,\n"
+            "  policy: ReleasePolicy,\n"
+            "  profile: AttestedReleaseConformance\n"
+            ") -&gt; ReleaseDecision</code></pre>"
+        )
+        unmarked_body = conformance.group("body") + unmarked_overload
+        unmarked = (
+            template[: conformance.start()]
+            + conformance.group("open")
+            + unmarked_body
+            + conformance.group("close")
+            + template[conformance.end() :]
+        )
+        unmarked_errors = validate(unmarked)
+        self.assertTrue(
+            any("profile-specific declaration outside local block" in error for error in unmarked_errors),
+            unmarked_errors,
+        )
+
+        exact_signature = (
+            "apply_release_policy(\n"
+            "  artifact: AttestedConformanceSealArtifact,\n"
+            "  approval: ReleaseApprovalArtifact,\n"
+            "  policy: ReleasePolicy,\n"
+            "  profile: AttestedReleaseConformance\n"
+            ") -&gt; ReleasePolicyApplicationResult"
+        )
+        duplicate_body = conformance.group("body") + f"<pre><code>{exact_signature}</code></pre>"
+        duplicate = (
+            template[: conformance.start()]
+            + conformance.group("open")
+            + duplicate_body
+            + conformance.group("close")
+            + template[conformance.end() :]
+        )
+        duplicate_errors = validate(duplicate)
+        self.assertTrue(
+            any("unique exact Attested apply_release_policy" in error for error in duplicate_errors),
+            duplicate_errors,
+        )
+
+        public_helper = template.replace(
+            "public exported ports (exact):\n",
+            "public exported ports (exact):\n"
+            "validate_and_seal_attested_conformance(\n"
+            "  authority: AttestedConformanceInvocationAuthority\n"
+            ") -&gt; AttestedConformanceRunResult\n",
+            1,
+        )
+        public_helper_errors = validate(public_helper)
+        self.assertTrue(
+            any("exact three public conformance ports" in error for error in public_helper_errors),
+            public_helper_errors,
+        )
+
+        wrong_apply_result = template.replace(
+            ") -&gt; ReleasePolicyApplicationResult\n\ninternal non-exported ports:",
+            ") -&gt; ReleaseDecision\n\ninternal non-exported ports:",
+            1,
+        )
+        wrong_apply_errors = validate(wrong_apply_result)
+        self.assertTrue(
+            any("unique exact Attested apply_release_policy" in error for error in wrong_apply_errors),
+            wrong_apply_errors,
+        )
+
+        membership_tokens = (
+            "require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation",
+            "if subject_digest not in approval_authority.store_snapshot.approved_by_subject:",
+            "require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation",
+        )
+        for token in membership_tokens:
+            with self.subTest(membership=token):
+                self.assertIn(token, template)
+                membership_errors = validate(template.replace(token, "MISSING_MEMBERSHIP_CHECK", 1))
+                self.assertTrue(
+                    any("map lookup membership closure" in error for error in membership_errors),
+                    membership_errors,
+                )
+
+        attested_rule = (
+            "measured_payload_digest == policy.expected_execution_environment_digest"
+        )
+        self.assertEqual(template.count(attested_rule), 2)
+        rule_removed = replace_in_module(
+            template,
+            "conformance",
+            attested_rule,
+            "REHOSTED_MEASURED_PAYLOAD_RULE",
+        )
+        rule_removed = replace_in_module(
+            rule_removed,
+            "conformance",
+            attested_rule,
+            "REHOSTED_MEASURED_PAYLOAD_RULE",
+        )
+        removed_section = module_section_match(rule_removed, "conformance")
+        rule_rehosted_body = (
+            removed_section.group("body")
+            + f"<p>{attested_rule}; {attested_rule}</p>"
+        )
+        rule_rehosted = (
+            rule_removed[: removed_section.start()]
+            + removed_section.group("open")
+            + rule_rehosted_body
+            + removed_section.group("close")
+            + rule_removed[removed_section.end() :]
+        )
+        rule_rehosted_errors = validate(rule_rehosted)
+        self.assertTrue(
+            any("profile-specific declaration outside local block" in error for error in rule_rehosted_errors),
+            rule_rehosted_errors,
+        )
+
+        extra_approved_field = template.replace(
+            "  release_policy_digest\n\nReleaseApprovalStoreSnapshot:",
+            "  release_policy_digest\n  profile_schema_id\n\n"
+            "ReleaseApprovalStoreSnapshot:",
+            1,
+        )
+        extra_approved_errors = validate(extra_approved_field)
+        self.assertTrue(
+            any("ApprovedDigestSet exact ten-field schema" in error for error in extra_approved_errors),
+            extra_approved_errors,
+        )
+
+        owner_mutations = (
+            (
+                "ProductionSubject:\n",
+                "ProductionSubject:\n  conformance_profile: ConformanceDeploymentProfile\n",
+                "ProductionSubject exact production schema",
+            ),
+            (
+                "Estimate&lt;T&gt;:\n",
+                "Estimate&lt;T&gt;:\n  basic_report: BasicOfflineReportArtifact\n",
+                "Estimate<T> exact production schema",
+            ),
+            (
+                "BackendSealArtifact&lt;T,V&gt;:\n",
+                "BackendSealArtifact&lt;T,V&gt;:\n"
+                "  conformance_seal: AttestedConformanceSealArtifact\n",
+                "BackendSealArtifact<T,V> exact production schema",
+            ),
+            (
+                "ComparisonResult:\n",
+                "ComparisonResult:\n  conformance_profile: ConformanceDeploymentProfile\n",
+                "ComparisonResult exact production schema",
+            ),
+            (
+                "ComparisonResultCandidate:\n",
+                "ComparisonResultCandidate:\n"
+                "  basic_report: BasicOfflineReportArtifact\n",
+                "ComparisonResultCandidate exact production schema",
+            ),
+            (
+                "ComparisonSealArtifact:\n",
+                "ComparisonSealArtifact:\n"
+                "  conformance_seal: AttestedConformanceSealArtifact\n",
+                "ComparisonSealArtifact exact production schema",
+            ),
+        )
+        for original, replacement, expected_error in owner_mutations:
+            with self.subTest(owner=original):
+                self.assertEqual(template.count(original), 1)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+    def test_task9_handoff_profiles_and_ports_are_structurally_synchronized(self) -> None:
+        handoff = (ROOT / "HANDOFF.md").read_text(encoding="utf-8")
+        errors: list[str] = []
+        verify_gates.check_handoff_conformance_sync(handoff, errors)
+        self.assertEqual(errors, [])
+
+        mutations = (
+            (
+                "  BasicOfflineConformance\n  | AttestedReleaseConformance {",
+                "  BasicOfflineConformance\n  | ExperimentalConformance\n  | AttestedReleaseConformance {",
+                "exact two arms/default",
+            ),
+            (
+                "default_conformance_deployment_profile := BasicOfflineConformance",
+                "default_conformance_deployment_profile := AttestedReleaseConformance",
+                "exact two arms/default",
+            ),
+            (
+                "artifact: AttestedConformanceSealArtifact,",
+                "artifact: BasicOfflineReportArtifact,",
+                "AttestedRelease profile boundary",
+            ),
+            (
+                "`run_basic_offline_conformance(...)`、",
+                "",
+                "module locator/profile ports",
+            ),
+        )
+        for original, replacement, expected_error in mutations:
+            with self.subTest(original=original):
+                self.assertIn(original, handoff)
+                mutated_errors: list[str] = []
+                verify_gates.check_handoff_conformance_sync(
+                    handoff.replace(original, replacement, 1), mutated_errors
+                )
+                self.assertTrue(
+                    any(expected_error in error for error in mutated_errors),
+                    mutated_errors,
+                )
+
+    def test_task9_conformance_profiles_are_structural_and_branch_local(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        mutations = (
+            (
+                'data-conformance-profile="basic-offline"',
+                'data-conformance-profile="unknown"',
+                "exact shared/deployment/basic-offline/attested-release",
+            ),
+            (
+                'profile_schema_id := "basic-offline/v1"',
+                'profile_schema_id := "attested-release/v1"',
+                "basic-offline every digest-owning concrete schema",
+            ),
+            (
+                "BasicOfflineConformanceAuthority:",
+                "BasicOfflineConformanceAuthority:\n  signature: Bytes",
+                "basic-offline block contains attested/release token",
+            ),
+            (
+                "BasicOfflineConformanceAuthority:",
+                "BasicOfflineConformanceAuthority:\n  trust_root: Bytes",
+                "basic-offline block contains attested/release token",
+            ),
+            (
+                "BasicOfflineConformanceAuthority:",
+                "BasicOfflineConformanceAuthority:\n  execution_session_id: Bytes",
+                "basic-offline block contains attested/release token",
+            ),
+            (
+                "| AttestedReleaseConformance {",
+                "| Disabled\n  | AttestedReleaseConformance {",
+                "exact two arms",
+            ),
+            (
+                "  }\n\ndefault_conformance_deployment_profile := BasicOfflineConformance",
+                "  }\n  | ExperimentalConformance\n\n"
+                "default_conformance_deployment_profile := BasicOfflineConformance",
+                "exact two arms",
+            ),
+            (
+                'data-conformance-scope="shared"',
+                'data-conformance-scope="shared" '
+                'data-conformance-profile="basic-offline"',
+                "exact shared/deployment/basic-offline/attested-release",
+            ),
+            (
+                "apply_release_policy(\n  artifact: AttestedConformanceSealArtifact,\n  approval: ReleaseApprovalArtifact,\n  policy: ReleasePolicy,\n  profile: AttestedReleaseConformance\n) -&gt; ReleasePolicyApplicationResult",
+                "apply_release_policy(\n  artifact: BasicOfflineReportArtifact,\n  approval: ReleaseApprovalArtifact,\n  policy: ReleasePolicy,\n  profile: AttestedReleaseConformance\n) -&gt; ReleasePolicyApplicationResult",
+                "attested-release block missing contract",
+            ),
+            (
+                "GL--&gt;&gt;BO: clause observations and GateExecutionLedger",
+                "GL--&gt;&gt;BO: AttestedConformanceSealArtifact",
+                "Task9 Figure 10 exact mutually-exclusive profile ownership",
+            ),
+            (
+                "    else AttestedReleaseConformance\n      AR-&gt;&gt;GL:",
+                "    else BasicOfflineConformance\n      AR-&gt;&gt;GL:",
+                "Task9 Figure 10 exact mutually-exclusive profile ownership",
+            ),
+            (
+                "  release_policy_digest\n\nReleaseApprovalStoreSnapshot:",
+                "  release_policy_digest\n  profile_digest\n\n"
+                "ReleaseApprovalStoreSnapshot:",
+                "ApprovedDigestSet exact ten-field schema",
+            ),
+        )
+        for original, replacement, expected_error in mutations:
+            with self.subTest(original=original):
+                self.assertIn(original, template)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+        rehost_token = (
+            "negative fixture: replay valid measurement envelope from another "
+            "execution session"
+        )
+        self.assertEqual(template.count(rehost_token), 1)
+        removed = replace_in_module(
+            template, "conformance", rehost_token, "REHOSTED_ATTESTED_RULE"
+        )
+        conformance = module_section_match(removed, "conformance")
+        rehosted_body = (
+            conformance.group("body")
+            + f"<p>{rehost_token}</p>"
+        )
+        rehosted = (
+            removed[: conformance.start()]
+            + conformance.group("open")
+            + rehosted_body
+            + conformance.group("close")
+            + removed[conformance.end() :]
+        )
+        rehosted_errors = validate(rehosted)
+        self.assertTrue(
+            any("attested-release block missing contract" in error for error in rehosted_errors),
+            rehosted_errors,
+        )
+
     def test_final_review_contracts_are_section_local_and_mutation_sensitive(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         cases = (
@@ -398,6 +2471,110 @@ class VerifyGatesContractTest(unittest.TestCase):
                 self.assertTrue(
                     any("RequestSnapshot exact schema" in error for error in errors),
                     errors,
+                )
+
+    def test_task9_conformance_cannot_enter_any_production_identity_surface(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        mutations = (
+            (
+                "common profile field",
+                "  comparison_schema_snapshot: ComparisonSchemaSnapshot\n",
+                "  comparison_schema_snapshot: ComparisonSchemaSnapshot\n"
+                "  conformance_profile: ConformanceDeploymentProfile\n",
+                "CommonProductionInputs exact schema",
+            ),
+            (
+                "request report artifact",
+                "  comparison_request: ComparisonRequest | None\n  request_digest: Digest",
+                "  comparison_request: ComparisonRequest | None\n"
+                "  basic_report_artifact: BasicOfflineReportArtifact\n"
+                "  request_digest: Digest",
+                "RequestSnapshot exact schema",
+            ),
+            (
+                "requested arm seal artifact",
+                "    memory_registry_snapshot: MemoryRegistrySnapshot }",
+                "    memory_registry_snapshot: MemoryRegistrySnapshot\n"
+                "    conformance_seal: AttestedConformanceSealArtifact }",
+                "RequestedBackendInput exact union",
+            ),
+            (
+                "comparison basis profile",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n",
+                "  logical_rank_id_set: OrderedSet[LogicalRank]\n"
+                "  conformance_profile: ConformanceDeploymentProfile\n",
+                "ComparisonBasis exact schema",
+            ),
+            (
+                "time input report",
+                "  projection_witness_digest: Digest\n",
+                "  projection_witness_digest: Digest\n"
+                "  basic_report_artifact: BasicOfflineReportArtifact\n",
+                "TimeSimulationInputDomain exact schema",
+            ),
+            (
+                "model digest profile",
+                "canonical_payload_without_derived_digests(CodeIR))",
+                "canonical_payload_without_derived_digests(CodeIR), "
+                "ConformanceDeploymentProfile)",
+                "production digest exact input closure mismatch: model_digest",
+            ),
+            (
+                "runtime digest report",
+                "canonical_payload_without_derived_digests(RuntimeEventPlan))",
+                "canonical_payload_without_derived_digests(RuntimeEventPlan), "
+                "BasicOfflineReportArtifact)",
+                "production digest exact input closure mismatch: runtime_plan_digest",
+            ),
+            (
+                "core digest seal",
+                "canonical_payload_without_derived_digests(SimulationPlanCore))",
+                "canonical_payload_without_derived_digests(SimulationPlanCore), "
+                "AttestedConformanceSealArtifact)",
+                "production digest exact input closure mismatch: simulation_core_digest",
+            ),
+            (
+                "memory digest profile",
+                "memory backend and numeric semantic versions)",
+                "memory backend and numeric semantic versions, "
+                "ConformanceDeploymentProfile)",
+                "production digest exact input closure mismatch: memory_simulation_digest",
+            ),
+            (
+                "time digest report",
+                "hash(canonical(TimeSimulationInputDomain))",
+                "hash(canonical(TimeSimulationInputDomain), BasicOfflineReportArtifact)",
+                "production digest exact input closure mismatch: time_simulation_digest",
+            ),
+            (
+                "result digest seal",
+                "hash(canonical_payload_without_derived_digests(Estimate))",
+                "hash(canonical_payload_without_derived_digests(Estimate), "
+                "AttestedConformanceSealArtifact)",
+                "production digest exact input closure mismatch: result_digest",
+            ),
+            (
+                "cache profile",
+                "(memory_simulation_digest, memory_result_schema_version)",
+                "(memory_simulation_digest, memory_result_schema_version, "
+                "ConformanceDeploymentProfile)",
+                "production cache exact schema",
+            ),
+            (
+                "backend result report arm",
+                "  | NotRequested\n\nSemanticValue&lt;T&gt;:",
+                "  | NotRequested\n  | ConformanceReport { artifact: "
+                "BasicOfflineReportArtifact }\n\nSemanticValue&lt;T&gt;:",
+                "BackendResult exact three-arm production union",
+            ),
+        )
+        for label, original, replacement, expected_error in mutations:
+            with self.subTest(label=label):
+                self.assertEqual(template.count(original), 1, original)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
                 )
 
         digest_formula = "hash(canonical_payload_without_derived_digests(RequestSnapshot))"
@@ -1257,9 +3434,10 @@ class VerifyGatesContractTest(unittest.TestCase):
             "conformance": (
                 "ConformanceFinding:",
                 "ApprovedDigestSet:",
-                "run_conformance( authority: ConformanceInvocationAuthority, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ConformanceRunResult",
-                "apply_release_policy( artifact: ConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, release_trust_root: ReleaseApprovalTrustRootCapability ) -> ReleaseDecision",
-                "derive_approved_digest_set( artifact: ConformanceSealArtifact, policy: ReleasePolicy ) -> ApprovedDigestSet",
+                "run_basic_offline_conformance( authority: BasicOfflineConformanceAuthority ) -> BasicOfflineRunResult",
+                "run_attested_release_conformance( authority: AttestedConformanceInvocationAuthority, profile: AttestedReleaseConformance, measured_environment: MeasuredExecutionEnvironment ) -> AttestedConformanceRunResult",
+                "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+                "derive_approved_digest_set( artifact: AttestedConformanceSealArtifact, policy: ReleasePolicy ) -> ApprovedDigestSet",
                 "derive_approved_digest_set fields:",
                 "subject_digest := recompute artifact.invocation_authority.production_subject.subject_digest",
                 "fixture_set_digest := recompute artifact.invocation_authority.fixture_set.fixture_set_digest",
@@ -1273,7 +3451,8 @@ class VerifyGatesContractTest(unittest.TestCase):
                 "release_policy_digest := recompute policy.release_policy_digest",
                 "derived_approved := derive_approved_digest_set(artifact, policy)",
                 "require approved == derived_approved",
-                "require approved == derive_approved_digest_set(artifact, policy)",
+                "approved_mismatches := canonical_schema_path_diff(approved, derived_approved)",
+                "map(approved_mismatches, path -> ApprovedDigestMismatch(path))",
                 "all ten approved digest fields",
                 "outside production digests and cache keys",
                 "does not alter BackendResult",
@@ -1282,23 +3461,23 @@ class VerifyGatesContractTest(unittest.TestCase):
                 "FixtureSet is the sole fixture-to-(invocation, clause) mapping",
                 "FixtureSet: bindings: OrderedMap<FixtureRef, FixtureBinding> derived_coverage_by_clause := derive_fixture_coverage(bindings)",
                 "RunnerAttestation:",
-                "ConformanceExecutionRecord:",
-                "ConformanceExecutionLedger:",
+                "AttestedConformanceExecutionRecord:",
+                "AttestedConformanceExecutionLedger:",
                 "conformance_execution_record_digest :=",
-                "ConformanceRunResult := Completed { artifact: ConformanceSealArtifact } | InternalViolation { violation: InternalContractViolation }",
-                "conformance_seal_artifact_digest := hash(canonical_payload_without_derived_digests(ConformanceSealArtifact))",
+                "AttestedConformanceRunResult := Completed { artifact: AttestedConformanceSealArtifact } | InternalViolation { violation: InternalContractViolation }",
+                'hash("attested-conformance-seal-artifact/v1", canonical_payload_without_derived_digests(AttestedConformanceSealArtifact))',
                 "runner crash, schema failure, digest failure or conservation failure",
                 "complete, valid execution",
                 "record.fixture_ref == record_key",
                 "record.target_invocation_id == binding.target_invocation_id",
                 "record.target_clause_id == binding.target_clause_id",
-                "ConformanceInvocationAuthority:",
+                "AttestedConformanceInvocationAuthority:",
                 "trust_store_snapshot_ref: TrustStoreSnapshotRef",
                 "runner_attestation_policy_ref: RunnerAttestationPolicyRef",
                 "conformance_invocation_digest :=",
-                "fixture_digest evaluation_input_digest := hash(authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest) observed_clause_output_digest",
+                'evaluation_input_digest := hash("attested-conformance-record-input/v1", authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest) observed_clause_output: ObservedClauseOutput',
                 "ConformanceObservedOutput:",
-                "ConformanceObservedOutput: execution_records: OrderedMap<FixtureRef, ConformanceExecutionRecord> findings: OrderedMap<FindingId, ConformanceFinding> coverage_gaps: OrderedSet<GateClauseId> observed_output_digest := hash(canonical execution_records, findings, coverage_gaps)",
+                "ConformanceObservedOutput: observed_clause_outputs: OrderedMap<FixtureRef, ObservedClauseOutput> findings: OrderedMap<FindingId, ConformanceFinding> coverage_gaps: OrderedSet<GateClauseId> observed_output_digest := hash(canonical observed_clause_outputs, findings, coverage_gaps)",
                 "ledger.observed_output_digest == report.observed_output_digest == attestation.observed_output_digest",
                 "TrustStoreSnapshot:",
                 "trusted_key_material_by_id: OrderedMap<AttestationKeyId, TrustedPublicKeyMaterial>",
@@ -1335,18 +3514,18 @@ class VerifyGatesContractTest(unittest.TestCase):
                 "negative fixture: unsupported runner attestation signature scheme",
                 "negative fixture: tampered runner execution environment",
                 "negative fixture: runner self-owned attestation key",
-                "validate_and_seal_conformance( authority: ConformanceInvocationAuthority, trust_root: ConformanceTrustRootCapability, session: ValidatedMeasurementSessionCapability, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, attestation: RunnerAttestation ) -> ConformanceRunResult",
-                "validate_and_seal_conformance first operation:",
+                "validate_and_seal_attested_conformance( authority: AttestedConformanceInvocationAuthority, trust_root: ConformanceTrustRootCapability, session: ValidatedMeasurementSessionCapability, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, attestation: RunnerAttestation ) -> AttestedConformanceRunResult",
+                "validate_and_seal_attested_conformance first operation:",
                 "recompute every authority.fixture_set binding, nested fixture and fixture_set_digest",
                 "recompute authority.gate_manifest and every nested entry/clause digest",
                 "recompute authority.conformance_invocation_digest only after all nested recomputations",
                 "negative fixture: old invocation digest plus substituted policy or trust-store reference",
-                "derive_conformance_report( authority: ConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, attestation: RunnerAttestation ) -> ConformanceReport",
-                "ConformanceReport.findings: OrderedMap<FindingId, ConformanceFinding>",
+                "derive_attested_conformance_report( authority: AttestedConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, attestation: RunnerAttestation ) -> AttestedConformanceReport",
+                "AttestedConformanceReport.findings: OrderedMap<FindingId, ConformanceFinding>",
                 "report.findings == observed.findings",
-                "failure_findings := policy_classified_failure_findings(authority.validation_policy, observed.findings)",
+                "failure_findings := policy_classified_failure_findings(validation_policy, findings)",
                 "verdict := fail iff failure_findings is non-empty",
-                "else insufficient iff exact_evidence_or_coverage_gaps(authority, observed, ledger) is non-empty",
+                "else insufficient iff exact_evidence_gaps or observed.coverage_gaps is non-empty",
                 "else pass",
                 "execute -> observed -> runner attestation -> ledger -> derived report -> seal",
                 "negative fixture: valid signature plus failing observed output cannot be sealed with forged pass",
@@ -1495,10 +3674,10 @@ class VerifyGatesContractTest(unittest.TestCase):
     def test_conformance_contract_rejects_unsealed_report_interfaces(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         for forbidden in (
-            "validate_and_seal_conformance( authority: ConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, report: ConformanceReport",
-            "apply_release_policy( report: ConformanceReport",
-            "run_conformance( subject: ProductionSubject",
-            "apply_release_policy( artifact: ConformanceSealArtifact, approved: ApprovedDigestSet",
+            "validate_and_seal_attested_conformance( authority: AttestedConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, report: AttestedConformanceReport",
+            "apply_release_policy( report: AttestedConformanceReport",
+            "run_attested_release_conformance( subject: ProductionSubject",
+            "apply_release_policy( artifact: AttestedConformanceSealArtifact, approved: ApprovedDigestSet",
             "verify_signature(runner.trusted_attestation_key_id, runner.attestation_signature_scheme",
             "VerifierRunner: runner_id, runner_version, executable_artifact_digest trusted_attestation_key_id, attestation_signature_scheme",
         ):
@@ -1516,7 +3695,7 @@ class VerifyGatesContractTest(unittest.TestCase):
                 )
 
         report_findings = re.compile(
-            r"(?s)(ConformanceReport:\s*.*?verdict:\s*pass\s*\|\s*fail\s*\|\s*insufficient\s*)"
+            r"(?s)(AttestedConformanceReport:\s*.*?verdict:\s*pass\s*\|\s*fail\s*\|\s*insufficient\s*)"
             r"findings:\s*OrderedMap&lt;FindingId,\s*ConformanceFinding&gt;"
         )
         self.assertIsNotNone(report_findings.search(template))
@@ -1525,7 +3704,7 @@ class VerifyGatesContractTest(unittest.TestCase):
         )
         errors = validate(mutated)
         self.assertTrue(
-            any("ConformanceReport.findings" in error for error in errors), errors
+            any("AttestedConformanceReport.findings" in error for error in errors), errors
         )
 
         authority_ref = "  trust_store_snapshot_ref: TrustStoreSnapshotRef"
@@ -1560,7 +3739,7 @@ class VerifyGatesContractTest(unittest.TestCase):
             "  recompute every authority.fixture_set binding, nested fixture and fixture_set_digest\n"
         )
         after_first_operation = (
-            "validate_and_seal_conformance equations after first operation:"
+            "validate_and_seal_attested_conformance equations after first operation:"
         )
         self.assertIn(nested_recompute, template)
         mutated = template.replace(nested_recompute, "", 1).replace(
@@ -1586,13 +3765,15 @@ class VerifyGatesContractTest(unittest.TestCase):
             "measurer_identity_and_freshness_evidence",
             "measured_execution_environment_digest := hash(canonical_payload_without_derived_digests(MeasuredExecutionEnvironment))",
             "ValidatedMeasurementSessionCapability:",
-            "validate_and_consume_measurement_envelope( authority: ConformanceInvocationAuthority, runner: VerifierRunner, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ValidatedMeasurementSessionCapability | InternalContractViolation",
+            "validate_and_consume_measurement_envelope( authority: AttestedConformanceInvocationAuthority, runner: VerifierRunner, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ValidatedMeasurementSessionCapability | InternalContractViolation",
             "measurement_envelope_digest == hash(canonical_payload_without_derived_digests(measured_environment))",
             "measured_environment.conformance_invocation_digest == authority.conformance_invocation_digest",
             "measured_environment.verifier_runner_digest == runner.verifier_runner_digest",
             "measured_environment.executable_artifact_digest == runner.executable_artifact_digest",
             "current_execution_session_context() == canonical_tuple(measured_environment.execution_session_id, measured_environment.process_identity, measured_environment.container_identity)",
-            "measured_environment.verifier_nonce is active, bound to this exact invocation/runner/executable/session/time-window tuple, and atomically consumed exactly once",
+            "terminal_consumption_receipt_key( environment: MeasuredExecutionEnvironment ) := canonical_tuple( environment.verifier_nonce, environment.conformance_invocation_digest, environment.verifier_runner_digest, environment.executable_artifact_digest, environment.execution_session_id, environment.process_identity, environment.container_identity, environment.execution_time_window, environment.measured_execution_environment_digest)",
+            "atomically consumed exactly once while persisting a terminal receipt under that exact key",
+            "session.nonce_consumption_receipt proves the terminal registry contains exact terminal_consumption_receipt_key(measured_environment)",
             "verify_measurer_identity_and_freshness_evidence(",
             "measured_payload_digest == policy.expected_execution_environment_digest",
             "execute the exact binding once under session.capability",
@@ -1648,11 +3829,12 @@ class VerifyGatesContractTest(unittest.TestCase):
             "supported_release_approval_signature_schemes: OrderedSet<SignatureScheme>",
             "trusted_approver_public_key_material_by_id: OrderedMap<ApproverKeyId, TrustedPublicKeyMaterial>",
             "cannot be constructed by request deserialization, fixture, policy, approval store or approval artifact",
-            "apply_release_policy( artifact: ConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, release_trust_root: ReleaseApprovalTrustRootCapability ) -> ReleaseDecision",
+            "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy, profile: AttestedReleaseConformance ) -> ReleasePolicyApplicationResult",
+            "release_trust_root := profile.release_trust_root",
             "apply_release_policy first operation:",
             "recompute artifact and every nested invocation/report/ledger/attestation/environment digest",
             "recompute approval_authority.store_snapshot and every nested ApprovedDigestSet value",
-            "before resolving release_trust_root key material, verifying signature or reading verdict",
+            "before resolving either profile trust root key material, verifying any signature or reading verdict",
             "root := resolve_release_approval_trust_root(release_trust_root)",
             "root.expected_release_policy_digest == policy.release_policy_digest",
             "canonical(root.expected_release_policy) == canonical(policy)",
@@ -1668,7 +3850,7 @@ class VerifyGatesContractTest(unittest.TestCase):
             "negative fixture: release approval substituted policy",
         )
         forbidden_tokens = (
-            "apply_release_policy( artifact: ConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy ) -> ReleaseDecision",
+            "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy ) -> ReleaseDecision",
             "verify_signature(policy.trusted_approver_key_id",
             "policy.approval_signature_scheme in SUPPORTED_RELEASE_APPROVAL_SIGNATURE_SCHEMES",
         )
@@ -1812,19 +3994,24 @@ class VerifyGatesContractTest(unittest.TestCase):
             "FixtureSet": "fixture_set_digest",
             "ValidationPolicy": "validation_policy_digest",
             "VerifierRunner": "verifier_runner_digest",
+            "BasicOfflineConformanceAuthority": "basic_offline_authority_digest",
+            "BasicOfflineExecutionRecord": "basic_offline_execution_record_digest",
+            "BasicOfflineExecutionLedger": "basic_offline_execution_ledger_digest",
+            "BasicOfflineReport": "basic_offline_report_digest",
+            "BasicOfflineReportArtifact": "basic_offline_report_artifact_digest",
             "TrustStoreSnapshot": "trust_store_snapshot_digest",
             "RunnerAttestationPolicy": "runner_attestation_policy_digest",
             "MeasuredExecutionEnvironment": "measured_execution_environment_digest",
-            "ConformanceInvocationAuthority": "conformance_invocation_digest",
+            "AttestedConformanceInvocationAuthority": "conformance_invocation_digest",
             "RunnerAttestation": "runner_attestation_digest",
-            "ConformanceExecutionRecord": "conformance_execution_record_digest",
+            "AttestedConformanceExecutionRecord": "conformance_execution_record_digest",
             "ConformanceObservedOutput": "observed_output_digest",
-            "ConformanceExecutionLedger": "conformance_execution_ledger_digest",
+            "AttestedConformanceExecutionLedger": "conformance_execution_ledger_digest",
             "ReleaseApprovalStoreSnapshot": "release_approval_store_snapshot_digest",
             "ReleaseApprovalAuthority": "release_approval_authority_digest",
             "ReleaseApprovalArtifact": "release_approval_artifact_digest",
-            "ConformanceSealArtifact": "conformance_seal_artifact_digest",
-            "ConformanceReport": "conformance_report_digest",
+            "AttestedConformanceSealArtifact": "conformance_seal_artifact_digest",
+            "AttestedConformanceReport": "conformance_report_digest",
             "ReleasePolicy": "release_policy_digest",
             "Estimate": "result_digest",
         }

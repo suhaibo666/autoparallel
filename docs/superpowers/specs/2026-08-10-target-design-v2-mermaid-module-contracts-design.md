@@ -215,8 +215,40 @@ BackendExecution<T, W> :=
 ## 11. 验收条件
 
 1. 十张承重图全部由 Mermaid 11.16.0 构建，生成 HTML 不含 ASCII 架构/流程图或旧 Excalidraw/SVG 引用。
-2. 九个模块均有结构与接口契约说明，列出的缺失叶子类型和辅助接口具有唯一正式定义。
+2. 十个模块均有结构与接口契约说明，列出的缺失叶子类型和辅助接口具有唯一正式定义。
 3. `index.html`/`artifact.html` 离线、无 JS 可显示全部静态图，资源闭包和 SVG 安全测试通过。
 4. 明暗、窄屏、打印视觉检查通过，无不可读文字、裁切、重叠或错误颜色依赖。
 5. 原 v4.2 语义、18 门、blocker scope、partial result、digest/cache 与 comparison contract 无回归。
 6. 不读取或修改仿真器实现；全部变更限于目标设计文档和文档构建/验证工具。
+
+## 12. 2026-08-11 评审修订设计
+
+### 12.1 核心产品口径
+
+- Memory 仅由仿真器消费 CodeIR/RuntimeEventPlan 中的 shape、storage、alias、lifetime 与显式 workspace 语义，并按确定逻辑顺序重放；不得读取 compute duration、profiler op-time 或通信公式。
+- Time 的 compute event 必须精确命中用户在待预测请求前 profile、规范化并冻结的 op-time record；不得插值、roofline 或用通信公式替代。未知 compute op 没有精确 record 时只阻断 time。
+- P2P/collective 的 duration 只由冻结理论公式、bytes、参与者/路径与硬件拓扑求值；不得读取 profiler communication duration。
+- Memory 与 Time 是两个独立 projection/backend。某侧缺必需输入只阻断该侧；共享 CodeIR/Runtime/Core 结构失败才同时阻断。
+- Profiler 只为 Time 提供 compute op-time。未知 op 若同时缺少 Memory 必需的 shape/storage/lifetime 语义，Memory 独立阻断，不能从 profiler 反推这些语义。
+
+### 12.2 评审缺口收敛
+
+1. Comparison 四态使用互斥优先级：双侧 NotRequested；任一侧非 Ok；双侧 Ok 但 basis 不同；双侧 Ok 且 basis 相同。
+2. 不扩展跨 world-size 数值比较；目标与比较章节明确不同 logical-rank set 为 Incomparable。
+3. Coverage 使用带类型、计数宇宙与 aggregation scope 的结构；source obligation planned 计数不得与 emitted node 计数混用。
+4. 生产 CalibrationTrainManifest 与离线 HoldoutManifest 分离；holdout 不进入生产 payload、time digest 或 cache key。
+5. memory_capacity 不属于生产 HardwareProfile 或 simulation digest；若上层规划器需要，只能作为仿真结果之外的 PlanningMetadata。
+6. Chapter 14 与 Chapter 0 十条非目标逐项对齐，并把生产评估器与离线验证器分开描述。
+
+### 12.3 模块架构视图
+
+- 图 1 改为系统级 Mermaid 分层模块架构，不再用 artifact 流程图冒充软件架构。
+- 图 7 改为 Plan/Projection 子系统模块架构；新增 `plan-projection` 模块契约，拥有 `SimulationPlanCore`、双 ProjectionCandidate、ProjectionBundleAuthority 与联合 blocker/gate 闭包。
+- 其余数据血缘、构建流程、状态机、数据模型、算法流程和时序图保留原视图类型。
+- 每个模块在总览表中列出职责、核心 contract type、正式入口 port 与允许依赖；详细 module-contract 继续给出数据、接口、结果联合和不变量。
+
+### 12.4 Conformance 部署 profile
+
+- `BasicOfflineConformance` 是默认可选验证 profile：产生内容寻址的离线误差报告，但不能授权发布，也不进入生产仿真输入或摘要。
+- `AttestedReleaseConformance` 是可选加固 profile：复用现有 measurement-session、runner trust root、release trust root、签名和防重放契约，只有该 profile 可以调用 release policy。
+- 两个 profile 都是生产评估器的单向旁路；关闭或删除全部验证制品不得改变 Memory/Time BackendResult、ComparisonResult 或缓存键。

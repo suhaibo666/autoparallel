@@ -129,6 +129,22 @@ class ModuleContractStructureTest(unittest.TestCase):
         self.assertEqual(len(matches), 1, f"{module}: {len(matches)} sections")
         return matches[0].text
 
+    def conformance_local_text(self, kind: str, value: str) -> str:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        attribute = f"data-conformance-{kind}"
+        matches = re.findall(
+            rf'<div\b[^>]*{re.escape(attribute)}="{re.escape(value)}"[^>]*>'
+            rf"(?P<body>.*?)</div>",
+            template,
+            re.DOTALL,
+        )
+        self.assertTrue(matches, f"missing {attribute}={value}")
+        return re.sub(
+            r"\s+",
+            " ",
+            " ".join(unescape(re.sub(r"<[^>]+>", " ", body)) for body in matches),
+        ).strip()
+
     def test_task3_contract_sections_are_complete_and_accessible(self) -> None:
         for module in TARGET_MODULES:
             with self.subTest(module=module):
@@ -1074,6 +1090,29 @@ class ModuleContractStructureTest(unittest.TestCase):
         self.assertNotIn("positive_fixture_refs", gate_clause.group(1))
         self.assertNotIn("negative_boundary_fixture_refs", gate_clause.group(1))
 
+    def test_conformance_has_closed_optional_deployment_profiles(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        text = self.conformance_local_text("scope", "deployment")
+        for attribute in (
+            'data-conformance-scope="shared"',
+            'data-conformance-scope="deployment"',
+            'data-conformance-profile="basic-offline"',
+            'data-conformance-profile="attested-release"',
+        ):
+            self.assertIn(attribute, template)
+        self.assertRegex(
+            text,
+            r"ConformanceDeploymentProfile\s*:=\s*BasicOfflineConformance\s*\|\s*"
+            r"AttestedReleaseConformance\s*\{\s*"
+            r"conformance_trust_root:\s*ConformanceTrustRootCapability\s*"
+            r"release_trust_root:\s*ReleaseApprovalTrustRootCapability\s*\}",
+        )
+        self.assertIn(
+            "default_conformance_deployment_profile := BasicOfflineConformance", text
+        )
+        self.assertNotRegex(text, r"\bDisabled\b")
+        self.assertNotIn("conformance_deployment_profile: ConformanceDeploymentProfile", template)
+
     def test_comparison_contract_consumes_only_same_request_sealed_artifacts(self) -> None:
         text = self.contract_text("comparison")
         for token in (
@@ -1455,19 +1494,24 @@ class ModuleContractStructureTest(unittest.TestCase):
             "FixtureSet": "fixture_set_digest",
             "ValidationPolicy": "validation_policy_digest",
             "VerifierRunner": "verifier_runner_digest",
+            "BasicOfflineConformanceAuthority": "basic_offline_authority_digest",
+            "BasicOfflineExecutionRecord": "basic_offline_execution_record_digest",
+            "BasicOfflineExecutionLedger": "basic_offline_execution_ledger_digest",
+            "BasicOfflineReport": "basic_offline_report_digest",
+            "BasicOfflineReportArtifact": "basic_offline_report_artifact_digest",
             "TrustStoreSnapshot": "trust_store_snapshot_digest",
             "RunnerAttestationPolicy": "runner_attestation_policy_digest",
             "MeasuredExecutionEnvironment": "measured_execution_environment_digest",
-            "ConformanceInvocationAuthority": "conformance_invocation_digest",
+            "AttestedConformanceInvocationAuthority": "conformance_invocation_digest",
             "RunnerAttestation": "runner_attestation_digest",
-            "ConformanceExecutionRecord": "conformance_execution_record_digest",
+            "AttestedConformanceExecutionRecord": "conformance_execution_record_digest",
             "ConformanceObservedOutput": "observed_output_digest",
-            "ConformanceExecutionLedger": "conformance_execution_ledger_digest",
+            "AttestedConformanceExecutionLedger": "conformance_execution_ledger_digest",
             "ReleaseApprovalStoreSnapshot": "release_approval_store_snapshot_digest",
             "ReleaseApprovalAuthority": "release_approval_authority_digest",
             "ReleaseApprovalArtifact": "release_approval_artifact_digest",
-            "ConformanceSealArtifact": "conformance_seal_artifact_digest",
-            "ConformanceReport": "conformance_report_digest",
+            "AttestedConformanceSealArtifact": "conformance_seal_artifact_digest",
+            "AttestedConformanceReport": "conformance_report_digest",
             "ReleasePolicy": "release_policy_digest",
             "Estimate": "result_digest",
         }
@@ -1506,13 +1550,16 @@ class ModuleContractStructureTest(unittest.TestCase):
             "FixtureSet:",
             "ConformanceFinding:",
             "ApprovedDigestSet:",
-            "ConformanceReport",
+            "AttestedConformanceReport",
             "ReleaseDecision",
-            "run_conformance(",
+            "BasicOfflineReportArtifact",
+            "run_basic_offline_conformance(",
+            "run_attested_release_conformance(",
             "apply_release_policy(",
             "derive_approved_digest_set(",
             "derive_approved_digest_set fields:",
-            "require approved == derive_approved_digest_set(artifact, policy)",
+            "approved_mismatches := canonical_schema_path_diff(approved, derived_approved)",
+            "map(approved_mismatches, path -> ApprovedDigestMismatch(path))",
             "all ten approved digest fields",
             "positive fixture",
             "negative-boundary fixture",
@@ -1528,11 +1575,11 @@ class ModuleContractStructureTest(unittest.TestCase):
             self.assertIn(token, text)
         self.assertRegex(
             text,
-            r"run_conformance\(\s*authority:\s*ConformanceInvocationAuthority,\s*trust_root:\s*ConformanceTrustRootCapability,\s*measured_environment:\s*MeasuredExecutionEnvironment\s*\)\s*->\s*ConformanceRunResult",
+            r"run_attested_release_conformance\(\s*authority:\s*AttestedConformanceInvocationAuthority,\s*profile:\s*AttestedReleaseConformance,\s*measured_environment:\s*MeasuredExecutionEnvironment\s*\)\s*->\s*AttestedConformanceRunResult",
         )
         self.assertRegex(
             text,
-            r"apply_release_policy\(\s*artifact:\s*ConformanceSealArtifact,\s*approval:\s*ReleaseApprovalArtifact,\s*policy:\s*ReleasePolicy,\s*release_trust_root:\s*ReleaseApprovalTrustRootCapability\s*\)\s*->\s*ReleaseDecision",
+            r"apply_release_policy\(\s*artifact:\s*AttestedConformanceSealArtifact,\s*approval:\s*ReleaseApprovalArtifact,\s*policy:\s*ReleasePolicy,\s*profile:\s*AttestedReleaseConformance\s*\)\s*->\s*ReleasePolicyApplicationResult",
         )
         template = TEMPLATE.read_text(encoding="utf-8")
         self.assertRegex(
@@ -1547,7 +1594,7 @@ class ModuleContractStructureTest(unittest.TestCase):
 
     def test_release_approval_uses_external_trust_root_capability(self) -> None:
         """A policy/store/key tuple supplied by the approval cannot authorize itself."""
-        text = self.contract_text("conformance")
+        text = self.conformance_local_text("profile", "attested-release")
         for token in (
             "ReleaseApprovalTrustRootCapability: opaque deployment/verifier-owned capability",
             "expected_release_policy: ReleasePolicy",
@@ -1558,12 +1605,13 @@ class ModuleContractStructureTest(unittest.TestCase):
             "trusted_approver_public_key_material_by_id: OrderedMap<ApproverKeyId, TrustedPublicKeyMaterial>",
             "cannot be constructed by request deserialization, fixture, policy, approval store or approval artifact",
             "apply_release_policy first operation:",
+            "release_trust_root := profile.release_trust_root",
             "recompute artifact and every nested invocation/report/ledger/attestation/environment digest",
             "recompute approval_authority.store_snapshot and every nested ApprovedDigestSet value",
             "recompute policy.release_policy_digest",
             "recompute approval_authority.release_approval_authority_digest",
             "recompute approval.release_approval_artifact_digest",
-            "before resolving release_trust_root key material, verifying signature or reading verdict",
+            "before resolving either profile trust root key material, verifying any signature or reading verdict",
             "root := resolve_release_approval_trust_root(release_trust_root)",
             "root.expected_release_policy_digest == policy.release_policy_digest",
             "canonical(root.expected_release_policy) == canonical(policy)",
@@ -1572,7 +1620,7 @@ class ModuleContractStructureTest(unittest.TestCase):
             "policy.approval_signature_scheme in root.supported_release_approval_signature_schemes",
             "trusted_approver_public_key_material := root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]",
             "release_approval_signed_message := canonical_tuple(",
-            "canonical(derived_approved)",
+            "canonical(approved)",
             "verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)",
             "negative fixture: release approval self-owned approver key",
             "negative fixture: release approval wrong store snapshot",
@@ -1584,10 +1632,10 @@ class ModuleContractStructureTest(unittest.TestCase):
 
         self.assertRegex(
             text,
-            r"apply_release_policy\(\s*artifact:\s*ConformanceSealArtifact,\s*approval:\s*ReleaseApprovalArtifact,\s*policy:\s*ReleasePolicy,\s*release_trust_root:\s*ReleaseApprovalTrustRootCapability\s*\)\s*->\s*ReleaseDecision",
+            r"apply_release_policy\(\s*artifact:\s*AttestedConformanceSealArtifact,\s*approval:\s*ReleaseApprovalArtifact,\s*policy:\s*ReleasePolicy,\s*profile:\s*AttestedReleaseConformance\s*\)\s*->\s*ReleasePolicyApplicationResult",
         )
         self.assertNotIn(
-            "apply_release_policy( artifact: ConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy ) -> ReleaseDecision",
+            "apply_release_policy( artifact: AttestedConformanceSealArtifact, approval: ReleaseApprovalArtifact, policy: ReleasePolicy ) -> ReleaseDecision",
             text,
         )
         self.assertNotIn(
@@ -1605,6 +1653,7 @@ class ModuleContractStructureTest(unittest.TestCase):
             "all nested input digests not named above remain in the payload", 1
         )[0]
         for capability in (
+            "ConformanceDeploymentProfile",
             "ConformanceTrustRootCapability",
             "ReleaseApprovalTrustRootCapability",
             "ValidatedMeasurementSessionCapability",
@@ -1612,24 +1661,24 @@ class ModuleContractStructureTest(unittest.TestCase):
             with self.subTest(capability=capability):
                 self.assertNotIn(f"{capability} -&gt;", table)
         self.assertIn(
-            "Opaque capabilities ConformanceTrustRootCapability, ReleaseApprovalTrustRootCapability and ValidatedMeasurementSessionCapability are non-serializable, own no derived digest and therefore have no exclusion-table row",
+            "Opaque capabilities ConformanceDeploymentProfile, ConformanceTrustRootCapability, ReleaseApprovalTrustRootCapability and ValidatedMeasurementSessionCapability are non-serializable, own no derived digest and therefore have no exclusion-table row",
             template,
         )
 
     def test_conformance_execution_is_attested_sealed_and_recomputed(self) -> None:
-        text = self.contract_text("conformance")
+        text = self.conformance_local_text("profile", "attested-release")
         for token in (
             "RunnerAttestation:",
-            "ConformanceExecutionRecord:",
-            "ConformanceExecutionLedger:",
+            "AttestedConformanceExecutionRecord:",
+            "AttestedConformanceExecutionLedger:",
             "runner_attestation_digest",
             "conformance_execution_ledger_digest :=",
             "conformance_execution_record_digest :=",
             "conformance_report_digest",
-            "ConformanceSealArtifact:",
+            "AttestedConformanceSealArtifact:",
             "conformance_seal_artifact_digest :=",
-            "ConformanceRunResult :=",
-            "Completed { artifact: ConformanceSealArtifact }",
+            "AttestedConformanceRunResult :=",
+            "Completed { artifact: AttestedConformanceSealArtifact }",
             "| InternalViolation { violation: InternalContractViolation }",
             "runner crash, schema failure, digest failure or conservation failure",
             "complete, valid execution",
@@ -1638,7 +1687,7 @@ class ModuleContractStructureTest(unittest.TestCase):
             "record.target_clause_id == binding.target_clause_id",
             "derived_approved := derive_approved_digest_set(artifact, policy)",
             "require approved == derived_approved",
-            "validate_and_seal_conformance first operation:",
+            "validate_and_seal_attested_conformance first operation:",
             "recompute authority.production_subject.subject_digest",
             "recompute every authority.fixture_set binding, nested fixture and fixture_set_digest",
             "recompute authority.validation_policy.validation_policy_digest",
@@ -1651,22 +1700,23 @@ class ModuleContractStructureTest(unittest.TestCase):
             self.assertIn(token, text)
         self.assertNotRegex(
             text,
-            r"run_conformance\([^)]*\)\s*->\s*ConformanceReport",
+            r"run_attested_release_conformance\([^)]*\)\s*->\s*AttestedConformanceReport",
         )
         self.assertNotRegex(
             text,
-            r"apply_release_policy\(\s*report:\s*ConformanceReport",
+            r"apply_release_policy\(\s*report:\s*AttestedConformanceReport",
         )
         template = TEMPLATE.read_text(encoding="utf-8")
         self.assertRegex(
             template,
-            r"(?s)ConformanceReport:.*?conformance_report_digest\s*:=\s*hash\(canonical_payload_without_derived_digests\(ConformanceReport\)\)",
+            r'(?s)AttestedConformanceReport:.*?conformance_report_digest\s*:=\s*hash\("attested-conformance-report/v1",\s*canonical_payload_without_derived_digests\(AttestedConformanceReport\)\)',
         )
 
     def test_conformance_provenance_is_signed_observed_and_release_approved(self) -> None:
-        text = self.contract_text("conformance")
+        text = self.conformance_local_text("profile", "attested-release")
+        shared_text = self.conformance_local_text("scope", "shared")
         for token in (
-            "ConformanceInvocationAuthority:",
+            "AttestedConformanceInvocationAuthority:",
             "production_subject: ProductionSubject",
             "fixture_set: FixtureSet",
             "validation_policy: ValidationPolicy",
@@ -1675,9 +1725,7 @@ class ModuleContractStructureTest(unittest.TestCase):
             "trust_store_snapshot_ref: TrustStoreSnapshotRef",
             "runner_attestation_policy_ref: RunnerAttestationPolicyRef",
             "conformance_invocation_digest :=",
-            "evaluation_input_digest := hash(authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest)",
-            "ConformanceObservedOutput:",
-            "observed_output_digest := hash(canonical execution_records, findings, coverage_gaps)",
+            'evaluation_input_digest := hash("attested-conformance-record-input/v1", authority.conformance_invocation_digest, session.measured_execution_environment_digest, canonical(binding), binding.fixture_binding_digest)',
             "ledger.observed_output_digest == report.observed_output_digest == attestation.observed_output_digest",
             "TrustStoreSnapshot:",
             "trusted_key_material_by_id: OrderedMap<AttestationKeyId, TrustedPublicKeyMaterial>",
@@ -1696,7 +1744,6 @@ class ModuleContractStructureTest(unittest.TestCase):
             "protected_environment_measurer",
             "measured_execution_environment_digest := hash(canonical_payload_without_derived_digests(MeasuredExecutionEnvironment))",
             "signed_message := canonical_tuple( measured_execution_environment_digest, executable_artifact_digest, trusted_attestation_key_id, attestation_signature_scheme, conformance_invocation_digest, observed_output_digest, verifier_runner_digest)",
-            "verifier_runner_digest := hash(canonical_payload_without_derived_digests(VerifierRunner))",
             "(store, policy) := resolve_conformance_trust_root(trust_root)",
             "authority.trust_store_snapshot_ref.trust_store_snapshot_digest == store.trust_store_snapshot_digest",
             "authority.runner_attestation_policy_ref.runner_attestation_policy_digest == policy.runner_attestation_policy_digest",
@@ -1714,7 +1761,7 @@ class ModuleContractStructureTest(unittest.TestCase):
             "negative fixture: unsupported runner attestation signature scheme",
             "negative fixture: tampered runner execution environment",
             "negative fixture: runner self-owned attestation key",
-            "validate_and_seal_conformance(",
+            "validate_and_seal_attested_conformance(",
             "ReleaseApprovalStoreSnapshot:",
             "ReleaseApprovalAuthority:",
             "ReleaseApprovalArtifact:",
@@ -1727,16 +1774,25 @@ class ModuleContractStructureTest(unittest.TestCase):
             "negative fixture: tampered execution record or observed output",
         ):
             self.assertIn(token, text)
-        self.assertRegex(
-            text,
-            r"validate_and_seal_conformance\(\s*authority:\s*ConformanceInvocationAuthority,\s*trust_root:\s*ConformanceTrustRootCapability,\s*session:\s*ValidatedMeasurementSessionCapability,\s*observed:\s*ConformanceObservedOutput,\s*ledger:\s*ConformanceExecutionLedger,\s*attestation:\s*RunnerAttestation\s*\)\s*->\s*ConformanceRunResult",
+        self.assertIn("ConformanceObservedOutput:", shared_text)
+        self.assertIn(
+            "verifier_runner_digest := hash(canonical_payload_without_derived_digests(VerifierRunner))",
+            shared_text,
+        )
+        self.assertIn(
+            "observed_output_digest := hash(canonical observed_clause_outputs, findings, coverage_gaps)",
+            shared_text,
         )
         self.assertRegex(
             text,
-            r"run_conformance\(\s*authority:\s*ConformanceInvocationAuthority,\s*trust_root:\s*ConformanceTrustRootCapability,\s*measured_environment:\s*MeasuredExecutionEnvironment\s*\)\s*->\s*ConformanceRunResult",
+            r"validate_and_seal_attested_conformance\(\s*authority:\s*AttestedConformanceInvocationAuthority,\s*trust_root:\s*ConformanceTrustRootCapability,\s*session:\s*ValidatedMeasurementSessionCapability,\s*observed:\s*ConformanceObservedOutput,\s*ledger:\s*AttestedConformanceExecutionLedger,\s*attestation:\s*RunnerAttestation\s*\)\s*->\s*AttestedConformanceRunResult",
+        )
+        self.assertRegex(
+            text,
+            r"run_attested_release_conformance\(\s*authority:\s*AttestedConformanceInvocationAuthority,\s*profile:\s*AttestedReleaseConformance,\s*measured_environment:\s*MeasuredExecutionEnvironment\s*\)\s*->\s*AttestedConformanceRunResult",
         )
         authority_schema = re.search(
-            r"(?s)ConformanceInvocationAuthority:\s*(.*?)\s*RunnerAttestation:",
+            r"(?s)AttestedConformanceInvocationAuthority:\s*(.*?)\s*RunnerAttestation:",
             text,
         )
         self.assertIsNotNone(authority_schema)
@@ -1758,7 +1814,7 @@ class ModuleContractStructureTest(unittest.TestCase):
         )
 
     def test_conformance_measurement_envelope_is_session_bound_and_non_replayable(self) -> None:
-        text = self.contract_text("conformance")
+        text = self.conformance_local_text("profile", "attested-release")
         envelope_match = re.search(
             r"MeasuredExecutionEnvironment:\s*(.*?)\s*ValidatedMeasurementSessionCapability:",
             text,
@@ -1786,14 +1842,17 @@ class ModuleContractStructureTest(unittest.TestCase):
         for token in (
             "ValidatedMeasurementSessionCapability:",
             "opaque call-scoped, non-serializable and non-transferable capability",
-            "validate_and_consume_measurement_envelope( authority: ConformanceInvocationAuthority, runner: VerifierRunner, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ValidatedMeasurementSessionCapability | InternalContractViolation",
+            "validate_and_consume_measurement_envelope( authority: AttestedConformanceInvocationAuthority, runner: VerifierRunner, trust_root: ConformanceTrustRootCapability, measured_environment: MeasuredExecutionEnvironment ) -> ValidatedMeasurementSessionCapability | InternalContractViolation",
             "measurement_envelope_digest := recompute measured_environment.measured_execution_environment_digest",
             "measurement_envelope_digest == hash(canonical_payload_without_derived_digests(measured_environment))",
             "measured_environment.conformance_invocation_digest == authority.conformance_invocation_digest",
             "measured_environment.verifier_runner_digest == runner.verifier_runner_digest",
             "measured_environment.executable_artifact_digest == runner.executable_artifact_digest",
             "current_execution_session_context() == canonical_tuple(measured_environment.execution_session_id, measured_environment.process_identity, measured_environment.container_identity)",
-            "measured_environment.verifier_nonce is active, bound to this exact invocation/runner/executable/session/time-window tuple, and atomically consumed exactly once",
+            "terminal_consumption_receipt_key( environment: MeasuredExecutionEnvironment ) := canonical_tuple( environment.verifier_nonce, environment.conformance_invocation_digest, environment.verifier_runner_digest, environment.executable_artifact_digest, environment.execution_session_id, environment.process_identity, environment.container_identity, environment.execution_time_window, environment.measured_execution_environment_digest)",
+            "terminal_consumption_receipt_key_value := terminal_consumption_receipt_key(measured_environment)",
+            "atomically consumed exactly once while persisting a terminal receipt under that exact key",
+            "session.nonce_consumption_receipt proves the terminal registry contains exact terminal_consumption_receipt_key(measured_environment)",
             "verify_measurer_identity_and_freshness_evidence(",
             "measured_payload_digest := hash(canonical measured_environment.measured_environment_payload)",
             "measured_payload_digest == policy.expected_execution_environment_digest",
@@ -1818,33 +1877,38 @@ class ModuleContractStructureTest(unittest.TestCase):
         )
 
     def test_conformance_report_is_uniquely_derived_from_observed_output(self) -> None:
-        text = self.contract_text("conformance")
+        text = self.conformance_local_text("profile", "attested-release")
+        shared_text = self.conformance_local_text("scope", "shared")
         for token in (
-            "derive_conformance_report( authority: ConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: ConformanceExecutionLedger, attestation: RunnerAttestation ) -> ConformanceReport",
-            "ConformanceReport.findings: OrderedMap<FindingId, ConformanceFinding>",
+            "derive_attested_conformance_report( authority: AttestedConformanceInvocationAuthority, observed: ConformanceObservedOutput, ledger: AttestedConformanceExecutionLedger, attestation: RunnerAttestation ) -> AttestedConformanceReport",
+            "AttestedConformanceReport.findings: OrderedMap<FindingId, ConformanceFinding>",
             "report.findings == observed.findings",
-            "failure_findings := policy_classified_failure_findings(authority.validation_policy, observed.findings)",
-            "verdict := fail iff failure_findings is non-empty",
-            "else insufficient iff exact_evidence_or_coverage_gaps(authority, observed, ledger) is non-empty",
-            "else pass",
+            "derive_conformance_findings_and_verdict(",
             "execute -> observed -> runner attestation -> ledger -> derived report -> seal",
             "negative fixture: valid signature plus failing observed output cannot be sealed with forged pass",
         ):
             self.assertIn(token, text)
+        for token in (
+            "failure_findings := policy_classified_failure_findings(validation_policy, findings)",
+            "verdict := fail iff failure_findings is non-empty",
+            "else insufficient iff exact_evidence_gaps or observed.coverage_gaps is non-empty",
+            "else pass",
+        ):
+            self.assertIn(token, shared_text)
         self.assertNotRegex(
             text,
-            r"validate_and_seal_conformance\([^)]*report:\s*ConformanceReport",
+            r"validate_and_seal_attested_conformance\([^)]*report:\s*AttestedConformanceReport",
         )
         template = TEMPLATE.read_text(encoding="utf-8")
         self.assertRegex(
             template,
-            r"(?s)ConformanceReport:\s*.*?verdict:\s*pass\s*\|\s*fail\s*\|\s*insufficient\s*findings:\s*OrderedMap&lt;FindingId,\s*ConformanceFinding&gt;",
+            r"(?s)AttestedConformanceReport:\s*.*?verdict:\s*pass\s*\|\s*fail\s*\|\s*insufficient\s*findings:\s*OrderedMap&lt;FindingId,\s*ConformanceFinding&gt;",
         )
 
     def test_release_approval_uses_only_external_root_key_and_scheme(self) -> None:
-        text = self.contract_text("conformance")
+        text = self.conformance_local_text("profile", "attested-release")
         for token in (
-            "derive_approved_digest_set( artifact: ConformanceSealArtifact, policy: ReleasePolicy ) -> ApprovedDigestSet",
+            "derive_approved_digest_set( artifact: AttestedConformanceSealArtifact, policy: ReleasePolicy ) -> ApprovedDigestSet",
             "subject_digest := recompute artifact.invocation_authority.production_subject.subject_digest",
             "fixture_set_digest := recompute artifact.invocation_authority.fixture_set.fixture_set_digest",
             "validation_policy_digest := recompute artifact.invocation_authority.validation_policy.validation_policy_digest",

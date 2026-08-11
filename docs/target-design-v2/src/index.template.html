@@ -147,7 +147,7 @@ value、最终三态结果与可选 comparison 也各有绑定当前 subject 的
 <tr data-module-id="time-backend" data-layer="L3" data-allowed-dependencies=""><td>L3</td><td><code>time-backend</code></td><td>构造时间视图并执行 DES</td><td>TimeEventView, StepTimeEstimate</td><td>build_time_projection_candidate; run_time_backend</td><td>无</td></tr>
 <tr data-module-id="result-sealing" data-layer="L4" data-allowed-dependencies="gate-system,memory-backend,plan-projection,time-backend"><td>L4</td><td><code>result-sealing</code></td><td>生成并封装后端结果</td><td>BackendSealArtifact</td><td>run_backend_build_candidate_and_seal</td><td>gate-system, memory-backend, plan-projection, time-backend</td></tr>
 <tr data-module-id="comparison" data-layer="L4" data-allowed-dependencies="gate-system,result-sealing"><td>L4</td><td><code>comparison</code></td><td>同口径配置比较</td><td>ComparisonResult</td><td>derive_comparison_basis_pair; build_comparison_source_authority; compare_per_metric_from_authority</td><td>gate-system, result-sealing</td></tr>
-<tr data-module-id="conformance" data-layer="OFFLINE" data-allowed-dependencies="comparison,gate-system,result-sealing"><td>离线</td><td><code>conformance</code></td><td>离线对照与发布门</td><td>ConformanceReport</td><td>run_conformance; apply_release_policy</td><td>comparison, gate-system, result-sealing</td></tr>
+<tr data-module-id="conformance" data-layer="OFFLINE" data-allowed-dependencies="comparison,gate-system,result-sealing"><td>离线</td><td><code>conformance</code></td><td>可选离线对照与加固发布门</td><td>BasicOfflineReportArtifact, AttestedConformanceSealArtifact</td><td>run_basic_offline_conformance; run_attested_release_conformance; apply_release_policy</td><td>comparison, gate-system, result-sealing</td></tr>
 </table></div>
 <p>“允许调用依赖”只授权运行时 port 调用。图 1 的每条实线从 dependency provider 指向 runtime caller，
 必须恰为本表每个 caller → dependency pair 的反向；虚线只表示 immutable DTO/data lineage，
@@ -332,7 +332,7 @@ result_digest :=
 <code>result_digest</code> 只排除它自身，并覆盖 Estimate 的 value 与全部 metadata，因而可独立复算且不递归。
 <code>model_digest</code> 是规范 CodeIR 的实际内容身份，不只是输入承诺；硬件变化不得改变它。
 <code>simulation_digest</code> 在 Estimate 中表示对应后端的 memory/time digest，而不是一个混合两侧
-状态的公共键。TraceFixture、ConformanceReport、requested backend set 与 NotRequested 状态不进入这些
+状态的公共键。TraceFixture、任一 conformance profile/report/artifact、requested backend set 与 NotRequested 状态不进入这些
 语义摘要；任何影响某后端事件、bytes、duration、次序或进展的生产字段必须进入该后端摘要。</p>
 
 <pre><code>derived-digest exclusion table (exact):
@@ -395,25 +395,30 @@ result_digest :=
   FixtureSet             -&gt; { fixture_set_digest }
   ValidationPolicy       -&gt; { validation_policy_digest }
   VerifierRunner         -&gt; { verifier_runner_digest }
+  BasicOfflineConformanceAuthority -&gt; { basic_offline_authority_digest }
+  BasicOfflineExecutionRecord -&gt; { basic_offline_execution_record_digest }
+  BasicOfflineExecutionLedger -&gt; { basic_offline_execution_ledger_digest }
+  BasicOfflineReport     -&gt; { basic_offline_report_digest }
+  BasicOfflineReportArtifact -&gt; { basic_offline_report_artifact_digest }
   TrustStoreSnapshot     -&gt; { trust_store_snapshot_digest }
   RunnerAttestationPolicy -&gt; { runner_attestation_policy_digest }
   MeasuredExecutionEnvironment -&gt; { measured_execution_environment_digest }
-  ConformanceInvocationAuthority -&gt; { conformance_invocation_digest }
+  AttestedConformanceInvocationAuthority -&gt; { conformance_invocation_digest }
   RunnerAttestation      -&gt; { runner_attestation_digest }
-  ConformanceExecutionRecord -&gt; { conformance_execution_record_digest }
+  AttestedConformanceExecutionRecord -&gt; { conformance_execution_record_digest }
   ConformanceObservedOutput -&gt; { observed_output_digest }
-  ConformanceExecutionLedger -&gt; { conformance_execution_ledger_digest }
+  AttestedConformanceExecutionLedger -&gt; { conformance_execution_ledger_digest }
   ReleaseApprovalStoreSnapshot -&gt; { release_approval_store_snapshot_digest }
   ReleaseApprovalAuthority -&gt; { release_approval_authority_digest }
   ReleaseApprovalArtifact -&gt; { release_approval_artifact_digest }
-  ConformanceSealArtifact -&gt; { conformance_seal_artifact_digest }
-  ConformanceReport      -&gt; { conformance_report_digest }
+  AttestedConformanceSealArtifact -&gt; { conformance_seal_artifact_digest }
+  AttestedConformanceReport      -&gt; { conformance_report_digest }
   ReleasePolicy          -&gt; { release_policy_digest }
   Estimate               -&gt; { result_digest }
 
 all nested input digests not named above remain in the payload</code></pre>
 
-<p>Opaque capabilities ConformanceTrustRootCapability, ReleaseApprovalTrustRootCapability and ValidatedMeasurementSessionCapability are non-serializable, own no derived digest and therefore have no exclusion-table row；
+<p>Opaque capabilities ConformanceDeploymentProfile, ConformanceTrustRootCapability, ReleaseApprovalTrustRootCapability and ValidatedMeasurementSessionCapability are non-serializable, own no derived digest and therefore have no exclusion-table row；
 它们必须由部署/verifier 的受保护边界发行，不能退化为可由请求或验证制品自填并自证的摘要记录。</p>
 
 <p>排除表按 schema version 固定；例如 Core 中的 runtime/model/binding semantic digests 是输入身份，不能因为
@@ -1926,10 +1931,11 @@ RequestSnapshot requested-backend equations:
   // therefore request_digest fingerprints only requested backend facts
 
 EvaluationInstanceIdentity:
-  request_digest
+  request_digest: Digest
   config_ref: ConfigRef
-  normalized_config_digest
-  config_input_digest
+  normalized_config_digest: Digest
+  config_input_digest: Digest
+  evaluation_instance_digest: Digest
   evaluation_instance_digest :=
     hash(request_digest, config_ref, normalized_config_digest,
          config_input_digest)
@@ -1945,11 +1951,12 @@ derive_evaluation_identity(request, config_ref):
     hash(canonical config_input))
 
 ProductionSubject:
-  build_artifact_content_digest
-  evaluator_and_registry_digests
+  build_artifact_content_digest: Digest
+  evaluator_and_registry_digests: OrderedSet[Digest]
     // shared evaluator/registry identities only; no backend input arm
-  production_policy_digests
-  backend_semantics_digests
+  production_policy_digests: OrderedSet[Digest]
+  backend_semantics_digests: OrderedMap[memory | time, Digest]
+  subject_digest: Digest
   subject_digest := hash(all four constituent fields in schema order)
 
 ProductionSubject construction equation:
@@ -3182,8 +3189,10 @@ ProposedBlocked。</p>
 </section>
 
 <pre><code>EstimateCandidate&lt;T&gt;:
-  estimate: Estimate&lt;T&gt;  // unsealed; not externally observable as Ok
-  backend_execution_witness
+  estimate: Estimate&lt;T&gt;
+  // unsealed; not externally observable as Ok
+  backend_execution_witness: MemoryExecutionWitness | TimeExecutionWitness
+  estimate_candidate_digest: Digest
   estimate_candidate_digest :=
     hash(canonical_payload_without_derived_digests(EstimateCandidate))
 
@@ -3197,10 +3206,11 @@ BackendResultBranch&lt;T&gt; :=
 
 BackendResultCandidate&lt;T&gt;:
   backend: memory | time
-  source_authority_digest
-  value_gate_authority_digest
-  pre_seal_gate_execution_ledger_digest
+  source_authority_digest: Digest
+  value_gate_authority_digest: Digest
+  pre_seal_gate_execution_ledger_digest: Digest
   branch: BackendResultBranch&lt;T&gt;
+  backend_result_candidate_digest: Digest
   backend_result_candidate_digest :=
     hash(canonical_payload_without_derived_digests(BackendResultCandidate))
 
@@ -3208,9 +3218,11 @@ BackendResultSourceAuthority&lt;V&gt;:
   projection_bundle_authority: ProjectionBundleAuthority
   backend: memory | time
   source_projection_result: ProjectionResult&lt;V&gt;
+  source_projection_digest: Digest
   source_projection_digest :=
     hash(canonical source_projection_result payload and tagged branch)
   projection_gate_ledger: GateExecutionLedger
+  source_authority_digest: Digest
   source_authority_digest :=
     hash(canonical_payload_without_derived_digests(
            BackendResultSourceAuthority))
@@ -3223,6 +3235,7 @@ BackendValueSubject&lt;T&gt; :=
 BackendValueGateAuthority&lt;T,V&gt;:
   source_authority: BackendResultSourceAuthority&lt;V&gt;
   value_subject: BackendValueSubject&lt;T&gt;
+  value_gate_authority_digest: Digest
   value_gate_authority_digest :=
     hash(canonical_payload_without_derived_digests(
            BackendValueGateAuthority))
@@ -3230,17 +3243,19 @@ BackendValueGateAuthority&lt;T,V&gt;:
 BackendSealAuthority&lt;T,V&gt;:
   value_gate_authority: BackendValueGateAuthority&lt;T,V&gt;
   pre_seal_gate_ledger: GateExecutionLedger
+  backend_seal_authority_digest: Digest
   backend_seal_authority_digest :=
     hash(canonical_payload_without_derived_digests(BackendSealAuthority))
 
 BackendSealArtifact&lt;T,V&gt;:
-  request_digest
-  evaluation_instance_digest
+  request_digest: Digest
+  evaluation_instance_digest: Digest
   backend: memory | time
   seal_authority: BackendSealAuthority&lt;T,V&gt;
   result_candidate: BackendResultCandidate&lt;T&gt;
   sealed_gate_ledger: GateExecutionLedger
   result: BackendResult&lt;T&gt;
+  backend_seal_artifact_digest: Digest
   backend_seal_artifact_digest :=
     hash(canonical_payload_without_derived_digests(BackendSealArtifact))
 
@@ -3727,23 +3742,24 @@ Incomparable；仅 basis 逐字节相同且两侧均 Ok 才使用 common_compari
 <pre><code>ComparisonArmAuthority:
   config_ref: ConfigRef
   evaluation_identity: EvaluationInstanceIdentity
-  projection_bundle_authority_digest
+  projection_bundle_authority_digest: Digest
   seal_artifacts: OrderedMap[memory | time, BackendSealArtifact]
 
 ComparisonSourceAuthority:
   request_snapshot: RequestSnapshot
   left_arm: ComparisonArmAuthority
   right_arm: ComparisonArmAuthority
-  canonical_comparison_basis_pairs:
-    OrderedMap[memory | time, ComparisonBasisPair]
+  canonical_comparison_basis_pairs: OrderedMap[memory | time, ComparisonBasisPair]
   production_validation_context: ProductionValidationContext
   gate_manifest: GateManifest
+  comparison_source_authority_digest: Digest
   comparison_source_authority_digest :=
     hash(canonical_payload_without_derived_digests(ComparisonSourceAuthority))
 
 ComparisonResultCandidate:
-  source_authority_digest
+  source_authority_digest: Digest
   value: ComparisonResult
+  comparison_result_candidate_digest: Digest
   comparison_result_candidate_digest :=
     hash(canonical_payload_without_derived_digests(
            ComparisonResultCandidate))
@@ -3751,6 +3767,7 @@ ComparisonResultCandidate:
 ComparisonSealAuthority:
   source_authority: ComparisonSourceAuthority
   result_candidate: ComparisonResultCandidate
+  comparison_seal_authority_digest: Digest
   comparison_seal_authority_digest :=
     hash(canonical_payload_without_derived_digests(ComparisonSealAuthority))
 
@@ -3758,6 +3775,7 @@ ComparisonSealArtifact:
   seal_authority: ComparisonSealAuthority
   comparison_gate_ledger: GateExecutionLedger
   result: ComparisonResult
+  comparison_seal_artifact_digest: Digest
   comparison_seal_artifact_digest :=
     hash(canonical_payload_without_derived_digests(ComparisonSealArtifact))
 
@@ -3951,7 +3969,9 @@ Blocked 侧没有 null/0 数值、空 timeline 或上次缓存结果。</p>
 <h3 id="c12-1">12.1 两类验证不能混合</h3>
 <p>结构门验证“仿真是否按自己的契约执行”；<code>IRConformance</code> 和调度一致性测试验证
 “源码求值与事件模型是否接近目标框架真实执行”。前者是每次生产求值的内部检查；
-后者是离线/CI 测试，可以阻止版本发布，但不成为运行时依赖。</p>
+后者是可选的 one-way 离线/CI sidecar，不成为运行时依赖：默认 BasicOfflineConformance 只输出
+offline_verdict；部署显式选择 AttestedReleaseConformance 时，才增加受保护会话、runner trust 与发布批准链。
+两种 profile 都不得进入生产输入、摘要、缓存、比较 basis 或 BackendResult。</p>
 
 <h3 id="c12-2">12.2 完整结构门</h3>
 <div class="tw"><table>
@@ -4519,7 +4539,8 @@ sequenceDiagram
   participant CS as ComparisonSourceAuthority
   participant CC as ComparisonResultCandidate
   participant CA as ComparisonSealArtifact
-  participant CF as Conformance and ReleasePolicy
+  participant BO as Basic offline validator
+  participant AR as Attested release validator
   PB-&gt;&gt;SA: exact ProjectionResult and projection ledger
   alt Ready
     SA-&gt;&gt;BE: immutable Ready view
@@ -4540,9 +4561,19 @@ sequenceDiagram
     CC-&gt;&gt;GL: G-REP2 clauses
     GL--&gt;&gt;CA: sealed ComparisonResult
   end
-  CF-&gt;&gt;GL: exact subject manifest fixtures policy and runner
-  GL--&gt;&gt;CF: ConformanceReport
-  Note over CF,GL: offline CI is excluded from production digests</code></pre><figcaption><b>图 10 · 结果门、封装与配置比较。</b><span class="src">解释图；相邻 gate manifest、authority 与 seal schema 为规范。</span></figcaption></figure>
+  opt OfflineConformanceRequested
+    alt BasicOfflineConformance (default)
+      BO-&gt;&gt;GL: exact subject manifest fixtures policy and runner
+      GL--&gt;&gt;BO: clause observations and GateExecutionLedger
+      BO-&gt;&gt;BO: construct BasicOfflineReportArtifact
+    else AttestedReleaseConformance
+      AR-&gt;&gt;GL: same fixtures plus protected measured session
+      GL--&gt;&gt;AR: clause observations and GateExecutionLedger
+      AR-&gt;&gt;AR: construct AttestedConformanceSealArtifact
+      AR-&gt;&gt;AR: apply_release_policy with current profile roots
+    end
+  end
+  Note over BO,AR: optional offline sidecars excluded from production digests</code></pre><figcaption><b>图 10 · 结果门、封装、比较与可选离线验证。</b><span class="src">解释图；Basic 只给离线报告，Attested 才能进入外部信任根保护的发布判定。</span></figcaption></figure>
 
 <section class="module-contract" data-module="conformance" aria-labelledby="mc-conformance">
 <h3 id="mc-conformance">模块契约 · 离线 Conformance 与发布判定</h3>
@@ -4554,6 +4585,7 @@ GateManifest 做独立验证并给出发布判定。fixture、finding、report �
 也不能补齐、改写或重新封装任何生产结果。</p>
 
 <h4 id="mc-conformance-data">核心数据结构</h4>
+<div data-conformance-scope="shared">
 <pre><code>TraceFixture:
   isolated_input_and_trace_payload
   expected_clause_outcome
@@ -4585,7 +4617,116 @@ VerifierRunner:
   runner_id, runner_version, executable_artifact_digest
   verifier_runner_digest := hash(canonical_payload_without_derived_digests(VerifierRunner))
 
-TrustStoreSnapshot:
+ConformanceFinding:
+  finding_id, target_invocation_id, clause_id, fixture_ref
+  expected_outcome, observed_outcome
+  expected_disposition, observed_failure_witnesses
+  subject_digest, fixture_digest, validation_policy_digest
+
+ObservedClauseOutput:
+  target_invocation_id, target_clause_id, observed_clause_output_digest
+  observed_clause_outcome, finding_ids: OrderedSet&lt;FindingId&gt;
+
+ConformanceObservedOutput:
+  observed_clause_outputs: OrderedMap&lt;FixtureRef, ObservedClauseOutput&gt;
+  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
+  coverage_gaps: OrderedSet&lt;GateClauseId&gt;
+  observed_output_digest := hash(canonical observed_clause_outputs, findings, coverage_gaps)
+    == hash(canonical_payload_without_derived_digests(ConformanceObservedOutput))
+
+derive_conformance_findings_and_verdict(
+  validation_policy: ValidationPolicy,
+  observed: ConformanceObservedOutput,
+  exact_evidence_gaps: OrderedSet&lt;EvidenceGap&gt;
+) -&gt; (OrderedMap&lt;FindingId, ConformanceFinding&gt;, pass | fail | insufficient)
+
+deterministic finding/verdict rules:
+  findings := observed.findings
+  failure_findings := policy_classified_failure_findings(validation_policy, findings)
+  verdict := fail iff failure_findings is non-empty
+  else insufficient iff exact_evidence_gaps or observed.coverage_gaps is non-empty
+  else pass</code></pre>
+</div>
+
+<div data-conformance-scope="deployment">
+<pre><code>ConformanceDeploymentProfile :=
+  BasicOfflineConformance
+  | AttestedReleaseConformance {
+      conformance_trust_root: ConformanceTrustRootCapability
+      release_trust_root: ReleaseApprovalTrustRootCapability
+    }
+
+default_conformance_deployment_profile := BasicOfflineConformance
+ConformanceDeploymentProfile is deployment/validator-owned, non-serializable,
+owns no digest, and is never a RequestSnapshot field.
+Selecting AttestedReleaseConformance without both protected capabilities -&gt;
+  InternalContractViolation; never silently downgrade to BasicOfflineConformance.
+Unknown tag, extra arm payload, missing arm payload, or discriminant/payload mismatch -&gt;
+  InternalContractViolation before reading any verdict.</code></pre>
+</div>
+
+<div data-conformance-profile="basic-offline">
+<pre><code>BasicOfflineConformanceAuthority:
+  profile_schema_id := "basic-offline/v1"
+  production_subject: ProductionSubject
+  fixture_set: FixtureSet
+  validation_policy: ValidationPolicy
+  gate_manifest: GateManifest
+  verifier_runner: VerifierRunner
+  basic_offline_authority_digest := hash("basic-offline-authority/v1",
+    canonical_payload_without_derived_digests(BasicOfflineConformanceAuthority))
+
+BasicOfflineExecutionRecord:
+  profile_schema_id := "basic-offline/v1"
+  fixture_ref: FixtureRef
+  target_invocation_id: GateInvocationId
+  target_clause_id: GateClauseId
+  fixture_digest
+  evaluation_input_digest := hash("basic-offline-record-input/v1",
+    authority.basic_offline_authority_digest,
+    canonical(binding), binding.fixture_binding_digest)
+  observed_clause_output: ObservedClauseOutput
+  basic_offline_execution_record_digest := hash("basic-offline-record/v1",
+    canonical_payload_without_derived_digests(BasicOfflineExecutionRecord))
+
+BasicOfflineExecutionLedger:
+  profile_schema_id := "basic-offline/v1"
+  basic_offline_authority_digest
+  subject_digest, fixture_set_digest, validation_policy_digest
+  gate_manifest_digest, verifier_runner_digest
+  execution_records: OrderedMap&lt;FixtureRef, BasicOfflineExecutionRecord&gt;
+  observed_output: ConformanceObservedOutput
+  expected_binding_domain: OrderedSet&lt;FixtureRef&gt;
+  basic_offline_execution_ledger_digest := hash("basic-offline-ledger/v1",
+    canonical_payload_without_derived_digests(BasicOfflineExecutionLedger))
+
+BasicOfflineReport:
+  profile_schema_id := "basic-offline/v1"
+  production_subject: ProductionSubject
+  subject_digest, basic_offline_authority_digest, observed_output_digest
+  fixture_set_digest, validation_policy_digest, gate_manifest_digest
+  verifier_runner_digest, basic_offline_execution_ledger_digest
+  offline_verdict: pass | fail | insufficient
+  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
+  basic_offline_report_digest := hash("basic-offline-report/v1",
+    canonical_payload_without_derived_digests(BasicOfflineReport))
+
+BasicOfflineReportArtifact:
+  profile_schema_id := "basic-offline/v1"
+  authority: BasicOfflineConformanceAuthority
+  observed_output: ConformanceObservedOutput
+  execution_ledger: BasicOfflineExecutionLedger
+  report: BasicOfflineReport
+  basic_offline_report_artifact_digest := hash("basic-offline-report-artifact/v1",
+    canonical_payload_without_derived_digests(BasicOfflineReportArtifact))
+
+BasicOfflineRunResult :=
+  Completed { artifact: BasicOfflineReportArtifact }
+  | InternalViolation { violation: InternalContractViolation }</code></pre>
+</div>
+
+<div data-conformance-profile="attested-release">
+<pre><code>TrustStoreSnapshot:
   schema_version
   trusted_key_material_by_id:
     OrderedMap&lt;AttestationKeyId, TrustedPublicKeyMaterial&gt;
@@ -4646,7 +4787,17 @@ ValidatedMeasurementSessionCapability:
   nonce_consumption_receipt: OpaqueSingleUseNonceConsumptionReceipt
   // created only by validate_and_consume_measurement_envelope in the current call
 
-ConformanceInvocationAuthority:
+terminal_consumption_receipt_key(
+  environment: MeasuredExecutionEnvironment
+) := canonical_tuple(
+  environment.verifier_nonce, environment.conformance_invocation_digest,
+  environment.verifier_runner_digest, environment.executable_artifact_digest,
+  environment.execution_session_id, environment.process_identity,
+  environment.container_identity, environment.execution_time_window,
+  environment.measured_execution_environment_digest)
+
+AttestedConformanceInvocationAuthority:
+  profile_schema_id := "attested-release/v1"
   production_subject: ProductionSubject
   fixture_set: FixtureSet
   validation_policy: ValidationPolicy
@@ -4654,8 +4805,10 @@ ConformanceInvocationAuthority:
   verifier_runner: VerifierRunner
   trust_store_snapshot_ref: TrustStoreSnapshotRef
   runner_attestation_policy_ref: RunnerAttestationPolicyRef
+  conformance_invocation_digest: Digest
   conformance_invocation_digest :=
-    hash(canonical_payload_without_derived_digests(ConformanceInvocationAuthority))
+    hash("attested-conformance-authority/v1",
+      canonical_payload_without_derived_digests(AttestedConformanceInvocationAuthority))
 
 RunnerAttestation:
   verifier_runner_digest
@@ -4671,22 +4824,24 @@ RunnerAttestation:
     verifier_runner_digest)
   signature
   runner_attestation_digest :=
-    hash(canonical_payload_without_derived_digests(RunnerAttestation))
+    hash("attested-conformance-runner-attestation/v1",
+      canonical_payload_without_derived_digests(RunnerAttestation))
 
-ConformanceExecutionRecord:
+AttestedConformanceExecutionRecord:
   fixture_ref: FixtureRef
   target_invocation_id: GateInvocationId
   target_clause_id: GateClauseId
   fixture_digest
-  evaluation_input_digest := hash(authority.conformance_invocation_digest,
+  evaluation_input_digest := hash("attested-conformance-record-input/v1",
+    authority.conformance_invocation_digest,
     session.measured_execution_environment_digest,
     canonical(binding), binding.fixture_binding_digest)
-  observed_clause_output_digest
-  observed_clause_outcome, finding_ids: OrderedSet&lt;FindingId&gt;
+  observed_clause_output: ObservedClauseOutput
   conformance_execution_record_digest :=
-    hash(canonical_payload_without_derived_digests(ConformanceExecutionRecord))
+    hash("attested-conformance-record/v1",
+      canonical_payload_without_derived_digests(AttestedConformanceExecutionRecord))
 
-ConformanceExecutionLedger:
+AttestedConformanceExecutionLedger:
   conformance_invocation_digest
   subject_digest
   fixture_set_digest
@@ -4695,24 +4850,13 @@ ConformanceExecutionLedger:
   verifier_runner_digest
   measured_execution_environment_digest
   runner_attestation_digest
+  execution_records: OrderedMap&lt;FixtureRef, AttestedConformanceExecutionRecord&gt;
   observed_output: ConformanceObservedOutput
   observed_output_digest := observed_output.observed_output_digest
   expected_binding_domain: OrderedSet&lt;FixtureRef&gt;
   conformance_execution_ledger_digest :=
-    hash(canonical_payload_without_derived_digests(ConformanceExecutionLedger))
-
-ConformanceFinding:
-  finding_id, target_invocation_id, clause_id, fixture_ref
-  expected_outcome, observed_outcome
-  expected_disposition, observed_failure_witnesses
-  subject_digest, fixture_digest, validation_policy_digest
-
-ConformanceObservedOutput:
-  execution_records: OrderedMap&lt;FixtureRef, ConformanceExecutionRecord&gt;
-  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
-  coverage_gaps: OrderedSet&lt;GateClauseId&gt;
-  observed_output_digest := hash(canonical execution_records, findings, coverage_gaps)
-    == hash(canonical_payload_without_derived_digests(ConformanceObservedOutput))
+    hash("attested-conformance-ledger/v1",
+      canonical_payload_without_derived_digests(AttestedConformanceExecutionLedger))
 
 ApprovedDigestSet:
   subject_digest
@@ -4748,11 +4892,14 @@ ReleaseApprovalTrustRootCapability: opaque deployment/verifier-owned capability
 ReleaseApprovalAuthority:
   store_snapshot: ReleaseApprovalStoreSnapshot
   approved: ApprovedDigestSet
-  trusted_approver_key_id, approval_signature_scheme
+  trusted_approver_key_id: ApproverKeyId
+  approval_signature_scheme: SignatureScheme
+  signed_message: CanonicalMessage
   signed_message := canonical_tuple(
     approved.release_policy_digest,
     store_snapshot.release_approval_store_snapshot_digest,
     trusted_approver_key_id, approval_signature_scheme, canonical(approved))
+  release_approval_authority_digest: Digest
   release_approval_authority_digest :=
     hash(canonical_payload_without_derived_digests(ReleaseApprovalAuthority))
 
@@ -4762,62 +4909,177 @@ ReleaseApprovalArtifact:
   release_approval_artifact_digest :=
     hash(canonical_payload_without_derived_digests(ReleaseApprovalArtifact))
 
-ConformanceSealArtifact:
-  invocation_authority: ConformanceInvocationAuthority
-  measured_environment: MeasuredExecutionEnvironment
-  report: ConformanceReport
-  execution_ledger: ConformanceExecutionLedger
-  runner_attestation: RunnerAttestation
-  conformance_seal_artifact_digest :=
-    hash(canonical_payload_without_derived_digests(ConformanceSealArtifact))
+AttestedConformanceReport:
+  profile_schema_id := "attested-release/v1"
+  production_subject: ProductionSubject
+  subject_digest := production_subject.subject_digest
+  conformance_invocation_digest
+  observed_output_digest
+  fixture_set_digest
+  validation_policy_digest
+  gate_manifest_digest
+  verifier_runner_digest
+  measured_execution_environment_digest
+  runner_attestation_digest
+  conformance_execution_ledger_digest
+  verdict: pass | fail | insufficient
+  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
+  conformance_report_digest := hash("attested-conformance-report/v1",
+    canonical_payload_without_derived_digests(AttestedConformanceReport))
 
-ConformanceRunResult :=
-  Completed { artifact: ConformanceSealArtifact }
+ReleasePolicy:
+  schema_version
+  trusted_approver_key_id, approval_signature_scheme
+  pass: MAY release only if
+        approved == derive_approved_digest_set(artifact, self)
+  fail: MUST block the exact subject_digest
+  insufficient: explicit allow_or_block decision, versioned in policy
+  release_policy_digest :=
+    hash(canonical_payload_without_derived_digests(ReleasePolicy))
+
+AttestedConformanceSealArtifact:
+  profile_schema_id := "attested-release/v1"
+  invocation_authority: AttestedConformanceInvocationAuthority
+  measured_environment: MeasuredExecutionEnvironment
+  report: AttestedConformanceReport
+  execution_ledger: AttestedConformanceExecutionLedger
+  runner_attestation: RunnerAttestation
+  conformance_seal_artifact_digest: Digest
+  conformance_seal_artifact_digest :=
+    hash("attested-conformance-seal-artifact/v1",
+      canonical_payload_without_derived_digests(AttestedConformanceSealArtifact))
+
+AttestedConformanceRunResult :=
+  Completed { artifact: AttestedConformanceSealArtifact }
   | InternalViolation { violation: InternalContractViolation }
 
 ReleaseBlockReason :=
   ConformanceFail | InsufficientDisallowed |
-  ApprovedDigestMismatch(CanonicalSchemaPath)
+  ApprovedDigestMismatch(CanonicalSchemaPath) | ApprovalMissing
 
 ReleaseDecision :=
   ReleaseAllowed { subject_digest, approved: ApprovedDigestSet }
   | ReleaseBlocked { subject_digest, reasons: NonEmpty&lt;ReleaseBlockReason&gt; }
 
-ConformanceReport.findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
-ConformanceReport and ReleasePolicy reuse the authoritative schemas in 12.4.</code></pre>
+ReleasePolicyApplicationResult :=
+  Completed { decision: ReleaseDecision }
+  | InternalViolation { violation: InternalContractViolation }
+
+AttestedConformanceReport.findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;</code></pre>
+</div>
 
 <h4 id="mc-conformance-interface">接口定义</h4>
-<pre><code>run_conformance(
-  authority: ConformanceInvocationAuthority,
-  trust_root: ConformanceTrustRootCapability,
-  measured_environment: MeasuredExecutionEnvironment
-) -&gt; ConformanceRunResult
+<div data-conformance-profile="basic-offline">
+<pre><code>public exported ports (exact):
+run_basic_offline_conformance(
+  authority: BasicOfflineConformanceAuthority
+) -&gt; BasicOfflineRunResult
 
-validate_and_seal_conformance(
-  authority: ConformanceInvocationAuthority,
+run_basic_offline_conformance equations:
+  recompute authority and every nested content digest before any binding
+  require authority.basic_offline_authority_digest == hash("basic-offline-authority/v1",
+    canonical_payload_without_derived_digests(authority))
+  require authority.gate_manifest.subject_digest == authority.production_subject.subject_digest
+  require keys(authority.fixture_set.bindings) is the exact expected binding domain
+  for every (record_key, binding) in authority.fixture_set.bindings:
+    execute binding exactly once and build record: BasicOfflineExecutionRecord
+    require record.fixture_ref == record_key
+    require record.target_invocation_id == binding.target_invocation_id
+    require record.target_clause_id == binding.target_clause_id
+    require record.fixture_digest == binding.fixture.fixture_digest
+    require record.evaluation_input_digest == hash("basic-offline-record-input/v1",
+      authority.basic_offline_authority_digest,
+      canonical(binding), binding.fixture_binding_digest)
+    require record.observed_clause_output == observed_clause_outputs[record_key]
+    require record.basic_offline_execution_record_digest == hash("basic-offline-record/v1",
+      canonical_payload_without_derived_digests(record))
+  observed := ConformanceObservedOutput(observed_clause_outputs, findings, coverage_gaps)
+  ledger := BasicOfflineExecutionLedger(authority identity fields,
+    execution_records, observed, keys(authority.fixture_set.bindings))
+  require ledger.expected_binding_domain == keys(authority.fixture_set.bindings)
+  require keys(ledger.execution_records) == ledger.expected_binding_domain
+  require ledger.basic_offline_authority_digest == authority.basic_offline_authority_digest
+  require ledger.subject_digest == authority.production_subject.subject_digest
+  require ledger.fixture_set_digest == authority.fixture_set.fixture_set_digest
+  require ledger.validation_policy_digest == authority.validation_policy.validation_policy_digest
+  require ledger.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest
+  require ledger.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest
+  require ledger.observed_output == observed
+  require ledger.basic_offline_execution_ledger_digest == hash("basic-offline-ledger/v1",
+    canonical_payload_without_derived_digests(ledger))
+  (derived_findings, derived_offline_verdict) := derive_conformance_findings_and_verdict(
+    authority.validation_policy, observed,
+    exact_evidence_or_coverage_gaps(authority, observed, ledger))
+  report := BasicOfflineReport(authority/observed/ledger identity fields,
+    derived_offline_verdict, derived_findings)
+  require report.production_subject == authority.production_subject
+  require report.subject_digest == authority.production_subject.subject_digest
+  require report.basic_offline_authority_digest == authority.basic_offline_authority_digest
+  require report.observed_output_digest == observed.observed_output_digest
+  require report.fixture_set_digest == authority.fixture_set.fixture_set_digest
+  require report.validation_policy_digest == authority.validation_policy.validation_policy_digest
+  require report.gate_manifest_digest == authority.gate_manifest.gate_manifest_digest
+  require report.verifier_runner_digest == authority.verifier_runner.verifier_runner_digest
+  require report.basic_offline_execution_ledger_digest == ledger.basic_offline_execution_ledger_digest
+  require report.offline_verdict == derived_offline_verdict
+  require report.findings == observed.findings
+  require report.basic_offline_report_digest == hash("basic-offline-report/v1",
+    canonical_payload_without_derived_digests(report))
+  artifact := BasicOfflineReportArtifact(authority, observed, ledger, report)
+  require artifact.authority == authority
+  require artifact.observed_output == observed
+  require artifact.execution_ledger == ledger
+  require artifact.report == report
+  recompute every Basic artifact nested digest before Completed
+  require artifact.basic_offline_report_artifact_digest == hash(
+    "basic-offline-report-artifact/v1",
+    canonical_payload_without_derived_digests(artifact))
+  content hashes prove identity/integrity only, not runner authenticity
+  return Completed iff every Basic closure equation holds; otherwise InternalViolation</code></pre>
+</div>
+
+<div data-conformance-profile="attested-release">
+<pre><code>public exported ports (exact):
+run_attested_release_conformance(
+  authority: AttestedConformanceInvocationAuthority,
+  profile: AttestedReleaseConformance,
+  measured_environment: MeasuredExecutionEnvironment
+) -&gt; AttestedConformanceRunResult
+
+apply_release_policy(
+  artifact: AttestedConformanceSealArtifact,
+  approval: ReleaseApprovalArtifact,
+  policy: ReleasePolicy,
+  profile: AttestedReleaseConformance
+) -&gt; ReleasePolicyApplicationResult
+
+internal non-exported ports:
+
+validate_and_seal_attested_conformance(
+  authority: AttestedConformanceInvocationAuthority,
   trust_root: ConformanceTrustRootCapability,
   session: ValidatedMeasurementSessionCapability,
   observed: ConformanceObservedOutput,
-  ledger: ConformanceExecutionLedger,
+  ledger: AttestedConformanceExecutionLedger,
   attestation: RunnerAttestation
-) -&gt; ConformanceRunResult
+) -&gt; AttestedConformanceRunResult
 
 validate_and_consume_measurement_envelope(
-  authority: ConformanceInvocationAuthority,
+  authority: AttestedConformanceInvocationAuthority,
   runner: VerifierRunner,
   trust_root: ConformanceTrustRootCapability,
   measured_environment: MeasuredExecutionEnvironment
 ) -&gt; ValidatedMeasurementSessionCapability | InternalContractViolation
 
-derive_conformance_report(
-  authority: ConformanceInvocationAuthority,
+derive_attested_conformance_report(
+  authority: AttestedConformanceInvocationAuthority,
   observed: ConformanceObservedOutput,
-  ledger: ConformanceExecutionLedger,
+  ledger: AttestedConformanceExecutionLedger,
   attestation: RunnerAttestation
-) -&gt; ConformanceReport
+) -&gt; AttestedConformanceReport
 
 derive_approved_digest_set(
-  artifact: ConformanceSealArtifact,
+  artifact: AttestedConformanceSealArtifact,
   policy: ReleasePolicy
 ) -&gt; ApprovedDigestSet
 
@@ -4833,14 +5095,8 @@ derive_approved_digest_set fields:
   conformance_seal_artifact_digest := recompute artifact.conformance_seal_artifact_digest
   release_policy_digest := recompute policy.release_policy_digest
 
-apply_release_policy(
-  artifact: ConformanceSealArtifact,
-  approval: ReleaseApprovalArtifact,
-  policy: ReleasePolicy,
-  release_trust_root: ReleaseApprovalTrustRootCapability
-) -&gt; ReleaseDecision
-
-run_conformance equations:
+run_attested_release_conformance equations:
+  trust_root := profile.conformance_trust_root
   recompute authority and every nested input digest by the validator's
     first-operation equations below before executing any binding
   require authority.gate_manifest.subject_digest ==
@@ -4861,18 +5117,20 @@ run_conformance equations:
   require policy.trust_store_snapshot_digest == store.trust_store_snapshot_digest
   require policy.supported_signature_schemes == store.supported_signature_schemes
   require policy.attestation_signature_scheme in store.supported_signature_schemes
+  require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation
   trusted_key_material := store.trusted_key_material_by_id[policy.trusted_attestation_key_id]
   session := validate_and_consume_measurement_envelope(
     authority, runner, trust_root, measured_environment)
   if session is InternalContractViolation: return InternalViolation; execute no binding
   for every (record_key, binding) in authority.fixture_set.bindings:
-    evaluation_input_digest := hash(authority.conformance_invocation_digest,
+    evaluation_input_digest := hash("attested-conformance-record-input/v1",
+      authority.conformance_invocation_digest,
       session.measured_execution_environment_digest,
       canonical(binding), binding.fixture_binding_digest)
     execute the exact binding once under session.capability and require the record key/fixture_ref identity
-  observed := ConformanceObservedOutput(execution_records, findings, coverage_gaps)
+  observed := ConformanceObservedOutput(observed_clause_outputs, findings, coverage_gaps)
   observed.observed_output_digest :=
-    hash(canonical execution_records, findings, coverage_gaps)
+    hash(canonical observed_clause_outputs, findings, coverage_gaps)
   measurement_envelope_digest :=
     session.measured_execution_environment_digest
   attestation := runner signs canonical_tuple(
@@ -4881,7 +5139,7 @@ run_conformance equations:
     authority.conformance_invocation_digest, observed.observed_output_digest,
     runner.verifier_runner_digest)
   construct ledger only after the signed attestation is available
-  return validate_and_seal_conformance(
+  return validate_and_seal_attested_conformance(
     authority, trust_root, session, observed, ledger, attestation)
 
 validate_and_consume_measurement_envelope equations, in this exact order
@@ -4896,7 +5154,7 @@ before any binding execution or read of observed/ledger/attestation:
     runner.verifier_runner_digest
   require measured_environment.executable_artifact_digest ==
     runner.executable_artifact_digest
-  policy := trust_root.expected_runner_attestation_policy
+  (store, policy) := resolve_conformance_trust_root(trust_root)
   require current_execution_session_context() == canonical_tuple(measured_environment.execution_session_id,
     measured_environment.process_identity,
     measured_environment.container_identity)
@@ -4920,20 +5178,21 @@ before any binding execution or read of observed/ledger/attestation:
   measured_payload_digest :=
     hash(canonical measured_environment.measured_environment_payload)
   require measured_payload_digest == policy.expected_execution_environment_digest
-  require measured_environment.verifier_nonce is active, bound to this exact
-    invocation/runner/executable/session/time-window tuple, and atomically consumed exactly once
+  terminal_consumption_receipt_key_value :=
+    terminal_consumption_receipt_key(measured_environment)
+  require measured_environment.verifier_nonce is active, bound to this exact key,
+    and atomically consumed exactly once while persisting a terminal receipt under that exact key
   return a capability bound to measurement_envelope_digest, the exact current
-    session/process/container identities and the nonce-consumption receipt
+    session/process/container identities, terminal_consumption_receipt_key_value and the nonce-consumption receipt
 
-derive_conformance_report equations:
-  report.findings == observed.findings
-  failure_findings := policy_classified_failure_findings(authority.validation_policy, observed.findings)
-  verdict := fail iff failure_findings is non-empty
-  else insufficient iff exact_evidence_or_coverage_gaps(authority, observed, ledger) is non-empty
-  else pass
+derive_attested_conformance_report equations:
+  (report.findings, report.verdict) := derive_conformance_findings_and_verdict(
+    authority.validation_policy, observed,
+    exact_evidence_or_coverage_gaps(authority, observed, ledger))
+  require report.findings == observed.findings
   derive all report identity and digest fields from authority, observed, ledger and attestation
 
-validate_and_seal_conformance first operation:
+validate_and_seal_attested_conformance first operation:
   // This entire block executes before reading observed, ledger, attestation, session.measured_environment or trust_root-selected key/scheme.
   recompute authority.production_subject.subject_digest
   recompute every authority.fixture_set binding, nested fixture and fixture_set_digest
@@ -4944,9 +5203,10 @@ validate_and_seal_conformance first operation:
   recompute authority.conformance_invocation_digest only after all nested recomputations
   require every stored nested digest equals its recomputed value
   require authority.conformance_invocation_digest ==
-    hash(canonical_payload_without_derived_digests(authority))
+    hash("attested-conformance-authority/v1",
+      canonical_payload_without_derived_digests(authority))
 
-validate_and_seal_conformance equations after first operation:
+validate_and_seal_attested_conformance equations after first operation:
   runner := authority.verifier_runner
   (store, policy) := resolve_conformance_trust_root(trust_root)
   require trust_root was issued by deployment/verifier configuration and
@@ -4964,6 +5224,7 @@ validate_and_seal_conformance equations after first operation:
   require policy.supported_signature_schemes == store.supported_signature_schemes
   require policy.attestation_signature_scheme in policy.supported_signature_schemes
   require policy.attestation_signature_scheme in store.supported_signature_schemes
+  require policy.trusted_attestation_key_id in store.trusted_key_material_by_id; otherwise InternalViolation
   measured_environment := session.measured_environment
   measurement_envelope_digest :=
     recompute measured_environment.measured_execution_environment_digest
@@ -4972,9 +5233,9 @@ validate_and_seal_conformance equations after first operation:
   require session is the exact call-scoped capability returned by
     validate_and_consume_measurement_envelope(authority, runner, trust_root, measured_environment)
   require session.capability is active only for current_execution_session_context()
-  require session.nonce_consumption_receipt proves the envelope verifier_nonce
-    was bound to the exact invocation/runner/executable/session/time-window tuple
-    and atomically consumed exactly once in this run
+  require session.nonce_consumption_receipt proves the terminal registry contains exact
+    terminal_consumption_receipt_key(measured_environment)
+    and that key was atomically consumed exactly once in this run
   require measured_environment.conformance_invocation_digest == authority.conformance_invocation_digest
   require measured_environment.verifier_runner_digest == runner.verifier_runner_digest
   require measured_environment.executable_artifact_digest == runner.executable_artifact_digest
@@ -5014,7 +5275,7 @@ validate_and_seal_conformance equations after first operation:
   require attestation.signed_message == signed_message
   trusted_key_material := store.trusted_key_material_by_id[policy.trusted_attestation_key_id]
   require verify_signature(trusted_key_material, policy.attestation_signature_scheme, signed_message, attestation.signature)
-  report := derive_conformance_report(authority, observed, ledger, attestation)
+  report := derive_attested_conformance_report(authority, observed, ledger, attestation)
   require ledger.conformance_invocation_digest ==
           report.conformance_invocation_digest ==
           attestation.conformance_invocation_digest ==
@@ -5025,16 +5286,26 @@ validate_and_seal_conformance equations after first operation:
           measured_environment.measured_execution_environment_digest
   require ledger.observed_output_digest == report.observed_output_digest == attestation.observed_output_digest
   require ledger.observed_output == observed and recompute every record key,
-          binding identity, evaluation_input_digest, record digest, finding and gap
+          binding identity, record digest, finding and gap
+  for every (record_key, binding) in authority.fixture_set.bindings:
+    evaluation_input_digest := hash("attested-conformance-record-input/v1",
+      authority.conformance_invocation_digest,
+      session.measured_execution_environment_digest,
+      canonical(binding), binding.fixture_binding_digest)
+    require ledger.execution_records[record_key].evaluation_input_digest ==
+            evaluation_input_digest
   require report/ledger/attestation subject, fixture, policy, manifest, runner,
           invocation and observed-output digest equations all hold
-  construct ConformanceSealArtifact with measured_environment only here;
+  construct AttestedConformanceSealArtifact with profile_schema_id := "attested-release/v1"
+    and measured_environment only here;
     transition session.capability to terminal consumed state; otherwise return
     InternalViolation { violation: canonical_internal_violation_union(all_internal_violations) }
 
 canonical construction order: validate and consume envelope -&gt; execute -&gt; observed -&gt; runner attestation -&gt; ledger -&gt; derived report -&gt; seal
 
 apply_release_policy first operation:
+  conformance_trust_root := profile.conformance_trust_root
+  release_trust_root := profile.release_trust_root
   recompute artifact and every nested invocation/report/ledger/attestation/environment digest
   approval_authority := approval.authority
   approved := approval_authority.approved
@@ -5050,16 +5321,130 @@ apply_release_policy first operation:
   recompute approval.release_approval_artifact_digest
   require approval.release_approval_artifact_digest ==
     hash(canonical_payload_without_derived_digests(approval))
+  subject_digest := artifact.invocation_authority.production_subject.subject_digest
   derived_approved := derive_approved_digest_set(artifact, policy)
-  require approved == derived_approved
-  require approved == derive_approved_digest_set(artifact, policy)
-  require approval_authority.store_snapshot.approved_by_subject[
-            artifact.invocation_authority.production_subject.subject_digest] == approved
-  require every stored nested digest and every one of the ten ApprovedDigestSet
-          fields equals the recomputed value above
-  require all equations above execute before resolving release_trust_root key material, verifying signature or reading verdict
+  approved_mismatches := canonical_schema_path_diff(approved, derived_approved)
+  require canonical(approved) == canonical(approval_authority.approved)
+  require derived_approved == derive_approved_digest_set(artifact, policy)
+  require every stored nested digest equals its own enclosing payload recomputation; no approved/derived cross-equality
+  require all equations above execute before resolving either profile trust root key material, verifying any signature or reading verdict
 
 apply_release_policy equations after first operation:
+  (current_conformance_store, current_conformance_policy) :=
+    resolve_conformance_trust_root(conformance_trust_root)
+  require conformance_trust_root was issued by deployment/verifier configuration and
+          cannot be constructed by request deserialization, fixture, artifact,
+          approval store or approval artifact
+  require current_conformance_store.key_registry_digest ==
+    hash(canonical current_conformance_store.trusted_key_material_by_id)
+  require current_conformance_store.trust_store_snapshot_digest ==
+    hash(canonical_payload_without_derived_digests(current_conformance_store))
+  require current_conformance_policy.runner_attestation_policy_digest ==
+    hash(canonical_payload_without_derived_digests(current_conformance_policy))
+  require canonical(current_conformance_store) ==
+          canonical(conformance_trust_root.expected_trust_store_snapshot)
+  require canonical(current_conformance_policy) ==
+          canonical(conformance_trust_root.expected_runner_attestation_policy)
+  require artifact.invocation_authority.trust_store_snapshot_ref.trust_store_snapshot_digest ==
+          current_conformance_store.trust_store_snapshot_digest ==
+          conformance_trust_root.expected_trust_store_snapshot_digest
+  require artifact.invocation_authority.runner_attestation_policy_ref.runner_attestation_policy_digest ==
+          current_conformance_policy.runner_attestation_policy_digest ==
+          conformance_trust_root.expected_runner_attestation_policy_digest
+  require current_conformance_policy.trust_store_snapshot_digest ==
+          current_conformance_store.trust_store_snapshot_digest
+  require current_conformance_policy.supported_signature_schemes ==
+          current_conformance_store.supported_signature_schemes
+  require current_conformance_policy.attestation_signature_scheme in
+          current_conformance_policy.supported_signature_schemes
+  require artifact.measured_environment.conformance_invocation_digest ==
+          artifact.runner_attestation.conformance_invocation_digest ==
+          artifact.execution_ledger.conformance_invocation_digest ==
+          artifact.report.conformance_invocation_digest ==
+          artifact.invocation_authority.conformance_invocation_digest
+  require artifact.measured_environment.verifier_runner_digest ==
+          artifact.runner_attestation.verifier_runner_digest ==
+          artifact.execution_ledger.verifier_runner_digest ==
+          artifact.report.verifier_runner_digest ==
+          artifact.invocation_authority.verifier_runner.verifier_runner_digest
+  require artifact.measured_environment.executable_artifact_digest ==
+          artifact.runner_attestation.executable_artifact_digest ==
+          artifact.invocation_authority.verifier_runner.executable_artifact_digest
+  require artifact.runner_attestation.measured_execution_environment_digest ==
+          artifact.execution_ledger.measured_execution_environment_digest ==
+          artifact.report.measured_execution_environment_digest ==
+          artifact.measured_environment.measured_execution_environment_digest
+  require artifact.runner_attestation.observed_output_digest ==
+          artifact.execution_ledger.observed_output_digest ==
+          artifact.report.observed_output_digest
+  require artifact.execution_ledger.subject_digest ==
+          artifact.report.subject_digest ==
+          artifact.invocation_authority.production_subject.subject_digest
+  require artifact.execution_ledger.fixture_set_digest ==
+          artifact.report.fixture_set_digest ==
+          artifact.invocation_authority.fixture_set.fixture_set_digest
+  require artifact.execution_ledger.validation_policy_digest ==
+          artifact.report.validation_policy_digest ==
+          artifact.invocation_authority.validation_policy.validation_policy_digest
+  require artifact.execution_ledger.gate_manifest_digest ==
+          artifact.report.gate_manifest_digest ==
+          artifact.invocation_authority.gate_manifest.gate_manifest_digest
+  require artifact.execution_ledger.runner_attestation_digest ==
+          artifact.report.runner_attestation_digest ==
+          artifact.runner_attestation.runner_attestation_digest
+  require artifact.report.conformance_execution_ledger_digest ==
+          artifact.execution_ledger.conformance_execution_ledger_digest
+  require artifact.report.production_subject ==
+          artifact.invocation_authority.production_subject
+  require artifact.execution_ledger.observed_output_digest ==
+          artifact.execution_ledger.observed_output.observed_output_digest
+  require artifact.report.findings ==
+          artifact.execution_ledger.observed_output.findings
+  require current_conformance_policy.trusted_attestation_key_id in
+          current_conformance_store.trusted_key_material_by_id; otherwise InternalViolation
+  current_conformance_trusted_key_material :=
+    current_conformance_store.trusted_key_material_by_id[
+      current_conformance_policy.trusted_attestation_key_id]
+  require artifact.runner_attestation.trusted_attestation_key_id ==
+          current_conformance_policy.trusted_attestation_key_id
+  require artifact.runner_attestation.attestation_signature_scheme ==
+          current_conformance_policy.attestation_signature_scheme
+  require current_conformance_policy.attestation_signature_scheme in
+          current_conformance_store.supported_signature_schemes
+  current_measurement_evidence_message := canonical_tuple(
+    artifact.measured_environment.conformance_invocation_digest,
+    artifact.measured_environment.verifier_runner_digest,
+    artifact.measured_environment.executable_artifact_digest,
+    artifact.measured_environment.execution_session_id,
+    artifact.measured_environment.process_identity,
+    artifact.measured_environment.container_identity,
+    artifact.measured_environment.verifier_nonce,
+    artifact.measured_environment.execution_time_window,
+    canonical(artifact.measured_environment.measured_environment_payload))
+  require verify_measurer_identity_and_freshness_evidence(
+    conformance_trust_root.measurement_session_authority,
+    current_measurement_evidence_message,
+    artifact.measured_environment.measurer_identity_and_freshness_evidence)
+  current_measured_payload_digest :=
+    hash(canonical artifact.measured_environment.measured_environment_payload)
+  require current_measured_payload_digest ==
+          current_conformance_policy.expected_execution_environment_digest
+  require conformance_trust_root.measurement_session_authority.has_terminal_consumption_receipt(
+    terminal_consumption_receipt_key(artifact.measured_environment))
+  current_conformance_signed_message := canonical_tuple(
+    artifact.runner_attestation.measured_execution_environment_digest,
+    artifact.runner_attestation.executable_artifact_digest,
+    artifact.runner_attestation.trusted_attestation_key_id,
+    artifact.runner_attestation.attestation_signature_scheme,
+    artifact.runner_attestation.conformance_invocation_digest,
+    artifact.runner_attestation.observed_output_digest,
+    artifact.runner_attestation.verifier_runner_digest)
+  require artifact.runner_attestation.signed_message ==
+          current_conformance_signed_message
+  require verify_signature(current_conformance_trusted_key_material,
+    current_conformance_policy.attestation_signature_scheme,
+    current_conformance_signed_message, artifact.runner_attestation.signature)
+  reverify sealed runner attestation under current profile root without consuming a measurement session or nonce
   root := resolve_release_approval_trust_root(release_trust_root)
   require release_trust_root was issued by deployment/verifier configuration and
           cannot be constructed by request deserialization, fixture, policy,
@@ -5070,27 +5455,39 @@ apply_release_policy equations after first operation:
           approval_authority.store_snapshot.release_approval_store_snapshot_digest
   require canonical(root.expected_release_approval_store_snapshot) ==
           canonical(approval_authority.store_snapshot)
+  if subject_digest not in approval_authority.store_snapshot.approved_by_subject:
+    return Completed { decision: ReleaseBlocked { subject_digest, reasons: {ApprovalMissing} } }
+  require approval_authority.store_snapshot.approved_by_subject[subject_digest] == approved
   require approval_authority.trusted_approver_key_id ==
           policy.trusted_approver_key_id
   require approval_authority.approval_signature_scheme == policy.approval_signature_scheme
   require policy.approval_signature_scheme in
           root.supported_release_approval_signature_schemes
+  require policy.trusted_approver_key_id in root.trusted_approver_public_key_material_by_id; otherwise InternalViolation
   trusted_approver_public_key_material :=
     root.trusted_approver_public_key_material_by_id[policy.trusted_approver_key_id]
   release_approval_signed_message := canonical_tuple(
     root.expected_release_policy_digest,
     root.expected_release_approval_store_snapshot_digest,
     policy.trusted_approver_key_id, policy.approval_signature_scheme,
-    canonical(derived_approved))
+    canonical(approved))
   require approval_authority.signed_message == release_approval_signed_message
   require verify_signature(trusted_approver_public_key_material, policy.approval_signature_scheme, release_approval_signed_message, approval.signature)
   verify release approval signature only with external-root public key material
-  then apply the versioned pass/fail/insufficient rule; compare all ten approved digest fields</code></pre>
+  if approved_mismatches is NonEmpty:
+    return Completed { decision: ReleaseBlocked { subject_digest, reasons:
+      map(approved_mismatches, path -&gt; ApprovedDigestMismatch(path)) } }
+  require approved == derived_approved
+  require all ten ApprovedDigestSet fields are byte-equal only on this authenticated empty-diff path
+  decision := apply the versioned pass/fail/insufficient rule after comparing all ten approved digest fields
+  return Completed { decision }
+  any failed recomputation, root, scheme, key-membership or signature equation -&gt;
+    InternalViolation { violation: canonical_internal_violation_union(all_internal_violations) }</code></pre>
 
-<p><code>run_conformance</code> 先复算全部输入摘要，执行完整 binding domain，并要求 ledger 的 expected domain、
+<p><code>run_attested_release_conformance</code> 先复算全部输入摘要，执行完整 binding domain，并要求 ledger 的 expected domain、
 execution records、finding 与 coverage gap 守恒。runner crash, schema failure, digest failure or conservation failure
 均返回单一 InternalContractViolation，且不产生 report 或 seal。只有完整合法执行才构造 report、runner attestation、
-ledger 与 ConformanceSealArtifact。每条记录必须满足 <code>record.fixture_ref == record_key</code>、
+ledger 与 AttestedConformanceSealArtifact。每条记录必须满足 <code>record.fixture_ref == record_key</code>、
 <code>record.target_invocation_id == binding.target_invocation_id</code> 与
 <code>record.target_clause_id == binding.target_clause_id</code>，并复算 fixture/input/output/record digest。</p>
 <p>runner attestation 的信任能力来自部署/verifier 持有、请求反序列化无法构造的 <code>ConformanceTrustRootCapability</code>，
@@ -5107,8 +5504,16 @@ measurer identity/freshness evidence；payload 摘要再与 policy expected 值�
 root 固定的 ReleasePolicy 与 approval-store payload/digest 逐字相等，只允许 root-supported scheme，并仅从 root 的 trusted approver
 public-key registry 解析验签材料。批准签名消息覆盖 root 固定的 policy/store identity、key/scheme 与规范十字段 ApprovedDigestSet；
 policy 中的 key id 只是经外部 root 认证后的选择器，不能充当公钥或自证信任根。</p>
+</div>
 
 <h4 id="mc-conformance-outcomes">成功与阻断语义</h4>
+<div data-conformance-profile="basic-offline">
+<p>BasicOfflineRunResult 只在完整执行精确 binding domain、记录与 observed output 守恒后产生
+<code>offline_verdict: pass | fail | insufficient</code>；输入或内容摘要不闭合则返回单一
+InternalContractViolation。Basic 的 pass 只是离线质量结论，不能授权发布，也不能通过附加字段升级；
+进入更强部署模式必须新建 authority 并重新执行。</p>
+</div>
+<div data-conformance-profile="attested-release">
 <p>每个 manifest clause 必须同时有 positive fixture 与 negative-boundary fixture，并验证预期
 failure disposition；只有 complete, valid execution 对全部已声明 binding 执行且守恒后，coverage gap 才使 verdict 为 insufficient 而不是 pass。结构/数值不符产生 fail 和逐 clause
 ConformanceFinding；缺独立证据产生 insufficient。release policy 对 pass/fail/insufficient 三态分别处理：fail
@@ -5120,7 +5525,7 @@ ReleasePolicy 明示，不能默认为 pass。</p>
 后者不能在重算 record/global output 后保持 signature；均不得生成或放行 seal。runner crash 仍返回单一 ICV；
 insufficient 只允许在 authority、逐 binding execution、observed output、signature 与守恒全部合法完成后表达证据缺口。</p>
 <p><code>negative fixture: valid signature plus failing observed output cannot be sealed with forged pass</code>：
-即使 runner signature 有效，validate_and_seal_conformance 仍内部重算 report，调用方无法提交或替换 verdict。</p>
+即使 runner signature 有效，validate_and_seal_attested_conformance 仍内部重算 report，调用方无法提交或替换 verdict。</p>
 <p><code>negative fixture: release approval wrong signature scheme</code> 与
 <code>negative fixture: unsupported release approval signature scheme</code> 必须在读取批准 verdict 前失败；
 authority 不能选择与 ReleasePolicy 不同或 verifier 不支持的 scheme。</p>
@@ -5132,8 +5537,10 @@ authority 不能选择与 ReleasePolicy 不同或 verifier 不支持的 scheme�
 <p>runner attestation trust 负例必须包含 <code>negative fixture: wrong runner attestation trust store</code>、
 <code>negative fixture: unsupported runner attestation signature scheme</code>、
 <code>negative fixture: tampered runner execution environment</code> 与
-<code>negative fixture: runner self-owned attestation key</code>；wrong store、unsupported scheme、被篡改 environment 或
-runner 自带 key material 任一情况均在 report/seal 构造前返回 InternalContractViolation。</p>
+<code>negative fixture: runner self-owned attestation key</code> 与
+<code>negative fixture: release artifact from different conformance trust root</code>；wrong store、unsupported scheme、被篡改 environment、
+runner 自带 key material 或由不同 conformance root 封装的 artifact，均必须返回 InternalContractViolation。发布时只重验 seal 内的 runner attestation，
+不再次消费 measurement session 或 nonce。</p>
 <p><code>negative fixture: old invocation digest plus substituted policy or trust-store reference</code>：validator 的首个动作必须
 先复算 authority 的全部 nested input digest，再复算 invocation digest；替换 ValidationPolicy 或任一 trust-root ref 后沿用旧 digest
 必定在读取 observed/ledger/attestation 或选择 key/scheme 前失败。外部 root payload 与 authority ref 不等、把 self-owned store
@@ -5143,18 +5550,33 @@ session/process/container identity 不等或 single-use nonce 已消费而在任
 <code>negative fixture: change only measurer identity or freshness evidence while retaining old envelope digest</code> 必须在 envelope 摘要复算或
 measurer evidence 验证时失败；change only measurer_identity_and_freshness_evidence changes measured_execution_environment_digest，
 因此 provenance/freshness 不是摘要外旁注。</p>
+</div>
 
 <h4 id="mc-conformance-invariants">不变量</h4>
+<div data-conformance-scope="shared">
+<ul>
+  <li>FixtureSet is the sole fixture-to-(invocation, clause) mapping；其 <code>derived_coverage_by_clause := derive_fixture_coverage(bindings)</code> 的 key 集精确等于 manifest 全部 clause_id，binding 引用存在、kind 正确且 target invocation/clause 双向闭合；</li>
+  <li>两个 profile 只引用同一组 TraceFixture、FixtureBinding/Set、ValidationPolicy、VerifierRunner、ProductionSubject、GateManifest、ConformanceFinding、ConformanceObservedOutput 与 deterministic finding/verdict rules，不复制共享真值；</li>
+  <li>profile selection、fixture、observed output、ledger、report 及其摘要与全部加固制品均为 one-way offline sidecar；删除它们不改变 CommonProductionInputs、RequestSnapshot、memory/time input domain 或 simulation digest、生产 cache tuple、ComparisonBasis、BackendResult、ComparisonResult 的任何字节。</li>
+</ul>
+</div>
+<div data-conformance-profile="basic-offline">
+<ul>
+  <li>Basic 五种 content-addressed payload 的 own digest 只使用 basic-offline/v1 schema 与各自 basic-offline-*/v1 hash domain；BasicOfflineRunResult 是无 own digest、无 profile_schema_id field 的 transport union；不得接收另一 profile 的 payload 或 digest。</li>
+  <li>BasicOfflineReport.offline_verdict 只表达内容寻址的离线对照结果；不存在从 BasicOfflineReportArtifact 到另一 profile artifact 的转换接口。</li>
+</ul>
+</div>
+<div data-conformance-profile="attested-release">
 <ul>
   <li>report.production_subject 必须由 build artifact、evaluator/registry、production policy、backend semantics 四组 constituent 重算，report.subject_digest、manifest.subject_digest 与 approval.authority.approved.subject_digest 逐字相等；</li>
   <li>fixture_set_digest、validation_policy_digest、gate_manifest_digest、verifier_runner_digest 必须分别由 invocation authority 的实际 FixtureSet、ValidationPolicy、GateManifest、VerifierRunner 重算并与 report/approval artifact 逐字相等；</li>
-  <li>invocation authority 只固定 TrustStoreSnapshotRef 与 RunnerAttestationPolicyRef；完整 store/policy 只能由外部 ConformanceTrustRootCapability 提供并复算，validator 只使用 root policy-selected key/scheme 与 root store-owned trusted key material，runner/请求/fixture 无权自带或替换验签 key/scheme；</li>
+  <li>invocation authority 只固定 TrustStoreSnapshotRef 与 RunnerAttestationPolicyRef；完整 store/policy 只能由外部 ConformanceTrustRootCapability 提供并复算，validator 只使用 root policy-selected key/scheme 与 root store-owned trusted key material，runner/请求/fixture 无权自带或替换验签 key/scheme；apply_release_policy 还必须用当前 profile 的 conformance root 逐字重验 artifact authority refs 与 runner attestation，不能把另一 conformance domain 的 seal 交给当前 release root；</li>
   <li>MeasuredExecutionEnvironment 是由 protected measurer 发行、绑定精确 invocation/runner/executable/session/process/container/nonce/time window 的 envelope；其摘要覆盖 payload 与 measurer identity/freshness evidence，single-use nonce 只可原子消费一次，全部 fixture binding 只在同一 call-scoped session capability 下执行；</li>
   <li>ReleasePolicy 包含 schema_version、pass/fail/insufficient 规则、approver key/scheme selector 和 release_policy_digest；它自身不是信任根。apply_release_policy 必须复算它并要求同时等于 approval authority 内 ApprovedDigestSet.release_policy_digest 与外部 ReleaseApprovalTrustRootCapability 固定的完整 policy payload/digest；</li>
-  <li><code>apply_release_policy</code> 只调用 <code>derive_approved_digest_set(artifact, policy)</code> 重算 ApprovedDigestSet 当前全部十个字段，并要求 approved 整对象逐字相等；批准 store 必须等于外部 root 固定的完整 snapshot，验签 key material 只能来自外部 root；调用者不能直接提交 loose report、字段子集或 self-owned key/store/policy；</li>
-  <li>FixtureSet is the sole fixture-to-(invocation, clause) mapping；其 <code>derived_coverage_by_clause := derive_fixture_coverage(bindings)</code> 的 key 集精确等于 manifest 全部 clause_id，binding 引用存在、kind 正确且 target invocation/clause 双向闭合；</li>
-  <li>fixture lineage 与 calibration_train/holdout/生产请求全隔离；删除全部 fixture/report/release artifact 不改变任一生产摘要、cache key、BackendResult 或 ComparisonResult。</li>
+  <li><code>apply_release_policy</code> 先用当前 profile.conformance_trust_root 解析 store/policy、匹配 authority refs，并以 current root 的 measurement-session authority 查询绑定精确 measured_execution_environment_digest 的 terminal receipt，再用 root-owned key 重验 seal 内 runner signature，且不再次消费 session/nonce；随后才调用 <code>derive_approved_digest_set(artifact, policy)</code> 重算 ApprovedDigestSet 当前全部十个字段，并要求 approved 整对象逐字相等；批准 store 必须等于外部 release root 固定的完整 snapshot，验签 key material 只能来自相应外部 root；调用者不能直接提交 loose report、字段子集或 self-owned key/store/policy；</li>
+  <li>Basic payload、report 或 digest 不能加字段后冒充 Attested；必须新建 AttestedConformanceInvocationAuthority、取得 fresh measured session、消费 single-use nonce 并完整重新执行，才能构造 AttestedConformanceSealArtifact。</li>
 </ul>
+</div>
 </section>
 
 <h3 id="c12-3">12.3 CodeIR conformance</h3>
@@ -5192,66 +5614,26 @@ IRConformance(predicted, fixture):
 dependency 或通信 identity 是结构性 fail；数值误差按版本化 validation policy 判定。没有独立 fixture
 时为 insufficient，不得称 pass，也不推导零误差。</p>
 
-<pre><code>ConformanceReport:
-  production_subject: ProductionSubject
-  subject_digest := production_subject.subject_digest
-  conformance_invocation_digest
-  observed_output_digest
-  fixture_set_digest
-  validation_policy_digest
-  gate_manifest_digest
-  verifier_runner_digest
-  measured_execution_environment_digest
-  runner_attestation_digest
-  conformance_execution_ledger_digest
-  verdict: pass | fail | insufficient
-  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
-  conformance_report_digest :=
-    hash(canonical_payload_without_derived_digests(ConformanceReport))
+<pre><code>validator configuration without explicit profile
+  -&gt; BasicOfflineConformance
 
-ReleasePolicy:
-  schema_version
-  trusted_approver_key_id, approval_signature_scheme
-  pass: MAY release only if
-        approved == derive_approved_digest_set(artifact, self)
-  fail: MUST block the exact subject_digest
-  insufficient: explicit allow_or_block decision, versioned in policy
-  release_policy_digest :=
-    hash(canonical_payload_without_derived_digests(ReleasePolicy))
+BasicOfflineConformance
+  -&gt; BasicOfflineReportArtifact
+  -&gt; offline_verdict: pass | fail | insufficient
+  -&gt; identity/integrity evidence only; never ReleaseDecision
 
-ReleaseApprovalTrustRootCapability: opaque deployment/verifier-owned capability
-  pins the complete ReleasePolicy payload and release_policy_digest
-  pins the complete ReleaseApprovalStoreSnapshot payload and digest
-  pins supported release-approval signature schemes
-  owns trusted approver public key material by ApproverKeyId
-  is outside request, fixture, policy, approval store and approval artifact
+AttestedReleaseConformance
+  -&gt; fresh measured session + consumed nonce + runner trust verification
+  -&gt; AttestedConformanceSealArtifact
+  -&gt; apply_release_policy(..., profile: AttestedReleaseConformance)
+  -&gt; ReleasePolicyApplicationResult</code></pre>
 
-apply_release_policy(
-  artifact: ConformanceSealArtifact,
-  approval: ReleaseApprovalArtifact,
-  policy: ReleasePolicy,
-  release_trust_root: ReleaseApprovalTrustRootCapability
-) -&gt; ReleaseDecision
-
-release approval signature covers canonical_tuple(
-  pinned release_policy_digest,
-  pinned release_approval_store_snapshot_digest,
-  trusted_approver_key_id, approval_signature_scheme,
-  canonical(all ten fields of derive_approved_digest_set(artifact, policy)))</code></pre>
-
-<p>ConformanceReport 必须经 ConformanceInvocationAuthority 绑定精确被测 content-addressed subject、fixture 集合、判定 policy、GateManifest
-和 verifier runner，并绑定同一 non-replayable measurement envelope、canonical observed output 与受信 runner signature；旧报告、旧 session envelope
-或自选弱 fixture/policy 不能套用于任何字段变化后的 build/registry/policy 组合。
-报告、ProductionValidationContext 与 GateManifest 引用的是同一个 ProductionSubject；consumer 必须从
-build artifact、evaluator/registry、production policy 与 backend semantics 四组实际 constituent digest 复算
-subject_digest，不能接受调用方自由填写的 opaque 字符串。
-<code>GateManifest.subject_digest</code> 与 <code>ConformanceReport.subject_digest</code> 必须逐字相等，且
-verifier_runner_digest 同时等于报告字段与批准清单；仅间接引用 manifest digest 不足以跨 subject 复用。
-pass 只有在受信 ReleaseApprovalArtifact 由外部 <code>ReleaseApprovalTrustRootCapability</code> 的 public key material 验签、
-ReleasePolicy 与 approval store 的完整 payload/digest 都等于该 root 固定值，且
-<code>approved == derive_approved_digest_set(artifact, policy)</code> 的全部十个字段命中批准 store snapshot 时才可发布；fail 必须阻止该 subject；
-insufficient 的处理由显式 ReleasePolicy 决定，
-不得被当作 pass。该引用始终从报告指向生产 subject，生产摘要不得反向读取报告。</p>
+<p>两个 profile 复用同一 ProductionSubject、FixtureSet、ValidationPolicy、GateManifest、VerifierRunner、
+ConformanceFinding、ConformanceObservedOutput 与确定性 verdict 规则。Basic 是默认的轻量离线对照，只产生
+<code>offline_verdict</code>；它不具有发布权限，也不存在添加签名即可升级的路径。Attested 是显式可选的部署加固：
+只有它绑定 non-replayable measurement envelope、外部 runner/release trust roots、十字段 ApprovedDigestSet 与
+ReleasePolicy。显式选择 Attested 但缺任一受保护 capability 时返回 InternalContractViolation，绝不回退 Basic。
+二者都从生产 subject 向外单向取证；生产摘要、比较 basis、缓存键和 BackendResult 不反向读取任何验证制品。</p>
 
 <h3 id="c12-5">12.5 采集侵入边界</h3>
 <p>默认 fixture 通过框架标准 profiler、memory tracker 和独立 runner/launch 配置采集，
@@ -5261,13 +5643,15 @@ insufficient 的处理由显式 ReleasePolicy 决定，
 <h3 id="c12-6">12.6 测试数据与生产隔离</h3>
 <p>TraceFixture、IRConformance report 和 schedule conformance report 只存在于测试目录、CI artifact
 与验证 runner。生产 API、请求 schema、缓存查找和仿真进程不得读取它们。
-CI 必须因 conformance fail 阻止对应 <code>subject_digest</code> 发布；pass 也只有在 signed approval artifact 通过部署/verifier-owned、
-请求与 validation artifacts 无法构造的 <code>ReleaseApprovalTrustRootCapability</code> 验证，且 policy/store payload 与 digest、
-root-supported scheme、root-owned trusted approver public key material 均闭合，再满足
-<code>approved == derive_approved_digest_set(artifact, policy)</code> 的 all ten approved digest fields 全部逐字匹配时才可放行。
-verdict 不改变生产 BackendResult。
-已经发布的仿真器在没有 fixture 时仍按相同生产输入返回相同预测。ConformanceReport 必须引用被测
-subject，禁止生产摘要、比较 basis 或缓存键反向依赖验证制品。</p>
+BasicOfflineConformance 是默认离线质量检查，产生的 pass/fail/insufficient 只属于
+<code>BasicOfflineReportArtifact</code>，不授权发布。选择 AttestedReleaseConformance 的部署才启用 signed approval：
+只有 <code>AttestedConformanceSealArtifact</code> 经 profile 内两个外部 trust root 验证、policy/store payload 与 digest、
+root-supported scheme、root-owned trusted approver public key material 均闭合，并满足
+<code>approved == derive_approved_digest_set(artifact, policy)</code> 的 all ten approved digest fields 全部逐字匹配，
+才产生 ReleaseAllowed。两个 profile 的 verdict 都不改变生产 BackendResult。
+移除全部 profile selection、fixture、observed output、ledger、report、trust/session/signature/seal/release artifact 后，
+CommonProductionInputs、RequestSnapshot、memory/time input domain 与摘要、生产 cache tuple、ComparisonBasis 和
+BackendResult 的规范字节逐字不变。</p>
 
 <h2 id="c13"><span class="cn">Chapter 13</span>复杂度、配置 sweep 与迁移</h2>
 
@@ -5489,7 +5873,10 @@ assumptions 和严格同口径配置差分；结构不完整时明确阻断；
 
 <div class="cal honest" data-capability-scope="offline-validation"><span class="lbl">离线 validator 能力</span>
 <p>独立消费 HoldoutEvaluationManifest 或 TraceFixture，追加采集适用性、IR/schedule conformance 与误差报告；
-这些离线制品不改变生产 BackendResult，也不成为生产发布前提或比较口径。</p></div>
+未显式选择 profile 时使用 BasicOfflineConformance，只给内容寻址的 offline_verdict；需要对抗性 CI/供应链发布保护时，
+部署可显式选择 AttestedReleaseConformance，以受保护 measurement session、runner trust 与 release approval chain
+产生 ReleaseDecision。显式 Attested 缺 capability 时 fail closed，不降级 Basic。两种可选 one-way sidecar 都不改变
+生产 BackendResult，也不成为生产计算输入、摘要、缓存或比较口径。</p></div>
 
 <div class="cal why"><span class="lbl">为什么这一形态符合多维并行规划</span>
 <p>TP/PP/DP/CP/EP、microbatch、重计算、分桶和预取首先改变逐 rank 源码分支、运行时事件、

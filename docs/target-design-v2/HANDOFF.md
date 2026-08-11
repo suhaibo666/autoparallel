@@ -68,7 +68,7 @@
 | `result-sealing` / `mc-result-sealing` | candidate 与 source/value/seal authority；`run_backend_build_candidate_and_seal(...)` |
 | `gate-system` / `mc-gate-system` | GateManifest/Clause/Ledger/Blocker；`compile_gate_manifest(...)`、`run_gate_domain(...)`、ledger extension |
 | `comparison` / `mc-comparison` | typed arms、basis/source/candidate/seal；basis 派生、authority 构造与逐 metric comparison |
-| `conformance` / `mc-conformance` | fixture/report/finding/release；`run_conformance(...)` 与 `apply_release_policy(...)` |
+| `conformance` / `mc-conformance` | `BasicOfflineReportArtifact` / `AttestedConformanceSealArtifact`；`run_basic_offline_conformance(...)`、`run_attested_release_conformance(...)` 与 `apply_release_policy(...)` |
 
 ## 1. v4.2 已定边界
 
@@ -342,7 +342,7 @@ EstimateCandidate、backend source/value/seal authority/candidate/artifact 与 c
 ResolvedEventSemantic 也各自只排除自己的 deployment/protocol/formula/semantic digest。嵌套输入 digest
 保留；KernelVariantBinding 的自身字段固定名为 `kernel_variant_binding_digest`；禁止把自身置零后 hash 或由实现自行删字段。
 
-TraceFixture、ConformanceReport 和 ConformanceVerdict 不进入生产摘要、比较 basis 或缓存键。
+TraceFixture、AttestedConformanceReport 和 ConformanceVerdict 不进入生产摘要、比较 basis 或缓存键。
 requested backend set 与 NotRequested 也不进入仿真摘要；memory/time result 使用独立 cache namespace。
 EvaluationInstanceIdentity 只是 request/config capability provenance，不进入 model/runtime/backend simulation digest、
 Estimate.result_digest 或模型结果 cache key。缓存命中的 backend value 只能在当前 evaluation 的
@@ -512,16 +512,84 @@ memory/time、Ok/Blocked/NotRequested 不互相制造假依赖，也不能用游
 
 ## 6. conformance
 
-`ConformanceVerdict = pass | fail | insufficient`：
+### 6.1 部署 profile 闭包与共享事实
+
+部署侧选择是一个无摘要、不可序列化且不会进入 `RequestSnapshot` 的闭联合：
+
+```text
+ConformanceDeploymentProfile :=
+  BasicOfflineConformance
+  | AttestedReleaseConformance {
+      conformance_trust_root: ConformanceTrustRootCapability,
+      release_trust_root: ReleaseApprovalTrustRootCapability
+    }
+default_conformance_deployment_profile := BasicOfflineConformance
+```
+
+没有显式 profile 时只运行 Basic；显式选择 Attested 却缺少任一受保护 capability 是
+`InternalContractViolation`，不得静默降级。两条分支复用唯一的 TraceFixture、FixtureBinding/Set、
+ValidationPolicy、VerifierRunner、ProductionSubject、GateManifest、ConformanceFinding、
+ConformanceObservedOutput 与确定性 finding/verdict 规则。
+Figure 10 先以 OfflineConformanceRequested opt 表达整个离线 sidecar 可选，其内再以 Basic(default)/Attested 单一 alt 表达 profile 互斥；gate system 只返回 clause observations 与
+`GateExecutionLedger`，Basic/Attested validator 各自构造 `BasicOfflineReportArtifact` / `AttestedConformanceSealArtifact`，
+只有 Attested 分支随后调用 `apply_release_policy`。
+
+### 6.2 BasicOfflineConformance
+
+`ConformanceVerdict = pass | fail | insufficient`。Basic 的唯一入口与结果边界是：
+
+```text
+run_basic_offline_conformance(
+  authority: BasicOfflineConformanceAuthority
+) -> BasicOfflineRunResult
+```
+
+`BasicOfflineConformanceAuthority`、`BasicOfflineExecutionRecord`、`BasicOfflineExecutionLedger`、
+`BasicOfflineReport`、`BasicOfflineReportArtifact` 与 `BasicOfflineRunResult` 中，前五种是 content-addressed payload，使用 `profile_schema_id="basic-offline/v1"` 与彼此独立的 `basic-offline-*/v1` hash domain；`BasicOfflineRunResult` 只是无 own digest、无 profile field 的 transport union。
+Basic 执行精确 fixture domain，产出 content-addressed `offline_verdict`；内容摘要只证明 identity/integrity，
+不证明 runner authenticity，也不能授权发布、附签升级或转换为 Attested artifact。
+
+### 6.3 AttestedReleaseConformance
+
+只有部署显式选择 `AttestedReleaseConformance` 才启用受保护 measurement session、runner attestation、
+single-use nonce、外部 approval trust root 与发布策略。它的两个公开入口精确为：
+
+```text
+run_attested_release_conformance(
+  authority: AttestedConformanceInvocationAuthority,
+  profile: AttestedReleaseConformance,
+  measured_environment: MeasuredExecutionEnvironment
+) -> AttestedConformanceRunResult
+
+apply_release_policy(
+  artifact: AttestedConformanceSealArtifact,
+  approval: ReleaseApprovalArtifact,
+  policy: ReleasePolicy,
+  profile: AttestedReleaseConformance
+) -> ReleasePolicyApplicationResult
+
+ReleasePolicyApplicationResult :=
+  Completed { decision: ReleaseDecision }
+  | InternalViolation { violation: InternalContractViolation }
+```
+
+Attested authority、report 与 seal payload 固定 `profile_schema_id="attested-release/v1"`；创建它必须使用新的
+authority、fresh measured session、已消费 nonce 并完整重跑，不存在接受 Basic artifact 或公共 artifact union 的重载。
+只有 `run_basic_offline_conformance`、`run_attested_release_conformance`、`apply_release_policy` 是公开端口；
+envelope validation、seal validation、report/approved-set derivation helper 均为 internal/non-exported。
+
+### 6.4 判定、批准与隔离
+
+两条 profile 共享以下判定含义：
 
 - missing/extra/unresolved node、错误 branch/dependency/communication identity 是结构性 fail；
 - peak/step/start/end 等数值误差按版本化 validation policy；
 - 没有独立 fixture 时为 insufficient，不能称 pass；
-- `ConformanceReport` 必须绑定 content-addressed subject、fixture set、validation policy、GateManifest 和
+- Attested 分支的 `AttestedConformanceReport` 必须绑定 content-addressed subject、fixture set、validation policy、GateManifest 和
   verifier runner digests；
 - subject 必须与 ProductionValidationContext 共用同一 ProductionSubject，并从 build artifact、evaluator/registry、
   production policy、backend semantics 四组实际 constituent digest 复算，不能接受 opaque 自填字符串；
-- `GateManifest.subject_digest == ConformanceReport.subject_digest`，runner digest 也同时匹配报告和批准清单；
+- `GateManifest.subject_digest == AttestedConformanceReport.subject_digest`，runner digest 也同时匹配报告和批准清单；
 - pass 必须先调用 `derive_approved_digest_set(artifact, policy)`，逐字重算并匹配以下全部十个字段：
   `subject_digest`、`fixture_set_digest`、`validation_policy_digest`、`gate_manifest_digest`、
   `verifier_runner_digest`、`runner_attestation_digest`、`conformance_execution_ledger_digest`、
@@ -530,20 +598,30 @@ memory/time、Ok/Blocked/NotRequested 不互相制造假依赖，也不能用游
   `ReleaseApprovalTrustRootCapability` 固定完整 ReleasePolicy 与 approval-store snapshot，限制支持的 scheme，
   并只使用 root-owned trusted approver public key material 验证覆盖 pinned policy/store identity 与上述十字段的签名；
   self-owned key、wrong store、unsupported scheme 或 substituted policy 即使内部 digest/signature 自洽也不得发布；
-- fail 必须阻止精确 subject；insufficient 的发布行为由显式版本化 ReleasePolicy 决定；
+- `apply_release_policy` 必须先从当前 `profile.conformance_trust_root` 解析 store/policy，逐字匹配 artifact authority 的
+  trust-store/policy refs，复算 store key registry/store/policy own digest 与 scheme 集合，并逐字闭合 environment、attestation、
+  ledger、report 到 authority/runner/observed 的全部重复 identity；使用该 root 的 measurement-session authority 重验 evidence，并从 current-root nonce registry
+  查询绑定精确 measured-execution-environment digest 的 terminal consumption receipt，
+  并使用 root-owned key/scheme/message 重验 seal 内 runner attestation；这一步不再次消费 measurement session/nonce。
+  另一 conformance domain 产生的 seal 即使 release approval 自洽也必须返回 InternalViolation；
+- terminal receipt 的唯一规范 key 覆盖 nonce、invocation/runner/executable、session/process/container、time window 与
+  measured-execution-environment digest；envelope validator 原子消费时写入该 key，seal 校验同一 receipt，release 只读查询同一 key；
+- 每次 trust-store、approval-store 或 approver-key map lookup 前必须先验证 key membership；缺 attestation/approver key
+  返回 InternalViolation，可信 approval store 中缺当前 subject 则返回 Completed(ReleaseBlocked/ApprovalMissing)；
+- Attested 的 fail 必须阻止精确 subject；insufficient 的发布行为由显式版本化 ReleasePolicy 决定；
 - verdict 不改变生产 BackendResult，生产摘要也不反向依赖报告。
 
 CodeIR conformance 按 rank 对比并聚合 rank set；event conformance 覆盖 backward/recompute/optimizer、
 TensorInstance、P2P/collective、microbatch/pipeline 与 logical allocation timeline。
 
-离线 conformance 的会话边界已经闭合：`MeasuredExecutionEnvironment` 是 protected measurer 发行的
+Attested-only 会话边界已经闭合：`MeasuredExecutionEnvironment` 是 protected measurer 发行的
 不可重放 envelope，摘要覆盖 invocation、runner/executable、process/container/session identity、single-use nonce、
 execution time window、measured payload 与 measurer identity/freshness evidence；所有 fixture binding 只能在
 `ValidatedMeasurementSessionCapability` 对应的同一调用域执行，runner attestation 签完整 envelope digest，
 validator 在读取 observed/ledger 前复算并消费 nonce。跨会话重放或只替换 provenance/freshness 都是
 InternalContractViolation。这个闭包仍以部署侧 `ConformanceTrustRootCapability`、`ReleaseApprovalTrustRootCapability`、
 protected measurer、可信单调时钟、进程/容器身份提供者与 trusted approver public-key provisioning 为外部信任根；
-摘要与签名不能自行证明这些物理根可信，也不能把 offline conformance
+摘要与签名不能自行证明这些物理根可信，也不能把 Attested offline conformance
 表述为脱离该信任根的宿主隔离证明。
 
 ## 7. 缓存闭包
@@ -587,8 +665,8 @@ protected measurer、可信单调时钟、进程/容器身份提供者与 truste
 以下为 PowerShell 的活动构建与验证路径；只能由 `build_doc.py` 写 `index.html`/`artifact.html`：
 
 实现阶段必须另提供内容寻址的 `validation/gate-manifest.json` 与 runtime gate runner；它们不是当前设计文档
-linter 的产物。发布 CI 以 ConformanceReport 中的 manifest/runner digest 绑定精确制品，不能只运行
-`verify_gates.py`。
+linter 的产物。Basic profile 的 CI 只给离线质量结论；显式选择 Attested profile 的发布 CI 才以
+AttestedConformanceReport 中的 manifest/runner digest 绑定精确制品，且不能只运行 `verify_gates.py`。
 
 从 `docs/target-design-v2`：
 
@@ -640,6 +718,6 @@ Get-FileHash -Algorithm SHA256 index.html, artifact.html
 16. config_ref→EvaluationInstanceIdentity→BackendSealArtifact→ComparisonArmAuthority 是否全链可复算，A/B artifact 是否不可交换，同臂 artifact 是否共享字节相同 bundle/current subject/manifest；
 17. GateClause 的 map key/record/manifest identity 是否三方相等，failure disposition 是否只从 manifest 派生；
 18. 逐 metric comparison、basis pair、scenario axis、零 baseline、分层 cache 与 NotRequested 是否保持类型闭包；
-19. ConformanceReport 是否绑定批准 subject/fixture/policy/manifest/runner，GateClause 是否逐子句有正反例。
+19. Basic 是否只能生成不可发布的离线报告；AttestedConformanceReport 是否绑定批准 subject/fixture/policy/manifest/runner，GateClause 是否逐子句有正反例。
 
 不要为本版重新引入编译器图优化、精确 layout/stride、多流完成时刻内存复用或资源竞争模型。
