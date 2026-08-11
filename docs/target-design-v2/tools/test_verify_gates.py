@@ -427,17 +427,17 @@ class VerifyGatesContractTest(unittest.TestCase):
             (
                 'inputFacts["input-facts"]',
                 'inputFacts["input-facts / RequestSnapshot"]',
-                "artifact node forbidden",
+                "exact node/label set mismatch",
             ),
             (
-                'data-module-id="memory-backend" data-layer="L3" data-allowed-dependencies="plan-projection"',
-                'data-module-id="memory-backend" data-layer="L3" data-allowed-dependencies="comparison"',
-                "module/dependency table",
+                'data-module-id="plan-projection" data-layer="L2" data-allowed-dependencies="gate-system,memory-backend,time-backend"',
+                'data-module-id="plan-projection" data-layer="L2" data-allowed-dependencies="comparison,gate-system,memory-backend,time-backend"',
+                "exact six-cell module table",
             ),
             (
                 '<tr data-module-id="conformance"',
                 '<tr data-module-id="unknown-module"',
-                "module/dependency table",
+                "exact six-cell module table",
             ),
         )
         for original, replacement, expected in mutations:
@@ -453,6 +453,50 @@ class VerifyGatesContractTest(unittest.TestCase):
         )
         errors = validate(mutated + "\nexactly one candidate per backend/evaluation identity")
         self.assertTrue(any("plan-projection" in error for error in errors), errors)
+
+    def test_task8_plan_ports_generics_and_dependency_dag_mutations_are_rejected(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        mutations = (
+            (
+                "core_build_result: CoreBuildResult<SimulationPlanCore>",
+                "core_build_result: CoreBuildResult<MemoryEventView>",
+                "PlanProjectionOwnedContracts",
+            ),
+            (
+                "policy: HardwareBindingPolicySnapshot",
+                "binding_policy: HardwareBindingPolicySnapshot",
+                "plan-projection typed port",
+            ),
+            (
+                "expected_invocation_domain(",
+                "missing_gate_domain_port(",
+                "plan-projection typed port",
+            ),
+        )
+        for original, replacement, expected in mutations:
+            with self.subTest(expected=expected):
+                mutated = replace_in_module(
+                    template, "plan-projection", original, replacement
+                )
+                self.assertNotEqual(mutated, template)
+                errors = validate(mutated)
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        cycle_anchor = (
+            'data-module-id="plan-projection" data-layer="L2" '
+            'data-allowed-dependencies="gate-system,memory-backend,time-backend"'
+        )
+        self.assertEqual(template.count(cycle_anchor), 1)
+        errors = validate(
+            template.replace(
+                cycle_anchor,
+                'data-module-id="plan-projection" data-layer="L2" '
+                'data-allowed-dependencies="gate-system,memory-backend,result-sealing,time-backend"',
+                1,
+            )
+        )
+        self.assertTrue(any("dependency DAG" in error for error in errors), errors)
 
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")

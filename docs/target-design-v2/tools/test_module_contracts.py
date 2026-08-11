@@ -164,6 +164,7 @@ class ModuleContractStructureTest(unittest.TestCase):
     def test_plan_projection_contract_has_existing_typed_ports_and_closed_outcomes(self) -> None:
         text = self.contract_text("plan-projection")
         for token in (
+            "PlanProjectionOwnedContracts:",
             "SimulationPlanCore",
             "CoreBuildResult<SimulationPlanCore>",
             "ProjectionCandidate<MemoryEventView>",
@@ -172,21 +173,22 @@ class ModuleContractStructureTest(unittest.TestCase):
             "ProjectionBundleBuild",
             "ProjectionResult<MemoryEventView>",
             "ProjectionResult<TimeEventView>",
-            "Ready { view: V }",
-            "Blocked { blockers: NonEmpty<BlockerRecord> }",
-            "NotRequested",
             "bind_core(",
             "evaluate_and_finalize_projection_bundle(",
             "build_memory_projection_candidate(",
             "build_time_projection_candidate(",
             "run_gate_domain(",
             "exactly one candidate per backend/evaluation identity",
-            "missing compute profile blocks time only",
-            "missing shape/storage/lifetime blocks memory only",
+            "missing exact compute profile blocks time only",
+            "missing memory-only storage/alias/lifetime/explicit-workspace facts blocks memory only",
+            "missing shared compute shape yields BLK-MISSING-SHAPE and affects both faces",
             "no capacity, completion-time or contention reads",
             "one canonical InternalContractViolation and no partial bundle",
         ):
             self.assertIn(token, text)
+        self.assertNotIn("CoreBuildResult<SimulationPlanCore> :=", text)
+        self.assertNotIn("ProjectionResult<V> :=", text)
+        self.assertNotIn("ProjectionCandidate<MemoryEventView> :=", text)
 
     def test_chapter1_module_table_is_exact_and_dependency_closed(self) -> None:
         template = TEMPLATE.read_text(encoding="utf-8")
@@ -197,15 +199,15 @@ class ModuleContractStructureTest(unittest.TestCase):
         )
         expected = {
             "input-facts": ("L0", ""),
-            "code-ir": ("L1", "input-facts"),
-            "runtime-events": ("L1", "code-ir,input-facts"),
-            "plan-projection": ("L2", "gate-system,input-facts,memory-backend,runtime-events,time-backend"),
-            "gate-system": ("L2", "input-facts"),
-            "memory-backend": ("L3", "plan-projection"),
-            "time-backend": ("L3", "plan-projection"),
-            "result-sealing": ("L4", "gate-system,memory-backend,time-backend"),
+            "code-ir": ("L1", ""),
+            "runtime-events": ("L1", ""),
+            "plan-projection": ("L2", "gate-system,memory-backend,time-backend"),
+            "gate-system": ("L2", ""),
+            "memory-backend": ("L3", ""),
+            "time-backend": ("L3", ""),
+            "result-sealing": ("L4", "gate-system,memory-backend,plan-projection,time-backend"),
             "comparison": ("L4", "gate-system,result-sealing"),
-            "conformance": ("OFFLINE", "comparison,result-sealing"),
+            "conformance": ("OFFLINE", "comparison,gate-system,result-sealing"),
         }
         self.assertEqual({module: (layer, deps) for module, layer, deps in rows}, expected)
 

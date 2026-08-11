@@ -12,10 +12,10 @@
 
 这是一个纯代码驱动的多维混合并行训练内存与 step-time 工程预测仿真器。
 
-完整主链只维护一份：见权威模板 [`src/index.template.html`](src/index.template.html) 中
+权威模块架构只维护一份：见权威模板 [`src/index.template.html`](src/index.template.html) 中
 `data-diagram-id="layered-module-architecture"` 的 Mermaid 源，以及由它生成的 `index.html`/`artifact.html`
 同名静态 SVG。HANDOFF 不再复制一份可能漂移的 ASCII 架构图；下文 `text` 代码块仅用于 schema、公式或
-伪代码，不是第二套架构/流程图。
+伪代码，不是第二套架构/流程图。artifact 的规范装配顺序见正文 §13.2，不由模块架构图重复定义。
 
 - 内存只按确定的 logical kernel order 重放 `Allocate/Bind/Use/Free`，不读取 duration 或完成时刻。
 - 时间使用无资源竞争的 global progress DAG；只建模依赖、stream 次序、P2P/collective rendezvous。

@@ -551,27 +551,74 @@ TASK8_ARCHITECTURE_DIAGRAM_IDS = {
     "layered-module-architecture",
     "plan-projection-module-architecture",
 }
-TASK8_ARCHITECTURE_FORBIDDEN_ARTIFACTS = (
-    "RequestSnapshot",
-    "SimulationPlanCore",
-    "ProjectionCandidate",
-    "GateExecutionLedger",
-    "BackendSealArtifact",
-)
 TASK8_MODULE_DEPENDENCIES = {
     "input-facts": ("L0", ""),
-    "code-ir": ("L1", "input-facts"),
-    "runtime-events": ("L1", "code-ir,input-facts"),
-    "plan-projection": (
-        "L2",
-        "gate-system,input-facts,memory-backend,runtime-events,time-backend",
+    "code-ir": ("L1", ""),
+    "runtime-events": ("L1", ""),
+    "plan-projection": ("L2", "gate-system,memory-backend,time-backend"),
+    "gate-system": ("L2", ""),
+    "memory-backend": ("L3", ""),
+    "time-backend": ("L3", ""),
+    "result-sealing": (
+        "L4",
+        "gate-system,memory-backend,plan-projection,time-backend",
     ),
-    "gate-system": ("L2", "input-facts"),
-    "memory-backend": ("L3", "plan-projection"),
-    "time-backend": ("L3", "plan-projection"),
-    "result-sealing": ("L4", "gate-system,memory-backend,time-backend"),
     "comparison": ("L4", "gate-system,result-sealing"),
-    "conformance": ("OFFLINE", "comparison,result-sealing"),
+    "conformance": ("OFFLINE", "comparison,gate-system,result-sealing"),
+}
+TASK8_MODULE_ROWS = {
+    "input-facts": ("L0", "冻结生产事实与请求", "CommonProductionInputs, RequestSnapshot", "build_request_snapshot", "无"),
+    "code-ir": ("L1", "逐 rank 源码求值", "RankCodeIR, CodeIR", "evaluate_source; assemble_code_ir", "无"),
+    "runtime-events": ("L1", "展开训练与通信事件", "RuntimeEventPlan", "expand_runtime_semantics", "无"),
+    "plan-projection": ("L2", "绑定共享核并联合闭合双投影", "SimulationPlanCore, ProjectionBundleBuild", "bind_core; evaluate_and_finalize_projection_bundle", "gate-system, memory-backend, time-backend"),
+    "gate-system": ("L2", "执行 staged gate 与 ledger", "GateEvaluationAuthority, GateExecutionLedger", "compile_gate_manifest; build_gate_evaluation_authority; expected_invocation_domain; run_gate_domain", "无"),
+    "memory-backend": ("L3", "构造并重放内存视图", "MemoryEventView, MemoryEstimate", "build_memory_projection_candidate; run_memory_backend", "无"),
+    "time-backend": ("L3", "构造时间视图并执行 DES", "TimeEventView, StepTimeEstimate", "build_time_projection_candidate; run_time_backend", "无"),
+    "result-sealing": ("L4", "生成并封装后端结果", "BackendSealArtifact", "run_backend_build_candidate_and_seal", "gate-system, memory-backend, plan-projection, time-backend"),
+    "comparison": ("L4", "同口径配置比较", "ComparisonResult", "derive_comparison_basis_pair; build_comparison_source_authority; compare_per_metric_from_authority", "gate-system, result-sealing"),
+    "conformance": ("离线", "离线对照与发布门", "ConformanceReport", "run_conformance; apply_release_policy", "comparison, gate-system, result-sealing"),
+}
+TASK8_ARCHITECTURE_NODES = {
+    "layered-module-architecture": {
+        "l0label": "L0 · Input facts", "inputFacts": "input-facts",
+        "l1label": "L1 · IR and events", "codeIr": "code-ir", "runtimeEvents": "runtime-events",
+        "l2label": "L2 · Coordination", "planProjection": "plan-projection", "gateSystem": "gate-system",
+        "l3label": "L3 · Backends", "memoryBackend": "memory-backend", "timeBackend": "time-backend",
+        "l4label": "L4 · Product outputs", "resultSealing": "result-sealing", "comparison": "comparison",
+        "offlineLabel": "Offline sidecar · outside production digest chain", "conformance": "conformance",
+    },
+    "plan-projection-module-architecture": {
+        "upstreamLabel": "Upstream modules", "inputFacts": "input-facts", "runtimeEvents": "runtime-events",
+        "boundaryLabel": "plan-projection boundary", "coreBinder": "Core binder", "faceCoordinator": "Face coordinator", "bundleFinalizer": "Bundle finalizer",
+        "portsLabel": "Injected ports", "memoryBackend": "memory-backend", "timeBackend": "time-backend", "gateSystem": "gate-system",
+    },
+}
+TASK8_ARCHITECTURE_EDGES = {
+    "layered-module-architecture": {
+        ("inputFacts", "-->", "codeIr"), ("inputFacts", "-->", "runtimeEvents"),
+        ("codeIr", "-->", "runtimeEvents"), ("runtimeEvents", "-->", "planProjection"),
+        ("inputFacts", "-->", "gateSystem"), ("gateSystem", "-->", "planProjection"),
+        ("planProjection", "-->", "memoryBackend"), ("planProjection", "-->", "timeBackend"),
+        ("planProjection", "-->", "resultSealing"), ("memoryBackend", "-->", "resultSealing"),
+        ("timeBackend", "-->", "resultSealing"), ("gateSystem", "-->", "resultSealing"),
+        ("resultSealing", "-->", "comparison"), ("resultSealing", "-.->", "conformance"),
+        ("comparison", "-.->", "conformance"), ("gateSystem", "-.->", "conformance"),
+    },
+    "plan-projection-module-architecture": {
+        ("inputFacts", "-->", "coreBinder"), ("runtimeEvents", "-->", "coreBinder"),
+        ("coreBinder", "-->", "faceCoordinator"), ("faceCoordinator", "-->", "memoryBackend"),
+        ("faceCoordinator", "-->", "timeBackend"), ("faceCoordinator", "-->", "gateSystem"),
+        ("faceCoordinator", "-->", "bundleFinalizer"), ("bundleFinalizer", "-->", "gateSystem"),
+    },
+}
+TASK8_PLAN_OWNED_FIELDS = {
+    "core_build_result": "CoreBuildResult<SimulationPlanCore>",
+    "memory_candidate": "ProjectionCandidate<MemoryEventView>",
+    "time_candidate": "ProjectionCandidate<TimeEventView>",
+    "bundle_authority": "ProjectionBundleAuthority",
+    "bundle_build": "ProjectionBundleBuild",
+    "memory_result": "ProjectionResult<MemoryEventView>",
+    "time_result": "ProjectionResult<TimeEventView>",
 }
 
 MODULE_CONTRACT_SUBSECTIONS = {
@@ -631,6 +678,7 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "expand_runtime_semantics( code_ir: CodeIR, config: NormalizedParallelConfig, scenario: ExecutionScenario, registry: RuntimeRegistrySnapshot ) -> RuntimeBuildResult | InternalContractViolation",
     ),
     "plan-projection": (
+        "PlanProjectionOwnedContracts:",
         "SimulationPlanCore",
         "CoreBuildResult<SimulationPlanCore>",
         "ProjectionCandidate<MemoryEventView>",
@@ -639,9 +687,6 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "ProjectionBundleBuild",
         "ProjectionResult<MemoryEventView>",
         "ProjectionResult<TimeEventView>",
-        "Ready { view: V }",
-        "Blocked { blockers: NonEmpty<BlockerRecord> }",
-        "NotRequested",
         "bind_core(",
         "evaluate_and_finalize_projection_bundle(",
         "build_memory_projection_candidate(",
@@ -650,8 +695,9 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "exactly one candidate per backend/evaluation identity",
         "shared Runtime/Core/G-IR blockers affect both faces",
         "face-local blockers affect only that face",
-        "missing compute profile blocks time only",
-        "missing shape/storage/lifetime blocks memory only",
+        "missing exact compute profile blocks time only",
+        "missing memory-only storage/alias/lifetime/explicit-workspace facts blocks memory only",
+        "missing shared compute shape yields BLK-MISSING-SHAPE and affects both faces",
         "unrequested arms are empty and unread",
         "blocker union/scope closure occurs before both results",
         "shared G-IR runs once",
@@ -2088,25 +2134,128 @@ def check_diagrams(html: str, errors: list[str]) -> None:
         errors.append("Task8 authoritative diagram ID/order 不闭合")
     sources = dict(figures)
     for diagram_id in TASK8_ARCHITECTURE_DIAGRAM_IDS:
-        source = sources.get(diagram_id, "")
+        source = unescape(sources.get(diagram_id, ""))
         if '"useGradient": false' not in source or not re.search(
             r"(?m)^block-beta\s*$", source
         ):
             errors.append(f"Task8 architecture diagram kind mismatch: {diagram_id}")
         if re.search(r"(?m)^flowchart\b", source):
             errors.append(f"Task8 architecture diagram forbids flowchart: {diagram_id}")
-        for artifact in TASK8_ARCHITECTURE_FORBIDDEN_ARTIFACTS:
-            if artifact in source:
-                errors.append(
-                    f"Task8 architecture diagram artifact node forbidden: {diagram_id}/{artifact}"
-                )
-    module_rows = re.findall(
-        r'<tr\b[^>]*data-module-id="([a-z-]+)"[^>]*data-layer="([A-Z0-9-]+)"'
-        r'[^>]*data-allowed-dependencies="([a-z,-]*)"[^>]*>',
+        nodes = dict(re.findall(r'(?m)^\s+([A-Za-z][A-Za-z0-9]*)\["([^"]+)"\]\s*$', source))
+        edges = set(
+            re.findall(
+                r"(?m)^\s+([A-Za-z][A-Za-z0-9]*)\s+(-->|-\.->)\s+"
+                r"([A-Za-z][A-Za-z0-9]*)\s*$",
+                source,
+            )
+        )
+        if nodes != TASK8_ARCHITECTURE_NODES[diagram_id]:
+            errors.append(f"Task8 architecture exact node/label set mismatch: {diagram_id}")
+        if edges != TASK8_ARCHITECTURE_EDGES[diagram_id]:
+            errors.append(f"Task8 architecture exact edge set mismatch: {diagram_id}")
+
+    table_match = re.search(
+        r'<table\b[^>]*data-module-architecture="normative"[^>]*>'
+        r'(?P<body>.*?)</table>',
         html,
+        re.DOTALL,
     )
-    if {module: (layer, deps) for module, layer, deps in module_rows} != TASK8_MODULE_DEPENDENCIES:
-        errors.append("Task8 Chapter 1 module/dependency table 不闭合")
+    parsed_rows: dict[str, tuple[str, str, str, str, str]] = {}
+    dependency_rows: dict[str, tuple[str, str]] = {}
+    malformed = table_match is None
+    if table_match is not None:
+        header = re.search(r"<tr>(.*?)</tr>", table_match.group("body"), re.DOTALL)
+        header_cells = [
+            re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", cell))).strip()
+            for cell in re.findall(r"<th[^>]*>(.*?)</th>", header.group(1) if header else "", re.DOTALL)
+        ]
+        malformed = header_cells != ["层", "模块 ID", "职责", "核心契约类型", "正式入口 port", "允许调用依赖"]
+        for row in re.finditer(r"<tr\b(?P<attrs>[^>]*)>(?P<body>.*?)</tr>", table_match.group("body"), re.DOTALL):
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row.group("body"), re.DOTALL)
+            if not cells:
+                continue
+            attrs = dict(re.findall(r'([a-z-]+)="([^"]*)"', row.group("attrs")))
+            module = attrs.get("data-module-id", "")
+            normalized = tuple(
+                re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", cell))).strip()
+                for cell in cells
+            )
+            if len(normalized) != 6 or not module or module in parsed_rows:
+                malformed = True
+                continue
+            layer = attrs.get("data-layer", "")
+            deps = attrs.get("data-allowed-dependencies", "")
+            parsed_rows[module] = (normalized[0], normalized[2], normalized[3], normalized[4], normalized[5])
+            dependency_rows[module] = (layer, deps)
+            if normalized[1] != module or normalized[0] != ("离线" if layer == "OFFLINE" else layer):
+                malformed = True
+    if malformed or parsed_rows != TASK8_MODULE_ROWS or dependency_rows != TASK8_MODULE_DEPENDENCIES:
+        errors.append("Task8 Chapter 1 exact six-cell module table 不闭合")
+
+    graph = {
+        module: tuple(filter(None, deps.split(",")))
+        for module, (_, deps) in dependency_rows.items()
+    }
+    graph_invalid = set(graph) != set(TASK8_MODULE_DEPENDENCIES) or any(
+        dep not in graph for deps in graph.values() for dep in deps
+    )
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    def visit(module: str) -> bool:
+        if module in visiting:
+            return False
+        if module in visited:
+            return True
+        visiting.add(module)
+        if any(not visit(dep) for dep in graph.get(module, ())):
+            return False
+        visiting.remove(module)
+        visited.add(module)
+        return True
+    if graph_invalid or any(not visit(module) for module in graph):
+        errors.append("Task8 module dependency DAG 不闭合")
+
+    for module, row in TASK8_MODULE_ROWS.items():
+        section = re.search(
+            rf'<section\b[^>]*data-module="{re.escape(module)}"[^>]*>(?P<body>.*?)</section>',
+            html,
+            re.DOTALL,
+        )
+        interface = re.search(
+            rf'<h4\b[^>]*id="mc-{re.escape(module)}-interface"[^>]*>.*?</h4>'
+            rf'(?P<body>.*?)(?=<h4\b|$)',
+            section.group("body") if section else "",
+            re.DOTALL,
+        )
+        interface_text = _normalize_contract_text(
+            [unescape(re.sub(r"<[^>]+>", " ", interface.group("body")))]
+        ) if interface else ""
+        for port in row[3].split("; "):
+            if f"{port}(" not in interface_text:
+                errors.append(f"Task8 table port missing from {module} interface: {port}")
+
+    plan_section = re.search(
+        r'<section\b[^>]*data-module="plan-projection"[^>]*>(?P<body>.*?)</section>',
+        html,
+        re.DOTALL,
+    )
+    plan_body = plan_section.group("body") if plan_section else ""
+    if _exact_flat_schema_fields(plan_body, "PlanProjectionOwnedContracts") != TASK8_PLAN_OWNED_FIELDS:
+        errors.append("Task8 PlanProjectionOwnedContracts exact field mapping 不闭合")
+    if re.search(r"(?:CoreBuildResult|ProjectionResult|ProjectionCandidate)[^\r\n]*:=", unescape(plan_body)):
+        errors.append("Task8 plan-projection forbids local result/union second truth")
+    plan_text = _normalize_contract_text([unescape(re.sub(r"<[^>]+>", " ", plan_body))])
+    required_plan_ports = (
+        "bind_core( plan: RuntimeEventPlan, hardware: HardwareProfile, deployment: ExecutionDeployment, policy: HardwareBindingPolicySnapshot ) -> CoreBuildResult<SimulationPlanCore> | InternalContractViolation",
+        "evaluate_and_finalize_projection_bundle( authority: ProjectionBundleAuthority ) -> ProjectionBundleBuild | InternalContractViolation",
+        "build_memory_projection_candidate( request: RequestSnapshot, evaluation_identity: EvaluationInstanceIdentity, core: SimulationPlanCore ) -> ProjectionCandidate<MemoryEventView> | InternalContractViolation",
+        "build_time_projection_candidate( request: RequestSnapshot, evaluation_identity: EvaluationInstanceIdentity, core: SimulationPlanCore ) -> ProjectionCandidate<TimeEventView> | InternalContractViolation",
+        "build_gate_evaluation_authority( subject: GateEvaluationSubject, manifest: GateManifest, runner: GateRunnerSnapshot ) -> GateEvaluationAuthority | InternalContractViolation",
+        "expected_invocation_domain( authority: GateEvaluationAuthority, base: GateExecutionLedger ) -> ExpectedInvocationDomain",
+        "run_gate_domain( authority: GateEvaluationAuthority, base: GateExecutionLedger, invocation_domain: OrderedSet<GateInvocationId> ) -> GateExecutionLedger | InternalContractViolation",
+    )
+    if any(port not in plan_text for port in required_plan_ports):
+        errors.append("Task8 plan-projection typed port signature 不闭合")
 
 
 def main() -> int:

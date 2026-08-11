@@ -444,6 +444,18 @@ class BuildDocActivityPathTest(unittest.TestCase):
         self.assertNotIn("`core-dual-projection`", handoff)
         self.assertIn("十组模块契约索引", handoff)
 
+        template = SOURCE.read_text(encoding="utf-8")
+        indexed_diagrams = re.findall(r"\| `([a-z0-9-]+)` \| §", handoff)
+        indexed_modules = re.findall(
+            r"\| `([a-z-]+)` / `([a-z-]+)` \|", handoff
+        )
+        self.assertEqual(tuple(indexed_diagrams), EXPECTED_DIAGRAM_IDS)
+        for diagram_id in indexed_diagrams:
+            self.assertEqual(template.count(f'data-diagram-id="{diagram_id}"'), 1)
+        for module_id, anchor in indexed_modules:
+            self.assertEqual(template.count(f'data-module="{module_id}"'), 1)
+            self.assertEqual(template.count(f'id="{anchor}"'), 1)
+
     def test_handoff_documents_the_offline_deterministic_safe_build(self) -> None:
         """An unpinned, network-backed, or unaudited build recipe must fail."""
         handoff = HANDOFF.read_text(encoding="utf-8")
