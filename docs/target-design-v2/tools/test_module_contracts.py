@@ -171,6 +171,7 @@ class ModuleContractStructureTest(unittest.TestCase):
         for backend_field in (
             "memory_registry_snapshot",
             "calibration_set",
+            "calibration_train_manifest_snapshot",
             "communication_model_snapshot",
             "time_cost_policy",
         ):
@@ -179,7 +180,7 @@ class ModuleContractStructureTest(unittest.TestCase):
         for token in (
             "RequestedBackendInput :=",
             "MemoryRequested { memory_registry_snapshot: MemoryRegistrySnapshot }",
-            "TimeRequested { calibration_set: CalibrationSet communication_model_snapshot: CommunicationModelSnapshot time_cost_policy: TimeCostPolicy }",
+            "TimeRequested { calibration_set: CalibrationSet calibration_train_manifest_snapshot: CalibrationTrainManifest communication_model_snapshot: CommunicationModelSnapshot time_cost_policy: TimeCostPolicy }",
             "| NotRequested",
             "requested_backend_inputs: OrderedMap<memory | time, RequestedBackendInput>",
             "domain(requested_backend_inputs) == {memory,time}",
@@ -944,7 +945,6 @@ class ModuleContractStructureTest(unittest.TestCase):
             {
                 "active_compute_records": "Map[MeasurementKey, ComputeMeasurementRecord]",
                 "measurement_protocols": "Map[ProtocolDigest, MeasurementProtocol]",
-                "calibration_train_manifest": "CalibrationTrainManifest",
                 "calibration_train_manifest_digest": "Digest",
             },
         )
@@ -1005,6 +1005,89 @@ class ModuleContractStructureTest(unittest.TestCase):
         self.assertEqual(len(refs), 10)
         self.assertEqual(set(ids), set(refs))
         self.assertEqual(decision_ids, [f"D{index}" for index in range(1, 20)])
+
+    def test_task7_authority_and_behavior_equations_are_closed(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+
+        request_input = re.search(
+            r"RequestedBackendInput\s*:=\s*(.*?)RequestedBackendInputMap\s*:=",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(request_input)
+        assert request_input is not None
+        request_text = re.sub(r"\s+", " ", request_input.group(1))
+        self.assertIn(
+            "calibration_train_manifest_snapshot: CalibrationTrainManifest",
+            request_text,
+        )
+        self.assertNotIn("HoldoutEvaluationManifest", request_text)
+
+        time_constructor = re.search(
+            r"build_time_projection_candidate\(request, evaluation_identity, core\):"
+            r"(?P<body>.*?)evaluate_and_finalize_projection_bundle\(authority\):",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(time_constructor)
+        assert time_constructor is not None
+        time_text = re.sub(r"\s+", " ", time_constructor.group("body"))
+        for equation in (
+            "calibration := time_inputs.calibration_set",
+            "train_manifest := time_inputs.calibration_train_manifest_snapshot",
+            "calibration.calibration_train_manifest_digest == train_manifest.calibration_train_manifest_digest",
+            "keys(calibration.active_compute_records) == train_manifest.active_measurement_keys",
+            "keys(calibration.measurement_protocols) == train_manifest.active_protocol_digests",
+        ):
+            self.assertIn(equation, time_text)
+
+        coverage_region = re.search(
+            r"Coverage:\s*(?P<body>.*?)<h3 id=\"c2-4\"",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(coverage_region)
+        assert coverage_region is not None
+        for equation in (
+            "source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed",
+            "event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable",
+        ):
+            self.assertIn(equation, coverage_region.group("body"))
+
+        basis = re.search(
+            r"ComparisonBasis:\s*(?P<body>.*?)comparison_basis_digest\s*:=",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(basis)
+        assert basis is not None
+        self.assertIn("logical_rank_id_set", basis.group("body"))
+        self.assertNotIn("HoldoutEvaluationManifest", basis.group("body"))
+
+        bundle = re.search(
+            r"evaluate_and_finalize_projection_bundle\(authority\):"
+            r"(?P<body>.*?)</code></pre>",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(bundle)
+        assert bundle is not None
+        bundle_text = re.sub(r"\s+", " ", bundle.group("body"))
+        for scope_equation in (
+            "each construction blocker contains candidate.backend in affected_backends",
+            "every BlockerRecord that prevents RuntimeBuildResult or CoreBuildResult from being Ready has affected_backends=={memory,time}",
+            "every InputBlocker occurrence from a shared structure/G-IR invocation has affected_backends=={memory,time}",
+        ):
+            self.assertIn(scope_equation, bundle_text)
+
+        time_digest = re.search(
+            r"time_simulation_digest\s*:=\s*(?P<body>.*?)result_digest\s*:=",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(time_digest)
+        assert time_digest is not None
+        self.assertNotIn("HoldoutEvaluationManifest", time_digest.group("body"))
 
     def test_comparison_schema_derivation_and_task5_digest_exclusions_are_closed(self) -> None:
         text = self.contract_text("comparison")

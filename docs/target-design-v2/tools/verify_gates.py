@@ -437,7 +437,7 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "gate_runner_snapshot: GateRunnerSnapshot",
         "RequestedBackendInput :=",
         "MemoryRequested { memory_registry_snapshot: MemoryRegistrySnapshot }",
-        "TimeRequested { calibration_set: CalibrationSet communication_model_snapshot: CommunicationModelSnapshot time_cost_policy: TimeCostPolicy }",
+        "TimeRequested { calibration_set: CalibrationSet calibration_train_manifest_snapshot: CalibrationTrainManifest communication_model_snapshot: CommunicationModelSnapshot time_cost_policy: TimeCostPolicy }",
         "| NotRequested",
         "requested_backend_inputs: RequestedBackendInputMap",
         "domain(requested_backend_inputs) == {memory,time}",
@@ -1192,6 +1192,7 @@ def check_module_contracts(html: str, errors: list[str]) -> None:
                 for backend_field in (
                     "memory_registry_snapshot",
                     "calibration_set",
+                    "calibration_train_manifest_snapshot",
                     "communication_model_snapshot",
                     "time_cost_policy",
                 ):
@@ -1260,12 +1261,11 @@ def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
     expected_calibration = {
         "active_compute_records": "Map[MeasurementKey, ComputeMeasurementRecord]",
         "measurement_protocols": "Map[ProtocolDigest, MeasurementProtocol]",
-        "calibration_train_manifest": "CalibrationTrainManifest",
         "calibration_train_manifest_digest": "Digest",
     }
     if calibration != expected_calibration:
         errors.append(
-            "Task7 CalibrationSet 必须自包含 active records/protocols 并绑定 train manifest payload/digest"
+            "Task7 CalibrationSet 必须只持 active records/protocols 与 train manifest digest"
         )
 
     train_manifest = _flat_schema_fields(html, "CalibrationTrainManifest")
@@ -1369,6 +1369,172 @@ def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
     )
     if capability_scopes != ["production", "offline-validation"]:
         errors.append("Task7 14.5 必须分离 production 与 offline-validation 能力")
+
+
+def check_task7_behavioral_contracts(html: str, errors: list[str]) -> None:
+    request_input = re.search(
+        r"RequestedBackendInput\s*:=\s*(.*?)RequestedBackendInputMap\s*:=",
+        html,
+        re.DOTALL,
+    )
+    request_text = (
+        _normalize_contract_text([request_input.group(1)])
+        if request_input is not None
+        else ""
+    )
+    request_tokens = (
+        "calibration_set: CalibrationSet",
+        "calibration_train_manifest_snapshot: CalibrationTrainManifest",
+        "communication_model_snapshot: CommunicationModelSnapshot",
+        "time_cost_policy: TimeCostPolicy",
+    )
+    if request_input is None or any(token not in request_text for token in request_tokens):
+        errors.append("Task7 TimeRequested 未携带独立 train manifest authority input")
+    if "HoldoutEvaluationManifest" in request_text:
+        errors.append("Task7 holdout 不得进入 RequestSnapshot backend payload")
+
+    request_builder = re.search(
+        r"build_request_snapshot gate specification equations:"
+        r"(?P<body>.*?)</code></pre>",
+        html,
+        re.DOTALL,
+    )
+    request_builder_text = (
+        _normalize_contract_text([request_builder.group("body")])
+        if request_builder is not None
+        else ""
+    )
+    request_closure_tokens = (
+        "calibration := requested_backend_inputs[time].calibration_set",
+        "train_manifest := requested_backend_inputs[time].calibration_train_manifest_snapshot",
+        "calibration.calibration_train_manifest_digest == train_manifest.calibration_train_manifest_digest",
+        "keys(calibration.active_compute_records) == train_manifest.active_measurement_keys",
+        "keys(calibration.measurement_protocols) == train_manifest.active_protocol_digests",
+    )
+    if request_builder is None or any(
+        token not in request_builder_text for token in request_closure_tokens
+    ):
+        errors.append("Task7 RequestSnapshot train manifest authority closure 不闭合")
+
+    memory_constructor = re.search(
+        r"build_memory_projection_candidate\(request, evaluation_identity, core\):"
+        r"(?P<body>.*?)build_time_projection_candidate\(",
+        html,
+        re.DOTALL,
+    )
+    memory_text = (
+        _normalize_contract_text([memory_constructor.group("body")])
+        if memory_constructor is not None
+        else ""
+    )
+    if (
+        memory_constructor is None
+        or "construct only from memory_inputs.memory_registry_snapshot" not in memory_text
+        or any(
+            forbidden in memory_text
+            for forbidden in (
+                "calibration_set",
+                "calibration_train_manifest_snapshot",
+                "communication_model_snapshot",
+                "time_cost_policy",
+                "requested_backend_inputs[time]",
+            )
+        )
+    ):
+        errors.append("Task7 memory face authority 必须只读取 memory input arm")
+
+    time_constructor = re.search(
+        r"build_time_projection_candidate\(request, evaluation_identity, core\):"
+        r"(?P<body>.*?)evaluate_and_finalize_projection_bundle\(authority\):",
+        html,
+        re.DOTALL,
+    )
+    time_text = (
+        _normalize_contract_text([time_constructor.group("body")])
+        if time_constructor is not None
+        else ""
+    )
+    time_tokens = (
+        "calibration := time_inputs.calibration_set",
+        "train_manifest := time_inputs.calibration_train_manifest_snapshot",
+        "communication_model := time_inputs.communication_model_snapshot",
+        "time_policy := time_inputs.time_cost_policy",
+        "calibration.calibration_train_manifest_digest == train_manifest.calibration_train_manifest_digest",
+        "keys(calibration.active_compute_records) == train_manifest.active_measurement_keys",
+        "keys(calibration.measurement_protocols) == train_manifest.active_protocol_digests",
+    )
+    if time_constructor is None or any(token not in time_text for token in time_tokens):
+        errors.append("Task7 time authority 未闭合 calibration records/protocols 与 train manifest")
+    if "memory_registry_snapshot" in time_text or "HoldoutEvaluationManifest" in time_text:
+        errors.append("Task7 time face authority 混入 memory/holdout input")
+
+    bundle = re.search(
+        r"evaluate_and_finalize_projection_bundle\(authority\):"
+        r"(?P<body>.*?)</code></pre>",
+        html,
+        re.DOTALL,
+    )
+    bundle_text = (
+        _normalize_contract_text([bundle.group("body")]) if bundle is not None else ""
+    )
+    shared_scope_tokens = (
+        "each construction blocker contains candidate.backend in affected_backends",
+        "every BlockerRecord that prevents RuntimeBuildResult or CoreBuildResult from being Ready has affected_backends=={memory,time}",
+        "every InputBlocker occurrence from a shared structure/G-IR invocation has affected_backends=={memory,time}",
+    )
+    if bundle is None or any(token not in bundle_text for token in shared_scope_tokens):
+        errors.append("Task7 backend-local 与 shared failure scope 不闭合")
+
+    comparison_basis = re.search(
+        r"ComparisonBasis:\s*(?P<body>.*?)comparison_basis_digest\s*:=",
+        html,
+        re.DOTALL,
+    )
+    basis_text = (
+        _normalize_contract_text([comparison_basis.group("body")])
+        if comparison_basis is not None
+        else ""
+    )
+    if comparison_basis is None or re.search(
+        r"(?m)^\s*logical_rank_id_set\s*$", comparison_basis.group("body")
+    ) is None:
+        errors.append("Task7 ComparisonBasis 缺少 logical_rank_id_set world boundary")
+    if "HoldoutEvaluationManifest" in basis_text:
+        errors.append("Task7 holdout 不得进入 ComparisonBasis")
+
+    coverage_section = re.search(
+        r"Coverage:\s*(?P<body>.*?)<h3 id=\"c2-4\"",
+        html,
+        re.DOTALL,
+    )
+    coverage_text = coverage_section.group("body") if coverage_section is not None else ""
+    coverage_equations = (
+        "source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed",
+        "event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable",
+    )
+    if coverage_section is None or any(
+        equation not in coverage_text for equation in coverage_equations
+    ):
+        errors.append("Task7 Coverage obligation conservation equations 不闭合")
+
+    time_digest = re.search(
+        r"time_simulation_digest\s*:=\s*(?P<body>.*?)result_digest\s*:=",
+        html,
+        re.DOTALL,
+    )
+    if time_digest is None or "HoldoutEvaluationManifest" in time_digest.group("body"):
+        errors.append("Task7 holdout 不得进入 time_simulation_digest")
+
+    cache_section = _section_between(html, "c13-3", "c13-4") or ""
+    cache_key_cells = [
+        cells[1]
+        for row in re.findall(r"<tr>(.*?)</tr>", cache_section, re.DOTALL)
+        if len(cells := re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)) == 3
+    ]
+    if not cache_key_cells or any(
+        "HoldoutEvaluationManifest" in cell for cell in cache_key_cells
+    ):
+        errors.append("Task7 holdout 不得进入 production cache key")
 
 
 def check_derived_digest_exclusions(html: str, errors: list[str]) -> None:
@@ -1566,6 +1732,7 @@ def check_required(html: str, errors: list[str]) -> None:
     check_release_approved_digest_contract(html, errors)
     check_module_contracts(html, errors)
     check_task7_modeling_contracts(html, errors)
+    check_task7_behavioral_contracts(html, errors)
 
 
 def check_forbidden(html: str, errors: list[str]) -> None:

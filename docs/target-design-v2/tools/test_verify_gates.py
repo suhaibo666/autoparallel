@@ -168,43 +168,142 @@ class VerifyGatesContractTest(unittest.TestCase):
                 "coverage numerator type",
                 "op_occurrences_modeled: OpOccurrenceCount",
                 "op_occurrences_modeled: ByteCount",
+                "Coverage field/type mismatch",
             ),
             (
-                "calibration manifest payload",
-                "calibration_train_manifest: CalibrationTrainManifest",
-                "calibration_train_manifest: Digest",
+                "calibration embeds manifest payload",
+                "CalibrationSet:\n  active_compute_records: Map[MeasurementKey, ComputeMeasurementRecord]\n  measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]\n  calibration_train_manifest_digest: Digest",
+                "CalibrationSet:\n  active_compute_records: Map[MeasurementKey, ComputeMeasurementRecord]\n  measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]\n  calibration_train_manifest: CalibrationTrainManifest\n  calibration_train_manifest_digest: Digest",
+                "CalibrationSet 必须只持",
+            ),
+            (
+                "train manifest authority field",
+                "calibration_train_manifest_snapshot: CalibrationTrainManifest",
+                "calibration_train_manifest_snapshot: Digest",
+                "TimeRequested 未携带独立 train manifest",
+            ),
+            (
+                "request manifest closure",
+                "calibration := requested_backend_inputs[time].calibration_set",
+                "calibration := requested_backend_inputs[time].unvalidated_calibration_set",
+                "RequestSnapshot train manifest authority closure",
+            ),
+            (
+                "train manifest moved to common inputs",
+                "comparison_schema_snapshot: ComparisonSchemaSnapshot",
+                "comparison_schema_snapshot: ComparisonSchemaSnapshot\n  calibration_train_manifest_snapshot: CalibrationTrainManifest",
+                "CommonProductionInputs 混入 backend-specific field",
+            ),
+            (
+                "active record closure",
+                "keys(calibration.active_compute_records) ==\n            train_manifest.active_measurement_keys\n    require keys(calibration.measurement_protocols) ==\n            train_manifest.active_protocol_digests\n    require every record",
+                "keys(calibration.active_compute_records) !=\n            train_manifest.active_measurement_keys\n    require keys(calibration.measurement_protocols) ==\n            train_manifest.active_protocol_digests\n    require every record",
+                "time authority 未闭合",
             ),
             (
                 "hardware field",
                 "devices: DeviceCatalog",
                 "devices: DeviceCatalog\n  memory_capacity: ByteCount",
+                "HardwareProfile production schema",
             ),
             (
                 "comparison branch",
                 "return Unavailable",
                 "return ComparableDelta",
+                "comparison outcome branch priority/order",
+            ),
+            (
+                "comparison world boundary",
+                "  logical_rank_id_set\n",
+                "  world_size_only\n",
+                "logical_rank_id_set world boundary",
+            ),
+            (
+                "coverage conservation",
+                "source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed",
+                "source_obligations_total = source_obligations_planned - source_obligations_residual + source_obligations_proven_not_executed",
+                "Coverage obligation conservation",
+            ),
+            (
+                "memory reads time arm",
+                "construct only from memory_inputs.memory_registry_snapshot",
+                "construct only from memory_inputs.memory_registry_snapshot and request.requested_backend_inputs[time]",
+                "memory face authority",
+            ),
+            (
+                "time reads memory arm",
+                "construct only from calibration, train_manifest, communication_model and time_policy",
+                "construct only from calibration, train_manifest, communication_model, time_policy and memory_inputs.memory_registry_snapshot",
+                "time face authority",
+            ),
+            (
+                "backend-local blocker scope",
+                "each construction blocker\n          contains candidate.backend in affected_backends",
+                "each construction blocker\n          excludes candidate.backend from affected_backends",
+                "shared failure scope",
+            ),
+            (
+                "shared runtime scope",
+                "every BlockerRecord that prevents RuntimeBuildResult or\n          CoreBuildResult from being Ready has affected_backends=={memory,time}",
+                "every BlockerRecord that prevents RuntimeBuildResult or\n          CoreBuildResult from being Ready has affected_backends=={time}",
+                "shared failure scope",
+            ),
+            (
+                "shared G-IR scope",
+                "every InputBlocker occurrence from a shared structure/G-IR invocation\n          has affected_backends=={memory,time}",
+                "every InputBlocker occurrence from a shared structure/G-IR invocation\n          has affected_backends=={memory}",
+                "shared failure scope",
+            ),
+            (
+                "holdout in request payload",
+                "calibration_train_manifest_snapshot: CalibrationTrainManifest",
+                "calibration_train_manifest_snapshot: CalibrationTrainManifest\n      holdout_manifest: HoldoutEvaluationManifest",
+                "holdout 不得进入 RequestSnapshot",
+            ),
+            (
+                "holdout in time digest",
+                "hash(simulation_core_digest, time registry, CalibrationSet,",
+                "hash(simulation_core_digest, time registry, CalibrationSet, HoldoutEvaluationManifest,",
+                "holdout 不得进入 time_simulation_digest",
+            ),
+            (
+                "holdout in comparison basis",
+                "  logical_rank_id_set\n",
+                "  logical_rank_id_set\n  holdout_manifest: HoldoutEvaluationManifest\n",
+                "holdout 不得进入 ComparisonBasis",
+            ),
+            (
+                "holdout in cache key",
+                "<tr><td>Time result</td><td>(time_simulation_digest, time_result_schema_version)</td>",
+                "<tr><td>Time result</td><td>(time_simulation_digest, time_result_schema_version, HoldoutEvaluationManifest)</td>",
+                "holdout 不得进入 production cache key",
             ),
             (
                 "non-goal id",
                 'data-non-goal-id="NG-AUTOMATIC-SEARCH"',
                 'data-non-goal-id="NG-AUTOMATIC-SEARCH-MUTATED"',
+                "十个唯一稳定 non-goal ID",
             ),
             (
                 "decision ref",
                 'data-non-goal-ref="NG-ALLOCATOR-RESERVED"',
                 'data-non-goal-ref="NG-CAPACITY"',
+                "决策 ref",
             ),
             (
                 "decision id",
                 'data-decision-id="D18"',
                 'data-decision-id="D17"',
+                "唯一稳定 decision ID",
             ),
         )
-        for label, original, replacement in mutations:
+        for label, original, replacement, expected_error in mutations:
             with self.subTest(label=label):
                 self.assertEqual(template.count(original), 1, original)
                 errors = validate(template.replace(original, replacement, 1))
-                self.assertTrue(errors, label)
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
 
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")

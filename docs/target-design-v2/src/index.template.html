@@ -266,6 +266,7 @@ memory_simulation_digest :=
 
 time_simulation_digest :=
   hash(simulation_core_digest, time registry, CalibrationSet,
+       CalibrationTrainManifest,
        CommunicationModelSnapshot, TimeCostPolicy,
        exact CostBindings, StreamBindings,
        resolved time fallbacks/assumptions, progress semantics,
@@ -459,6 +460,7 @@ RequestedBackendInput :=
     memory_registry_snapshot: MemoryRegistrySnapshot }
   | TimeRequested {
       calibration_set: CalibrationSet
+      calibration_train_manifest_snapshot: CalibrationTrainManifest
       communication_model_snapshot: CommunicationModelSnapshot
       time_cost_policy: TimeCostPolicy }
   | NotRequested
@@ -506,6 +508,16 @@ build_request_snapshot gate specification equations:
   require requested_backend_inputs[time] is TimeRequested | NotRequested
   require requested_backends == keys tagged MemoryRequested or TimeRequested
   require NotRequested carries no payload and no digest
+  if requested_backend_inputs[time] is TimeRequested:
+    calibration := requested_backend_inputs[time].calibration_set
+    train_manifest := requested_backend_inputs[time].calibration_train_manifest_snapshot
+    recompute train_manifest.calibration_train_manifest_digest
+    require calibration.calibration_train_manifest_digest ==
+            train_manifest.calibration_train_manifest_digest
+    require keys(calibration.active_compute_records) ==
+            train_manifest.active_measurement_keys
+    require keys(calibration.measurement_protocols) ==
+            train_manifest.active_protocol_digests
   request_policy := common.blocker_scope_policy_snapshot
   request_specifications := common.gate_specification_set_snapshot
   request_runner := common.gate_runner_snapshot
@@ -546,7 +558,7 @@ config-indexed 输入进入 <code>RequestSnapshot</code> 的唯一生产入口�
   <li>gate_specification_set_ref.digest 必须等于 gate_specification_set_snapshot 重算摘要，且 specification 内嵌 blocker policy 必须逐字等于独立 blocker_scope_policy_snapshot；其 entry/applicability/clause predicate digest 全部存在并等于 gate_runner_snapshot。ProductionSubject.production_policy_digests 同时包含 specification、runner 与 blocker scope policy 摘要，RequestSnapshot 不接受只由 manifest 自报的 identity；</li>
   <li>相同规范输入产生字节相同的 RequestSnapshot；TraceFixture、holdout 和请求时 profiler 不进入生产 payload 或 digest；</li>
   <li>requested_backends 只决定后端是否请求，不改变源码、配置或共享结构语义；RequestSnapshot.request_digest 覆盖完整 tagged map，但每个 NotRequested arm 都是无 payload、无 digest 的闭合空分支；</li>
-  <li>memory-only request neither requires nor fingerprints CalibrationSet, CommunicationModelSnapshot or TimeCostPolicy；time-only request neither requires nor fingerprints MemoryRegistrySnapshot。</li>
+  <li>memory-only request neither requires nor fingerprints CalibrationSet, CommunicationModelSnapshot or TimeCostPolicy，且不读取 CalibrationTrainManifest；time-only request neither requires nor fingerprints MemoryRegistrySnapshot。</li>
 </ul>
 </section>
 
@@ -563,7 +575,8 @@ config-indexed 输入进入 <code>RequestSnapshot</code> 的唯一生产入口�
 <tr data-input-fact="hardware-profile"><td><code>HardwareProfile</code></td><td>device、topology、link latency/bandwidth、alignment、physical stream catalog</td><td>SimulationPlanCore / projections</td><td>机器与运行时指纹；不含容量</td></tr>
 <tr><td><code>ExecutionDeployment</code></td><td>logical rank 到物理 device 的显式规范映射</td><td>SimulationPlanCore</td><td>全覆盖、设备限定且一一映射</td></tr>
 <tr><td><code>HardwareBindingPolicySnapshot</code></td><td>硬件相关 kernel variant 的成本无关唯一 selector</td><td>SimulationPlanCore</td><td>内容寻址、0/多候选阻断</td></tr>
-<tr><td><code>CalibrationSet</code></td><td>用户预采集并冻结的 compute duration records 与 protocol snapshots</td><td>time compute 成本求值</td><td>精确 key、版本、ObservationRef 与 split</td></tr>
+<tr><td><code>CalibrationSet</code></td><td>用户预采集并冻结的 active compute records、protocol snapshots 与 train manifest digest</td><td>time compute 成本求值</td><td>不嵌入 manifest payload</td></tr>
+<tr><td><code>CalibrationTrainManifest</code></td><td>权威 train split 的 active key/protocol key 集与数据集摘要</td><td>RequestSnapshot / time authority</td><td>payload/digest 可复算且与 CalibrationSet 双向闭合</td></tr>
 <tr><td><code>CommunicationModelSnapshot</code></td><td>P2P/collective 具名理论公式及适用域</td><td>通信成本求值</td><td>公式内容摘要</td></tr>
 <tr><td><code>TimeCostPolicy</code></td><td>measurement protocol、stream assignment 与 numeric policy</td><td>TimeEventView</td><td>内容寻址且 selector 唯一</td></tr>
 </table></div>
@@ -713,7 +726,6 @@ ComputeMeasurementRecord:
 CalibrationSet:
   active_compute_records: Map[MeasurementKey, ComputeMeasurementRecord]
   measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]
-  calibration_train_manifest: CalibrationTrainManifest
   calibration_train_manifest_digest: Digest
 
 CalibrationTrainManifest:
@@ -732,12 +744,6 @@ HoldoutEvaluationManifest:
 calibration_train_manifest_digest :=
   hash(canonical_payload_without_derived_digests(CalibrationTrainManifest))
 
-require CalibrationSet.calibration_train_manifest_digest ==
-        CalibrationSet.calibration_train_manifest.calibration_train_manifest_digest
-require keys(CalibrationSet.active_compute_records) ==
-        CalibrationSet.calibration_train_manifest.active_measurement_keys
-require keys(CalibrationSet.measurement_protocols) ==
-        CalibrationSet.calibration_train_manifest.active_protocol_digests
 require every active record ObservationRef.split == calibration_train
 
 TimeCostPolicy:
@@ -781,9 +787,10 @@ MemoryRegistrySnapshot:
   priority, specificity
   memory_registry_digest</code></pre>
 
-<p><code>CalibrationSet</code> 自包含生产 lookup 使用的 active compute records 与 protocol snapshots，
-同时携带只描述 train split 的 manifest payload 及其可复算 digest；manifest 的 key 集必须与 active map
-双向相等。<code>HoldoutEvaluationManifest</code> 是独立离线输入，只供误差评估，不能进入生产请求、
+<p><code>CalibrationSet</code> 只持生产 lookup 使用的 active compute records、protocol snapshots 与权威
+train manifest digest，不嵌入 manifest payload。独立的 <code>CalibrationTrainManifest</code> snapshot 由
+TimeRequested arm 携带；请求构造器与 time projection authority 都先复算其 digest，再验证 manifest key 集与
+active map 双向相等。<code>HoldoutEvaluationManifest</code> 是独立离线输入，只供误差评估，不能进入生产请求、
 time simulation digest、结果缓存或 comparison basis。</p>
 
 <p><code>CommunicationModelSnapshot</code> 只为单个通信 cohort 计算固定 duration，例如
@@ -1715,8 +1722,8 @@ build_memory_projection(core, MemoryRegistrySnapshot):
                                       → unique WorkspaceBinding
   bindings + tensor/storage/lifetime → per-rank memory events
 
-build_time_projection(core, CalibrationSet, CommunicationModelSnapshot,
-                      TimeCostPolicy):
+build_time_projection(core, CalibrationSet, CalibrationTrainManifest,
+                      CommunicationModelSnapshot, TimeCostPolicy):
   event                            → unique StreamBinding
   MeasurementKeyTemplate + hardware facts + shared KernelVariantBinding
                                    → complete MeasurementKey
@@ -2040,8 +2047,20 @@ build_memory_projection_candidate(request, evaluation_identity, core):
 build_time_projection_candidate(request, evaluation_identity, core):
   if time in request.requested_backends:
     time_inputs := require TimeRequested at request.requested_backend_inputs[time]
-    construct only from time_inputs.calibration_set,
-      time_inputs.communication_model_snapshot and time_inputs.time_cost_policy
+    calibration := time_inputs.calibration_set
+    train_manifest := time_inputs.calibration_train_manifest_snapshot
+    communication_model := time_inputs.communication_model_snapshot
+    time_policy := time_inputs.time_cost_policy
+    recompute train_manifest.calibration_train_manifest_digest
+    require calibration.calibration_train_manifest_digest ==
+            train_manifest.calibration_train_manifest_digest
+    require keys(calibration.active_compute_records) ==
+            train_manifest.active_measurement_keys
+    require keys(calibration.measurement_protocols) ==
+            train_manifest.active_protocol_digests
+    require every record in calibration.active_compute_records has
+            observation_ref.split == calibration_train
+    construct only from calibration, train_manifest, communication_model and time_policy
   call finalize_projection_candidate exactly once; when requested, return
   CandidateView only if every construction binding succeeded, otherwise
   CandidateBlocked with the complete canonical construction-blocker set
@@ -2655,7 +2674,8 @@ coverage、assumptions 与 digests 只存在于外层 Estimate，不允许第二
 
 <h4 id="mc-time-backend-boundary">职责边界</h4>
 <p>本模块从当前 request/evaluation identity、共享 core 和 request-owned
-<code>TimeRequested</code> arm 内的 CalibrationSet、CommunicationModelSnapshot、TimeCostPolicy 构造
+<code>TimeRequested</code> arm 内的 CalibrationSet、CalibrationTrainManifest snapshot、
+CommunicationModelSnapshot、TimeCostPolicy 构造
 <code>ProjectionCandidate&lt;TimeEventView&gt;</code>，然后只对 scope-closed Ready view 执行
 step-relative、no contention DES。stream selector 只通过 <code>TimeCostPolicy.stream_assignment_policy</code>
 进入；RouteBinding 是 <code>CostBinding communication arm</code> 的规范子 payload，不是可独立选择或缓存的
@@ -2741,8 +2761,16 @@ TimeExecutionWitness:
 when time is requested:
   time_inputs := require TimeRequested at request.requested_backend_inputs[time]
   calibration := time_inputs.calibration_set
+  train_manifest := time_inputs.calibration_train_manifest_snapshot
   communication_model := time_inputs.communication_model_snapshot
   time_policy := time_inputs.time_cost_policy
+  recompute train_manifest.calibration_train_manifest_digest
+  require calibration.calibration_train_manifest_digest ==
+          train_manifest.calibration_train_manifest_digest
+  require keys(calibration.active_compute_records) ==
+          train_manifest.active_measurement_keys
+  require keys(calibration.measurement_protocols) ==
+          train_manifest.active_protocol_digests
 when time is not requested:
   require request.requested_backend_inputs[time] == NotRequested
   do not read or synthesize time facts
