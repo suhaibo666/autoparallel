@@ -13,7 +13,7 @@
 这是一个纯代码驱动的多维混合并行训练内存与 step-time 工程预测仿真器。
 
 完整主链只维护一份：见权威模板 [`src/index.template.html`](src/index.template.html) 中
-`data-diagram-id="production-pipeline"` 的 Mermaid 源，以及由它生成的 `index.html`/`artifact.html`
+`data-diagram-id="layered-module-architecture"` 的 Mermaid 源，以及由它生成的 `index.html`/`artifact.html`
 同名静态 SVG。HANDOFF 不再复制一份可能漂移的 ASCII 架构图；下文 `text` 代码块仅用于 schema、公式或
 伪代码，不是第二套架构/流程图。
 
@@ -39,18 +39,18 @@
 
 | diagram ID | 权威位置与责任 |
 |---|---|
-| `production-pipeline` | §1.1；请求、逐 rank CodeIR、Runtime/Core、双投影、seal、comparison/conformance 总链 |
+| `layered-module-architecture` | §1.1/§1.2；L0–L4 十模块分层、正式调用依赖与离线 conformance sidecar |
 | `facts-and-digests` | §2.4/§3.1；输入事实、模型/运行时/后端摘要和验证旁路 |
 | `per-rank-codeir` | §4.2/§4.3；逐 logical rank 求值、obligation disposition 与 CodeIR 汇总 |
 | `value-storage-identity` | §5.2/§5.3；prototype、event occurrence、Tensor/Storage instance、binding 与 initial state |
 | `semantic-effect-closure` | §6.3–§6.5；语义注册/校验、effect 闭包与 blocker 状态机 |
 | `runtime-event-expansion` | §7/§8.1–§8.3；forward/backward/recompute/optimizer 与 P2P/collective intent 展开 |
-| `core-dual-projection` | §8.5/§9.1；共享 core、memory/time candidate、联合 gate 与 scope closure |
+| `plan-projection-module-architecture` | §9.1；上游模块、plan-projection 三段边界与注入 backend/gate ports |
 | `memory-logical-replay` | §9.2/§10.1；逻辑 Allocate/Bind/Use/Free 重放与 peak |
 | `time-progress-des` | §9.3/§10.3；精确 compute record、理论 communication、progress DAG 与无竞争 DES |
 | `result-gate-comparison` | §10.4/§10.5/§12.2；source/value/seal authority、ledger、comparison 与 conformance 旁路 |
 
-### 0.2 九组模块契约索引
+### 0.2 十组模块契约索引
 
 每组契约的 HTML anchor 即下表 locator；其中集中列出模块责任、核心结构、唯一生产者/消费者、正式入口、
 显式结果联合、blocker/InternalContractViolation 边界以及缓存与序列化不变量。
@@ -60,6 +60,7 @@
 | `input-facts` / `mc-input-facts` | Source/Registry/Request snapshots；`build_request_snapshot(...) -> RequestSnapshotBuildResult` |
 | `code-ir` / `mc-code-ir` | CodeIR、RankCodeIR、obligation、leaf IR types；`evaluate_source(...) -> RankCodeIRBuildResult` |
 | `runtime-events` / `mc-runtime-events` | RuntimeEventPlan、ExecEvent、semantics、autograd/lifetime/intents；`expand_runtime_semantics(...) -> RuntimeBuildResult` |
+| `plan-projection` / `mc-plan-projection` | SimulationPlanCore、typed ProjectionCandidate/Result 与 ProjectionBundleBuild；`bind_core(...)`、`evaluate_and_finalize_projection_bundle(...)` |
 | `memory-backend` / `mc-memory-backend` | Storage/Workspace bindings、MemoryEventView/Estimate；`build_memory_projection_candidate(...)` 与 `run_memory_backend(...)` |
 | `time-backend` / `mc-time-backend` | stream/cost/communication bindings、TimeEventView/StepTimeEstimate；`build_time_projection_candidate(...)` 与 `run_time_backend(...)` |
 | `result-sealing` / `mc-result-sealing` | candidate 与 source/value/seal authority；`run_backend_build_candidate_and_seal(...)` |

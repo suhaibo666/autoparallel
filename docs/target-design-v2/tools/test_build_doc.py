@@ -19,7 +19,7 @@ HANDOFF = ROOT / "HANDOFF.md"
 BUILD_SCRIPT = ROOT / "tools" / "build_doc.py"
 
 EXPECTED_DIAGRAM_TEXT = {
-    "production-pipeline": ("RankCodeIR(P,r)", "RuntimeEventPlan", "BackendSealArtifact"),
+    "layered-module-architecture": ("input-facts", "plan-projection", "conformance"),
     "facts-and-digests": ("model_input_digest", "memory_simulation_digest", "TraceFixture"),
     "per-rank-codeir": ("SourceObligation", "RankCodeIR(P,r)", "CodeIR(P)"),
     "value-storage-identity": ("ValuePrototypeRef", "TensorInstanceId", "SimulationInitialState"),
@@ -30,7 +30,7 @@ EXPECTED_DIAGRAM_TEXT = {
         "InternalContractViolation",
     ),
     "runtime-event-expansion": ("AutogradLink", "P2PIntent", "CollectiveIntent"),
-    "core-dual-projection": ("KernelVariantBinding", "ProjectionBundleAuthority", "NotRequested"),
+    "plan-projection-module-architecture": ("Core binder", "Face coordinator", "Bundle finalizer"),
     "memory-logical-replay": ("logical_kernel_order", "Allocate", "MemoryEstimate"),
     "time-progress-des": ("ComputeMeasurementRecord", "CommunicationModelSnapshot", "No-contention DES"),
     "result-gate-comparison": ("BackendResultSourceAuthority", "GateExecutionLedger", "G-REP2"),
@@ -77,6 +77,26 @@ def _write_fixture(directory: pathlib.Path, template: str) -> tuple[pathlib.Path
 
 
 class BuildDocArtifactTest(unittest.TestCase):
+    def test_architecture_views_are_block_layered_and_not_artifact_flows(self) -> None:
+        sources = _mermaid_sources()
+        for diagram_id in (
+            "layered-module-architecture",
+            "plan-projection-module-architecture",
+        ):
+            with self.subTest(diagram_id=diagram_id):
+                self.assertIn(diagram_id, sources)
+                source = sources.get(diagram_id, "")
+                self.assertIn('"useGradient": false', source)
+                self.assertRegex(source, r"(?m)^block-beta\s*$")
+                self.assertNotRegex(source, r"(?m)^flowchart\b")
+                for artifact in (
+                    "RequestSnapshot",
+                    "SimulationPlanCore",
+                    "ProjectionCandidate",
+                    "GateExecutionLedger",
+                    "BackendSealArtifact",
+                ):
+                    self.assertNotIn(artifact, source)
     def test_facts_digest_source_has_independent_runtime_inputs(self) -> None:
         """Making runtime facts a model-digest derivative must fail."""
         source = _mermaid_sources()["facts-and-digests"]
@@ -405,6 +425,7 @@ class BuildDocActivityPathTest(unittest.TestCase):
             "input-facts",
             "code-ir",
             "runtime-events",
+            "plan-projection",
             "memory-backend",
             "time-backend",
             "result-sealing",
@@ -419,6 +440,9 @@ class BuildDocActivityPathTest(unittest.TestCase):
         for module_id in expected_modules:
             with self.subTest(module_id=module_id):
                 self.assertIn(f"`{module_id}`", handoff)
+        self.assertNotIn("`production-pipeline`", handoff)
+        self.assertNotIn("`core-dual-projection`", handoff)
+        self.assertIn("十组模块契约索引", handoff)
 
     def test_handoff_documents_the_offline_deterministic_safe_build(self) -> None:
         """An unpinned, network-backed, or unaudited build recipe must fail."""
@@ -455,7 +479,7 @@ class BuildDocActivityPathTest(unittest.TestCase):
 
         self.assertNotRegex(fenced_text, r"RequestSnapshot[\s\S]*RuntimeEventPlan")
         self.assertNotRegex(all_fenced_blocks, r"[├└│]|(?:^|\n)\s*\+--")
-        self.assertIn("`production-pipeline`", overview)
+        self.assertIn('data-diagram-id="layered-module-architecture"', overview)
         self.assertIn("`src/index.template.html`", overview)
 
     def test_handoff_does_not_overclaim_conformance_session_isolation(self) -> None:

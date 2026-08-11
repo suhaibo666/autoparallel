@@ -414,6 +414,46 @@ class VerifyGatesContractTest(unittest.TestCase):
             errors,
         )
 
+    def test_task8_architecture_and_dependency_mutations_are_rejected(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        mutations = (
+            (
+                'data-diagram-id="layered-module-architecture"',
+                'data-diagram-id="production-pipeline"',
+                "diagram ID/order",
+            ),
+            ("block-beta", "flowchart TD", "architecture diagram kind mismatch"),
+            (
+                'inputFacts["input-facts"]',
+                'inputFacts["input-facts / RequestSnapshot"]',
+                "artifact node forbidden",
+            ),
+            (
+                'data-module-id="memory-backend" data-layer="L3" data-allowed-dependencies="plan-projection"',
+                'data-module-id="memory-backend" data-layer="L3" data-allowed-dependencies="comparison"',
+                "module/dependency table",
+            ),
+            (
+                '<tr data-module-id="conformance"',
+                '<tr data-module-id="unknown-module"',
+                "module/dependency table",
+            ),
+        )
+        for original, replacement, expected in mutations:
+            with self.subTest(expected=expected):
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        mutated = replace_in_module(
+            template,
+            "plan-projection",
+            "exactly one candidate per backend/evaluation identity",
+            "REHOSTED_OUTSIDE_CONTRACT",
+        )
+        errors = validate(mutated + "\nexactly one candidate per backend/evaluation identity")
+        self.assertTrue(any("plan-projection" in error for error in errors), errors)
+
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         original_tag = (

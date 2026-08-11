@@ -535,6 +535,45 @@ INCOMPATIBLE_DIAGRAMS = (
     "{{SVG:06-placement-execution}}",
 )
 
+TASK8_DIAGRAM_IDS = (
+    "layered-module-architecture",
+    "facts-and-digests",
+    "per-rank-codeir",
+    "value-storage-identity",
+    "semantic-effect-closure",
+    "runtime-event-expansion",
+    "plan-projection-module-architecture",
+    "memory-logical-replay",
+    "time-progress-des",
+    "result-gate-comparison",
+)
+TASK8_ARCHITECTURE_DIAGRAM_IDS = {
+    "layered-module-architecture",
+    "plan-projection-module-architecture",
+}
+TASK8_ARCHITECTURE_FORBIDDEN_ARTIFACTS = (
+    "RequestSnapshot",
+    "SimulationPlanCore",
+    "ProjectionCandidate",
+    "GateExecutionLedger",
+    "BackendSealArtifact",
+)
+TASK8_MODULE_DEPENDENCIES = {
+    "input-facts": ("L0", ""),
+    "code-ir": ("L1", "input-facts"),
+    "runtime-events": ("L1", "code-ir,input-facts"),
+    "plan-projection": (
+        "L2",
+        "gate-system,input-facts,memory-backend,runtime-events,time-backend",
+    ),
+    "gate-system": ("L2", "input-facts"),
+    "memory-backend": ("L3", "plan-projection"),
+    "time-backend": ("L3", "plan-projection"),
+    "result-sealing": ("L4", "gate-system,memory-backend,time-backend"),
+    "comparison": ("L4", "gate-system,result-sealing"),
+    "conformance": ("OFFLINE", "comparison,result-sealing"),
+}
+
 MODULE_CONTRACT_SUBSECTIONS = {
     "职责边界",
     "核心数据结构",
@@ -590,6 +629,35 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
     "runtime-events": (
         "RuntimeRuleSnapshot:",
         "expand_runtime_semantics( code_ir: CodeIR, config: NormalizedParallelConfig, scenario: ExecutionScenario, registry: RuntimeRegistrySnapshot ) -> RuntimeBuildResult | InternalContractViolation",
+    ),
+    "plan-projection": (
+        "SimulationPlanCore",
+        "CoreBuildResult<SimulationPlanCore>",
+        "ProjectionCandidate<MemoryEventView>",
+        "ProjectionCandidate<TimeEventView>",
+        "ProjectionBundleAuthority",
+        "ProjectionBundleBuild",
+        "ProjectionResult<MemoryEventView>",
+        "ProjectionResult<TimeEventView>",
+        "Ready { view: V }",
+        "Blocked { blockers: NonEmpty<BlockerRecord> }",
+        "NotRequested",
+        "bind_core(",
+        "evaluate_and_finalize_projection_bundle(",
+        "build_memory_projection_candidate(",
+        "build_time_projection_candidate(",
+        "run_gate_domain(",
+        "exactly one candidate per backend/evaluation identity",
+        "shared Runtime/Core/G-IR blockers affect both faces",
+        "face-local blockers affect only that face",
+        "missing compute profile blocks time only",
+        "missing shape/storage/lifetime blocks memory only",
+        "unrequested arms are empty and unread",
+        "blocker union/scope closure occurs before both results",
+        "shared G-IR runs once",
+        "ledgers append without prefix overwrite",
+        "no capacity, completion-time or contention reads",
+        "one canonical InternalContractViolation and no partial bundle",
     ),
     "memory-backend": (
         "MemoryProjectionSemanticsSnapshot:",
@@ -2010,6 +2078,35 @@ def check_diagrams(html: str, errors: list[str]) -> None:
     for placeholder in INCOMPATIBLE_DIAGRAMS:
         if placeholder in html:
             errors.append(f"引用了仍含 v3 证明语义的图：{placeholder}")
+    figures = re.findall(
+        r'<figure\b[^>]*data-diagram-id="([^"]+)"[^>]*>.*?'
+        r'<pre class="mermaid-source"><code>(.*?)</code></pre>',
+        html,
+        re.DOTALL,
+    )
+    if tuple(diagram_id for diagram_id, _ in figures) != TASK8_DIAGRAM_IDS:
+        errors.append("Task8 authoritative diagram ID/order 不闭合")
+    sources = dict(figures)
+    for diagram_id in TASK8_ARCHITECTURE_DIAGRAM_IDS:
+        source = sources.get(diagram_id, "")
+        if '"useGradient": false' not in source or not re.search(
+            r"(?m)^block-beta\s*$", source
+        ):
+            errors.append(f"Task8 architecture diagram kind mismatch: {diagram_id}")
+        if re.search(r"(?m)^flowchart\b", source):
+            errors.append(f"Task8 architecture diagram forbids flowchart: {diagram_id}")
+        for artifact in TASK8_ARCHITECTURE_FORBIDDEN_ARTIFACTS:
+            if artifact in source:
+                errors.append(
+                    f"Task8 architecture diagram artifact node forbidden: {diagram_id}/{artifact}"
+                )
+    module_rows = re.findall(
+        r'<tr\b[^>]*data-module-id="([a-z-]+)"[^>]*data-layer="([A-Z0-9-]+)"'
+        r'[^>]*data-allowed-dependencies="([a-z,-]*)"[^>]*>',
+        html,
+    )
+    if {module: (layer, deps) for module, layer, deps in module_rows} != TASK8_MODULE_DEPENDENCIES:
+        errors.append("Task8 Chapter 1 module/dependency table 不闭合")
 
 
 def main() -> int:

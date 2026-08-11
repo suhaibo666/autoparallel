@@ -14,6 +14,7 @@ TARGET_MODULES = (
     "input-facts",
     "code-ir",
     "runtime-events",
+    "plan-projection",
     "memory-backend",
     "time-backend",
     "result-sealing",
@@ -159,6 +160,54 @@ class ModuleContractStructureTest(unittest.TestCase):
         )
         self.assertIn("Blocked 仅", text)
         self.assertIn("唯一生产", text)
+
+    def test_plan_projection_contract_has_existing_typed_ports_and_closed_outcomes(self) -> None:
+        text = self.contract_text("plan-projection")
+        for token in (
+            "SimulationPlanCore",
+            "CoreBuildResult<SimulationPlanCore>",
+            "ProjectionCandidate<MemoryEventView>",
+            "ProjectionCandidate<TimeEventView>",
+            "ProjectionBundleAuthority",
+            "ProjectionBundleBuild",
+            "ProjectionResult<MemoryEventView>",
+            "ProjectionResult<TimeEventView>",
+            "Ready { view: V }",
+            "Blocked { blockers: NonEmpty<BlockerRecord> }",
+            "NotRequested",
+            "bind_core(",
+            "evaluate_and_finalize_projection_bundle(",
+            "build_memory_projection_candidate(",
+            "build_time_projection_candidate(",
+            "run_gate_domain(",
+            "exactly one candidate per backend/evaluation identity",
+            "missing compute profile blocks time only",
+            "missing shape/storage/lifetime blocks memory only",
+            "no capacity, completion-time or contention reads",
+            "one canonical InternalContractViolation and no partial bundle",
+        ):
+            self.assertIn(token, text)
+
+    def test_chapter1_module_table_is_exact_and_dependency_closed(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        rows = re.findall(
+            r'<tr\b[^>]*data-module-id="([a-z-]+)"[^>]*data-layer="([A-Z0-9-]+)"'
+            r'[^>]*data-allowed-dependencies="([a-z,-]*)"[^>]*>',
+            template,
+        )
+        expected = {
+            "input-facts": ("L0", ""),
+            "code-ir": ("L1", "input-facts"),
+            "runtime-events": ("L1", "code-ir,input-facts"),
+            "plan-projection": ("L2", "gate-system,input-facts,memory-backend,runtime-events,time-backend"),
+            "gate-system": ("L2", "input-facts"),
+            "memory-backend": ("L3", "plan-projection"),
+            "time-backend": ("L3", "plan-projection"),
+            "result-sealing": ("L4", "gate-system,memory-backend,time-backend"),
+            "comparison": ("L4", "gate-system,result-sealing"),
+            "conformance": ("OFFLINE", "comparison,result-sealing"),
+        }
+        self.assertEqual({module: (layer, deps) for module, layer, deps in rows}, expected)
 
     def test_backend_specific_request_inputs_are_tagged_and_independent(self) -> None:
         text = self.contract_text("input-facts")

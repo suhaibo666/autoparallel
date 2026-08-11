@@ -68,28 +68,47 @@ evidence 解释每个量从哪里来；coverage 解释模型覆盖面；assumpti
 <h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体架构与分层</h2>
 
 <h3 id="c1-1">1.1 权威生产数据流</h3>
-<figure class="mermaid-figure" data-diagram-id="production-pipeline" data-title="权威生产数据流" data-description="从请求快照和逐 rank CodeIR 到双投影、后端封装与可选比较的权威生产链。"><pre class="mermaid-source"><code>flowchart TD
-  req["RequestSnapshot"] --&gt; evalId["EvaluationInstanceIdentity"]
-  req --&gt; inputs["CanonicalConfigEvaluationInput and common production inputs"]
-  inputs --&gt; rankir["RankCodeIR(P,r) for every logical rank"]
-  rankir --&gt; codeir["CodeIR(P) OrderedMap by logical rank"]
-  codeir --&gt; runtime["RuntimeEventPlan"]
-  runtime --&gt; core["CoreBuildResult / SimulationPlanCore"]
-  core --&gt; mem["ProjectionCandidate / MemoryEventView"]
-  core --&gt; time["ProjectionCandidate / TimeEventView"]
-  evalId --&gt; authority["ProjectionBundleAuthority"]
-  mem --&gt; authority
-  time --&gt; authority
-  authority --&gt; projection["Joint projection ledger and scope-closed ProjectionResult"]
-  projection --&gt; seal["BackendSealArtifact per backend"]
-  seal --&gt; compare["ComparisonResult when requested"]
-  inputs -.-&gt; validation["TraceFixture and ConformanceReport / validation only"]
-  codeir -.-&gt; validation
-  class req,inputs input
-  class evalId,runtime,core,authority,projection plan
-  class rankir,codeir ir
-  class mem,time,seal,compare backend
-  class validation note</code></pre><figcaption><b>图 1 · 权威生产数据流。</b><span class="src">解释图；相邻 schema 与正文为规范。</span></figcaption></figure>
+<figure class="mermaid-figure" data-diagram-id="layered-module-architecture" data-title="分层仿真器模块架构" data-description="十个正式模块按事实、IR、规划投影、后端、封装比较分层；离线 conformance 位于生产摘要链之外。"><pre class="mermaid-source"><code>%%{init: {"themeVariables": {"useGradient": false}}}%%
+block-beta
+  columns 1
+  block:l0
+    columns 3
+    l0label["L0 · Input facts"] inputFacts["input-facts"] space
+  end
+  block:l1
+    columns 3
+    l1label["L1 · IR and events"] codeIr["code-ir"] runtimeEvents["runtime-events"]
+  end
+  block:l2
+    columns 3
+    l2label["L2 · Coordination"] planProjection["plan-projection"] gateSystem["gate-system"]
+  end
+  block:l3
+    columns 3
+    l3label["L3 · Backends"] memoryBackend["memory-backend"] timeBackend["time-backend"]
+  end
+  block:l4
+    columns 3
+    l4label["L4 · Product outputs"] resultSealing["result-sealing"] comparison["comparison"]
+  end
+  block:offline
+    columns 3
+    offlineLabel["Offline sidecar · outside production digest chain"] conformance["conformance"] space
+  end
+  inputFacts --&gt; codeIr
+  inputFacts --&gt; runtimeEvents
+  codeIr --&gt; runtimeEvents
+  runtimeEvents --&gt; planProjection
+  inputFacts --&gt; gateSystem
+  gateSystem --&gt; planProjection
+  planProjection --&gt; memoryBackend
+  planProjection --&gt; timeBackend
+  memoryBackend --&gt; resultSealing
+  timeBackend --&gt; resultSealing
+  gateSystem --&gt; resultSealing
+  resultSealing --&gt; comparison
+  resultSealing -.-&gt; conformance
+  comparison -.-&gt; conformance</code></pre><figcaption><b>图 1 · 分层仿真器模块架构。</b><span class="src">模块与允许调用以 1.2 节规范表为准。</span></figcaption></figure>
 
 <p><code>RankCodeIR(P,r)</code> 直接对应当前源码在当前配置、当前 logical rank 下可见的结构；
 顶层 <code>CodeIR(P)</code> 是规范 rank 顺序的有序映射，不是一张带 rank 备择 guard 的母图。
@@ -102,15 +121,20 @@ value、最终三态结果与可选 comparison 也各有绑定当前 subject 的
 因此缺 compute 测量不会妨碍构造合法的 memory view。不建立共享资源竞争；两个后端只读各自的自包含视图。</p>
 
 <h3 id="c1-2">1.2 分层职责</h3>
-<div class="tw"><table>
-<tr><th class="nw">对象</th><th>负责表达</th><th>明确不得包含</th><th>主要检查</th></tr>
-<tr><td><code>FactSnapshot</code></td><td>带版本和来源的生产事实</td><td>某次验证运行的 raw trace</td><td>schema、来源和摘要可重放</td></tr>
-<tr><td><code>CodeIR(P)</code></td><td>每个 logical rank 在当前配置下的源码 op、tensor、storage 与依赖</td><td>设备型号、容量、带宽、stream 和 kernel duration</td><td>rank 集合完整、源码 obligation 双向闭合、硬件独立</td></tr>
-<tr><td><code>RuntimeEventPlan</code></td><td>训练阶段、逻辑 rank、microbatch、P2P/collective 与重复执行实例</td><td>对 CodeIR 节点的修改或编译优化</td><td>event obligation、effect 顺序、通信进展、依赖无环</td></tr>
-<tr><td><code>SimulationPlanCore</code></td><td>两侧共享的 rank/device 绑定、硬件投影事实与公共摘要</td><td>重复初态或任何一侧专属的必需成本字段</td><td>共享绑定完整且不使单侧 blocker 污染另一侧</td></tr>
-<tr><td><code>ProjectionResult</code></td><td>各自的 MemoryEventView 或 TimeEventView，或显式阻断/未请求</td><td>另一侧成本、伪默认值或共享资源竞争</td><td>成本证据、自包含性与次序确定</td></tr>
-<tr><td>两个后端</td><td>重放事件并聚合预测</td><td>回读源码、补语义或修改计划</td><td>生命周期、DES 和报告守恒</td></tr>
+<div class="tw"><table data-module-architecture="normative">
+<tr><th>层</th><th>模块 ID</th><th>职责</th><th>核心契约类型</th><th>正式入口 port</th><th>允许调用依赖</th></tr>
+<tr data-module-id="input-facts" data-layer="L0" data-allowed-dependencies=""><td>L0</td><td><code>input-facts</code></td><td>冻结生产事实与请求</td><td>CommonProductionInputs, RequestSnapshot</td><td>build_request_snapshot</td><td>无</td></tr>
+<tr data-module-id="code-ir" data-layer="L1" data-allowed-dependencies="input-facts"><td>L1</td><td><code>code-ir</code></td><td>逐 rank 源码求值</td><td>RankCodeIR, CodeIR</td><td>build_code_ir</td><td>input-facts</td></tr>
+<tr data-module-id="runtime-events" data-layer="L1" data-allowed-dependencies="code-ir,input-facts"><td>L1</td><td><code>runtime-events</code></td><td>展开训练与通信事件</td><td>RuntimeEventPlan</td><td>build_runtime_event_plan</td><td>code-ir, input-facts</td></tr>
+<tr data-module-id="plan-projection" data-layer="L2" data-allowed-dependencies="gate-system,input-facts,memory-backend,runtime-events,time-backend"><td>L2</td><td><code>plan-projection</code></td><td>绑定共享核并联合闭合双投影</td><td>SimulationPlanCore, ProjectionBundleBuild</td><td>bind_core; evaluate_and_finalize_projection_bundle</td><td>gate-system, input-facts, memory-backend, runtime-events, time-backend</td></tr>
+<tr data-module-id="gate-system" data-layer="L2" data-allowed-dependencies="input-facts"><td>L2</td><td><code>gate-system</code></td><td>执行 staged gate 与 ledger</td><td>GateEvaluationAuthority, GateExecutionLedger</td><td>run_gate_domain</td><td>input-facts</td></tr>
+<tr data-module-id="memory-backend" data-layer="L3" data-allowed-dependencies="plan-projection"><td>L3</td><td><code>memory-backend</code></td><td>构造并重放内存视图</td><td>MemoryEventView, MemoryEstimate</td><td>build_memory_projection_candidate; run_memory_backend</td><td>plan-projection</td></tr>
+<tr data-module-id="time-backend" data-layer="L3" data-allowed-dependencies="plan-projection"><td>L3</td><td><code>time-backend</code></td><td>构造时间视图并执行 DES</td><td>TimeEventView, StepTimeEstimate</td><td>build_time_projection_candidate; run_time_backend</td><td>plan-projection</td></tr>
+<tr data-module-id="result-sealing" data-layer="L4" data-allowed-dependencies="gate-system,memory-backend,time-backend"><td>L4</td><td><code>result-sealing</code></td><td>生成并封装后端结果</td><td>BackendSealArtifact</td><td>run_backend_build_candidate_and_seal</td><td>gate-system, memory-backend, time-backend</td></tr>
+<tr data-module-id="comparison" data-layer="L4" data-allowed-dependencies="gate-system,result-sealing"><td>L4</td><td><code>comparison</code></td><td>同口径配置比较</td><td>ComparisonResult</td><td>build_and_seal_comparison</td><td>gate-system, result-sealing</td></tr>
+<tr data-module-id="conformance" data-layer="OFFLINE" data-allowed-dependencies="comparison,result-sealing"><td>离线</td><td><code>conformance</code></td><td>离线对照与发布门</td><td>ConformanceReport</td><td>run_conformance</td><td>comparison, result-sealing</td></tr>
 </table></div>
+<p>“允许调用依赖”只授权运行时 port 调用；DTO/类型引用不授权反向 callback、隐藏 service locator 或越层执行。</p>
 
 <h3 id="c1-3">1.3 全局不变量</h3>
 <ol>
@@ -2186,30 +2210,96 @@ typed ComparisonArmAuthority → ComparisonSourceAuthority → candidate → G-R
 不存在由输出门回指 View Ready 的循环。Ready 以后若后端 value 或 report contract 失败，表示实现违反已验证
 输入契约，进入 InternalContractViolation；不得把它重新包装成用户可修复的 BlockerRecord。</p>
 
-<figure class="mermaid-figure" data-diagram-id="core-dual-projection" data-title="共享 Core 与双投影闭包" data-description="运行时计划先绑定共享硬件核，再由同一身份和联合门账本形成 scope-closed memory/time 投影。"><pre class="mermaid-source"><code>flowchart TD
-  request["RequestSnapshot / EvaluationInstanceIdentity"] --&gt; authority["ProjectionBundleAuthority"]
-  runtime["RuntimeBuildResult / RuntimeEventPlan.blocker_index"] --&gt; bind["bind_core"]
-  hardware["HardwareProfile / ExecutionDeployment / HardwareBindingPolicySnapshot"] --&gt; bind
-  bind --&gt; core["CoreBuildResult / SimulationPlanCore"]
-  core --&gt; variant["Shared KernelVariantBinding map"]
-  request --&gt; memCandidate["ProjectionCandidate / MemoryEventView"]
-  request --&gt; timeCandidate["ProjectionCandidate / TimeEventView"]
-  core --&gt; memCandidate
-  core --&gt; timeCandidate
-  variant --&gt; memCandidate
-  variant --&gt; timeCandidate
-  memoryFacts["RequestSnapshot memory arm / MemoryRequested / MemoryRegistrySnapshot"] --&gt; memCandidate
-  timeFacts["RequestSnapshot time arm / TimeRequested / CalibrationSet / CommunicationModelSnapshot / TimeCostPolicy"] --&gt; timeCandidate
-  runtime --&gt; authority
-  core --&gt; authority
-  memCandidate --&gt; authority
-  timeCandidate --&gt; authority
-  authority --&gt; joint["Joint GateExecutionLedger / canonical blocker union / affected_backends closure"]
-  joint --&gt; memoryResult["Memory ProjectionResult / Ready, Blocked or NotRequested"]
-  joint --&gt; timeResult["Time ProjectionResult / Ready, Blocked or NotRequested"]
-  class request,hardware,memoryFacts,timeFacts input
-  class runtime,bind,core,variant,authority,joint plan
-  class memCandidate,timeCandidate,memoryResult,timeResult backend</code></pre><figcaption><b>图 7 · 共享 Core 与双投影闭包。</b><span class="src">解释图；相邻 authority、candidate 与 gate 规则为规范。</span></figcaption></figure>
+<section class="module-contract" data-module="plan-projection" aria-labelledby="mc-plan-projection">
+<h3 id="mc-plan-projection">模块契约 · Plan/Projection 协调</h3>
+<h4 id="mc-plan-projection-boundary">职责边界</h4>
+<p>本模块拥有共享 Core binder、双 face coordinator 与 bundle finalizer；它协调已注入的 memory/time candidate builder 和 staged gate ports，但不运行 backend，也不创建 Estimate 或 BackendResult。</p>
+<h4 id="mc-plan-projection-data">核心数据结构</h4>
+<pre><code>CoreBuildResult&lt;SimulationPlanCore&gt; :=
+  Ready { core: SimulationPlanCore }
+  | Blocked { blockers: NonEmpty&lt;BlockerRecord&gt; }
+
+ProjectionCandidate&lt;MemoryEventView&gt;
+ProjectionCandidate&lt;TimeEventView&gt;
+ProjectionBundleAuthority
+ProjectionBundleBuild
+
+ProjectionResult&lt;V&gt; :=
+  Ready { view: V }
+  | Blocked { blockers: NonEmpty&lt;BlockerRecord&gt; }
+  | NotRequested
+
+ProjectionResult&lt;MemoryEventView&gt;
+ProjectionResult&lt;TimeEventView&gt;</code></pre>
+<h4 id="mc-plan-projection-interface">接口定义</h4>
+<pre><code>bind_core(
+  plan: RuntimeEventPlan,
+  hardware: HardwareProfile,
+  deployment: ExecutionDeployment,
+  policy: HardwareBindingPolicySnapshot
+) -&gt; CoreBuildResult&lt;SimulationPlanCore&gt; | InternalContractViolation
+
+evaluate_and_finalize_projection_bundle(
+  authority: ProjectionBundleAuthority
+) -&gt; ProjectionBundleBuild | InternalContractViolation
+
+required injected ports:
+  build_memory_projection_candidate(
+    request: RequestSnapshot,
+    evaluation_identity: EvaluationInstanceIdentity,
+    core: SimulationPlanCore
+  ) -&gt; ProjectionCandidate&lt;MemoryEventView&gt; | InternalContractViolation
+  build_time_projection_candidate(
+    request: RequestSnapshot,
+    evaluation_identity: EvaluationInstanceIdentity,
+    core: SimulationPlanCore
+  ) -&gt; ProjectionCandidate&lt;TimeEventView&gt; | InternalContractViolation
+  build_gate_evaluation_authority(...)
+  expected_invocation_domain(...)
+  run_gate_domain(...)</code></pre>
+<h4 id="mc-plan-projection-outcomes">成功与阻断语义</h4>
+<p>成功返回同时含 typed memory/time ProjectionResult 的 ProjectionBundleBuild。shared Runtime/Core/G-IR blockers affect both faces；face-local blockers affect only that face。contract failure yields one canonical InternalContractViolation and no partial bundle。</p>
+<h4 id="mc-plan-projection-invariants">不变量</h4>
+<ul>
+  <li>exactly one candidate per backend/evaluation identity；blocker union/scope closure occurs before both results。</li>
+  <li>missing compute profile blocks time only；missing shape/storage/lifetime blocks memory only。</li>
+  <li>unrequested arms are empty and unread；shared G-IR runs once。</li>
+  <li>ledgers append without prefix overwrite；no capacity, completion-time or contention reads。</li>
+  <li>本模块不得运行 backend，不得创建 Estimate/BackendResult，也不得建立 wrapper、digest 或 result 第二真值。</li>
+</ul>
+</section>
+
+<figure class="mermaid-figure" data-diagram-id="plan-projection-module-architecture" data-title="Plan/Projection 模块架构" data-description="上游事实与运行事件进入 plan-projection 的三段协调边界，并通过注入的 memory、time 与 gate ports 完成联合闭包。"><pre class="mermaid-source"><code>%%{init: {"themeVariables": {"useGradient": false}}}%%
+block-beta
+  columns 3
+  block:upstream
+    columns 1
+    upstreamLabel["Upstream modules"]
+    inputFacts["input-facts"]
+    runtimeEvents["runtime-events"]
+  end
+  block:boundary
+    columns 1
+    boundaryLabel["plan-projection boundary"]
+    coreBinder["Core binder"]
+    faceCoordinator["Face coordinator"]
+    bundleFinalizer["Bundle finalizer"]
+  end
+  block:ports
+    columns 1
+    portsLabel["Injected ports"]
+    memoryBackend["memory-backend"]
+    timeBackend["time-backend"]
+    gateSystem["gate-system"]
+  end
+  inputFacts --&gt; coreBinder
+  runtimeEvents --&gt; coreBinder
+  coreBinder --&gt; faceCoordinator
+  faceCoordinator --&gt; memoryBackend
+  faceCoordinator --&gt; timeBackend
+  faceCoordinator --&gt; gateSystem
+  faceCoordinator --&gt; bundleFinalizer
+  gateSystem --&gt; bundleFinalizer</code></pre><figcaption><b>图 7 · Plan/Projection 模块架构。</b><span class="src">仅表达正式模块边界与注入 port；相邻 contract 为规范。</span></figcaption></figure>
 
 <h3 id="c9-2">9.2 MemoryEventView</h3>
 <pre><code>LogicalAnchor :=
