@@ -16,6 +16,8 @@
 `data-diagram-id="layered-module-architecture"` 的 Mermaid 源，以及由它生成的 `index.html`/`artifact.html`
 同名静态 SVG。HANDOFF 不再复制一份可能漂移的 ASCII 架构图；下文 `text` 代码块仅用于 schema、公式或
 伪代码，不是第二套架构/流程图。artifact 的规范装配顺序见正文 §13.2，不由模块架构图重复定义。
+图 1 实线统一从 dependency provider 指向 runtime caller，并机械反转 §1.2 的 allowed-dependency pair；
+虚线只表示 immutable DTO/data lineage，不授予运行时调用权。
 
 - 内存只按确定的 logical kernel order 重放 `Allocate/Bind/Use/Free`，不读取 duration 或完成时刻。
 - 时间使用无资源竞争的 global progress DAG；只建模依赖、stream 次序、P2P/collective rendezvous。
@@ -39,13 +41,13 @@
 
 | diagram ID | 权威位置与责任 |
 |---|---|
-| `layered-module-architecture` | §1.1/§1.2；L0–L4 十模块分层、正式调用依赖与离线 conformance sidecar |
+| `layered-module-architecture` | §1.1/§1.2；L0–L4 十模块分层、provider→caller 实线依赖、DTO 虚线与离线 conformance sidecar |
 | `facts-and-digests` | §2.4/§3.1；输入事实、模型/运行时/后端摘要和验证旁路 |
 | `per-rank-codeir` | §4.2/§4.3；逐 logical rank 求值、obligation disposition 与 CodeIR 汇总 |
 | `value-storage-identity` | §5.2/§5.3；prototype、event occurrence、Tensor/Storage instance、binding 与 initial state |
 | `semantic-effect-closure` | §6.3–§6.5；语义注册/校验、effect 闭包与 blocker 状态机 |
 | `runtime-event-expansion` | §7/§8.1–§8.3；forward/backward/recompute/optimizer 与 P2P/collective intent 展开 |
-| `plan-projection-module-architecture` | §9.1；上游模块、plan-projection 三段边界与注入 backend/gate ports |
+| `plan-projection-module-architecture` | §9.1；上游 DTO 虚线、plan-projection 三段边界与 provider→coordinator/finalizer 注入 ports |
 | `memory-logical-replay` | §9.2/§10.1；逻辑 Allocate/Bind/Use/Free 重放与 peak |
 | `time-progress-des` | §9.3/§10.3；精确 compute record、理论 communication、progress DAG 与无竞争 DES |
 | `result-gate-comparison` | §10.4/§10.5/§12.2；source/value/seal authority、ledger、comparison 与 conformance 旁路 |

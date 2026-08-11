@@ -68,7 +68,7 @@ evidence 解释每个量从哪里来；coverage 解释模型覆盖面；assumpti
 <h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体架构与分层</h2>
 
 <h3 id="c1-1">1.1 权威生产数据流</h3>
-<figure class="mermaid-figure" data-diagram-id="layered-module-architecture" data-title="分层仿真器模块架构" data-description="十个正式模块按事实、IR、规划投影、后端、封装比较分层；离线 conformance 位于生产摘要链之外。"><pre class="mermaid-source"><code>%%{init: {"themeVariables": {"useGradient": false}}}%%
+<figure class="mermaid-figure" data-diagram-id="layered-module-architecture" data-title="分层仿真器模块架构" data-description="十个正式模块按事实、IR、规划投影、后端、封装比较分层；实线表示运行时调用依赖，虚线表示不可变数据谱系。"><pre class="mermaid-source"><code>%%{init: {"themeVariables": {"useGradient": false}}}%%
 block-beta
   columns 1
   block:l0
@@ -107,22 +107,23 @@ block-beta
     conformance["conformance"]
     space
   end
-  inputFacts --&gt; codeIr
-  inputFacts --&gt; runtimeEvents
-  codeIr --&gt; runtimeEvents
-  runtimeEvents --&gt; planProjection
-  inputFacts --&gt; gateSystem
+  inputFacts -.-&gt; codeIr
+  inputFacts -.-&gt; runtimeEvents
+  codeIr -.-&gt; runtimeEvents
+  runtimeEvents -.-&gt; planProjection
+  inputFacts -.-&gt; gateSystem
   gateSystem --&gt; planProjection
-  planProjection --&gt; memoryBackend
-  planProjection --&gt; timeBackend
-  planProjection --&gt; resultSealing
-  memoryBackend --&gt; resultSealing
-  timeBackend --&gt; resultSealing
+  memoryBackend --&gt; planProjection
+  timeBackend --&gt; planProjection
   gateSystem --&gt; resultSealing
+  memoryBackend --&gt; resultSealing
+  planProjection --&gt; resultSealing
+  timeBackend --&gt; resultSealing
+  gateSystem --&gt; comparison
   resultSealing --&gt; comparison
-  resultSealing -.-&gt; conformance
-  comparison -.-&gt; conformance
-  gateSystem -.-&gt; conformance</code></pre><figcaption><b>图 1 · 分层仿真器模块架构。</b><span class="src">模块与允许调用以 1.2 节规范表为准。</span></figcaption></figure>
+  comparison --&gt; conformance
+  gateSystem --&gt; conformance
+  resultSealing --&gt; conformance</code></pre><figcaption><b>图 1 · 分层仿真器模块架构。</b><span class="src">实线从 dependency provider 指向 runtime caller，恰为 1.2 表中依赖 pair 的反向；虚线仅表示 DTO/data lineage，不授权调用。</span></figcaption></figure>
 
 <p><code>RankCodeIR(P,r)</code> 直接对应当前源码在当前配置、当前 logical rank 下可见的结构；
 顶层 <code>CodeIR(P)</code> 是规范 rank 顺序的有序映射，不是一张带 rank 备择 guard 的母图。
@@ -148,7 +149,9 @@ value、最终三态结果与可选 comparison 也各有绑定当前 subject 的
 <tr data-module-id="comparison" data-layer="L4" data-allowed-dependencies="gate-system,result-sealing"><td>L4</td><td><code>comparison</code></td><td>同口径配置比较</td><td>ComparisonResult</td><td>derive_comparison_basis_pair; build_comparison_source_authority; compare_per_metric_from_authority</td><td>gate-system, result-sealing</td></tr>
 <tr data-module-id="conformance" data-layer="OFFLINE" data-allowed-dependencies="comparison,gate-system,result-sealing"><td>离线</td><td><code>conformance</code></td><td>离线对照与发布门</td><td>ConformanceReport</td><td>run_conformance; apply_release_policy</td><td>comparison, gate-system, result-sealing</td></tr>
 </table></div>
-<p>“允许调用依赖”只授权运行时 port 调用；DTO/类型引用不授权反向 callback、隐藏 service locator 或越层执行。</p>
+<p>“允许调用依赖”只授权运行时 port 调用。图 1 的每条实线从 dependency provider 指向 runtime caller，
+必须恰为本表每个 caller → dependency pair 的反向；虚线只表示 immutable DTO/data lineage，
+不授权反向 callback、隐藏 service locator 或越层执行。</p>
 
 <h3 id="c1-3">1.3 全局不变量</h3>
 <ol>
@@ -2068,30 +2071,33 @@ ProjectionResult(backend) is Ready iff:
   and affected_blockers(bundle_authority, joint_ledger, backend) is empty
   and every gate in ready_prerequisites(backend) passes on that candidate
 
-finalize_projection_candidate(request, evaluation_identity, backend,
-                              requested_branch_builder):
+expected_projection_candidate(request, evaluation_identity, backend,
+                              requested_branch) :=
+  // pure canonical equation; not a module port or runtime callback
   if backend not in request.requested_backends:
-    branch := CandidateNotRequested
+    require requested_branch == None
+    let expected_branch = CandidateNotRequested
   else:
-    branch := requested_branch_builder()  // CandidateView or CandidateBlocked
-  candidate := ProjectionCandidate {
-    evaluation_identity.evaluation_instance_digest, backend, branch }
-  candidate.projection_candidate_digest :=
-    hash(canonical candidate payload excluding only its own digest)
-  return candidate
-
-projection_candidate_from_request(request, evaluation_identity, backend,
-                                  shared_blockers) :=
-  finalize_projection_candidate(request, evaluation_identity, backend,
-    () -&gt; CandidateBlocked { construction_blockers=shared_blockers })
+    require requested_branch is CandidateView or CandidateBlocked
+    let expected_branch = requested_branch
+  let canonical_payload = {
+    evaluation_identity.evaluation_instance_digest, backend, expected_branch }
+  ProjectionCandidate {
+    canonical_payload,
+    projection_candidate_digest=hash(canonical_payload) }
 
 build_memory_projection_candidate(request, evaluation_identity, core):
   if memory in request.requested_backends:
     memory_inputs := require MemoryRequested at request.requested_backend_inputs[memory]
     construct only from memory_inputs.memory_registry_snapshot
-  call finalize_projection_candidate exactly once; when requested, return
-  CandidateView only if every construction binding succeeded, otherwise
-  CandidateBlocked with the complete canonical construction-blocker set
+    requested_branch := CandidateView only if every construction binding succeeded,
+                        otherwise CandidateBlocked with the complete canonical
+                        construction-blocker set
+  else:
+    requested_branch := None; do not read the memory input arm
+  require returned_candidate ==
+    expected_projection_candidate(request, evaluation_identity, memory,
+                                  requested_branch)
 
 build_time_projection_candidate(request, evaluation_identity, core):
   if time in request.requested_backends:
@@ -2110,9 +2116,14 @@ build_time_projection_candidate(request, evaluation_identity, core):
     require every record in calibration.active_compute_records has
             observation_ref.split == calibration_train
     construct only from calibration, train_manifest, communication_model and time_policy
-  call finalize_projection_candidate exactly once; when requested, return
-  CandidateView only if every construction binding succeeded, otherwise
-  CandidateBlocked with the complete canonical construction-blocker set
+    requested_branch := CandidateView only if every construction binding succeeded,
+                        otherwise CandidateBlocked with the complete canonical
+                        construction-blocker set
+  else:
+    requested_branch := None; do not read the time input arm
+  require returned_candidate ==
+    expected_projection_candidate(request, evaluation_identity, time,
+                                  requested_branch)
 
 evaluate_and_finalize_projection_bundle(authority):
   require authority.request_snapshot.request_digest ==
@@ -2229,17 +2240,17 @@ typed ComparisonArmAuthority → ComparisonSourceAuthority → candidate → G-R
 <h4 id="mc-plan-projection-boundary">职责边界</h4>
 <p>本模块拥有共享 Core binder、双 face coordinator 与 bundle finalizer；它协调已注入的 memory/time candidate builder 和 staged gate ports，但不运行 backend，也不创建 Estimate 或 BackendResult。</p>
 <h4 id="mc-plan-projection-data">核心数据结构</h4>
-<pre><code>
-PlanProjectionOwnedContracts:
-  core_build_result: CoreBuildResult&lt;SimulationPlanCore&gt;
-  memory_candidate: ProjectionCandidate&lt;MemoryEventView&gt;
-  time_candidate: ProjectionCandidate&lt;TimeEventView&gt;
-  bundle_authority: ProjectionBundleAuthority
-  bundle_build: ProjectionBundleBuild
-  memory_result: ProjectionResult&lt;MemoryEventView&gt;
-  time_result: ProjectionResult&lt;TimeEventView&gt;
-</code></pre>
-<p>以上字段只引用 9.1 节既有权威 generic 与结果联合，不在本模块重定义 CoreBuildResult、ProjectionCandidate 或 ProjectionResult。</p>
+<ul data-authoritative-contract-references="plan-projection">
+  <li data-contract-ref="SimulationPlanCore"><code>SimulationPlanCore</code></li>
+  <li data-contract-ref="CoreBuildResult&lt;SimulationPlanCore&gt;"><code>CoreBuildResult&lt;SimulationPlanCore&gt;</code></li>
+  <li data-contract-ref="ProjectionCandidate&lt;MemoryEventView&gt;"><code>ProjectionCandidate&lt;MemoryEventView&gt;</code></li>
+  <li data-contract-ref="ProjectionCandidate&lt;TimeEventView&gt;"><code>ProjectionCandidate&lt;TimeEventView&gt;</code></li>
+  <li data-contract-ref="ProjectionBundleAuthority"><code>ProjectionBundleAuthority</code></li>
+  <li data-contract-ref="ProjectionBundleBuild"><code>ProjectionBundleBuild</code></li>
+  <li data-contract-ref="ProjectionResult&lt;MemoryEventView&gt;"><code>ProjectionResult&lt;MemoryEventView&gt;</code></li>
+  <li data-contract-ref="ProjectionResult&lt;TimeEventView&gt;"><code>ProjectionResult&lt;TimeEventView&gt;</code></li>
+</ul>
+<p>以上是 9.1 节既有权威类型的精确引用集，不在本模块声明 wrapper schema，也不重定义 CoreBuildResult、ProjectionCandidate 或 ProjectionResult。</p>
 <h4 id="mc-plan-projection-interface">接口定义</h4>
 <pre><code>bind_core(
   plan: RuntimeEventPlan,
@@ -2313,14 +2324,14 @@ block-beta
     timeBackend["time-backend"]
     gateSystem["gate-system"]
   end
-  inputFacts --&gt; coreBinder
-  runtimeEvents --&gt; coreBinder
+  inputFacts -.-&gt; coreBinder
+  runtimeEvents -.-&gt; coreBinder
   coreBinder --&gt; faceCoordinator
-  faceCoordinator --&gt; memoryBackend
-  faceCoordinator --&gt; timeBackend
-  faceCoordinator --&gt; gateSystem
+  memoryBackend --&gt; faceCoordinator
+  timeBackend --&gt; faceCoordinator
+  gateSystem --&gt; faceCoordinator
   faceCoordinator --&gt; bundleFinalizer
-  bundleFinalizer --&gt; gateSystem</code></pre><figcaption><b>图 7 · Plan/Projection 模块架构。</b><span class="src">仅表达正式模块边界与注入 port；相邻 contract 为规范。</span></figcaption></figure>
+  gateSystem --&gt; bundleFinalizer</code></pre><figcaption><b>图 7 · Plan/Projection 模块架构。</b><span class="src">上游 DTO 使用虚线；注入 provider 以实线指向 coordinator/finalizer，边界内实线不映射为跨模块依赖。</span></figcaption></figure>
 
 <h3 id="c9-2">9.2 MemoryEventView</h3>
 <pre><code>LogicalAnchor :=
@@ -2595,8 +2606,10 @@ projection 嵌入 exact measurement+protocol snapshots，或 normalized formula 
 
 <section class="module-contract" data-module="memory-backend" aria-labelledby="mc-memory-backend">
 <p>内存侧只读取 shape、storage/alias、lifetime、显式 workspace 与逻辑次序语义，不读取 compute duration、
-profiler op-time、通信公式、TimeEventView 或 TimeEstimate。缺 compute profile 只阻断时间侧；缺内存
-shape/storage/lifetime 语义只阻断内存侧；共享 CodeIR、RuntimeEventPlan 或 Core 失败才同时阻断两侧。</p>
+profiler op-time、通信公式、TimeEventView 或 TimeEstimate。缺 compute profile 只阻断时间侧；
+缺共享 compute shape 以 BLK-MISSING-SHAPE 同时阻断两侧；
+缺 memory-only storage/alias/lifetime/explicit-workspace 事实只阻断内存侧；
+共享 CodeIR、RuntimeEventPlan 或 Core 失败也同时阻断两侧。</p>
 <h3 id="mc-memory-backend">模块契约 · Memory projection 与后端</h3>
 
 <h4 id="mc-memory-backend-boundary">职责边界</h4>
@@ -5277,10 +5290,14 @@ subject，禁止生产摘要、比较 basis 或缓存键反向依赖验证制品
                                 config_input.execution_deployment,
                                 hardware_binding_policy)
     if core_result is Blocked:
-        memory_projection_candidate = projection_candidate_from_request(
-          request_snapshot, evaluation_identity, memory, core_result.blockers)
-        time_projection_candidate = projection_candidate_from_request(
-          request_snapshot, evaluation_identity, time, core_result.blockers)
+        memory_projection_candidate = expected_projection_candidate(
+          request_snapshot, evaluation_identity, memory,
+          None if memory not in request_snapshot.requested_backends else
+            CandidateBlocked { construction_blockers: core_result.blockers })
+        time_projection_candidate = expected_projection_candidate(
+          request_snapshot, evaluation_identity, time,
+          None if time not in request_snapshot.requested_backends else
+            CandidateBlocked { construction_blockers: core_result.blockers })
     else:
         core = core_result.core
         memory_projection_candidate = build_memory_projection_candidate(

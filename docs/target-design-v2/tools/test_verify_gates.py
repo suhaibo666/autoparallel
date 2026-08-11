@@ -459,9 +459,9 @@ class VerifyGatesContractTest(unittest.TestCase):
         self.assertEqual(validate(template), [])
         mutations = (
             (
-                "core_build_result: CoreBuildResult<SimulationPlanCore>",
-                "core_build_result: CoreBuildResult<MemoryEventView>",
-                "PlanProjectionOwnedContracts",
+                "CoreBuildResult<SimulationPlanCore>",
+                "CoreBuildResult<MemoryEventView>",
+                "authoritative contract references",
             ),
             (
                 "policy: HardwareBindingPolicySnapshot",
@@ -497,6 +497,93 @@ class VerifyGatesContractTest(unittest.TestCase):
             )
         )
         self.assertTrue(any("dependency DAG" in error for error in errors), errors)
+
+    def test_task8_edge_reference_scope_and_helper_mutations_are_rejected(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+
+        mutations = (
+            (
+                "memoryBackend --&gt; planProjection",
+                "planProjection --&gt; memoryBackend",
+                "solid edges must reverse table dependencies",
+            ),
+            (
+                "inputFacts -.-&gt; codeIr",
+                "inputFacts --&gt; codeIr",
+                "solid edges must reverse table dependencies",
+            ),
+            (
+                "runtimeEvents -.-&gt; planProjection",
+                "runtimeEvents -.-&gt; gateSystem",
+                "dotted DTO lineage",
+            ),
+            (
+                "expected_projection_candidate(request, evaluation_identity, backend,\n"
+                "                              requested_branch) :=",
+                "finalize_projection_candidate(request, evaluation_identity, backend,\n"
+                "                              requested_branch) :=",
+                "pure expected_projection_candidate equation",
+            ),
+            (
+                "缺共享 compute shape 以 BLK-MISSING-SHAPE 同时阻断两侧",
+                "shape/storage/lifetime 语义只阻断内存侧",
+                "memory blocker scope",
+            ),
+            (
+                "expected_projection_candidate(request, evaluation_identity, memory,\n"
+                "                                  requested_branch)",
+                "expected_projection_candidate(request, evaluation_identity, time,\n"
+                "                                  requested_branch)",
+                "candidate builder postcondition binding",
+            ),
+            (
+                "memory_projection_candidate = expected_projection_candidate(\n"
+                "          request_snapshot, evaluation_identity, memory,",
+                "memory_projection_candidate = expected_projection_candidate(\n"
+                "          request_snapshot, evaluation_identity, time,",
+                "product orchestration candidate binding",
+            ),
+        )
+        for original, replacement, expected in mutations:
+            with self.subTest(expected=expected):
+                self.assertEqual(template.count(original), 1, original)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        for module in ("memory-backend", "time-backend"):
+            with self.subTest(module=module):
+                mutated = replace_in_module(
+                    template,
+                    module,
+                    "when time is not requested:"
+                    if module == "time-backend"
+                    else "run_memory_backend(",
+                    "candidate := expected_projection_candidate(...)\n"
+                    + (
+                        "when time is not requested:"
+                        if module == "time-backend"
+                        else "run_memory_backend("
+                    ),
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any("backend runtime-calls plan-owned helper" in error for error in errors),
+                    errors,
+                )
+
+        wrapper_anchor = '<h4 id="mc-plan-projection-data">核心数据结构</h4>'
+        self.assertEqual(template.count(wrapper_anchor), 1)
+        errors = validate(
+            template.replace(
+                wrapper_anchor,
+                wrapper_anchor + "\n<pre><code>PlanProjectionOwnedContracts:</code></pre>",
+                1,
+            )
+        )
+        self.assertTrue(
+            any("forbids local wrapper schema" in error for error in errors), errors
+        )
 
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")

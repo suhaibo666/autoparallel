@@ -29,6 +29,16 @@ REQUIRED_SUBSECTIONS = {
     "成功与阻断语义",
     "不变量",
 }
+PLAN_AUTHORITATIVE_CONTRACT_REFS = (
+    "SimulationPlanCore",
+    "CoreBuildResult<SimulationPlanCore>",
+    "ProjectionCandidate<MemoryEventView>",
+    "ProjectionCandidate<TimeEventView>",
+    "ProjectionBundleAuthority",
+    "ProjectionBundleBuild",
+    "ProjectionResult<MemoryEventView>",
+    "ProjectionResult<TimeEventView>",
+)
 
 
 @dataclass
@@ -164,7 +174,6 @@ class ModuleContractStructureTest(unittest.TestCase):
     def test_plan_projection_contract_has_existing_typed_ports_and_closed_outcomes(self) -> None:
         text = self.contract_text("plan-projection")
         for token in (
-            "PlanProjectionOwnedContracts:",
             "SimulationPlanCore",
             "CoreBuildResult<SimulationPlanCore>",
             "ProjectionCandidate<MemoryEventView>",
@@ -186,6 +195,30 @@ class ModuleContractStructureTest(unittest.TestCase):
             "one canonical InternalContractViolation and no partial bundle",
         ):
             self.assertIn(token, text)
+        template = TEMPLATE.read_text(encoding="utf-8")
+        contract = re.search(
+            r'<section\b[^>]*data-module="plan-projection"[^>]*>(.*?)</section>',
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(contract)
+        reference_list = re.search(
+            r'<ul\b[^>]*data-authoritative-contract-references="plan-projection"[^>]*>'
+            r'(.*?)</ul>',
+            contract.group(1),
+            re.DOTALL,
+        )
+        self.assertIsNotNone(reference_list)
+        refs = tuple(
+            unescape(ref)
+            for ref in re.findall(
+                r'<li\b[^>]*data-contract-ref="([^"]+)"[^>]*>',
+                reference_list.group(1),
+            )
+        )
+        self.assertEqual(refs, PLAN_AUTHORITATIVE_CONTRACT_REFS)
+        self.assertNotIn("PlanProjectionOwnedContracts", contract.group(1))
+        self.assertNotRegex(contract.group(1), r"(?m)^\s*[A-Za-z][A-Za-z0-9_<>]*\s*:=")
         self.assertNotIn("CoreBuildResult<SimulationPlanCore> :=", text)
         self.assertNotIn("ProjectionResult<V> :=", text)
         self.assertNotIn("ProjectionCandidate<MemoryEventView> :=", text)
@@ -210,6 +243,89 @@ class ModuleContractStructureTest(unittest.TestCase):
             "conformance": ("OFFLINE", "comparison,gate-system,result-sealing"),
         }
         self.assertEqual({module: (layer, deps) for module, layer, deps in rows}, expected)
+
+    def test_architecture_edges_encode_reverse_dependencies_and_dto_lineage(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        table_rows = re.findall(
+            r'<tr\b[^>]*data-module-id="([a-z-]+)"[^>]*'
+            r'data-allowed-dependencies="([a-z,-]*)"[^>]*>',
+            template,
+        )
+        source = diagram_source("layered-module-architecture")
+        nodes = dict(
+            re.findall(r'(?m)^\s+([A-Za-z][A-Za-z0-9]*)\["([^"]+)"\]\s*$', source)
+        )
+        module_nodes = {
+            label: node for node, label in nodes.items() if label in dict(table_rows)
+        }
+        solid = set(re.findall(r"(?m)^\s+(\w+)\s+(-->)\s+(\w+)\s*$", source))
+        dotted = set(re.findall(r"(?m)^\s+(\w+)\s+(-\.->)\s+(\w+)\s*$", source))
+        expected_solid = {
+            (module_nodes[dependency], "-->", module_nodes[caller])
+            for caller, dependencies in table_rows
+            for dependency in dependencies.split(",")
+            if dependency
+        }
+        self.assertEqual(solid, expected_solid)
+        self.assertEqual(
+            dotted,
+            {
+                ("inputFacts", "-.->", "codeIr"),
+                ("inputFacts", "-.->", "runtimeEvents"),
+                ("codeIr", "-.->", "runtimeEvents"),
+                ("runtimeEvents", "-.->", "planProjection"),
+                ("inputFacts", "-.->", "gateSystem"),
+            },
+        )
+
+        plan_source = diagram_source("plan-projection-module-architecture")
+        plan_solid = set(
+            re.findall(r"(?m)^\s+(\w+)\s+(-->)\s+(\w+)\s*$", plan_source)
+        )
+        plan_dotted = set(
+            re.findall(r"(?m)^\s+(\w+)\s+(-\.->)\s+(\w+)\s*$", plan_source)
+        )
+        self.assertEqual(
+            plan_solid,
+            {
+                ("coreBinder", "-->", "faceCoordinator"),
+                ("faceCoordinator", "-->", "bundleFinalizer"),
+                ("memoryBackend", "-->", "faceCoordinator"),
+                ("timeBackend", "-->", "faceCoordinator"),
+                ("gateSystem", "-->", "faceCoordinator"),
+                ("gateSystem", "-->", "bundleFinalizer"),
+            },
+        )
+        self.assertEqual(
+            plan_dotted,
+            {
+                ("inputFacts", "-.->", "coreBinder"),
+                ("runtimeEvents", "-.->", "coreBinder"),
+            },
+        )
+
+    def test_candidate_builders_use_pure_expected_postcondition(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        self.assertNotIn("finalize_projection_candidate", template)
+        self.assertIn("expected_projection_candidate(", template)
+        self.assertEqual(
+            template.count(
+                "require returned_candidate ==\n    expected_projection_candidate("
+            ),
+            2,
+        )
+        self.assertNotRegex(template, r"call\s+expected_projection_candidate")
+
+    def test_memory_blocker_scope_matches_shared_shape_authority(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        self.assertNotIn("shape/storage/lifetime 语义只阻断内存侧", template)
+        self.assertIn(
+            "缺共享 compute shape 以 BLK-MISSING-SHAPE 同时阻断两侧", template
+        )
+        self.assertIn(
+            "缺 memory-only storage/alias/lifetime/explicit-workspace 事实只阻断内存侧",
+            template,
+        )
 
     def test_backend_specific_request_inputs_are_tagged_and_independent(self) -> None:
         text = self.contract_text("input-facts")

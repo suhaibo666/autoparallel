@@ -76,6 +76,28 @@ def _write_fixture(directory: pathlib.Path, template: str) -> tuple[pathlib.Path
     return source, css
 
 
+def _handoff_module_locator_errors(handoff: str, template: str) -> list[str]:
+    errors: list[str] = []
+    rows = re.findall(r"\| `([a-z-]+)` / `([a-z-]+)` \|", handoff)
+    sections: dict[str, tuple[str, str]] = {}
+    for match in re.finditer(
+        r"<section\b(?P<attrs>[^>]*)>(?P<body>.*?)</section>",
+        template,
+        re.DOTALL,
+    ):
+        attrs = dict(re.findall(r'([:\w-]+)="([^"]*)"', match.group("attrs")))
+        module_id = attrs.get("data-module")
+        if module_id:
+            sections[module_id] = (attrs.get("aria-labelledby", ""), match.group("body"))
+    for module_id, anchor in rows:
+        labelled_by, body = sections.get(module_id, ("", ""))
+        if labelled_by != anchor or not re.search(
+            rf'<h3\b[^>]*id="{re.escape(anchor)}"[^>]*>', body
+        ):
+            errors.append(f"{module_id}/{anchor}")
+    return errors
+
+
 class BuildDocArtifactTest(unittest.TestCase):
     def test_architecture_views_are_block_layered_and_not_artifact_flows(self) -> None:
         sources = _mermaid_sources()
@@ -450,11 +472,26 @@ class BuildDocActivityPathTest(unittest.TestCase):
             r"\| `([a-z-]+)` / `([a-z-]+)` \|", handoff
         )
         self.assertEqual(tuple(indexed_diagrams), EXPECTED_DIAGRAM_IDS)
+        self.assertEqual(
+            tuple(module_id for module_id, _ in indexed_modules), expected_modules
+        )
         for diagram_id in indexed_diagrams:
             self.assertEqual(template.count(f'data-diagram-id="{diagram_id}"'), 1)
         for module_id, anchor in indexed_modules:
             self.assertEqual(template.count(f'data-module="{module_id}"'), 1)
             self.assertEqual(template.count(f'id="{anchor}"'), 1)
+        self.assertEqual(_handoff_module_locator_errors(handoff, template), [])
+
+        swapped = handoff.replace(
+            "`plan-projection` / `mc-plan-projection`",
+            "`plan-projection` / `__SWAP__`",
+            1,
+        ).replace(
+            "`memory-backend` / `mc-memory-backend`",
+            "`memory-backend` / `mc-plan-projection`",
+            1,
+        ).replace("`plan-projection` / `__SWAP__`", "`plan-projection` / `mc-memory-backend`", 1)
+        self.assertTrue(_handoff_module_locator_errors(swapped, template))
 
     def test_handoff_documents_the_offline_deterministic_safe_build(self) -> None:
         """An unpinned, network-backed, or unaudited build recipe must fail."""

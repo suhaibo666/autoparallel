@@ -593,33 +593,35 @@ TASK8_ARCHITECTURE_NODES = {
         "portsLabel": "Injected ports", "memoryBackend": "memory-backend", "timeBackend": "time-backend", "gateSystem": "gate-system",
     },
 }
-TASK8_ARCHITECTURE_EDGES = {
-    "layered-module-architecture": {
-        ("inputFacts", "-->", "codeIr"), ("inputFacts", "-->", "runtimeEvents"),
-        ("codeIr", "-->", "runtimeEvents"), ("runtimeEvents", "-->", "planProjection"),
-        ("inputFacts", "-->", "gateSystem"), ("gateSystem", "-->", "planProjection"),
-        ("planProjection", "-->", "memoryBackend"), ("planProjection", "-->", "timeBackend"),
-        ("planProjection", "-->", "resultSealing"), ("memoryBackend", "-->", "resultSealing"),
-        ("timeBackend", "-->", "resultSealing"), ("gateSystem", "-->", "resultSealing"),
-        ("resultSealing", "-->", "comparison"), ("resultSealing", "-.->", "conformance"),
-        ("comparison", "-.->", "conformance"), ("gateSystem", "-.->", "conformance"),
-    },
-    "plan-projection-module-architecture": {
-        ("inputFacts", "-->", "coreBinder"), ("runtimeEvents", "-->", "coreBinder"),
-        ("coreBinder", "-->", "faceCoordinator"), ("faceCoordinator", "-->", "memoryBackend"),
-        ("faceCoordinator", "-->", "timeBackend"), ("faceCoordinator", "-->", "gateSystem"),
-        ("faceCoordinator", "-->", "bundleFinalizer"), ("bundleFinalizer", "-->", "gateSystem"),
-    },
+TASK8_LAYERED_DOTTED_EDGES = {
+    ("inputFacts", "-.->", "codeIr"),
+    ("inputFacts", "-.->", "runtimeEvents"),
+    ("codeIr", "-.->", "runtimeEvents"),
+    ("runtimeEvents", "-.->", "planProjection"),
+    ("inputFacts", "-.->", "gateSystem"),
 }
-TASK8_PLAN_OWNED_FIELDS = {
-    "core_build_result": "CoreBuildResult<SimulationPlanCore>",
-    "memory_candidate": "ProjectionCandidate<MemoryEventView>",
-    "time_candidate": "ProjectionCandidate<TimeEventView>",
-    "bundle_authority": "ProjectionBundleAuthority",
-    "bundle_build": "ProjectionBundleBuild",
-    "memory_result": "ProjectionResult<MemoryEventView>",
-    "time_result": "ProjectionResult<TimeEventView>",
+TASK8_PLAN_ARCHITECTURE_SOLID_EDGES = {
+    ("coreBinder", "-->", "faceCoordinator"),
+    ("faceCoordinator", "-->", "bundleFinalizer"),
+    ("memoryBackend", "-->", "faceCoordinator"),
+    ("timeBackend", "-->", "faceCoordinator"),
+    ("gateSystem", "-->", "faceCoordinator"),
+    ("gateSystem", "-->", "bundleFinalizer"),
 }
+TASK8_PLAN_ARCHITECTURE_DOTTED_EDGES = {
+    ("inputFacts", "-.->", "coreBinder"),
+    ("runtimeEvents", "-.->", "coreBinder"),
+}
+TASK8_PLAN_AUTHORITATIVE_CONTRACT_REFS = (
+    "SimulationPlanCore",
+    "CoreBuildResult<SimulationPlanCore>",
+    "ProjectionCandidate<MemoryEventView>",
+    "ProjectionCandidate<TimeEventView>",
+    "ProjectionBundleAuthority",
+    "ProjectionBundleBuild",
+    "ProjectionResult<MemoryEventView>",
+    "ProjectionResult<TimeEventView>",
+)
 
 MODULE_CONTRACT_SUBSECTIONS = {
     "职责边界",
@@ -678,7 +680,6 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "expand_runtime_semantics( code_ir: CodeIR, config: NormalizedParallelConfig, scenario: ExecutionScenario, registry: RuntimeRegistrySnapshot ) -> RuntimeBuildResult | InternalContractViolation",
     ),
     "plan-projection": (
-        "PlanProjectionOwnedContracts:",
         "SimulationPlanCore",
         "CoreBuildResult<SimulationPlanCore>",
         "ProjectionCandidate<MemoryEventView>",
@@ -2133,6 +2134,7 @@ def check_diagrams(html: str, errors: list[str]) -> None:
     if tuple(diagram_id for diagram_id, _ in figures) != TASK8_DIAGRAM_IDS:
         errors.append("Task8 authoritative diagram ID/order 不闭合")
     sources = dict(figures)
+    architecture_edges: dict[str, set[tuple[str, str, str]]] = {}
     for diagram_id in TASK8_ARCHITECTURE_DIAGRAM_IDS:
         source = unescape(sources.get(diagram_id, ""))
         if '"useGradient": false' not in source or not re.search(
@@ -2149,10 +2151,16 @@ def check_diagrams(html: str, errors: list[str]) -> None:
                 source,
             )
         )
+        architecture_edges[diagram_id] = edges
         if nodes != TASK8_ARCHITECTURE_NODES[diagram_id]:
             errors.append(f"Task8 architecture exact node/label set mismatch: {diagram_id}")
-        if edges != TASK8_ARCHITECTURE_EDGES[diagram_id]:
-            errors.append(f"Task8 architecture exact edge set mismatch: {diagram_id}")
+        if diagram_id == "plan-projection-module-architecture":
+            solid = {edge for edge in edges if edge[1] == "-->"}
+            dotted = {edge for edge in edges if edge[1] == "-.->"}
+            if solid != TASK8_PLAN_ARCHITECTURE_SOLID_EDGES:
+                errors.append("Task8 plan architecture exact provider-to-caller edges mismatch")
+            if dotted != TASK8_PLAN_ARCHITECTURE_DOTTED_EDGES:
+                errors.append("Task8 plan architecture exact dotted DTO lineage mismatch")
 
     table_match = re.search(
         r'<table\b[^>]*data-module-architecture="normative"[^>]*>'
@@ -2191,6 +2199,31 @@ def check_diagrams(html: str, errors: list[str]) -> None:
                 malformed = True
     if malformed or parsed_rows != TASK8_MODULE_ROWS or dependency_rows != TASK8_MODULE_DEPENDENCIES:
         errors.append("Task8 Chapter 1 exact six-cell module table 不闭合")
+
+    layered_module_nodes = {
+        label: node
+        for node, label in TASK8_ARCHITECTURE_NODES[
+            "layered-module-architecture"
+        ].items()
+        if label in TASK8_MODULE_DEPENDENCIES
+    }
+    expected_layered_solid = {
+        (layered_module_nodes[dependency], "-->", layered_module_nodes[caller])
+        for caller, (_, dependencies) in dependency_rows.items()
+        if caller in layered_module_nodes
+        for dependency in dependencies.split(",")
+        if dependency in layered_module_nodes
+    }
+    layered_edges = architecture_edges.get("layered-module-architecture", set())
+    layered_solid = {edge for edge in layered_edges if edge[1] == "-->"}
+    layered_dotted = {edge for edge in layered_edges if edge[1] == "-.->"}
+    if (
+        set(layered_module_nodes) != set(dependency_rows)
+        or layered_solid != expected_layered_solid
+    ):
+        errors.append("Task8 layered solid edges must reverse table dependencies")
+    if layered_dotted != TASK8_LAYERED_DOTTED_EDGES:
+        errors.append("Task8 layered dotted DTO lineage mismatch")
 
     graph = {
         module: tuple(filter(None, deps.split(",")))
@@ -2240,8 +2273,55 @@ def check_diagrams(html: str, errors: list[str]) -> None:
         re.DOTALL,
     )
     plan_body = plan_section.group("body") if plan_section else ""
-    if _exact_flat_schema_fields(plan_body, "PlanProjectionOwnedContracts") != TASK8_PLAN_OWNED_FIELDS:
-        errors.append("Task8 PlanProjectionOwnedContracts exact field mapping 不闭合")
+    core_data = re.search(
+        r'<h4\b[^>]*id="mc-plan-projection-data"[^>]*>.*?</h4>'
+        r'(?P<body>.*?)(?=<h4\b|$)',
+        plan_body,
+        re.DOTALL,
+    )
+    core_data_body = core_data.group("body") if core_data else ""
+    reference_lists = list(
+        re.finditer(
+            r'<ul\b(?P<attrs>[^>]*)>(?P<body>.*?)</ul>',
+            core_data_body,
+            re.DOTALL,
+        )
+    )
+    refs: list[str] = []
+    refs_malformed = len(reference_lists) != 1
+    if reference_lists:
+        list_attrs = dict(
+            re.findall(r'([:\w-]+)="([^"]*)"', reference_lists[0].group("attrs"))
+        )
+        refs_malformed = refs_malformed or list_attrs.get(
+            "data-authoritative-contract-references"
+        ) != "plan-projection"
+        items = list(
+            re.finditer(
+                r'<li\b(?P<attrs>[^>]*)>(?P<body>.*?)</li>',
+                reference_lists[0].group("body"),
+                re.DOTALL,
+            )
+        )
+        for item in items:
+            item_attrs = dict(
+                re.findall(r'([:\w-]+)="([^"]*)"', item.group("attrs"))
+            )
+            ref = unescape(item_attrs.get("data-contract-ref", ""))
+            visible = re.sub(
+                r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", item.group("body")))
+            ).strip()
+            if not ref or ref != visible:
+                refs_malformed = True
+            refs.append(ref)
+    if refs_malformed or tuple(refs) != TASK8_PLAN_AUTHORITATIVE_CONTRACT_REFS:
+        errors.append("Task8 plan-projection exact authoritative contract references 不闭合")
+    core_data_text = unescape(re.sub(r"<[^>]+>", "\n", core_data_body))
+    if "PlanProjectionOwnedContracts" in plan_body or re.search(
+        r"(?m)^\s*[A-Za-z][A-Za-z0-9_]*(?:<[^>\n]+>)?\s*(?::=|:)(?:\s|$)",
+        core_data_text,
+    ):
+        errors.append("Task8 plan-projection forbids local wrapper schema")
     if re.search(r"(?:CoreBuildResult|ProjectionResult|ProjectionCandidate)[^\r\n]*:=", unescape(plan_body)):
         errors.append("Task8 plan-projection forbids local result/union second truth")
     plan_text = _normalize_contract_text([unescape(re.sub(r"<[^>]+>", " ", plan_body))])
@@ -2256,6 +2336,98 @@ def check_diagrams(html: str, errors: list[str]) -> None:
     )
     if any(port not in plan_text for port in required_plan_ports):
         errors.append("Task8 plan-projection typed port signature 不闭合")
+
+    document_text = unescape(html)
+    pure_candidate_equation = re.findall(
+        r"(?m)^expected_projection_candidate\(request, evaluation_identity, backend,\s*\n"
+        r"\s+requested_branch\) :=\s*$",
+        document_text,
+    )
+    candidate_postconditions = re.findall(
+        r"require\s+returned_candidate\s*==\s*expected_projection_candidate\(",
+        document_text,
+    )
+    if (
+        len(pure_candidate_equation) != 1
+        or len(candidate_postconditions) != 2
+        or "finalize_projection_candidate" in document_text
+        or "projection_candidate_from_request" in document_text
+        or re.search(r"\bcall\s+expected_projection_candidate", document_text)
+    ):
+        errors.append("Task8 candidate construction requires pure expected_projection_candidate equation")
+
+    builder_binding_invalid = False
+    for backend in ("memory", "time"):
+        builder = re.search(
+            rf"(?ms)^build_{backend}_projection_candidate\(request, evaluation_identity, core\):"
+            rf"(?P<body>.*?)(?=^build_(?:memory|time)_projection_candidate|"
+            rf"^evaluate_and_finalize_projection_bundle)",
+            document_text,
+        )
+        postcondition_backends = re.findall(
+            r"require\s+returned_candidate\s*==\s*"
+            r"expected_projection_candidate\(\s*request,\s*evaluation_identity,\s*"
+            r"(memory|time),\s*requested_branch\s*\)",
+            builder.group("body") if builder else "",
+        )
+        if postcondition_backends != [backend]:
+            builder_binding_invalid = True
+    if builder_binding_invalid:
+        errors.append("Task8 candidate builder postcondition binding mismatch")
+
+    sweep = re.search(
+        r'<h3\b[^>]*id="c13-2"[^>]*>.*?</h3>\s*'
+        r'<pre><code>(?P<body>.*?)</code></pre>',
+        html,
+        re.DOTALL,
+    )
+    sweep_text = unescape(sweep.group("body") if sweep else "")
+    blocked_candidate_bindings = sorted(
+        re.findall(
+            r"(memory|time)_projection_candidate\s*=\s*"
+            r"expected_projection_candidate\(\s*request_snapshot,\s*"
+            r"evaluation_identity,\s*(memory|time),",
+            sweep_text,
+        )
+    )
+    ready_candidate_bindings = sorted(
+        re.findall(
+            r"(memory|time)_projection_candidate\s*=\s*"
+            r"build_(memory|time)_projection_candidate\(",
+            sweep_text,
+        )
+    )
+    expected_candidate_bindings = [("memory", "memory"), ("time", "time")]
+    if (
+        blocked_candidate_bindings != expected_candidate_bindings
+        or ready_candidate_bindings != expected_candidate_bindings
+    ):
+        errors.append("Task8 product orchestration candidate binding mismatch")
+
+    for backend_module in ("memory-backend", "time-backend"):
+        backend_section = re.search(
+            rf'<section\b[^>]*data-module="{backend_module}"[^>]*>(?P<body>.*?)</section>',
+            html,
+            re.DOTALL,
+        )
+        if re.search(
+            r"\b(?:expected|finalize)_projection_candidate\s*\(",
+            unescape(backend_section.group("body") if backend_section else ""),
+        ):
+            errors.append(
+                f"Task8 {backend_module} backend runtime-calls plan-owned helper"
+            )
+
+    if (
+        "shape/storage/lifetime 语义只阻断内存侧" in document_text
+        or document_text.count(
+            "缺共享 compute shape 以 BLK-MISSING-SHAPE 同时阻断两侧"
+        ) != 1
+        or document_text.count(
+            "缺 memory-only storage/alias/lifetime/explicit-workspace 事实只阻断内存侧"
+        ) != 1
+    ):
+        errors.append("Task8 memory blocker scope mismatch")
 
 
 def main() -> int:
