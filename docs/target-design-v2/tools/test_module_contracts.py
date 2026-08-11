@@ -968,6 +968,23 @@ class ModuleContractStructureTest(unittest.TestCase):
             },
         )
         self.assertEqual(
+            fields("CanonicalProductionEvaluationInputs"),
+            {
+                "common_inputs": "CommonProductionInputs",
+                "configurations": "NonEmptyOrderedMap[ConfigRef, CanonicalConfigEvaluationInput]",
+            },
+        )
+        self.assertEqual(
+            fields("RequestSnapshot"),
+            {
+                "canonical_production_evaluation_inputs": "CanonicalProductionEvaluationInputs",
+                "requested_backend_inputs": "OrderedMap[memory | time, RequestedBackendInput]",
+                "requested_backends": "OrderedSet[memory | time]",
+                "comparison_request": "ComparisonRequest | None",
+                "request_digest": "Digest",
+            },
+        )
+        self.assertEqual(
             fields("ComparisonBasis"),
             {
                 "metric": "memory | time",

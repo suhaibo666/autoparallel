@@ -413,6 +413,23 @@ TASK7_COMMON_PRODUCTION_INPUT_FIELDS = {
     "production_policy_snapshots": "ProductionPolicySnapshots",
 }
 
+TASK7_CANONICAL_PRODUCTION_EVALUATION_INPUT_FIELDS = {
+    "common_inputs": "CommonProductionInputs",
+    "configurations": (
+        "NonEmptyOrderedMap[ConfigRef, CanonicalConfigEvaluationInput]"
+    ),
+}
+
+TASK7_REQUEST_SNAPSHOT_FIELDS = {
+    "canonical_production_evaluation_inputs": "CanonicalProductionEvaluationInputs",
+    "requested_backend_inputs": (
+        "OrderedMap[memory | time, RequestedBackendInput]"
+    ),
+    "requested_backends": "OrderedSet[memory | time]",
+    "comparison_request": "ComparisonRequest | None",
+    "request_digest": "Digest",
+}
+
 TASK7_REQUESTED_BACKEND_INPUT_ARMS = {
     "MemoryRequested": {
         "memory_registry_snapshot": "MemoryRegistrySnapshot",
@@ -1456,6 +1473,29 @@ def check_task7_modeling_contracts(html: str, errors: list[str]) -> None:
     common_inputs = _exact_flat_schema_fields(html, "CommonProductionInputs")
     if common_inputs != TASK7_COMMON_PRODUCTION_INPUT_FIELDS:
         errors.append("Task7 CommonProductionInputs exact schema 不闭合")
+
+    canonical_evaluation_inputs = _exact_flat_schema_fields(
+        html, "CanonicalProductionEvaluationInputs"
+    )
+    if (
+        canonical_evaluation_inputs
+        != TASK7_CANONICAL_PRODUCTION_EVALUATION_INPUT_FIELDS
+    ):
+        errors.append("Task7 CanonicalProductionEvaluationInputs exact schema 不闭合")
+
+    request_snapshot = _exact_flat_schema_fields(html, "RequestSnapshot")
+    if request_snapshot != TASK7_REQUEST_SNAPSHOT_FIELDS:
+        errors.append("Task7 RequestSnapshot exact schema 不闭合")
+    request_digest = re.search(
+        r"(?m)^request_digest\s*:=\s*(?P<body>.*?)"
+        r"^RequestSnapshot requested-backend equations:",
+        html,
+        re.DOTALL,
+    )
+    if request_digest is None or _normalize_contract_text(
+        [request_digest.group("body")]
+    ) != "hash(canonical_payload_without_derived_digests(RequestSnapshot))":
+        errors.append("Task7 request_digest 必须覆盖 exact RequestSnapshot schema")
 
     requested_arms = _requested_backend_input_arms(html)
     if requested_arms != TASK7_REQUESTED_BACKEND_INPUT_ARMS:

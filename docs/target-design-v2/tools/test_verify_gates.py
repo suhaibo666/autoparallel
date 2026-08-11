@@ -374,6 +374,46 @@ class VerifyGatesContractTest(unittest.TestCase):
                     any(expected_error in error for error in errors), errors
                 )
 
+    def test_task7_request_snapshot_rejects_direct_payload_aliases_structurally(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        anchor = (
+            "  comparison_request: ComparisonRequest | None\n"
+            "  request_digest: Digest"
+        )
+        for alias in (
+            "holdout_manifest_digest: Digest",
+            "evaluation_manifest_digest: Digest",
+        ):
+            with self.subTest(alias=alias):
+                self.assertEqual(template.count(anchor), 1)
+                mutated = template.replace(
+                    anchor,
+                    "  comparison_request: ComparisonRequest | None\n"
+                    f"  {alias}\n"
+                    "  request_digest: Digest",
+                    1,
+                )
+                errors = validate(mutated)
+                self.assertTrue(
+                    any("RequestSnapshot exact schema" in error for error in errors),
+                    errors,
+                )
+
+        digest_formula = "hash(canonical_payload_without_derived_digests(RequestSnapshot))"
+        self.assertEqual(template.count(digest_formula), 1)
+        errors = validate(
+            template.replace(
+                digest_formula,
+                "hash(canonical(RequestSnapshot.comparison_request))",
+                1,
+            )
+        )
+        self.assertTrue(
+            any("request_digest 必须覆盖 exact RequestSnapshot schema" in error for error in errors),
+            errors,
+        )
+
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         original_tag = (

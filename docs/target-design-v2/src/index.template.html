@@ -1863,17 +1863,19 @@ CanonicalConfigEvaluationInput:
   execution_deployment: ExecutionDeployment
   other_config_indexed_production_inputs
 
+CanonicalProductionEvaluationInputs:
+  common_inputs: CommonProductionInputs
+  configurations: NonEmptyOrderedMap[ConfigRef, CanonicalConfigEvaluationInput]
+
 RequestSnapshot:
-  canonical_production_evaluation_inputs:
-    common_inputs  // true shared, non-backend-specific production inputs
-    configurations:
-      NonEmptyOrderedMap[ConfigRef, CanonicalConfigEvaluationInput]
-  requested_backend_inputs:
-    OrderedMap[memory | time, RequestedBackendInput]
+  canonical_production_evaluation_inputs: CanonicalProductionEvaluationInputs
+  requested_backend_inputs: OrderedMap[memory | time, RequestedBackendInput]
   requested_backends: OrderedSet[memory | time]
   comparison_request: ComparisonRequest | None
-  request_digest :=
-    hash(canonical_payload_without_derived_digests(RequestSnapshot))
+  request_digest: Digest
+
+request_digest :=
+  hash(canonical_payload_without_derived_digests(RequestSnapshot))
 
 RequestSnapshot requested-backend equations:
   require domain(requested_backend_inputs) == {memory,time}
