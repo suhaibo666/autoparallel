@@ -1,0 +1,88 @@
+<svg class="dg" viewBox="0 0 1180 968" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="provenance 代数：certainty × roots 两条正交轴，由 readability 机器分派">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<text class="dg-note t-note" x="60" y="30.0" text-anchor="start" font-size="13.5">旧代数把 certainty 定义成 roots 的函数（「roots 必含标定才算 modeled」）。这一条同时造成两处症状：roofline 被判成事实；通信字节的嗅探门恒不可满足。</text>
+<rect class="dg-frame" x="60" y="68" width="470" height="300" rx="10"/>
+<text class="dg-ftitle t-note" x="72" y="60">轴一 · certainty —— 即使输入全对，我们施加的函数是不是真的那个函数</text>
+<text class="dg-note t-note" x="78" y="110.0" text-anchor="start" font-size="12.5">决定**形状**：答案该是点还是区间</text>
+<rect class="dg-box b-sd" x="82" y="128" width="300" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-sd" x="232.0" y="151.5" font-size="15">exact</text>
+<text class="dg-bsub dg-mono t-sd" x="232.0" y="166.5" font-size="12">只有工具自带的 ~15 个算术原语</text>
+<rect class="dg-box b-me" x="82" y="200" width="300" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-me" x="232.0" y="223.5" font-size="15">modeled</text>
+<text class="dg-bsub dg-mono t-me" x="232.0" y="238.5" font-size="12">经过一个复刻别人机制的算子</text>
+<rect class="dg-box b-as" x="82" y="272" width="300" height="52" rx="8"/>
+<text class="dg-blabel dg-mono t-as" x="232.0" y="295.5" font-size="15">assumed</text>
+<text class="dg-bsub dg-mono t-as" x="232.0" y="310.5" font-size="12">取值依赖运行期数据</text>
+<text class="dg-note t-note" x="400" y="164" text-anchor="start" font-size="12">⊔ = max</text>
+<text class="dg-note t-note" x="400" y="180" text-anchor="start" font-size="12">只升不降（P8）</text>
+<text class="dg-note t-block" x="400" y="246" text-anchor="start" font-size="12">注册域拿不到</text>
+<text class="dg-note t-block" x="400" y="262" text-anchor="start" font-size="12">exact（值域裁剪）</text>
+<text class="dg-note t-as" x="400" y="314" text-anchor="start" font-size="12">⇒ direction</text>
+<text class="dg-note t-as" x="400" y="330" text-anchor="start" font-size="12">必单侧（P6）</text>
+<rect class="dg-frame" x="566" y="68" width="554" height="300" rx="10"/>
+<text class="dg-ftitle t-note" x="578" y="60">轴二 · roots —— 输入的叶子事实来自哪里</text>
+<text class="dg-note t-note" x="584" y="110.0" text-anchor="start" font-size="12.5">决定**归因**：这条根错了，多少字节会变</text>
+<text class="dg-note dg-mono t-sd" x="584" y="144.0" text-anchor="start" font-size="11.5">事实类</text>
+<rect class="dg-box b-sd" x="668" y="126" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-sd" x="721.0" y="145.5" font-size="15">source</text>
+<rect class="dg-box b-sd" x="780" y="126" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-sd" x="833.0" y="145.5" font-size="15">configured</text>
+<rect class="dg-box b-sd" x="892" y="126" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-sd" x="945.0" y="145.5" font-size="15">transcribed</text>
+<rect class="dg-box b-sd" x="1004" y="126" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-sd" x="1057.0" y="145.5" font-size="15">calib</text>
+<text class="dg-note dg-mono t-me" x="584" y="188.0" text-anchor="start" font-size="11.5">复刻类</text>
+<rect class="dg-box b-me" x="668" y="170" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-me" x="721.0" y="189.5" font-size="15">replication</text>
+<text class="dg-note dg-mono t-as" x="584" y="232.0" text-anchor="start" font-size="11.5">人工判断类</text>
+<rect class="dg-box b-as" x="668" y="214" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-as" x="721.0" y="233.5" font-size="15">declared_semantics</text>
+<rect class="dg-box b-as" x="780" y="214" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-as" x="833.0" y="233.5" font-size="15">abstraction</text>
+<text class="dg-note dg-mono t-as" x="584" y="276.0" text-anchor="start" font-size="11.5">数据依赖</text>
+<rect class="dg-box b-as" x="668" y="258" width="106" height="30" rx="8"/>
+<text class="dg-blabel dg-mono t-as" x="721.0" y="277.5" font-size="15">assumption</text>
+<text class="dg-note t-note" x="584" y="320" text-anchor="start" font-size="12">闭集八种；⊔ = ∪。按 root 聚合是**覆盖量不是划分**（一个字节可有多个根）⇒ 报表禁止饼图。</text>
+<rect class="dg-frame" x="60" y="396" width="1060" height="214" rx="10"/>
+<text class="dg-ftitle t-block" x="72" y="388">readability —— PE 在阻断时刻计算并写入，用户不可填（AST 在不在是客观事实）</text>
+<rect class="dg-box b-block" x="90" y="434" width="220" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-block" x="200.0" y="460.5" font-size="15">readability(target)</text>
+<text class="dg-note dg-mono t-note" x="96" y="510" text-anchor="start" font-size="11">readability</text>
+<text class="dg-note dg-mono t-note" x="300" y="510" text-anchor="start" font-size="11">判据</text>
+<text class="dg-note dg-mono t-note" x="660" y="510" text-anchor="start" font-size="11">分派的根</text>
+<text class="dg-note dg-mono t-note" x="910" y="510" text-anchor="start" font-size="11">evidence.grade</text>
+<text class="dg-note dg-mono t-block" x="96" y="530.0" text-anchor="start" font-size="12.5">FULL</text>
+<text class="dg-note t-note" x="300" y="530.0" text-anchor="start" font-size="12.5">PySub 可解析全部可达体</text>
+<text class="dg-note dg-mono t-as" x="660" y="530.0" text-anchor="start" font-size="12.5">abstraction</text>
+<text class="dg-note dg-mono t-me" x="910" y="530.0" text-anchor="start" font-size="12.5">强制 reconstructed</text>
+<text class="dg-note dg-mono t-block" x="96" y="574.0" text-anchor="start" font-size="12.5">PARTIAL</text>
+<text class="dg-note t-note" x="300" y="574.0" text-anchor="start" font-size="12.5">入口可解析，体内有阻断站点</text>
+<text class="dg-note dg-mono t-as" x="660" y="574.0" text-anchor="start" font-size="12.5">abstraction（未求值站点）</text>
+<text class="dg-note dg-mono t-me" x="910" y="574.0" text-anchor="start" font-size="12.5">强制 reconstructed</text>
+<text class="dg-note dg-mono t-block" x="96" y="618.0" text-anchor="start" font-size="12.5">NONE</text>
+<text class="dg-note t-note" x="300" y="618.0" text-anchor="start" font-size="12.5">无 AST（C 扩展 / 二进制 kernel）</text>
+<text class="dg-note dg-mono t-as" x="660" y="618.0" text-anchor="start" font-size="12.5">declared_semantics</text>
+<text class="dg-note dg-mono t-me" x="910" y="618.0" text-anchor="start" font-size="12.5">可为 calibrated</text>
+<polyline class="dg-arrow a-block" points="200,478 200,508" marker-end="url(#ah)"/>
+<text class="dg-note t-block" x="90" y="480.0" text-anchor="start" font-size="11.5">self_certainty ≥ modeled，三档一律如此</text>
+<rect class="dg-frame" x="60" y="638" width="520" height="290" rx="10"/>
+<text class="dg-ftitle t-sd" x="72" y="630">P4 存在位下传 —— 承重墙，一条律解三处</text>
+<rect class="dg-box b-sd" x="84" y="676" width="300" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-sd" x="234.0" y="700.5" font-size="15">Prov(q) ⊒ Prov(exist(n))</text>
+<text class="dg-note t-note" x="84" y="754.0" text-anchor="start" font-size="12.5">· 被抽象节点的字节继承 abstraction 根</text>
+<text class="dg-note t-note" x="84" y="800.0" text-anchor="start" font-size="12.5">· 通信节点的字节继承 replication 根</text>
+<text class="dg-note t-note" x="84" y="846.0" text-anchor="start" font-size="12.5">· overlap 下 Free 时刻带标定根 ⇒ 显存继承时间根</text>
+<text class="dg-note t-block" x="84" y="900" text-anchor="start" font-size="12">没有它，抽象只污染「这是什么算子」，不污染「它产出多少字节」。</text>
+<rect class="dg-frame" x="614" y="638" width="506" height="290" rx="10"/>
+<text class="dg-ftitle t-me" x="626" y="630">P5 own_residual 的四个来源 + 兜底</text>
+<text class="dg-note dg-mono t-me" x="638" y="696.0" text-anchor="start" font-size="12.5">① G-B1a 抽象残差 hull(S_P, R_P)</text>
+<text class="dg-note dg-mono t-me" x="638" y="730.0" text-anchor="start" font-size="12.5">② 反向双候选 hull(a, b)</text>
+<text class="dg-note dg-mono t-me" x="638" y="764.0" text-anchor="start" font-size="12.5">③ 标定残差 residual_rel（grade=calibrated）</text>
+<text class="dg-note dg-mono t-me" x="638" y="798.0" text-anchor="start" font-size="12.5">④ declaration_unverified_bound</text>
+<rect class="dg-box b-block" x="638" y="824" width="458" height="56" rx="8"/>
+<text class="dg-blabel t-block" x="867.0" y="849.5" font-size="15">兜底：无一适用 ⇒ 取单侧</text>
+<text class="dg-bsub dg-mono t-block" x="867.0" y="864.5" font-size="12">**不得保持点值** —— 否则最不可信的那部分对区间宽度贡献为零</text>
+<text class="dg-note t-block" x="638" y="920" text-anchor="start" font-size="12">⇒ peak.hi 不可计算 ⇒ verdict = undetermined ⇒ 判定阻碍分解列出该标定谁</text>
+</svg>

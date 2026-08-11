@@ -1,0 +1,65 @@
+<svg class="dg" viewBox="0 0 1160 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="G2 分片传播与 G4 执行事件">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="1030" height="228" rx="10"/>
+<text class="dg-ftitle t-plan" x="72" y="52">G2 · Pass_shard：传播逐值 placement，失配处插 redistribute</text>
+<rect class="dg-box b-plan" x="90" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="165.0" y="146.5" font-size="15">段入口 x</text>
+<rect class="dg-box b-plan" x="300" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="375.0" y="146.5" font-size="15">Column</text>
+<rect class="dg-box b-plan" x="500" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="575.0" y="146.5" font-size="15">act</text>
+<rect class="dg-box b-plan" x="660" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="735.0" y="146.5" font-size="15">Row</text>
+<rect class="dg-box b-plan" x="870" y="120" width="150" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="945.0" y="146.5" font-size="15">out</text>
+<polyline class="dg-arrow a-plan" points="240,142 296,142" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-plan" points="450,142 496,142" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-plan" points="650,142 656,142" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-plan" points="810,142 866,142" marker-end="url(#ah)"/>
+<text class="dg-note dg-mono t-note" x="165" y="190" text-anchor="middle" font-size="12">{"S": tp}</text>
+<text class="dg-note dg-mono t-note" x="375" y="190" text-anchor="middle" font-size="12">{carrier: tp}</text>
+<text class="dg-note dg-mono t-note" x="575" y="190" text-anchor="middle" font-size="12">{carrier: tp}</text>
+<text class="dg-note dg-mono t-note" x="735" y="190" text-anchor="middle" font-size="12">{} + RS/AR</text>
+<text class="dg-note dg-mono t-note" x="945" y="190" text-anchor="middle" font-size="12">{}</text>
+<rect class="dg-box b-block" x="300" y="232" width="150" height="44" rx="8"/>
+<text class="dg-blabel t-block" x="375.0" y="251.5" font-size="15">注入 AG</text>
+<text class="dg-bsub dg-mono t-block" x="375.0" y="266.5" font-size="12">输入携带 S</text>
+<rect class="dg-box b-block" x="660" y="232" width="150" height="44" rx="8"/>
+<text class="dg-blabel t-block" x="735.0" y="251.5" font-size="15">注入 RS / AR</text>
+<text class="dg-bsub dg-mono t-block" x="735.0" y="266.5" font-size="12">sp / 非 sp</text>
+<polyline class="dg-arrow a-block" points="375,164 375,228" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-block" points="735,164 735,228" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="60" y="310" text-anchor="start" font-size="13">规则来自 S1 的 placement 面，而非推测。图上的「跑完无失配」只是 Pass_shard 自己的终止条件 —— 它是后置条件不是门；规则表相对 placement 格的完备性，由装载期的</text>
+<text class="dg-note t-note" x="60" y="327" text-anchor="start" font-size="13">G-P1 枚举检出。</text>
+<rect class="dg-frame" x="60" y="360" width="1030" height="268" rx="10"/>
+<text class="dg-ftitle t-plan" x="72" y="352">G4 · Pass_sched：生命周期 → 显式事件</text>
+<polyline class="dg-arrow a-note" points="110,540 1050,540" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="130" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="195.0" y="484.5" font-size="15">Allocate</text>
+<polyline class="dg-arrow a-plan" points="195,500 195,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="270" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="335.0" y="484.5" font-size="15">Bind</text>
+<polyline class="dg-arrow a-plan" points="335,500 335,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="400" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="465.0" y="484.5" font-size="15">Use</text>
+<polyline class="dg-arrow a-plan" points="465,500 465,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="530" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="595.0" y="484.5" font-size="15">Pin</text>
+<polyline class="dg-arrow a-plan" points="595,500 595,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="700" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="765.0" y="484.5" font-size="15">Retire</text>
+<polyline class="dg-arrow a-plan" points="765,500 765,534" marker-end="url(#ah)"/>
+<rect class="dg-box b-plan" x="850" y="460" width="130" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="915.0" y="484.5" font-size="15">Free</text>
+<polyline class="dg-arrow a-plan" points="915,500 915,534" marker-end="url(#ah)"/>
+<text class="dg-note t-plan" x="130" y="426" text-anchor="start" font-size="13">每个 StorageInstanceId 均有明确事件序；非 persistent 实例恰好执行一次 Allocate / Free，并在结束前执行 FinalAudit。</text>
+<rect class="dg-box b-backend" x="130" y="570" width="400" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="330.0" y="587.5" font-size="15">MemoryEventView</text>
+<text class="dg-bsub dg-mono t-backend" x="330.0" y="602.5" font-size="12">自包含 dependency / stream 偏序</text>
+<rect class="dg-box b-backend" x="620" y="570" width="400" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="820.0" y="587.5" font-size="15">ResourceRequest</text>
+<text class="dg-bsub dg-mono t-backend" x="820.0" y="602.5" font-size="12">自包含 PricingDescriptor</text>
+<text class="dg-note t-note" x="60" y="678" text-anchor="start" font-size="14">两个视图都必须自包含：后端一旦回读上游，profile / cache key 就会随上游结构变化而失效，实测画像复用也会静默失效。</text>
+</svg>

@@ -1,0 +1,21 @@
+{
+  "securityLevel": "strict",
+  "htmlLabels": false,
+  "deterministicIds": true,
+  "deterministicIDSeed": "target-design-v2",
+  "handDrawnSeed": 271828,
+  "theme": "base",
+  "flowchart": {
+    "htmlLabels": false
+  },
+  "themeVariables": {
+    "background": "transparent",
+    "fontFamily": "Arial, sans-serif",
+    "primaryColor": "#eef2f7",
+    "primaryTextColor": "#111318",
+    "primaryBorderColor": "#5a6371",
+    "lineColor": "#5a6371",
+    "secondaryColor": "#e6eefb",
+    "tertiaryColor": "#f2f4f7"
+  }
+}

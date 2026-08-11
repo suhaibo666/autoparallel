@@ -1,0 +1,65 @@
+<svg class="dg" viewBox="0 0 1160 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="语义层：注册域、DSL 编译与调用绑定">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="300" height="250" rx="10"/>
+<text class="dg-ftitle t-sem" x="72" y="52">三个物理隔离注册域</text>
+<rect class="dg-box b-sem" x="80" y="92" width="260" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="210.0" y="111.5" font-size="15">NativeOpRegistry</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="126.5" font-size="12">随版本发布，只读</text>
+<rect class="dg-box b-sem" x="80" y="152" width="260" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="210.0" y="171.5" font-size="15">UserOpRegistry</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="186.5" font-size="12">仅补充 Native 未覆盖项</text>
+<rect class="dg-box b-sem" x="80" y="212" width="260" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="210.0" y="231.5" font-size="15">NativePatchRegistry</text>
+<text class="dg-bsub dg-mono t-sem" x="210.0" y="246.5" font-size="12">完整替换 + hash 门禁</text>
+<rect class="dg-box b-sem" x="440" y="92" width="260" height="44" rx="8"/>
+<text class="dg-blabel t-sem" x="570.0" y="111.5" font-size="15">RegistryLoader</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="126.5" font-size="12">校验冲突、版本与完整性</text>
+<rect class="dg-box b-sem" x="440" y="168" width="260" height="44" rx="8"/>
+<text class="dg-blabel t-sem" x="570.0" y="187.5" font-size="15">DSL 编译</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="202.5" font-size="12">parse → typecheck → 模板展开</text>
+<rect class="dg-box b-ir" x="440" y="244" width="260" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="570.0" y="271.5" font-size="15">TypedRegistrySnapshot</text>
+<text class="dg-bsub dg-mono t-ir" x="570.0" y="286.5" font-size="12">不可变 + digest</text>
+<rect class="dg-box b-input" x="790" y="92" width="300" height="44" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="940.0" y="111.5" font-size="15">FrameworkRuntimeSnapshot</text>
+<text class="dg-bsub dg-mono t-input" x="940.0" y="126.5" font-size="12">framework / runtime 版本</text>
+<rect class="dg-box b-input" x="790" y="168" width="300" height="44" rx="8"/>
+<text class="dg-blabel t-input" x="940.0" y="187.5" font-size="15">TemplateLibrary</text>
+<text class="dg-bsub dg-mono t-input" x="940.0" y="202.5" font-size="12">固定模板，非第二执行路径</text>
+<polyline class="dg-arrow a-note" points="340,114 436,114" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570,140 570,164" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570,216 570,240" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="790,114 704,114" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="790,190 704,190" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="60" y="360" width="1030" height="230" rx="10"/>
+<text class="dg-ftitle t-ir" x="72" y="352">调用绑定（快照冻结后，不再解析 YAML、不再展开模板）</text>
+<rect class="dg-box b-input" x="90" y="402" width="210" height="48" rx="8"/>
+<text class="dg-blabel t-input" x="195.0" y="423.5" font-size="15">原子源码调用</text>
+<text class="dg-bsub dg-mono t-input" x="195.0" y="438.5" font-size="12">symbol + inputs + attrs</text>
+<rect class="dg-box b-sem" x="350" y="402" width="190" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="445.0" y="430.5" font-size="15">native 命中？</text>
+<rect class="dg-box b-sem" x="350" y="500" width="190" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="445.0" y="528.5" font-size="15">user 命中？</text>
+<rect class="dg-box b-sem" x="610" y="402" width="190" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="705.0" y="430.5" font-size="15">有有效 patch？</text>
+<rect class="dg-box b-ir" x="860" y="402" width="190" height="48" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="955.0" y="416.5" font-size="15">ResolvedCall</text>
+<text class="dg-bsub dg-mono t-ir" x="955.0" y="431.5" font-size="12">definition + attrs +</text>
+<text class="dg-bsub dg-mono t-ir" x="955.0" y="445.5" font-size="12">provenance</text>
+<rect class="dg-box b-block" x="610" y="500" width="190" height="48" rx="8"/>
+<text class="dg-blabel dg-mono t-block" x="705.0" y="521.5" font-size="15">E_OP_UNREGISTERED</text>
+<text class="dg-bsub dg-mono t-block" x="705.0" y="536.5" font-size="12">阻断 + 生成骨架</text>
+<polyline class="dg-arrow a-note" points="300,426 346,426" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="540,426 606,426" marker-end="url(#ah)"/>
+<text class="dg-alabel t-note" x="581.0" y="420.0">是</text>
+<polyline class="dg-arrow a-note" points="800,426 856,426" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="445,450 445,496" marker-end="url(#ah)"/>
+<text class="dg-alabel t-note" x="453.0" y="467.0">否</text>
+<polyline class="dg-arrow a-note" points="540,524 606,524" marker-end="url(#ah)"/>
+<text class="dg-alabel t-note" x="581.0" y="518.0">否</text>
+<polyline class="dg-arrow a-sem" points="445,548 445,570 960,570 960,454" marker-end="url(#ah)"/>
+<text class="dg-alabel t-sem" x="668" y="584">是（user 绑定）</text>
+<text class="dg-note t-sem" x="806" y="410" text-anchor="middle" font-size="12">patch 命中则优先</text>
+</svg>

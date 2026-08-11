@@ -1,0 +1,117 @@
+<svg class="dg" viewBox="0 0 1180 1046" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="总体分层：左＝该层独有不变量（G-L1 断言点），右＝策略输入">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="62" y="26" width="1040" height="78" rx="10"/>
+<text class="dg-ftitle t-input" x="74" y="18">S0 事实源（只有这五类产生新事实；表外字段 ⇒ BLK-UNCLASSIFIED）</text>
+<rect class="dg-box b-input" x="76" y="52" width="196" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="174.0" y="69.5" font-size="15">框架源码</text>
+<text class="dg-bsub dg-mono t-input" x="174.0" y="84.5" font-size="12">AST + 版本</text>
+<rect class="dg-box b-input" x="282" y="52" width="196" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="380.0" y="69.5" font-size="15">算子语义快照</text>
+<text class="dg-bsub dg-mono t-input" x="380.0" y="84.5" font-size="12">三注册域</text>
+<rect class="dg-box b-input" x="488" y="52" width="196" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="586.0" y="69.5" font-size="15">EnvFacts</text>
+<text class="dg-bsub dg-mono t-input" x="586.0" y="84.5" font-size="12">HBM / 设备</text>
+<rect class="dg-box b-input" x="694" y="52" width="196" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="792.0" y="69.5" font-size="15">CalibrationSet</text>
+<text class="dg-bsub dg-mono t-input" x="792.0" y="84.5" font-size="12">域片 + 实测点</text>
+<rect class="dg-box b-input" x="900" y="52" width="196" height="40" rx="8"/>
+<text class="dg-blabel t-input" x="998.0" y="69.5" font-size="15">八份 *Spec</text>
+<text class="dg-bsub dg-mono t-input" x="998.0" y="84.5" font-size="12">使用者配置</text>
+<rect class="dg-frame" x="62" y="128" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-ir" x="392" y="140" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="570.0" y="160.5" font-size="15">G0　CoreIR</text>
+<text class="dg-bsub dg-mono t-ir" x="570.0" y="175.5" font-size="12">PE(Src, ModelSpec, EnvFacts, π₀)</text>
+<text class="dg-note t-ir" x="62" y="158.0" text-anchor="start" font-size="11.5">policy(·) ∉ roots</text>
+<text class="dg-note t-ir" x="62" y="173.5" text-anchor="start" font-size="11.5">digest 在策略扰动下不变</text>
+<rect class="dg-frame" x="62" y="210" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-sem" x="392" y="222" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-sem" x="570.0" y="242.5" font-size="15">G0.5　ImplIR</text>
+<text class="dg-bsub dg-mono t-sem" x="570.0" y="257.5" font-size="12">impl_select ∘ fusion_logical ∘ precision_fwd</text>
+<text class="dg-note t-sem" x="62" y="240.0" text-anchor="start" font-size="11.5">op 集合自此定稿</text>
+<rect class="dg-box b-input" x="782" y="224" width="320" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="942.0" y="249.5" font-size="15">ImplSpec · PrecisionSpec</text>
+<polyline class="dg-arrow a-input" points="782,245 748,245" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570.0,198 570.0,218" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="62" y="292" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-derived" x="392" y="304" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="570.0" y="324.5" font-size="15">G1　TrainIR</text>
+<text class="dg-bsub dg-mono t-derived" x="570.0" y="339.5" font-size="12">Pass_train_step</text>
+<text class="dg-note t-derived" x="62" y="322.0" text-anchor="start" font-size="11.5">shape(grad_out[i]) == shape(in_i)</text>
+<text class="dg-note t-derived" x="62" y="337.5" text-anchor="start" font-size="11.5">每条梯度边恰一 producer</text>
+<polyline class="dg-arrow a-note" points="570.0,280 570.0,300" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="62" y="374" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-derived" x="392" y="386" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="570.0" y="406.5" font-size="15">G1.7　PrecIR</text>
+<text class="dg-bsub dg-mono t-derived" x="570.0" y="421.5" font-size="12">Pass_precision_opt</text>
+<text class="dg-note t-derived" x="62" y="404.0" text-anchor="start" font-size="11.5">新增节点下游不含 grad_role</text>
+<text class="dg-note t-derived" x="62" y="419.5" text-anchor="start" font-size="11.5">持久字节守恒</text>
+<rect class="dg-box b-input" x="782" y="388" width="320" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="942.0" y="413.5" font-size="15">PrecisionSpec</text>
+<polyline class="dg-arrow a-input" points="782,409 748,409" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570.0,362 570.0,382" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="62" y="456" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-plan" x="392" y="468" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="570.0" y="488.5" font-size="15">G2　ShardIR</text>
+<text class="dg-bsub dg-mono t-plan" x="570.0" y="503.5" font-size="12">Pass_shard</text>
+<text class="dg-note t-plan" x="62" y="486.0" text-anchor="start" font-size="11.5">placement 无失配</text>
+<text class="dg-note t-plan" x="62" y="501.5" text-anchor="start" font-size="11.5">桶数 = 真机归约 op 数</text>
+<rect class="dg-box b-input" x="782" y="470" width="320" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="942.0" y="488.0" font-size="15">ParallelSpec · PlacementAnnotation</text>
+<text class="dg-blabel dg-mono t-input" x="942.0" y="503.0" font-size="15">DistOptSpec</text>
+<polyline class="dg-arrow a-input" points="782,491 748,491" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570.0,444 570.0,464" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="62" y="538" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-plan" x="392" y="550" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="570.0" y="570.5" font-size="15">G2.5</text>
+<text class="dg-bsub dg-mono t-plan" x="570.0" y="585.5" font-size="12">Pass_fusion_dist</text>
+<text class="dg-note t-plan" x="62" y="568.0" text-anchor="start" font-size="11.5">融合前后通信节点语义多重集守恒</text>
+<polyline class="dg-arrow a-note" points="570.0,526 570.0,546" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="62" y="620" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-plan" x="392" y="632" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="570.0" y="652.5" font-size="15">G3　RematIR</text>
+<text class="dg-bsub dg-mono t-plan" x="570.0" y="667.5" font-size="12">Pass_remat</text>
+<text class="dg-note t-plan" x="62" y="650.0" text-anchor="start" font-size="11.5">stage_role==remat ⇒ origin 是前向节点</text>
+<rect class="dg-box b-input" x="782" y="634" width="320" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="942.0" y="659.5" font-size="15">RematSpec</text>
+<polyline class="dg-arrow a-input" points="782,655 748,655" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570.0,608 570.0,628" marker-end="url(#ah)"/>
+<rect class="dg-frame" x="62" y="702" width="1040" height="70" rx="10"/>
+<rect class="dg-box b-plan" x="392" y="714" width="356" height="46" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="570.0" y="734.5" font-size="15">G4　SchedIR</text>
+<text class="dg-bsub dg-mono t-plan" x="570.0" y="749.5" font-size="12">Pass_sched</text>
+<text class="dg-note t-plan" x="62" y="732.0" text-anchor="start" font-size="11.5">事件不重不漏、偏序无环</text>
+<text class="dg-note t-plan" x="62" y="747.5" text-anchor="start" font-size="11.5">roots(t_free)∋calib ⟺ timing_dependent</text>
+<rect class="dg-box b-input" x="782" y="716" width="320" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="942.0" y="741.5" font-size="15">ScheduleSpec · CalibrationSet</text>
+<polyline class="dg-arrow a-input" points="782,737 748,737" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="570.0,690 570.0,710" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-input" points="570.0,92 570.0,124" marker-end="url(#ah)"/>
+<text class="dg-note dg-mono t-note" x="62" y="122" text-anchor="start" font-size="11">独有不变量（断言点）</text>
+<text class="dg-note dg-mono t-note" x="782" y="122" text-anchor="start" font-size="11">策略输入</text>
+<text class="dg-note t-block" x="782" y="160.0" text-anchor="start" font-size="11.5">（G0 右侧空着 —— 这就是 policy-free）</text>
+<rect class="dg-frame" x="62" y="800" width="1040" height="108" rx="10"/>
+<text class="dg-ftitle t-backend" x="74" y="792">两个只读后端：零新事实（不得引入新的 root 种类）</text>
+<rect class="dg-box b-backend" x="120" y="828" width="380" height="62" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="310.0" y="856.5" font-size="15">MemorySimulator</text>
+<text class="dg-bsub dg-mono t-backend" x="310.0" y="871.5" font-size="12">liveness / allocator / peak 区间</text>
+<rect class="dg-box b-backend" x="664" y="828" width="380" height="62" rx="8"/>
+<text class="dg-blabel dg-mono t-backend" x="854.0" y="856.5" font-size="15">TimeSimulator</text>
+<text class="dg-bsub dg-mono t-backend" x="854.0" y="871.5" font-size="12">定价 / 竞争 / 两级 DES</text>
+<polyline class="dg-arrow a-note" points="452,772 310,812 310,824" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="688,772 854,812 854,824" marker-end="url(#ah)"/>
+<text class="dg-note t-block" x="582" y="876" text-anchor="middle" font-size="12">互不 import</text>
+<text class="dg-note t-block" x="582" y="892" text-anchor="middle" font-size="12">不回写上游</text>
+<rect class="dg-frame" x="62" y="928" width="1040" height="84" rx="10"/>
+<text class="dg-ftitle t-note" x="74" y="920">报告</text>
+<rect class="dg-box b-note" x="392" y="950" width="356" height="50" rx="8"/>
+<text class="dg-blabel dg-mono t-note" x="570.0" y="972.5" font-size="15">oom_verdict : Q3[Bool]</text>
+<text class="dg-bsub dg-mono t-note" x="570.0" y="987.5" font-size="12">peak 只有区间形态；undetermined 附判定阻碍分解</text>
+<polyline class="dg-arrow a-note" points="310,890 392,968" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="854,890 748,968" marker-end="url(#ah)"/>
+<text class="dg-note t-block" x="76" y="976.0" text-anchor="start" font-size="11.5">显存链：无外部裁判</text>
+<text class="dg-note t-block" x="76" y="991.5" text-anchor="start" font-size="11.5">（全部为自洽性检查）</text>
+<text class="dg-note t-sd" x="1040" y="976.0" text-anchor="end" font-size="11.5">时间链：op 级序列</text>
+<text class="dg-note t-sd" x="1040" y="991.5" text-anchor="end" font-size="11.5">与时长为唯一 oracle</text>
+</svg>

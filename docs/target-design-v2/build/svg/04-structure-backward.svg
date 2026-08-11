@@ -1,0 +1,63 @@
+<svg class="dg" viewBox="0 0 1160 780" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="G0 CoreIR 与 G1 TrainIR：源码给结构，注册域给语义">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="dg-ah"/></marker>
+</defs>
+<rect class="dg-frame" x="60" y="60" width="1030" height="190" rx="10"/>
+<text class="dg-ftitle t-ir" x="72" y="52">G0 · CoreIR = PE(Src, ModelSpec, EnvFacts, π₀)</text>
+<rect class="dg-box b-input" x="90" y="100" width="240" height="48" rx="8"/>
+<text class="dg-blabel t-input" x="210.0" y="121.5" font-size="15">PE · 偏特化</text>
+<text class="dg-bsub dg-mono t-input" x="210.0" y="136.5" font-size="12">在 π₀ 处内联并折叠 guard</text>
+<rect class="dg-box b-input" x="90" y="172" width="240" height="48" rx="8"/>
+<text class="dg-blabel dg-mono t-input" x="210.0" y="193.5" font-size="15">π₀ 残差</text>
+<text class="dg-bsub dg-mono t-input" x="210.0" y="208.5" font-size="12">symbol / 数据流 / attrs 字面值</text>
+<rect class="dg-box b-sem" x="430" y="136" width="240" height="48" rx="8"/>
+<text class="dg-blabel t-sem" x="550.0" y="164.5" font-size="15">SemanticResolver</text>
+<rect class="dg-box b-ir" x="430" y="68" width="240" height="40" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="550.0" y="85.5" font-size="15">TypedRegistrySnapshot</text>
+<text class="dg-bsub dg-mono t-ir" x="550.0" y="100.5" font-size="12">(输入shape, attrs) → 语义</text>
+<rect class="dg-box b-ir" x="780" y="136" width="280" height="60" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="920.0" y="163.5" font-size="15">CoreIR</text>
+<text class="dg-bsub dg-mono t-ir" x="920.0" y="178.5" font-size="12">OpInstance / TensorValue / Storage</text>
+<polyline class="dg-arrow a-note" points="210,148 210,168" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="330,196 426,170" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-ir" points="550,108 550,132" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-note" points="670,160 776,160" marker-end="url(#ah)"/>
+<text class="dg-note t-note" x="90" y="246" text-anchor="start" font-size="13">源码仅提供三类信息：符号、数据流、attrs 字面值。注册表提供完整语义。两者不重叠，因此结构上不会出现「两个真相源」。</text>
+<rect class="dg-frame" x="60" y="300" width="1030" height="300" rx="10"/>
+<text class="dg-ftitle t-derived" x="72" y="292">G1 · TrainIR（反向）与 G3 · RematIR（重算副本）：三类节点同构</text>
+<rect class="dg-box b-ir" x="100" y="352" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="160.0" y="377.5" font-size="15">op1</text>
+<rect class="dg-box b-ir" x="260" y="352" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="320.0" y="377.5" font-size="15">op2</text>
+<rect class="dg-box b-ir" x="420" y="352" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-ir" x="480.0" y="377.5" font-size="15">op3</text>
+<polyline class="dg-arrow a-ir" points="220,373 256,373" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-ir" points="380,373 416,373" marker-end="url(#ah)"/>
+<text class="dg-note t-ir" x="100" y="334" text-anchor="start" font-size="13">CoreIR 前向</text>
+<rect class="dg-box b-derived" x="100" y="480" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="160.0" y="505.5" font-size="15">op1′</text>
+<rect class="dg-box b-derived" x="260" y="480" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="320.0" y="505.5" font-size="15">op2′</text>
+<rect class="dg-box b-plan" x="420" y="480" width="150" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-plan" x="495.0" y="498.5" font-size="15">op2ʳ</text>
+<text class="dg-bsub dg-mono t-plan" x="495.0" y="513.5" font-size="12">stage_role=remat</text>
+<rect class="dg-box b-derived" x="610" y="480" width="120" height="42" rx="8"/>
+<text class="dg-blabel dg-mono t-derived" x="670.0" y="505.5" font-size="15">op3′</text>
+<polyline class="dg-arrow a-derived" points="610,501 574,501" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-derived" points="420,501 384,501" marker-end="url(#ah)"/>
+<polyline class="dg-arrow a-derived" points="260,501 224,501" marker-end="url(#ah)"/>
+<text class="dg-note t-derived" x="100" y="552" text-anchor="start" font-size="13">TrainIR 反向（右→左）</text>
+<polyline class="dg-arrow a-plan dg-dash" points="320,394 320,442 495,442 495,476" marker-end="url(#ah)"/>
+<text class="dg-alabel t-plan" x="415.5" y="432.5">复制</text>
+<rect class="dg-box b-ir" x="790" y="396" width="280" height="128" rx="8"/>
+<text class="dg-blabel t-ir" x="930.0" y="450.5" font-size="15">统一节点类型</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="465.5" font-size="12">前向 / 反向 / 重算三类节点同构，</text>
+<text class="dg-bsub dg-mono t-ir" x="930.0" y="479.5" font-size="12">共用同一套形状·类型·布局·资源计算机制</text>
+<text class="dg-note t-plan" x="610" y="552" text-anchor="start" font-size="13">重算节点 = 前向 op2 的副本：同 SemanticId、新 NodeId、origin 回指。插在该区</text>
+<text class="dg-note t-plan" x="610" y="569" text-anchor="start" font-size="13">域反向节点之前。</text>
+<text class="dg-note t-note" x="60" y="654" text-anchor="start" font-size="14">反向必须是派生层而不能写进 G0：G0 的定义就是 policy-free（∀f: policy(·) ∉ f.roots），而重算范围是策略。这条不变量是 CoreIR 唯一的断言点 —— 写进去就</text>
+<text class="dg-note t-note" x="60" y="672" text-anchor="start" font-size="14">没地方陈述它了（G-L1）。</text>
+<text class="dg-note t-note" x="60" y="700" text-anchor="start" font-size="14">一组本来要写成「契约字段」的东西因此变成图里的普通节点与边：autograd 契约就是边，梯度值规格就是 TensorValue + StorageRelation，fan-in 累加就是一个</text>
+<text class="dg-note t-note" x="60" y="718" text-anchor="start" font-size="14">add 节点。</text>
+<text class="dg-note t-note" x="60" y="746" text-anchor="start" font-size="14">不变量：改写 pass 只读上游、从不回写；RematSpec 是 G3 的输入；各层 digest 独立（G0 必须用内容 digest，否则其断言恒真）。</text>
+</svg>

@@ -1,0 +1,830 @@
+
+==============================================================================
+0. 规模与解析
+==============================================================================
+mindformers: found=1254 parsed=1254 failed=0
+   all_repo                               files=1254  lines=288101   funcs=9611   classes=1818
+   framework                              files=598   lines=184334   funcs=5736   classes=1015
+   model_subgraph                         files=279   lines=73678    funcs=2144   classes=466
+   import_closure_from_model_entries      files=459   lines=148536   funcs=4706   classes=845
+megatron: found=1243 parsed=1243 failed=0
+   all_repo                               files=1243  lines=423037   funcs=14062  classes=2084
+   framework                              files=543   lines=209426   funcs=5753   classes=796
+   model_subgraph                         files=159   lines=76862    funcs=1959   classes=317
+   import_closure_from_model_entries      files=206   lines=120162   funcs=3507   classes=472
+
+==============================================================================
+1. 关注构件频次 (framework / model_subgraph)  count(files)
+==============================================================================
+构件                         | mindformers fw / model | megatron fw / model   
+------------------------------------------------------------------------------
+推导式-list                   | 397(131f) / 101(40f)   | 774(166f) / 135(43f)  
+推导式-dict                   | 107(57f) / 9(8f)       | 114(62f) / 20(13f)    
+推导式-set                    | 9(6f) / 6(4f)          | 14(12f) / 4(2f)       
+生成器表达式                     | 205(75f) / 46(23f)     | 221(91f) / 60(21f)    
+推导式带filter                 | 135(60f) / 36(14f)     | 175(82f) / 31(16f)    
+多重for推导                    | 7(5f) / 1(1f)          | 45(19f) / 8(4f)       
+函数装饰器                      | 950(221f) / 342(94f)   | 1094(212f) / 487(78f) 
+带参装饰器                      | 136(64f) / 42(22f)     | 180(73f) / 83(36f)    
+类装饰器                       | 231(139f) / 76(67f)    | 150(91f) / 50(33f)    
+*args                      | 146(73f) / 67(37f)     | 178(72f) / 95(35f)    
+**kwargs                   | 603(196f) / 174(65f)   | 187(102f) / 85(37f)   
+默认值                        | 1454(397f) / 638(182f) | 1496(321f) / 589(108f)
+kwonly                     | 34(16f) / 20(9f)       | 159(78f) / 69(34f)    
+posonly                    | 0(0f) / 0(0f)          | 38(10f) / 24(7f)      
+getattr                    | 450(101f) / 162(31f)   | 581(122f) / 156(35f)  
+  getattr动态名               | 110(48f) / 19(8f)      | 122(51f) / 25(9f)     
+setattr                    | 55(28f) / 18(9f)       | 165(52f) / 93(20f)    
+  setattr动态名               | 37(19f) / 9(7f)        | 58(35f) / 21(9f)      
+hasattr                    | 311(100f) / 86(34f)    | 487(112f) / 199(39f)  
+delattr                    | 3(2f) / 3(2f)          | 12(8f) / 4(2f)        
+exec                       | 0(0f) / 0(0f)          | 0(0f) / 0(0f)         
+eval                       | 3(2f) / 0(0f)          | 10(7f) / 2(2f)        
+compile                    | 27(14f) / 7(4f)        | 9(5f) / 2(1f)         
+__import__                 | 1(1f) / 1(1f)          | 1(1f) / 1(1f)         
+importlib import           | 15(14f) / 0(0f)        | 20(18f) / 3(2f)       
+importlib 调用               | 19(13f) / 2(1f)        | 23(16f) / 3(2f)       
+type()三参造类                 | 0(0f) / 0(0f)          | 2(1f) / 0(0f)         
+globals()                  | 2(2f) / 1(1f)          | 3(2f) / 1(1f)         
+locals()                   | 5(5f) / 1(1f)          | 13(12f) / 8(8f)       
+vars()                     | 2(2f) / 1(1f)          | 16(12f) / 2(2f)       
+functools.partial          | 0(0f) / 0(0f)          | 21(10f) / 4(1f)       
+元类 metaclass=              | 1(1f) / 0(0f)          | 1(1f) / 0(0f)         
+动态基类(调用)                   | 0(0f) / 0(0f)          | 0(0f) / 0(0f)         
+多重继承                       | 43(39f) / 33(33f)      | 39(27f) / 9(9f)       
+单继承                        | 754(305f) / 354(162f)  | 472(217f) / 230(84f)  
+无基类                        | 218(149f) / 79(60f)    | 285(165f) / 78(46f)   
+super()调用                  | 641(285f) / 337(162f)  | 317(130f) / 184(61f)  
+super()零参                  | 511(246f) / 259(141f)  | 295(124f) / 171(57f)  
+def __getattr__            | 5(5f) / 2(2f)          | 5(4f) / 1(1f)         
+def __setattr__            | 4(4f) / 2(2f)          | 4(4f) / 0(0f)         
+嵌套def(闭包)                  | 5736(498f) / 2144(226f) | 5753(425f) / 1959(126f)
+nonlocal                   | 4(3f) / 1(1f)          | 21(7f) / 0(0f)        
+global 声明                  | 30(14f) / 19(8f)       | 267(42f) / 46(12f)    
+yield                      | 34(18f) / 12(6f)       | 54(34f) / 13(6f)      
+yield from                 | 0(0f) / 0(0f)          | 3(2f) / 0(0f)         
+async def                  | 0(0f) / 0(0f)          | 101(23f) / 0(0f)      
+await                      | 0(0f) / 0(0f)          | 118(21f) / 0(0f)      
+try                        | 217(115f) / 49(33f)    | 505(207f) / 127(58f)  
+except handler             | 248(114f) / 53(32f)    | 474(203f) / 121(58f)  
+裸except                    | 3(2f) / 0(0f)          | 33(19f) / 10(8f)      
+finally                    | 12(11f) / 3(3f)        | 40(30f) / 8(7f)       
+raise                      | 2159(325f) / 784(138f) | 1120(242f) / 436(76f) 
+with                       | 316(113f) / 83(21f)    | 365(115f) / 148(42f)  
+async with                 | 0(0f) / 0(0f)          | 7(3f) / 0(0f)         
+assert                     | 46(11f) / 8(3f)        | 2366(261f) / 869(92f) 
+match                      | 0(0f) / 0(0f)          | 1(1f) / 1(1f)         
+del                        | 61(29f) / 15(11f)      | 140(56f) / 49(15f)    
+lambda                     | 104(49f) / 25(12f)     | 213(85f) / 61(19f)    
+条件表达式 a if c else b        | 1039(249f) / 457(109f) | 1126(227f) / 495(83f) 
+walrus :=                  | 0(0f) / 0(0f)          | 28(17f) / 9(5f)       
+链式比较                       | 39(18f) / 11(4f)       | 43(25f) / 12(10f)     
+f-string                   | 2608(298f) / 637(108f) | 2439(272f) / 684(76f) 
+调用*解包                      | 130(52f) / 31(18f)     | 286(103f) / 163(48f)  
+调用**解包                     | 567(168f) / 144(53f)   | 343(124f) / 158(42f)  
+字面量**解包                    | 13(9f) / 4(3f)         | 17(12f) / 1(1f)       
+赋值序列解包                     | 1173(238f) / 564(108f) | 1360(220f) / 744(88f) 
+赋值星号解包                     | 10(6f) / 2(2f)         | 2(2f) / 2(2f)         
+链式赋值                       | 4(4f) / 1(1f)          | 22(15f) / 12(7f)      
+import *                   | 0(0f) / 0(0f)          | 9(8f) / 4(4f)         
+相对 import                  | 416(136f) / 166(52f)   | 422(136f) / 42(16f)   
+
+==============================================================================
+2. 属性链长度分布 (framework)
+==============================================================================
+mindformers: {'1': 55565, '2': 6553, '3': 647, '4': 104, '5': 8, '6': 5, '7': 1}
+   model: {'1': 24690, '2': 2490, '3': 193, '4': 13, '5': 3, '6': 2}
+megatron: {'1': 48651, '2': 8096, '3': 551, '4': 42, '5': 6}
+   model: {'1': 19559, '2': 3400, '3': 302, '4': 21, '5': 2}
+
+==============================================================================
+3. 类继承深度直方图 (仓内近似)
+==============================================================================
+mindformers fw={'0': 184, '1': 410, '2': 156, '3': 84, '4': 7}
+        model={'0': 60, '1': 196, '2': 63, '3': 50, '4': 6}
+megatron fw={'0': 282, '1': 283, '2': 126, '3': 66, '4': 21, '5': 6}
+        model={'0': 77, '1': 150, '2': 51, '3': 27, '4': 8, '5': 1}
+
+==============================================================================
+4. PySub 覆盖率曲线
+==============================================================================
+
+--- framework.funcs_only.seed_core ---
+mindformers (total=5736):
+   N=0   +<seed:30 tags>                     1868   32.57%
+   N=1   +decorator.func                     2285   39.84%
+   N=2   +ctl.raise                          2747   47.89%
+   N=3   +unpack.assign_seq                  3117   54.34%
+   N=4   +expr.IfExp                         3382   58.96%
+   N=5   +arg.kwarg                          3553   61.94%
+   N=6   +unpack.call_dstar                  3717   64.80%
+   N=7   +comp.list                          3830   66.77%
+   N=8   +ctl.with                           3932   68.55%
+   N=9   +oop.super_call                     4036   70.36%
+   N=10  +oop.super_zeroarg                  4430   77.23%
+   N=11  +decorator.func_parameterized       4524   78.87%
+   N=12  +comp.genexp                        4615   80.46%
+   N=13  +arg.vararg                         4692   81.80%
+   N=14  +comp.filter                        4742   82.67%
+   N=15  +comp.dict                          4796   83.61%
+   N=16  +expr.Lambda                        4838   84.34%
+   N=17  +ctl.del                            4880   85.08%
+   N=18  +imp.from_import                    4916   85.70%
+   N=19  +expr.chained_compare               4941   86.14%
+   N=20  +imp.import                         4960   86.47%
+   N=21  +scope.global                       4978   86.78%
+   N=22  +ctl.assert                         4996   87.10%
+   N=23  +gen.yield                          5014   87.41%
+   N=24  +dyn.compile                        5025   87.61%
+   N=25  +unpack.starred                     5035   87.78%
+   N=26  +unpack.call_star                   5109   89.07%
+   N=27  +unpack.assign_star                 5118   89.23%
+   N=28  +unpack.dict_star                   5127   89.38%
+   N=29  +scope.nonlocal                     5136   89.54%
+   N=30  +comp.set                           5141   89.63%
+   N=31  +assign.chained                     5146   89.71%
+   N=32  +comp.multi_for                     5150   89.78%
+   N=33  +dyn.importlib_call                 5154   89.85%
+   N=34  +dyn.def___setattr__                5158   89.92%
+   N=35  +dyn.def___getattr__                5161   89.98%
+   N=36  +dyn.locals                         5163   90.01%
+   N=37  +dyn.eval                           5165   90.05%
+   N=38  +ctl.with_multi                     5167   90.08%
+   N=39  +class.bases1                       5168   90.10%
+     >= 50% at N=3
+     >= 80% at N=12
+     >= 90% at N=36
+     >= 95% at N=47
+     >= 99% at N=53
+     >= 100% at N=61
+megatron (total=5753):
+   N=0   +<seed:30 tags>                     1779   30.92%
+   N=1   +decorator.func                     2283   39.68%
+   N=2   +ctl.assert                         2550   44.32%
+   N=3   +unpack.assign_seq                  2803   48.72%
+   N=4   +ctl.raise                          3038   52.81%
+   N=5   +expr.IfExp                         3251   56.51%
+   N=6   +comp.list                          3386   58.86%
+   N=7   +scope.global                       3495   60.75%
+   N=8   +ctl.with                           3597   62.52%
+   N=9   +decorator.func_parameterized       3695   64.23%
+   N=10  +imp.from_import                    3782   65.74%
+   N=11  +expr.Lambda                        3854   66.99%
+   N=12  +comp.genexp                        3919   68.12%
+   N=13  +comp.filter                        3977   69.13%
+   N=14  +unpack.call_dstar                  4028   70.02%
+   N=15  +arg.vararg                         4073   70.80%
+   N=16  +arg.kwarg                          4122   71.65%
+   N=17  +comp.dict                          4168   72.45%
+   N=18  +ctl.del                            4211   73.20%
+   N=19  +arg.posonly                        4245   73.79%
+   N=20  +imp.import                         4267   74.17%
+   N=21  +expr.chained_compare               4289   74.55%
+   N=22  +def.async_func                     4309   74.90%
+   N=23  +async.await                        4353   75.67%
+   N=24  +unpack.starred                     4371   75.98%
+   N=25  +unpack.call_star                   4529   78.72%
+   N=26  +comp.multi_for                     4549   79.07%
+   N=27  +imp.relative                       4568   79.40%
+   N=28  +scope.nonlocal                     4586   79.72%
+   N=29  +gen.yield                          4603   80.01%
+   N=30  +expr.walrus                        4620   80.31%
+   N=31  +unpack.dict_star                   4633   80.53%
+   N=32  +assign.chained                     4644   80.72%
+   N=33  +comp.set                           4655   80.91%
+   N=34  +oop.super_call                     4665   81.09%
+   N=35  +oop.super_zeroarg                  4884   84.89%
+   N=36  +dyn.importlib_call                 4892   85.03%
+   N=37  +dyn.functools_partial              4900   85.17%
+   N=38  +dyn.locals                         4906   85.28%
+   N=39  +ctl.async_with                     4912   85.38%
+     >= 50% at N=4
+     >= 80% at N=29
+     >= 90% at N=61
+     >= 95% at N=66
+     >= 99% at N=70
+     >= 100% at N=None
+
+--- model_subgraph.funcs_only.seed_core ---
+mindformers (total=2144):
+   N=0   +<seed:30 tags>                      732   34.14%
+   N=1   +unpack.assign_seq                   914   42.63%
+   N=2   +decorator.func                     1085   50.61%
+   N=3   +ctl.raise                          1241   57.88%
+   N=4   +expr.IfExp                         1364   63.62%
+   N=5   +oop.super_call                     1431   66.74%
+   N=6   +oop.super_zeroarg                  1619   75.51%
+   N=7   +arg.kwarg                          1668   77.80%
+   N=8   +unpack.call_dstar                  1720   80.22%
+   N=9   +arg.vararg                         1766   82.37%
+   N=10  +comp.list                          1796   83.77%
+   N=11  +decorator.func_parameterized       1817   84.75%
+   N=12  +comp.genexp                        1835   85.59%
+   N=13  +ctl.with                           1853   86.43%
+   N=14  +expr.Lambda                        1865   86.99%
+   N=15  +comp.filter                        1876   87.50%
+   N=16  +expr.chained_compare               1888   88.06%
+   N=17  +scope.global                       1898   88.53%
+   N=18  +ctl.del                            1907   88.95%
+   N=19  +imp.from_import                    1915   89.32%
+   N=20  +imp.import                         1923   89.69%
+   N=21  +comp.dict                          1928   89.92%
+   N=22  +gen.yield                          1932   90.11%
+   N=23  +comp.set                           1935   90.25%
+   N=24  +ctl.assert                         1938   90.39%
+   N=25  +dyn.def___getattr__                1940   90.48%
+   N=26  +dyn.def___setattr__                1942   90.58%
+   N=27  +unpack.starred                     1944   90.67%
+   N=28  +unpack.call_star                   1965   91.65%
+   N=29  +unpack.dict_star                   1969   91.84%
+   N=30  +scope.nonlocal                     1972   91.98%
+   N=31  +dyn.compile                        1974   92.07%
+   N=32  +unpack.assign_star                 1976   92.16%
+   N=33  +assign.chained                     1978   92.26%
+   N=34  +dyn.importlib_call                 1979   92.30%
+   N=35  +dyn.getattr                        1979   92.30%
+   N=36  +dyn.getattr_conststr               2028   94.59%
+   N=37  +dyn.getattr_dynamic                2038   95.06%
+   N=38  +comp.multi_for                     2039   95.10%
+   N=39  +dyn.setattr                        2039   95.10%
+     >= 50% at N=2
+     >= 80% at N=8
+     >= 90% at N=22
+     >= 95% at N=37
+     >= 99% at N=47
+     >= 100% at N=56
+megatron (total=1959):
+   N=0   +<seed:30 tags>                      532   27.16%
+   N=1   +decorator.func                      730   37.26%
+   N=2   +unpack.assign_seq                   852   43.49%
+   N=3   +ctl.assert                          928   47.37%
+   N=4   +expr.IfExp                         1017   51.91%
+   N=5   +ctl.raise                          1080   55.13%
+   N=6   +ctl.with                           1123   57.33%
+   N=7   +decorator.func_parameterized       1171   59.77%
+   N=8   +imp.from_import                    1212   61.87%
+   N=9   +comp.list                          1244   63.50%
+   N=10  +scope.global                       1270   64.83%
+   N=11  +comp.genexp                        1294   66.05%
+   N=12  +unpack.call_dstar                  1318   67.28%
+   N=13  +expr.Lambda                        1344   68.61%
+   N=14  +arg.posonly                        1368   69.83%
+   N=15  +arg.vararg                         1391   71.01%
+   N=16  +arg.kwarg                          1403   71.62%
+   N=17  +comp.filter                        1415   72.23%
+   N=18  +unpack.starred                     1425   72.74%
+   N=19  +unpack.call_star                   1509   77.03%
+   N=20  +imp.import                         1518   77.49%
+   N=21  +ctl.del                            1527   77.95%
+   N=22  +expr.chained_compare               1537   78.46%
+   N=23  +gen.yield                          1545   78.87%
+   N=24  +expr.walrus                        1553   79.27%
+   N=25  +comp.dict                          1560   79.63%
+   N=26  +assign.chained                     1567   79.99%
+   N=27  +comp.multi_for                     1573   80.30%
+   N=28  +comp.set                           1577   80.50%
+   N=29  +oop.super_call                     1581   80.70%
+   N=30  +oop.super_zeroarg                  1703   86.93%
+   N=31  +imp.relative                       1706   87.09%
+   N=32  +dyn.locals                         1709   87.24%
+   N=33  +dyn.compile                        1711   87.34%
+   N=34  +unpack.dict_star                   1713   87.44%
+   N=35  +ctl.with_multi                     1715   87.55%
+   N=36  +unpack.assign_star                 1717   87.65%
+   N=37  +dyn.importlib_call                 1719   87.75%
+   N=38  +dyn.functools_partial              1721   87.85%
+   N=39  +dyn.def___getattr__                1722   87.90%
+     >= 50% at N=4
+     >= 80% at N=27
+     >= 90% at N=47
+     >= 95% at N=54
+     >= 99% at N=55
+     >= 100% at N=62
+
+--- model_subgraph.funcs_and_module.seed_core ---
+mindformers (total=2423):
+   N=0   +<seed:30 tags>                      762   31.45%
+   N=1   +unpack.assign_seq                   944   38.96%
+   N=2   +decorator.func                     1115   46.02%
+   N=3   +ctl.raise                          1271   52.46%
+   N=4   +expr.IfExp                         1394   57.53%
+   N=5   +imp.from_import                    1484   61.25%
+   N=6   +imp.import                         1583   65.33%
+   N=7   +oop.super_call                     1650   68.10%
+   N=8   +oop.super_zeroarg                  1842   76.02%
+   N=9   +arg.kwarg                          1894   78.17%
+   N=10  +unpack.call_dstar                  1946   80.31%
+   N=11  +imp.relative                       1996   82.38%
+   N=12  +arg.vararg                         2042   84.28%
+   N=13  +comp.list                          2072   85.51%
+   N=14  +decorator.func_parameterized       2094   86.42%
+   N=15  +comp.genexp                        2112   87.17%
+   N=16  +ctl.with                           2130   87.91%
+   N=17  +expr.Lambda                        2144   88.48%
+   N=18  +comp.filter                        2155   88.94%
+   N=19  +expr.chained_compare               2167   89.44%
+   N=20  +ctl.del                            2177   89.85%
+   N=21  +scope.global                       2187   90.26%
+   N=22  +comp.dict                          2192   90.47%
+   N=23  +dyn.compile                        2196   90.63%
+   N=24  +gen.yield                          2200   90.80%
+   N=25  +comp.set                           2203   90.92%
+   N=26  +ctl.assert                         2206   91.04%
+   N=27  +dyn.def___getattr__                2208   91.13%
+   N=28  +dyn.def___setattr__                2210   91.21%
+   N=29  +unpack.starred                     2212   91.29%
+   N=30  +unpack.call_star                   2233   92.16%
+   N=31  +unpack.dict_star                   2237   92.32%
+   N=32  +scope.nonlocal                     2240   92.45%
+   N=33  +unpack.assign_star                 2242   92.53%
+   N=34  +assign.chained                     2244   92.61%
+   N=35  +dyn.importlib_call                 2245   92.65%
+   N=36  +dyn.getattr                        2245   92.65%
+   N=37  +dyn.getattr_conststr               2294   94.68%
+   N=38  +dyn.getattr_dynamic                2304   95.09%
+   N=39  +comp.multi_for                     2305   95.13%
+     >= 50% at N=3
+     >= 80% at N=10
+     >= 90% at N=21
+     >= 95% at N=38
+     >= 99% at N=48
+     >= 100% at N=57
+megatron (total=2118):
+   N=0   +<seed:30 tags>                      549   25.92%
+   N=1   +decorator.func                      747   35.27%
+   N=2   +unpack.assign_seq                   869   41.03%
+   N=3   +ctl.assert                          945   44.62%
+   N=4   +expr.IfExp                         1034   48.82%
+   N=5   +ctl.raise                          1097   51.79%
+   N=6   +imp.from_import                    1144   54.01%
+   N=7   +imp.import                         1218   57.51%
+   N=8   +ctl.with                           1264   59.68%
+   N=9   +decorator.func_parameterized       1315   62.09%
+   N=10  +comp.list                          1347   63.60%
+   N=11  +scope.global                       1373   64.83%
+   N=12  +unpack.call_dstar                  1398   66.01%
+   N=13  +expr.Lambda                        1423   67.19%
+   N=14  +comp.genexp                        1448   68.37%
+   N=15  +arg.posonly                        1472   69.50%
+   N=16  +arg.vararg                         1495   70.58%
+   N=17  +arg.kwarg                          1507   71.15%
+   N=18  +comp.filter                        1519   71.72%
+   N=19  +unpack.starred                     1529   72.19%
+   N=20  +unpack.call_star                   1613   76.16%
+   N=21  +imp.relative                       1623   76.63%
+   N=22  +ctl.del                            1632   77.05%
+   N=23  +expr.chained_compare               1642   77.53%
+   N=24  +gen.yield                          1650   77.90%
+   N=25  +expr.walrus                        1658   78.28%
+   N=26  +comp.dict                          1665   78.61%
+   N=27  +assign.chained                     1672   78.94%
+   N=28  +comp.multi_for                     1678   79.23%
+   N=29  +comp.set                           1682   79.42%
+   N=30  +oop.super_call                     1686   79.60%
+   N=31  +oop.super_zeroarg                  1808   85.36%
+   N=32  +imp.star                           1812   85.55%
+   N=33  +dyn.locals                         1815   85.69%
+   N=34  +class.bases1                       1817   85.79%
+   N=35  +dyn.compile                        1819   85.88%
+   N=36  +unpack.dict_star                   1821   85.98%
+   N=37  +ctl.with_multi                     1823   86.07%
+   N=38  +unpack.assign_star                 1825   86.17%
+   N=39  +dyn.importlib_call                 1827   86.26%
+     >= 50% at N=5
+     >= 80% at N=31
+     >= 90% at N=50
+     >= 95% at N=57
+     >= 99% at N=58
+     >= 100% at N=65
+
+--- framework.funcs_only.seed_empty ---
+mindformers (total=5736):
+   N=0   +<seed:0 tags>                         0    0.00%
+   N=1   +expr.Name                             0    0.00%
+   N=2   +oop.super_call                        0    0.00%
+   N=3   +expr.Attribute                        0    0.00%
+   N=4   +oop.super_zeroarg                     0    0.00%
+   N=5   +expr.Call                             0    0.00%
+   N=6   +stmt.Assign                           0    0.00%
+   N=7   +def.func                             17    0.30%
+   N=8   +stmt.Return                         144    2.51%
+   N=9   +decorator.func                      220    3.84%
+   N=10  +stmt.Expr                           269    4.69%
+   N=11  +expr.Constant                       725   12.64%
+   N=12  +arg.default                         835   14.56%
+   N=13  +expr.Subscript                      896   15.62%
+   N=14  +expr.Tuple                         1003   17.49%
+   N=15  +stmt.If                            1108   19.32%
+   N=16  +expr.Compare                       1281   22.33%
+   N=17  +expr.BinOp                         1438   25.07%
+   N=18  +expr.UnaryOp                       1610   28.07%
+   N=19  +unpack.assign_seq                  1801   31.40%
+   N=20  +expr.BoolOp                        1987   34.64%
+   N=21  +ctl.raise                          2164   37.73%
+   N=22  +expr.JoinedStr                     2430   42.36%
+   N=23  +expr.List                          2651   46.22%
+   N=24  +stmt.For                           2880   50.21%
+   N=25  +expr.IfExp                         3131   54.58%
+   N=26  +expr.Dict                          3346   58.33%
+   N=27  +arg.kwarg                          3507   61.14%
+   N=28  +unpack.call_dstar                  3703   64.56%
+   N=29  +expr.Slice                         3867   67.42%
+   N=30  +stmt.AugAssign                     3988   69.53%
+   N=31  +comp.list                          4097   71.43%
+   N=32  +ctl.with                           4198   73.19%
+   N=33  +decorator.func_parameterized       4290   74.79%
+   N=34  +comp.genexp                        4367   76.13%
+   N=35  +stmt.Continue                      4438   77.37%
+   N=36  +arg.vararg                         4510   78.63%
+   N=37  +stmt.Pass                          4560   79.50%
+   N=38  +comp.filter                        4606   80.30%
+   N=39  +comp.dict                          4658   81.21%
+     >= 50% at N=24
+     >= 80% at N=38
+     >= 90% at N=65
+     >= 95% at N=None
+     >= 99% at N=None
+     >= 100% at N=None
+megatron (total=5753):
+   N=0   +<seed:0 tags>                         0    0.00%
+   N=1   +expr.Constant                         0    0.00%
+   N=2   +stmt.If                               0    0.00%
+   N=3   +expr.Subscript                        0    0.00%
+   N=4   +def.func                              0    0.00%
+   N=5   +stmt.Expr                            12    0.21%
+   N=6   +stmt.Pass                            27    0.47%
+   N=7   +expr.Name                            37    0.64%
+   N=8   +stmt.Return                          88    1.53%
+   N=9   +expr.Attribute                      135    2.35%
+   N=10  +expr.Call                           403    7.00%
+   N=11  +decorator.func                      611   10.62%
+   N=12  +stmt.Assign                         808   14.04%
+   N=13  +expr.Compare                        935   16.25%
+   N=14  +arg.default                        1061   18.44%
+   N=15  +expr.BinOp                         1191   20.70%
+   N=16  +expr.Tuple                         1324   23.01%
+   N=17  +expr.UnaryOp                       1438   25.00%
+   N=18  +expr.BoolOp                        1551   26.96%
+   N=19  +ctl.assert                         1675   29.12%
+   N=20  +unpack.assign_seq                  1809   31.44%
+   N=21  +stmt.For                           1945   33.81%
+   N=22  +expr.List                          2120   36.85%
+   N=23  +expr.JoinedStr                     2261   39.30%
+   N=24  +ctl.raise                          2442   42.45%
+   N=25  +expr.Slice                         2592   45.05%
+   N=26  +expr.IfExp                         2736   47.56%
+   N=27  +expr.Dict                          2886   50.17%
+   N=28  +stmt.AugAssign                     3031   52.69%
+   N=29  +comp.list                          3151   54.77%
+   N=30  +scope.global                       3259   56.65%
+   N=31  +ctl.with                           3346   58.16%
+   N=32  +decorator.func_parameterized       3441   59.81%
+   N=33  +stmt.AnnAssign                     3524   61.26%
+   N=34  +imp.from_import                    3602   62.61%
+   N=35  +stmt.Continue                      3666   63.72%
+   N=36  +expr.Lambda                        3729   64.82%
+   N=37  +comp.genexp                        3789   65.86%
+   N=38  +comp.filter                        3840   66.75%
+   N=39  +arg.kwonly                         3890   67.62%
+     >= 50% at N=27
+     >= 80% at N=58
+     >= 90% at N=None
+     >= 95% at N=None
+     >= 99% at N=None
+     >= 100% at N=None
+
+==============================================================================
+5. blocker 排行 (model_subgraph, seed=CORE)
+==============================================================================
+mindformers total_scopes=2144
+  involved(用到该构件的函数数) top25:
+     ctl.raise                            396  (18.5%)
+     oop.super_call                       334  (15.6%)
+     decorator.func                       328  (15.3%)
+     unpack.assign_seq                    328  (15.3%)
+     oop.super_zeroarg                    256  (11.9%)
+     expr.IfExp                           247  (11.5%)
+     arg.kwarg                            179  (8.3%)
+     unpack.call_dstar                    106  (4.9%)
+     dyn.getattr                           91  (4.2%)
+     comp.list                             78  (3.6%)
+     dyn.getattr_conststr                  77  (3.6%)
+     arg.vararg                            74  (3.5%)
+     dyn.hasattr                           67  (3.1%)
+     dyn.hasattr_conststr                  60  (2.8%)
+     ctl.with                              45  (2.1%)
+     comp.genexp                           39  (1.8%)
+     decorator.func_parameterized          36  (1.7%)
+     unpack.starred                        36  (1.7%)
+     ctl.try                               32  (1.5%)
+     unpack.call_star                      32  (1.5%)
+     ctl.except_handler                    30  (1.4%)
+     comp.filter                           27  (1.3%)
+     dyn.getattr_dynamic                   18  (0.8%)
+     expr.Lambda                           18  (0.8%)
+     ctl.del                               14  (0.7%)
+  sole_blocker(该构件是唯一超纲项) top15:
+     unpack.assign_seq                    182
+     decorator.func                       164
+     ctl.raise                            110
+     expr.IfExp                            68
+     oop.super_call                        47
+     arg.kwarg                             26
+     arg.vararg                            19
+     comp.list                             16
+     scope.global                           7
+     expr.chained_compare                   6
+     ctl.with                               5
+     ctl.del                                4
+     comp.genexp                            4
+     unpack.call_dstar                      3
+     gen.yield                              2
+megatron total_scopes=1959
+  involved(用到该构件的函数数) top25:
+     decorator.func                       455  (23.2%)
+     unpack.assign_seq                    373  (19.0%)
+     ctl.assert                           362  (18.5%)
+     expr.IfExp                           289  (14.8%)
+     ctl.raise                            220  (11.2%)
+     oop.super_call                       175  (8.9%)
+     oop.super_zeroarg                    163  (8.3%)
+     unpack.starred                       154  (7.9%)
+     unpack.call_star                     135  (6.9%)
+     unpack.call_dstar                    133  (6.8%)
+     dyn.hasattr                          128  (6.5%)
+     dyn.hasattr_conststr                 120  (6.1%)
+     arg.vararg                           113  (5.8%)
+     ctl.with                             112  (5.7%)
+     imp.from_import                      107  (5.5%)
+     arg.kwarg                             97  (5.0%)
+     dyn.getattr                           97  (5.0%)
+     comp.list                             92  (4.7%)
+     decorator.func_parameterized          86  (4.4%)
+     dyn.getattr_conststr                  77  (3.9%)
+     comp.genexp                           55  (2.8%)
+     scope.global                          45  (2.3%)
+     expr.Lambda                           42  (2.1%)
+     dyn.setattr                           36  (1.8%)
+     ctl.try                               32  (1.6%)
+  sole_blocker(该构件是唯一超纲项) top15:
+     decorator.func                       198
+     unpack.assign_seq                     69
+     ctl.assert                            52
+     expr.IfExp                            41
+     ctl.raise                             32
+     arg.posonly                           24
+     scope.global                          21
+     imp.from_import                       15
+     ctl.with                              14
+     comp.list                             10
+     gen.yield                              6
+     comp.genexp                            6
+     arg.vararg                             4
+     unpack.call_dstar                      3
+     arg.kwarg                              2
+
+==============================================================================
+6. monkey-patch 点
+==============================================================================
+mindformers: framework=37  all_repo=115
+   by root_kind: {'unknown': 22, 'local_toplevel': 14, 'module': 1}
+   by form: {'patchfn_call': 22, 'assign': 15}
+   *** 对已 import 模块/名字的赋值 = 1
+   涉及文件 1 个, top:
+      mindformers/tools/logger.py                                            1
+megatron: framework=35  all_repo=77
+   by root_kind: {'name': 3, 'module': 30, 'unknown': 2}
+   by form: {'patchfn_call': 3, 'assign': 32}
+   *** 对已 import 模块/名字的赋值 = 33
+   涉及文件 25 个, top:
+      megatron/core/fusions/fused_indices_converter.py                       3
+      megatron/core/fusions/fused_mla_yarn_rope_apply.py                     3
+      megatron/core/fusions/fused_pad_routing_map.py                         3
+      megatron/core/__init__.py                                              2
+      megatron/core/inference/data_parallel_inference_coordinator.py         2
+      megatron/core/inference/communication/torch_symm_triton/barrier.py     1
+      megatron/core/inference/communication/torch_symm_triton/collectives.py 1
+      megatron/core/inference/communication/torch_symm_triton/fused_collectives.py 1
+      megatron/core/inference/communication/torch_symm_triton/multimem_asm.py 1
+      megatron/core/inference/communication/torch_symm_triton/utils.py       1
+      megatron/core/inference/communication/torch_symm_triton/variable_collectives.py 1
+      megatron/core/inference/contexts/attention_context/triton/tensor_ops.py 1
+      megatron/core/inference/contexts/dynamic_context.py                    1
+      megatron/core/inference/contexts/fused_kv_append_kernel.py             1
+      megatron/core/inference/moe/activations.py                             1
+
+==============================================================================
+7. 模块级全局
+==============================================================================
+mindformers: 顶层绑定名字总数=625  可变(任一证据)=95  强可变(global 重绑定)=24  全大写命名=355
+   全大写里实际可变的=53  (说明"全大写=常量"启发式的误判率 14.9%)
+   强可变全局按文件 top10:
+      mindformers/parallel_core/inference/parallel_state.py                  8
+      mindformers/modules/local_block_sparse_attention.py                    3
+      mindformers/parallel_core/inference/tensor_parallel/random.py          2
+      mindformers/pynative/distributed/activation_checkpoint.py              2
+      mindformers/pynative/transformers/moe/moe_utils.py                     2
+      mindformers/core/callback/callback.py                                  1
+      mindformers/parallel_core/training_graph/transformer/moe/router.py     1
+      mindformers/parallel_core/transformer_config_utils.py                  1
+      mindformers/trainer/optimizer_grouped_parameters.py                    1
+      mindformers/utils/tensorboard.py                                       1
+megatron: 顶层绑定名字总数=989  可变(任一证据)=394  强可变(global 重绑定)=143  全大写命名=440
+   全大写里实际可变的=261  (说明"全大写=常量"启发式的误判率 59.3%)
+   强可变全局按文件 top10:
+      megatron/core/parallel_state.py                                        49
+      megatron/training/ft_integration.py                                    10
+      megatron/training/global_vars.py                                       9
+      megatron/core/utils.py                                                 7
+      megatron/core/inference/unified_memory.py                              6
+      megatron/core/transformer/custom_layers/batch_invariant_kernels.py     5
+      megatron/training/training.py                                          5
+      megatron/core/fusions/fused_mhc_kernels.py                             4
+      megatron/core/tensor_parallel/random.py                                4
+      megatron/core/transformer/cuda_graphs.py                               4
+
+==============================================================================
+8. 访问器
+==============================================================================
+mindformers: 访问器函数定义=73
+   其中读到本文件可变模块级全局的 = 28
+      mindformers/parallel_core/inference/parallel_state.py                  27
+      mindformers/tools/utils.py                                             7
+      mindformers/parallel_core/inference/utils.py                           4
+      mindformers/pynative/transformers/moe/moe_utils.py                     4
+      mindformers/checkpoint/sharded_tensor.py                               3
+      mindformers/trainer/base_trainer.py                                    3
+      mindformers/checkpoint/converter/template.py                           2
+      mindformers/checkpoint/utils.py                                        2
+      mindformers/mindformer_book.py                                         2
+      mindformers/parallel_core/training_graph/device_matrix.py              2
+      mindformers/trainer/training_args.py                                   2
+      mindformers/checkpoint/metadata.py                                     1
+   访问器调用点: framework=285 次 / model_subgraph=80 次
+   model_subgraph top20 调用:
+      get_tensor_model_parallel_world_size                 10
+      get_tensor_model_parallel_rank                       9
+      get_group                                            9
+      get_pipeline_model_parallel_rank                     6
+      get_real_rank                                        5
+      get_pipeline_model_parallel_world_size               5
+      get_ranks                                            4
+      get_data_parallel_world_size                         4
+      is_current_pipeline_stage                            3
+      get_data_parallel_group                              3
+      get_data_from_shm                                    2
+      is_initialized                                       2
+      get_tp_world_size                                    2
+      get_moe_tensor_parallel_world_size                   2
+      get_parallel_config                                  2
+      get_world_size_from_group                            2
+      get_seq_length_tensor_pad                            1
+      is_pipeline_last_stage                               1
+      is_pipeline_first_stage                              1
+      get_tensor_model_parallel_group                      1
+megatron: 访问器函数定义=163
+   其中读到本文件可变模块级全局的 = 51
+      megatron/core/parallel_state.py                                        57
+      megatron/core/utils.py                                                 11
+      megatron/core/distributed/fsdp/src/megatron_fsdp/utils.py              9
+      megatron/core/pipeline_parallel/utils.py                               8
+      megatron/core/num_microbatches_calculator.py                           6
+      megatron/core/pipeline_parallel/schedules.py                           5
+      megatron/core/datasets/data_schedule.py                                4
+      megatron/core/tensor_parallel/random.py                                3
+      megatron/elastification/router/flex_budget_utils.py                    3
+      megatron/rl/sequence_packing_utils.py                                  3
+      megatron/training/utils/common_utils.py                                3
+      megatron/core/fp8_utils.py                                             2
+   访问器调用点: framework=1046 次 / model_subgraph=240 次
+   model_subgraph top20 调用:
+      get_tensor_model_parallel_group_if_none              33
+      get_pg_size                                          28
+      get_pg_rank                                          27
+      get_world_size                                       13
+      get_context_parallel_group                           12
+      get_tensor_model_parallel_group                      11
+      get_tensor_model_parallel_world_size                 8
+      is_initialized                                       8
+      is_vp_first_stage                                    7
+      get_tensor_model_parallel_rank                       7
+      get_data_parallel_group                              7
+      get_context_parallel_world_size                      5
+      get_pipeline_model_parallel_rank                     5
+      get_expert_parallel_rng_tracker_name                 4
+      is_pp_first_stage                                    4
+      is_vp_last_stage                                     4
+      get_pipeline_model_parallel_group                    4
+      get_pos_emb_on_this_cp_rank                          3
+      get_data_parallel_rank                               3
+      get_tokens_per_expert_and_token_count                3
+
+==============================================================================
+9. policy-tainted guards (model_subgraph)
+==============================================================================
+mindformers: guards=758  (子图内 If=3523 IfExp=457, 占比 19.0%)  framework guards=1429
+   按字段组(可重复计):
+      MoE              283
+      并行度              237
+      精度               102
+      融合/实现选择           73
+      重算                66
+      调度                35
+      分布式优化器            11
+   按结构 struct: {'single_sided': 433, 'both_nonempty': 166, 'one_side_trivial': 18, 'ifexp': 141}
+   按改写类别 cls: {'call_set_changes': 421, 'assign_only': 153, 'assign_only_with_call_delta': 138, 'same_calls_diff_args': 46}
+   node 类型: {'If': 617, 'IfExp': 141}
+   if 嵌套深度分布: {0: 519, 1: 173, 2: 46, 3: 16, 4: 2, 5: 1, 6: 1}
+   policy-guard 嵌套深度分布: {0: 645, 1: 96, 2: 16, 3: 1}
+   最高频字段 top25:
+      moe_config                                   43
+      use_flash_attention                          37
+      cp                                           29
+      moe_layer_freq                               27
+      tensor_model_parallel_size                   26
+      dtype                                        25
+      recompute                                    23
+      context_parallel_size                        23
+      data_parallel_size                           21
+      pp                                           18
+      context_parallel                             17
+      expert_num                                   15
+      select_recompute                             15
+      expert_model_parallel_size                   14
+      sequence_parallel                            14
+      moe_token_dispatcher_type                    14
+      quant_config                                 13
+      tp_comm_buffer_name                          12
+      num_experts                                  11
+      moe_layer_pattern                            11
+      use_shared_expert_gate                       11
+      checkpoint_name_or_path                      10
+      moe_router_load_balancing_type               10
+      rotary_interleaved                           9
+      quant_method                                 8
+   guard 最多的文件 top12:
+      mindformers/parallel_core/transformer_config.py                        45
+      mindformers/parallel_core/training_graph/transformer/utils.py          36
+      mindformers/parallel_core/training_graph/tensor_parallel/batched_layers.py 28
+      mindformers/modules/transformer/moe.py                                 26
+      mindformers/models/llama/llama_transformer.py                          23
+      mindformers/parallel_core/training_graph/tensor_parallel/layers.py     23
+      mindformers/pynative/base_models/gpt/parallelize.py                    22
+      mindformers/parallel_core/training_graph/base_models/gpt/gpt_model.py  21
+      mindformers/models/utils.py                                            16
+      mindformers/models/llama/llama_interleave.py                           15
+      mindformers/models/llama/llama_layer.py                                15
+      mindformers/parallel_core/inference/tensor_parallel/layers.py          15
+megatron: guards=1058  (子图内 If=4015 IfExp=495, 占比 23.5%)  framework guards=2496
+   按字段组(可重复计):
+      MoE              273
+      并行度              250
+      精度               214
+      融合/实现选择          213
+      重算               125
+      调度                59
+      分布式优化器            33
+   按结构 struct: {'single_sided': 678, 'both_nonempty': 259, 'one_side_trivial': 39, 'ifexp': 82}
+   按改写类别 cls: {'assign_only': 123, 'same_calls_diff_args': 126, 'call_set_changes': 641, 'assign_only_with_call_delta': 168}
+   node 类型: {'If': 976, 'IfExp': 82}
+   if 嵌套深度分布: {0: 623, 1: 266, 2: 102, 3: 42, 4: 23, 5: 2}
+   policy-guard 嵌套深度分布: {0: 774, 1: 195, 2: 60, 3: 20, 4: 7, 5: 2}
+   最高频字段 top25:
+      fp8                                          56
+      sequence_parallel                            52
+      dtype                                        29
+      tp_group                                     27
+      cuda_graph_impl                              26
+      cp_size                                      21
+      recompute_granularity                        21
+      recompute_modules                            17
+      tp_size                                      17
+      fp8_quantization_recipe                      16
+      moe_router                                   16
+      use_te                                       15
+      shared_experts                               15
+      fp8_recipe                                   14
+      apply_rope_fusion                            13
+      moe_layer_freq                               13
+      moe_preprocess                               13
+      virtual_pipeline_model_parallel_size         13
+      context_parallel_size                        12
+      world_size                                   12
+      pipeline_model_parallel_size                 11
+      pipeline_model_parallel_layout               11
+      fine_grained_activation_offloading           11
+      moe_latent_size                              11
+      moe_token_dispatcher_type                    11
+   guard 最多的文件 top12:
+      megatron/core/transformer/transformer_config.py                        168
+      megatron/core/extensions/transformer_engine.py                         93
+      megatron/core/transformer/transformer_layer.py                         69
+      megatron/core/transformer/moe/experts.py                               51
+      megatron/core/transformer/moe/token_dispatcher.py                      45
+      megatron/core/transformer/moe/moe_layer.py                             38
+      megatron/core/tensor_parallel/layers.py                                35
+      megatron/core/transformer/cuda_graphs.py                               32
+      megatron/core/transformer/transformer_block.py                         31
+      megatron/core/transformer/moe/moe_utils.py                             28
+      megatron/core/models/gpt/gpt_layer_specs.py                            26
+      megatron/core/transformer/multi_token_prediction.py                    22
