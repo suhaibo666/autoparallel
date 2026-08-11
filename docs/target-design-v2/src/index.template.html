@@ -62,6 +62,8 @@ evidence 解释每个量从哪里来；coverage 解释模型覆盖面；assumpti
 <p>相同生产输入摘要必须得到逐事件一致的结果；缺少必需语义时明确阻断受影响后端；
 有对照数据时报告误差，没有对照数据时报告“未评估真机误差”，但不改变预测路径。</p></div>
 
+<p>Comparison boundary: different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed.</p>
+
 <h2 id="c1" data-part="第一部分 · 总体"><span class="cn">Chapter 1</span>总体架构与分层</h2>
 
 <h3 id="c1-1">1.1 权威生产数据流</h3>
@@ -182,17 +184,23 @@ SemanticValue&lt;T&gt;:
   calibration_domain: Domain | None
 
 Coverage:
-  source_obligations_total, source_nodes_planned
-  source_residual, source_proven_not_executed
-  event_obligations_total, planned_events
-  blocked_event_obligations, not_applicable_event_obligations
-  total_ops, modeled_ops, blocked_ops
-  total_storages, modeled_storages
-  modeled_bytes, total_known_bytes
-  priced_events, total_time_events
+  source_obligations_total: SourceObligationCount
+  source_obligations_planned: SourceObligationCount
+  source_obligations_residual: SourceObligationCount
+  source_obligations_proven_not_executed: SourceObligationCount
+  event_obligations_total: EventObligationCount
+  event_obligations_planned: EventObligationCount
+  event_obligations_blocked: EventObligationCount
+  event_obligations_not_applicable: EventObligationCount
+  op_occurrences_total: OpOccurrenceCount
+  storage_instances_total: StorageInstanceCount
+  bytes_total: ByteCount
+  emitted_codeir_node_count: CodeIRNodeCount  // derived/statistical only
   quality_by_face
   missing_faces
   fallback_counts</code></pre>
+
+<p>source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed; event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable; conservation is over obligation buckets only. Op occurrences, storage instances and bytes each retain their own typed aggregation universe; emitted CodeIR node count is derived/statistical and is never an obligation bucket.</p>
 
 <p>Coverage 是覆盖事实，不是置信概率。源码 obligation 的分母由当前源码、配置与 rank context 在生成 IR
 之前独立枚举；event obligation 的分母由冻结训练语义规则枚举，二者不得从已生成节点反推。
@@ -576,12 +584,17 @@ CompileEnvFacts:
 
 HardwareProfile:
   devices
-  memory_capacity
   topology
   bandwidth
   link_latency
   allocator_alignment
   physical_stream_catalog
+
+PlanningMetadata:
+  capacity information
+  // external to production HardwareProfile and simulator identities
+
+PlanningMetadata is external to the simulator and owned by the upper-layer capacity consumer.
 
 ExecutionDeployment:
   rank_device_map: OrderedMap[LogicalRank, DeviceId]
@@ -678,9 +691,19 @@ ComputeMeasurementRecord:
   aggregate_member_sample_keys
 
 CalibrationSet:
+  calibration_train_manifest_digest: Digest
+  // production owns only this frozen manifest digest
+
+CalibrationTrainManifest:
   active_compute_records: Map[MeasurementKey, ComputeMeasurementRecord]
   measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]
-  dataset_manifest_digest
+  calibration_train_manifest_digest
+
+HoldoutEvaluationManifest:
+  holdout records and offline evaluation metadata
+
+CalibrationSet owns only calibration_train_manifest_digest.
+HoldoutEvaluationManifest is offline-only and never enters request payload, time simulation digest, production cache, or comparison basis.
 
 TimeCostPolicy:
   required_measurement_protocol_digest
@@ -2390,6 +2413,7 @@ projection 嵌入 exact measurement+protocol snapshots，或 normalized formula 
 <h2 id="c10" data-part="第四部分 · 输出"><span class="cn">Chapter 10</span>内存、时间后端与报告</h2>
 
 <section class="module-contract" data-module="memory-backend" aria-labelledby="mc-memory-backend">
+<p>Memory reads only shape/storage/alias/lifetime/explicit-workspace semantics and logical order. Memory never reads compute duration, profiler op-time, communication formula, TimeEventView, or TimeEstimate. A missing compute profile blocks only time; missing memory shape/storage/lifetime semantics blocks only memory. Shared CodeIR, RuntimeEventPlan or Core failure blocks both faces.</p>
 <h3 id="mc-memory-backend">模块契约 · Memory projection 与后端</h3>
 
 <h4 id="mc-memory-backend-boundary">职责边界</h4>
@@ -2582,6 +2606,7 @@ MemoryEstimate:
 coverage、assumptions 与 digests 只存在于外层 Estimate，不允许第二套 metadata。</p>
 
 <section class="module-contract" data-module="time-backend" aria-labelledby="mc-time-backend">
+<p>Compute duration is an exact lookup of a user-profiled, pre-request, normalized and frozen ComputeMeasurementRecord; an unknown compute op without an exact record returns BLK-MISSING-TIME; communication duration comes only from the frozen communication formula, bytes, participants/path and hardware topology; profiler communication duration is forbidden.</p>
 <h3 id="mc-time-backend">模块契约 · Time projection 与后端</h3>
 
 <h4 id="mc-time-backend-boundary">职责边界</h4>
@@ -3268,6 +3293,7 @@ BlockerRecord 才规范派生 ProposedBlocked/Blocked Diagnostic。BackendSealAr
 同形 JSON 升格为合法 artifact。缓存命中也必须在当前 subject 上重走 seal 才能获得新 capability。</p>
 
 <section class="module-contract" data-module="comparison" aria-labelledby="mc-comparison">
+<p>Comparison outcome priority is exhaustive: both NotRequested -&gt; NotRequested; else either non-Ok -&gt; Unavailable; else basis mismatch -&gt; Incomparable; else ComparableDelta. Unavailable never carries numeric delta; different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed.</p>
 <h3 id="mc-comparison">模块契约 · 同请求封装结果比较</h3>
 
 <h4 id="mc-comparison-boundary">职责边界</h4>
@@ -3366,6 +3392,7 @@ Comparable；左 baseline 为零时 relative 分支必须是 <code>UndefinedZero
 </section>
 
 <h3 id="c10-5">10.5 配置比较</h3>
+<p>For both memory and time, different logical-rank sets are Incomparable; no rank alignment is guessed.</p>
 <div class="cal inv"><span class="lbl">同口径配置可比较</span>
 <p>可比性逐 metric 判定；memory 不因 time 未请求/阻断而失去合法 delta。只有该 metric 的源码/模型
 workload、硬件口径、相关 registries/cost dataset/policy、resolved fallback/assumption、numeric 与
@@ -3687,7 +3714,7 @@ Blocked 侧没有 null/0 数值、空 timeline 或上次缓存结果。</p>
 <h3 id="c12-2">12.2 完整结构门</h3>
 <div class="tw"><table>
 <tr><th class="nw">编号</th><th>断言</th><th>失败说明</th><th class="nw">类别</th></tr>
-<tr data-gate="G-IR1"><td class="nw"><code>G-IR1</code></td><td>logical rank 集合完整；rank-qualified identity 唯一且引用存在；每个 source obligation 恰为 CodeNode、引用唯一 BlockerRecord 的 Residual 或有 guard 证据的 ProvenNotExecuted，且与生成对象双向闭合；BlockerInstanceId/BlockerCode 分离、scope 等于 BlockerScopePolicy；source coverage 守恒</td><td>漏 rank、身份碰撞、幽灵引用、同码根因覆盖、scope 任填或源码 occurrence 静默消失</td><td class="nw">IR</td></tr>
+<tr data-gate="G-IR1"><td class="nw"><code>G-IR1</code></td><td>logical rank 集合完整；rank-qualified identity 唯一且引用存在；每个 source obligation 恰为 CodeNode、引用唯一 BlockerRecord 的 Residual 或有 guard 证据的 ProvenNotExecuted，且与生成对象双向闭合；BlockerInstanceId/BlockerCode 分离、scope 等于 BlockerScopePolicy；typed source/event obligation coverage 各自在其 own universe 守恒，emitted CodeIR node count 仅为 derived/statistical 字段</td><td>漏 rank、身份碰撞、幽灵引用、同码根因覆盖、scope 任填或源码 occurrence 静默消失</td><td class="nw">IR</td></tr>
 <tr data-gate="G-IR2"><td class="nw"><code>G-IR2</code></td><td>每个 RankCodeIR 不含硬件字段；model_input_digest 覆盖 evaluator/PySub/规范 ID 语义；model_digest 按排除表复算 canonical payload 且更换 HardwareProfile 不变</td><td>摘要自引用、求值器语义或硬件事实进入错误身份层</td><td class="nw">IR</td></tr>
 <tr data-gate="G-IR3"><td class="nw"><code>G-IR3</code></td><td>event obligation 三分支与 coverage 守恒；source_model_digest、logical_rank_contexts、ResolvedEventSemantic（含唯一 effect summary）、Tensor/Storage instance/binding、structural report facts 与 CodeIR/runtime lowering 精确闭合；BlockerRecord 无丢失；AutogradLink 完整；effect edge 沿 base DAG 规范拓扑全序，最终规范边集无环</td><td>隐藏 CodeIR lookup、漏/多事件、context/effect/instance/binding 漂移、blocker 丢失、正反向不闭合或局部 effect 定向造环</td><td class="nw">IR</td></tr>
 <tr data-gate="G-MEM1"><td class="nw"><code>G-MEM1</code></td><td>部署/shared KernelVariantBinding 完整；每个 runtime storage 有唯一 StorageBinding，每个 compute workspace 有唯一 WorkspaceBinding；alignment 等式、per_rank keys/expected storage set 与 initial XOR Allocate 全部成立</td><td>bytes/alignment 任择、漏 rank、幽灵 workspace、漏/重复分配、伪造 identity 或 live-in 双计</td><td class="nw">Memory</td></tr>
@@ -3700,7 +3727,7 @@ Blocked 侧没有 null/0 数值、空 timeline 或上次缓存结果。</p>
 <tr data-gate="G-TIME2"><td class="nw"><code>G-TIME2</code></td><td>每 Event 唯一解析到 device-qualified PhysicalStreamId；stream bindings/sequence 与冻结 policy/plan 精确对应；occupied_streams(node) accessor 对 compute 返回 singleton、对 communication 返回 common.occupied_streams；endpoint descriptor 的 rank/device/stage/stream 可复算，effect/schedule edge 生效且 cohort 占用全部 endpoint stream</td><td>stream accessor 分支错误、stream 混同/歧义、endpoint stage 错配、非法并发、漏同步或语义顺序仅停留在标签</td><td class="nw">Time</td></tr>
 <tr data-gate="G-TIME3"><td class="nw"><code>G-TIME3</code></td><td>每个 P2P 的 send/recv、src/dst、channel、sequence、bytes、protocol 与 buffer lifetime 一一匹配</td><td>PP/CP 消息无法唯一关联或完成语义不明</td><td class="nw">Time</td></tr>
 <tr data-gate="G-TIME4"><td class="nw"><code>G-TIME4</code></td><td>collective 的 participant endpoint、group、sequence、bytes、correlation 与 all-participant rendezvous 在全部 rank 匹配；cohort 恰选择一个适用 algorithm/formula，group 次序进入 expected graph</td><td>collective 跨 rank progress 或 cohort algorithm 关系不闭合</td><td class="nw">Time</td></tr>
-<tr data-gate="G-TIME5"><td class="nw"><code>G-TIME5</code></td><td>每 compute 从 ResolvedEventSemantic 的权威 template+shared variant 补全 key并绑定唯一精确 record/protocol，record key、ObservationRef、selected protocol 与 TimeCostPolicy 的 protocol digest 四者相等；每通信绑定唯一 formula/route；timeline NumericPolicySnapshot 完整，成本有限非负，任意精度 preflight/NumericRangeWitness 证明全部输出标量不越界</td><td>隐藏 CodeIR lookup、错误 template、越域/歧义成本、protocol identity 断链、公式/舍入不等式、NaN 或聚合溢出</td><td class="nw">Time</td></tr>
+<tr data-gate="G-TIME5"><td class="nw"><code>G-TIME5</code></td><td>每 compute 从 ResolvedEventSemantic 的权威 template+shared variant 补全 key并绑定唯一 pre-request frozen ComputeMeasurementRecord/protocol，record key、ObservationRef、selected protocol 与 TimeCostPolicy 的 protocol digest 四者相等；每通信仅从 frozen formula、bytes、participants/path 与 topology 绑定唯一 formula/route，禁止 profiler communication duration；timeline NumericPolicySnapshot 完整，成本有限非负，任意精度 preflight/NumericRangeWitness 证明全部输出标量不越界</td><td>隐藏 CodeIR lookup、错误 template、越域/歧义成本、protocol identity 断链、公式/舍入不等式、NaN 或聚合溢出</td><td class="nw">Time</td></tr>
 <tr data-gate="G-TIME6"><td class="nw"><code>G-TIME6</code></td><td>作为 backend_value_postcondition，仅从 Ready view 与 execution witness 重算 EstimateCandidate：起点/空图、checked ns、makespan、规范 tie 与全部 busy/overlap/bubble/service 等式正确；无 contention；同 time digest timeline 一致</td><td>暗读 core、溢出、空图/domain/聚合错误、偷偷建模竞争或不确定性</td><td class="nw">Time</td></tr>
 <tr data-gate="G-REP1"><td class="nw"><code>G-REP1</code></td><td>封装前按 BackendSealAuthority 校验 source/value/seal authority、BackendResultCandidate 与各自 digest；(request_digest, evaluation_instance_digest, backend) 在 source、candidate 与 artifact 全链相等；requested backend 只从 RequestSnapshot 派生；ProposedOk 的完整 EstimateCandidate value/witness 与 value-gate subject 相等且 metadata/result_digest 唯一；ProposedBlocked 精确来自 scope-closed bundle projection 且无 value；ProposedNotRequested 仅对应 request 未请求</td><td>配置身份丢失、来源局部自洽、请求双真值、换 value 复用 Pass、分支绕门、metadata 改写、blocked 冒充或错误 NotRequested</td><td class="nw">Report</td></tr>
 <tr data-gate="G-REP2"><td class="nw"><code>G-REP2</code></td><td>仅在 typed ComparisonArmAuthority→ComparisonSourceAuthority→ComparisonResultCandidate→comparison ledger→seal 路径对当前 candidate 执行；左右 config_ref、EvaluationInstanceIdentity 与每个 BackendSealArtifact 精确闭合；每臂全部 artifact 必须共享字节相同的 ProjectionBundleAuthority，且其 ProductionValidationContext/GateManifest 与当前 ComparisonSourceAuthority 相同；ComparisonBasisPair 从完整 CanonicalConfigEvaluationInput 出发，仅对 P/scenario axes 及跨字段确定性派生闭包规范 mask，time protocol 同口径；逐 metric 仅两侧 Ok+basis 相同产生 ComparableDelta；fractional_change=(right-left)/left，零 baseline 用 UndefinedZeroBaseline</td><td>同臂混用 bundle/旧 subject、A/B artifact 对调、比较绕过门、复用旧记录、microbatch/场景/扩展配置偷变、部分结果/零基线不可表达，或成本/假设变化被误作策略收益</td><td class="nw">Report</td></tr>
@@ -5141,6 +5168,8 @@ Tensor/StorageInstance、effect edge、P2P/collective identity、bytes、formula
 任何改变预测语义的近似都成为具名 Assumption。</p>
 
 <h2 id="c14"><span class="cn">Chapter 14</span>决策记录与诚实边界</h2>
+
+<p>The production evaluator and offline validator are distinct. Chapter 14 preserves all ten Chapter 0 non-goals, including OOM/capacity, proof, layout/stride and communication scratch; automatic-search remains a non-goal, and Chapter 14 comparison follows the strict 10.5 boundary.</p>
 
 <h3 id="c14-1">14.1 已定决策</h3>
 <div class="tw"><table>

@@ -159,6 +159,56 @@ class VerifyGatesContractTest(unittest.TestCase):
                     errors,
                 )
 
+    def test_task7_core_modeling_contracts_reject_local_regressions(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        module_cases = (
+            (
+                "memory-backend",
+                "Memory never reads compute duration, profiler op-time, communication formula, TimeEventView, or TimeEstimate",
+            ),
+            (
+                "time-backend",
+                "profiler communication duration is forbidden",
+            ),
+            (
+                "comparison",
+                "both NotRequested -> NotRequested; else either non-Ok -> Unavailable; else basis mismatch -> Incomparable; else ComparableDelta",
+            ),
+            (
+                "comparison",
+                "different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed",
+            ),
+        )
+        for module, token in module_cases:
+            with self.subTest(module=module, token=token):
+                self.assertIn(token, verify_gates.MODULE_CONTRACT_REQUIRED_TEXT[module])
+                self.assertEqual(validate(template), [])
+                errors = validate(replace_in_module(template, module, token, "MUTATED"))
+                self.assertTrue(
+                    any(module in error and token in error for error in errors), errors
+                )
+
+        global_cases = (
+            "source_obligations_planned: SourceObligationCount",
+            "emitted_codeir_node_count: CodeIRNodeCount  // derived/statistical only",
+            "CalibrationSet owns only calibration_train_manifest_digest",
+            "HoldoutEvaluationManifest is offline-only and never enters request payload, time simulation digest, production cache, or comparison basis",
+            "PlanningMetadata is external to the simulator and owned by the upper-layer capacity consumer",
+            "production evaluator and offline validator are distinct",
+            "Chapter 14 preserves all ten Chapter 0 non-goals, including OOM/capacity, proof, layout/stride and communication scratch",
+            "Chapter 14 comparison follows the strict 10.5 boundary",
+        )
+        for token in global_cases:
+            with self.subTest(token=token):
+                self.assertIn(token, template)
+                self.assertEqual(validate(template), [])
+                errors = validate(template.replace(token, "MUTATED", 1))
+                self.assertTrue(any(token in error for error in errors), errors)
+
+        self.assertNotIn("memory_capacity", template)
+        errors = validate(template + "\nmemory_capacity")
+        self.assertTrue(any("memory_capacity" in error for error in errors), errors)
+
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         original_tag = (

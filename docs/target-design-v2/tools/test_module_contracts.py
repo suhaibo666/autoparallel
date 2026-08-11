@@ -469,6 +469,24 @@ class ModuleContractStructureTest(unittest.TestCase):
             r"(?s)memory_simulation_digest\s*:=\s*hash\(.*?MemoryProjectionSemanticsSnapshot.*?memory backend and numeric semantic versions\)",
         )
 
+    def test_memory_and_time_cost_faces_have_disjoint_owners(self) -> None:
+        memory = self.contract_text("memory-backend")
+        time = self.contract_text("time-backend")
+        for token in (
+            "Memory reads only shape/storage/alias/lifetime/explicit-workspace semantics and logical order",
+            "Memory never reads compute duration, profiler op-time, communication formula, TimeEventView, or TimeEstimate",
+            "missing compute profile blocks only time",
+            "missing memory shape/storage/lifetime semantics blocks only memory",
+        ):
+            self.assertIn(token, memory)
+        for token in (
+            "Compute duration is an exact lookup of a user-profiled, pre-request, normalized and frozen ComputeMeasurementRecord",
+            "unknown compute op without an exact record returns BLK-MISSING-TIME",
+            "communication duration comes only from the frozen communication formula, bytes, participants/path and hardware topology",
+            "profiler communication duration is forbidden",
+        ):
+            self.assertIn(token, time)
+
     def test_time_backend_contract_uses_exact_costs_and_no_contention_des(self) -> None:
         text = self.contract_text("time-backend")
         for token in (
@@ -899,6 +917,31 @@ class ModuleContractStructureTest(unittest.TestCase):
             text,
             r"compare_per_metric_from_authority\([^)]*\)\s*->\s*ComparisonSealArtifact",
         )
+
+    def test_comparison_priority_is_exhaustive_and_rank_sets_are_not_aligned(self) -> None:
+        text = self.contract_text("comparison")
+        for token in (
+            "both NotRequested -> NotRequested; else either non-Ok -> Unavailable; else basis mismatch -> Incomparable; else ComparableDelta",
+            "Unavailable never carries numeric delta",
+            "different logical-rank sets are Incomparable for both metrics; no rank alignment is guessed",
+        ):
+            self.assertIn(token, text)
+
+    def test_coverage_has_typed_obligation_conservation_universes(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        for token in (
+            "source_obligations_total: SourceObligationCount",
+            "source_obligations_planned: SourceObligationCount",
+            "event_obligations_total: EventObligationCount",
+            "op_occurrences_total: OpOccurrenceCount",
+            "storage_instances_total: StorageInstanceCount",
+            "bytes_total: ByteCount",
+            "emitted_codeir_node_count: CodeIRNodeCount  // derived/statistical only",
+            "source_obligations_total = source_obligations_planned + source_obligations_residual + source_obligations_proven_not_executed",
+            "event_obligations_total = event_obligations_planned + event_obligations_blocked + event_obligations_not_applicable",
+            "conservation is over obligation buckets only",
+        ):
+            self.assertIn(token, template)
 
     def test_comparison_schema_derivation_and_task5_digest_exclusions_are_closed(self) -> None:
         text = self.contract_text("comparison")
