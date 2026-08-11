@@ -585,6 +585,54 @@ class VerifyGatesContractTest(unittest.TestCase):
             any("forbids local wrapper schema" in error for error in errors), errors
         )
 
+    def test_task8_projection_bundle_core_branch_mutations_are_rejected(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        self.assertEqual(validate(template), [])
+        mutations = (
+            (
+                "    Blocked { blockers=blockers }:\n",
+                "    REMOVED_BLOCKED_BRANCH:\n",
+                "core-result candidate branches",
+            ),
+            (
+                "authority.memory_candidate is byte-equal to\n"
+                "              expected_projection_candidate(\n"
+                "                authority.request_snapshot, authority.evaluation_identity, memory,",
+                "authority.memory_candidate is byte-equal to\n"
+                "              build_memory_projection_candidate(\n"
+                "                authority.request_snapshot, authority.evaluation_identity, memory,",
+                "core-result candidate branches",
+            ),
+            (
+                "authority.memory_candidate is byte-equal to\n"
+                "              expected_projection_candidate(\n"
+                "                authority.request_snapshot, authority.evaluation_identity, memory,",
+                "authority.memory_candidate is byte-equal to\n"
+                "              expected_projection_candidate(\n"
+                "                authority.request_snapshot, authority.evaluation_identity, time,",
+                "core-result candidate branches",
+            ),
+            (
+                "None if memory not in\n"
+                "                  authority.request_snapshot.requested_backends else\n"
+                "                  CandidateBlocked { construction_blockers=blockers })",
+                "None if memory not in\n"
+                "                  authority.request_snapshot.requested_backends else\n"
+                "                  CandidateBlocked { construction_blockers=EMPTY })",
+                "core-result candidate branches",
+            ),
+            (
+                "require authority.core_result == Blocked { blockers=bs }",
+                "require authority.core_result == Ready { core=bs }",
+                "runtime-blocked core propagation",
+            ),
+        )
+        for original, replacement, expected in mutations:
+            with self.subTest(expected=expected, replacement=replacement):
+                self.assertEqual(template.count(original), 1, original)
+                errors = validate(template.replace(original, replacement, 1))
+                self.assertTrue(any(expected in error for error in errors), errors)
+
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         original_tag = (

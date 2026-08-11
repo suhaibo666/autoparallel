@@ -316,6 +316,50 @@ class ModuleContractStructureTest(unittest.TestCase):
         )
         self.assertNotRegex(template, r"call\s+expected_projection_candidate")
 
+    def test_projection_bundle_constructor_is_total_over_core_result(self) -> None:
+        template = TEMPLATE.read_text(encoding="utf-8")
+        evaluator = re.search(
+            r"evaluate_and_finalize_projection_bundle\(authority\):"
+            r"(?P<body>.*?)</code></pre>",
+            template,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(evaluator)
+        body = evaluator.group("body") if evaluator else ""
+        branches = re.search(
+            r"match authority\.core_result \(exhaustive, mutually exclusive\):\s*"
+            r"Ready \{ core=core \}:\s*(?P<ready>.*?)\s*"
+            r"Blocked \{ blockers=blockers \}:\s*(?P<blocked>.*?)\s*"
+            r"require exactly one candidate-construction branch executed",
+            body,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(branches)
+        ready = re.sub(r"\s+", " ", branches.group("ready") if branches else "")
+        blocked = re.sub(r"\s+", " ", branches.group("blocked") if branches else "")
+        for backend in ("memory", "time"):
+            self.assertIn(
+                f"authority.{backend}_candidate is byte-equal to "
+                f"build_{backend}_projection_candidate( authority.request_snapshot, "
+                "authority.evaluation_identity, core)",
+                ready,
+            )
+            self.assertIn(
+                f"authority.{backend}_candidate is byte-equal to "
+                "expected_projection_candidate( authority.request_snapshot, "
+                f"authority.evaluation_identity, {backend}, None if {backend} not in "
+                "authority.request_snapshot.requested_backends else CandidateBlocked "
+                "{ construction_blockers=blockers })",
+                blocked,
+            )
+        self.assertNotIn("build_memory_projection_candidate(", blocked)
+        self.assertNotIn("build_time_projection_candidate(", blocked)
+        self.assertIn("do not call either backend candidate builder", blocked)
+        self.assertNotIn(
+            "both candidates are byte-equal to the exact outputs of the declared candidate constructors",
+            re.sub(r"\s+", " ", body),
+        )
+
     def test_memory_blocker_scope_matches_shared_shape_authority(self) -> None:
         template = TEMPLATE.read_text(encoding="utf-8")
         self.assertNotIn("shape/storage/lifetime 语义只阻断内存侧", template)

@@ -1864,6 +1864,77 @@ def check_task7_behavioral_contracts(html: str, errors: list[str]) -> None:
     if bundle is None or any(token not in bundle_text for token in shared_scope_tokens):
         errors.append("Task7 backend-local 与 shared failure scope 不闭合")
 
+    bundle_source = unescape(bundle.group("body")) if bundle is not None else ""
+    runtime_branch = re.search(
+        r"match authority\.runtime_result:\s*"
+        r"Blocked \{ blockers=bs \}:\s*(?P<blocked>.*?)\s*"
+        r"Ready \{ runtime_plan=plan \}:\s*(?P<ready>.*?)\s*"
+        r"(?=match authority\.core_result)",
+        bundle_source,
+        re.DOTALL,
+    )
+    runtime_blocked_text = re.sub(
+        r"\s+", " ", runtime_branch.group("blocked") if runtime_branch else ""
+    ).strip()
+    if runtime_blocked_text != (
+        "require authority.core_result == Blocked { blockers=bs }"
+    ):
+        errors.append("Task8 runtime-blocked core propagation 不闭合")
+
+    core_branches = re.search(
+        r"match authority\.core_result \(exhaustive, mutually exclusive\):\s*"
+        r"Ready \{ core=core \}:\s*(?P<ready>.*?)\s*"
+        r"Blocked \{ blockers=blockers \}:\s*(?P<blocked>.*?)\s*"
+        r"require exactly one candidate-construction branch executed",
+        bundle_source,
+        re.DOTALL,
+    )
+    ready_core_text = core_branches.group("ready") if core_branches else ""
+    blocked_core_text = core_branches.group("blocked") if core_branches else ""
+    ready_bindings = sorted(
+        re.findall(
+            r"require\s+authority\.(memory|time)_candidate\s+is byte-equal to\s+"
+            r"build_(memory|time)_projection_candidate\(\s*"
+            r"authority\.request_snapshot,\s*authority\.evaluation_identity,\s*"
+            r"core\s*\)",
+            ready_core_text,
+        )
+    )
+    blocked_bindings = sorted(
+        re.findall(
+            r"require\s+authority\.(memory|time)_candidate\s+is byte-equal to\s+"
+            r"expected_projection_candidate\(\s*authority\.request_snapshot,\s*"
+            r"authority\.evaluation_identity,\s*(memory|time),\s*"
+            r"None if (memory|time) not in\s*"
+            r"authority\.request_snapshot\.requested_backends else\s*"
+            r"CandidateBlocked \{\s*construction_blockers=([A-Za-z_]+)\s*\}\s*\)",
+            blocked_core_text,
+        )
+    )
+    exact_backends = [("memory", "memory"), ("time", "time")]
+    exact_blocked_backends = [
+        ("memory", "memory", "memory", "blockers"),
+        ("time", "time", "time", "blockers"),
+    ]
+    if (
+        core_branches is None
+        or bundle_source.count("match authority.core_result") != 1
+        or bundle_source.count(
+            "require exactly one candidate-construction branch executed"
+        )
+        != 1
+        or ready_bindings != exact_backends
+        or "expected_projection_candidate(" in ready_core_text
+        or blocked_bindings != exact_blocked_backends
+        or "build_memory_projection_candidate(" in blocked_core_text
+        or "build_time_projection_candidate(" in blocked_core_text
+        or blocked_core_text.count("do not call either backend candidate builder")
+        != 1
+        or "both candidates are byte-equal to the exact outputs of the declared"
+        in bundle_source
+    ):
+        errors.append("Task8 exhaustive core-result candidate branches 不闭合")
+
     comparison_basis = re.search(
         r"ComparisonBasis:\s*(?P<body>.*?)comparison_basis_digest\s*:=",
         html,

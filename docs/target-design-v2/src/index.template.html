@@ -2144,10 +2144,31 @@ evaluate_and_finalize_projection_bundle(authority):
       require authority.core_result is byte-equal to bind_core(
         plan, exact HardwareProfile/ExecutionDeployment/
         HardwareBindingPolicy inputs from request/config input slices)
-  require both candidates are byte-equal to the exact outputs of the declared
-          candidate constructors on authority.core_result and the exact
-          config/shared slices plus only the matching requested-backend arm in
-          authority.request_snapshot; no NotRequested arm is read or fingerprinted
+  match authority.core_result (exhaustive, mutually exclusive):
+    Ready { core=core }:
+      require authority.memory_candidate is byte-equal to
+              build_memory_projection_candidate(
+                authority.request_snapshot, authority.evaluation_identity, core)
+      require authority.time_candidate is byte-equal to
+              build_time_projection_candidate(
+                authority.request_snapshot, authority.evaluation_identity, core)
+    Blocked { blockers=blockers }:
+      require authority.memory_candidate is byte-equal to
+              expected_projection_candidate(
+                authority.request_snapshot, authority.evaluation_identity, memory,
+                None if memory not in
+                  authority.request_snapshot.requested_backends else
+                  CandidateBlocked { construction_blockers=blockers })
+      require authority.time_candidate is byte-equal to
+              expected_projection_candidate(
+                authority.request_snapshot, authority.evaluation_identity, time,
+                None if time not in
+                  authority.request_snapshot.requested_backends else
+                  CandidateBlocked { construction_blockers=blockers })
+      do not call either backend candidate builder
+  require exactly one candidate-construction branch executed
+  require each branch reads only the exact config/shared slices plus the matching
+          requested-backend arm; no NotRequested arm is read or fingerprinted
   require for every CandidateBlocked candidate, each construction blocker
           contains candidate.backend in affected_backends
   require every BlockerRecord that prevents RuntimeBuildResult or
