@@ -1,5 +1,21 @@
 # 第五轮反驳 · 攻档 1 的 25 条修复、十条裁定、档 2/3 的漏判
 
+> ## ⚠ 作废抬头（2026-08-07 补，第十二轮）
+>
+> **本文件早于第十轮「显存链单侧化」裁定**（委托方原话：「仿真不考虑碎片问题，只预估实际的下限」）。
+> **凡涉及下列对象的条目一律作废，以 `src/index.template.html` 正文为准**：
+>
+> - 任何**峰值上界**：`peak.hi` / `peak_upper` / `peak_reserved` / `sup_interleave` / `peak_allocated.hi` —— **产物只有 `peak_interval.lo` 一端**，
+>   `peak_interval.hi` 与 `C_eff.lo` 现为**记号**（§10.2b `G-A(记号闭合)`：除 `oom_verdict` 的 `false` 分支外不得有任何消费者）。
+> - 任何形如「**装得下**可判定 / 标定碎片后可得 / `oom_verdict = false`」的条目 —— `false` 在**射程之外**，
+>   **不是知识缺口**，没有任何填法或标定能使它可算。`G-V1` 已无对象，`G-V*` 表当前为空。
+> - 任何**危险方向**的判断 —— 已翻转：**低估 `peak.lo` 是沉默侧**（只让"会 OOM"更难成立，不骗人），
+>   **高估 `peak.lo` 才买一个假 `true`**。凡按"低估最危险"写的优先级排序都要重排。
+> - 任何**门数**（本文件里的 40 / 44 等）—— 现为**条目 49 / 真门 43 / 独立真门 41**，且由 `tools/verify_gates.py` 机器核对。
+>
+> **本文件不再更新，保留它是为了留住"当时是怎么被打出来的"**——改内容会丢掉对抗过程的原始形态，
+> 而 `CLOSURE-REPORT.md` 的价值恰恰建在能回来读原文上。逐轮结论见 `CLOSURE-REPORT.md`，当前状态见 `HANDOFF.md`。
+
 > 只读三份文件：`src/index.template.html`（正文，效力最高）、`DEFECT-LEDGER.md`、`ADVERSARIAL-RECORD.md`。
 > 未读任何源码、未执行任何代码、未引用任何实测数字（PySub 61 条、758 guard、0.09 µs、153 B/事件、625/989 全局等一律不作论据）。
 > 行号指正文 `index.template.html`。

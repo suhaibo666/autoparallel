@@ -1,10 +1,10 @@
 # docs/target-design-v2/tools/build_doc.py
-"""模板 + 同源 SVG + CSS → 两份 HTML。
+"""模板 + 构建期 Mermaid SVG + CSS → 两份 HTML。
 
 替换的占位符：
   {{CSS}}            → <style> src/style.css </style>
   {{TOC}}            → 由文档标题**自动生成**的导航（不手维护，故不会漏章节）
-  {{SVG:<name>}}     → <figure>：内联 SVG + 图题 + 可编辑源路径
+  <figure class="mermaid-figure" ...> → 构建期渲染、校验并内联静态 SVG
 
 另做两件构建期修正：
   1. **自动给缺 id 的 h2/h3 补 id**（由标题里的「N.M」推），保证每个小节可锚定；
@@ -15,11 +15,12 @@
 
 产出两份，内容同源：
   index.html     独立文件（含 doctype/html/head + 主题切换），浏览器直接打开
-  artifact.html  仅 title/style/正文（Artifact 发布用，宿主自带外壳）
+  artifact.html  charset/title/style/正文（Artifact 发布用，宿主自带外壳）
 """
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import sys
 
@@ -27,15 +28,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "src", "index.template.html")
 CSS = os.path.join(ROOT, "src", "style.css")
-SVG_DIR = os.path.join(ROOT, "build", "svg")
+MERMAID_CONFIG = os.path.join(ROOT, "src", "mermaid.config.json")
 
-sys.path.insert(0, HERE)
-import gen_diagrams as G  # noqa: E402
-
-TITLES = {name: fn().title for name, fn in G.DIAGRAMS}
-#: 图号按**正文出现顺序**编，不按生成器清单顺序 —— 两者不同（正文里 04 在 03 之前用到），
-#: 按清单编会出现「图 4 排在图 3 前面」。由 main() 在替换占位符前填好。
-FIGNO: dict[str, int] = {}
+if __package__:
+    from .render_mermaid import extract_mermaid_figures, render_mermaid_figures
+else:
+    sys.path.insert(0, HERE)
+    from render_mermaid import extract_mermaid_figures, render_mermaid_figures
 
 #: CJK / 全角标点。用于判定「此处换行会不会在汉字间造出空隙」。
 CJK = r"[⺀-鿿豈-﫿︰-﹏＀-￯　-〿]"
@@ -118,14 +117,6 @@ def build_toc(html: str) -> str:
             + "\n    ".join(rows) + "\n  </ol>\n</nav>")
 
 
-def figure(name: str) -> str:
-    with open(os.path.join(SVG_DIR, name + ".svg"), "r", encoding="utf-8") as fh:
-        svg = fh.read()
-    return (f'<figure id="fig-{name}">\n<div class="fw">\n{svg}\n</div>\n'
-            f'<figcaption><span><b>图 {FIGNO[name]}</b>　{TITLES.get(name, name)}</span>'
-            f'<span class="src">diagrams/{name}.excalidraw</span></figcaption>\n</figure>')
-
-
 WRAPPER_HEAD = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -159,65 +150,112 @@ WRAPPER_TAIL = """
 """
 
 
-def main():
-    with open(SRC, "r", encoding="utf-8") as fh:
+def _extract_document_title(template_html: str) -> tuple[str, str]:
+    """Extract only the leading document title, never nested SVG titles."""
+    match = re.match(r"\s*(<title>.*?</title>)\s*", template_html, re.S | re.I)
+    if not match:
+        raise ValueError("template must start with one document-level <title>")
+    return match.group(1), template_html[match.end():]
+
+
+def build_document(
+    source_path: os.PathLike[str] | str = SRC,
+    css_path: os.PathLike[str] | str = CSS,
+    output_dir: os.PathLike[str] | str = ROOT,
+    *,
+    mermaid_config_path: os.PathLike[str] | str = MERMAID_CONFIG,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    source = pathlib.Path(source_path)
+    stylesheet = pathlib.Path(css_path)
+    destination = pathlib.Path(output_dir)
+
+    with source.open("r", encoding="utf-8") as fh:
         tpl = fh.read()
 
     tpl, n_ids = assign_ids(tpl)
+    document_title, tpl = _extract_document_title(tpl)
+    if tpl.count("{{CSS}}") != 1:
+        raise ValueError("template must contain exactly one {{CSS}} placeholder")
+    with stylesheet.open("r", encoding="utf-8") as fh:
+        document_style = "<style>\n" + fh.read().rstrip() + "\n</style>"
+    tpl = tpl.replace("{{CSS}}", "", 1)
+
     toc = build_toc(tpl)
-
-    used, missing = [], []
-
-    # 先按正文出现顺序定图号，再替换（figure() 要读 FIGNO）
-    for i, name in enumerate(re.findall(r"\{\{SVG:([\w-]+)\}\}", tpl)):
-        FIGNO.setdefault(name, len(FIGNO) + 1)
-
-    def sub(m):
-        name = m.group(1)
-        if not os.path.isfile(os.path.join(SVG_DIR, name + ".svg")):
-            missing.append(name)
-            return ""
-        used.append(name)
-        return figure(name)
-
-    body = re.sub(r"\{\{SVG:([\w-]+)\}\}", sub, tpl)
-    if missing:
-        raise SystemExit(f"build_doc: 模板引用了不存在的图 {missing}（先跑 gen_diagrams.py）")
-
-    body = body.replace("{{TOC}}", toc)
-    with open(CSS, "r", encoding="utf-8") as fh:
-        body = body.replace("{{CSS}}", "<style>\n" + fh.read().rstrip() + "\n</style>")
+    body = tpl.replace("{{TOC}}", toc)
+    body = render_mermaid_figures(body, mermaid_config_path, destination)
 
     left = re.findall(r"\{\{[^}]*\}\}", body)
     if left:
-        raise SystemExit(f"build_doc: 未替换的占位符 {left[:5]}")
+        raise ValueError(f"unresolved template placeholder(s): {left[:5]}")
 
     body, n_nl = collapse_cjk_newlines(body)
+    artifact_html = (
+        '<meta charset="utf-8">\n'
+        + document_title
+        + "\n"
+        + document_style
+        + body
+    )
+    index_html = (
+        WRAPPER_HEAD
+        + document_title
+        + "\n"
+        + document_style
+        + "\n</head>\n<body>\n"
+        + body.strip()
+        + WRAPPER_TAIL
+    )
 
-    art = os.path.join(ROOT, "artifact.html")
-    with open(art, "w", encoding="utf-8") as fh:
-        fh.write(body)
+    destination.mkdir(parents=True, exist_ok=True)
+    artifact = destination / "artifact.html"
+    index = destination / "index.html"
+    artifact.write_text(artifact_html, encoding="utf-8", newline="\n")
+    index.write_text(index_html, encoding="utf-8", newline="\n")
 
-    head_parts = re.findall(r"<title>.*?</title>|<style>.*?</style>", body, re.S)
-    rest = body
-    for p in head_parts:
-        rest = rest.replace(p, "", 1)
-    std = (WRAPPER_HEAD + "\n".join(head_parts) + "\n</head>\n<body>\n"
-           + rest.strip() + WRAPPER_TAIL)
-    idx = os.path.join(ROOT, "index.html")
-    with open(idx, "w", encoding="utf-8") as fh:
-        fh.write(std)
+    build_document.last_stats = {
+        "chapters": toc.count('<li><a'),
+        "subsections": toc.count('class="sub"'),
+        "assigned_ids": n_ids,
+        "collapsed_newlines": n_nl,
+        "diagrams": len(extract_mermaid_figures(tpl)),
+    }
+    return index, artifact
 
-    n_ch = toc.count('<li><a')
-    n_sub = toc.count('class="sub"')
-    print(f"  导航自动生成：{n_ch} 章 + {n_sub} 小节（补 id {n_ids} 个）")
-    print(f"  中文句中换行修正：{n_nl} 处")
-    unused = [n for n, _ in G.DIAGRAMS if n not in used]
-    print(f"  图已内联 {len(used)}/{len(G.DIAGRAMS)}" + (f"  未用：{unused}" if unused else ""))
-    for p in (idx, art):
-        print(f"  {os.path.relpath(p, os.path.dirname(ROOT)):<34} "
-              f"{os.path.getsize(p) / 1024:.0f} KB")
+
+build_document.last_stats = {}
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build target-design-v2 HTML documents")
+    parser.add_argument("--source", type=pathlib.Path, default=pathlib.Path(SRC))
+    parser.add_argument("--css", type=pathlib.Path, default=pathlib.Path(CSS))
+    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path(ROOT))
+    parser.add_argument(
+        "--mermaid-config",
+        type=pathlib.Path,
+        default=pathlib.Path(MERMAID_CONFIG),
+    )
+    args = parser.parse_args(argv)
+    index, artifact = build_document(
+        args.source,
+        args.css,
+        args.output_dir,
+        mermaid_config_path=args.mermaid_config,
+    )
+
+    stats = build_document.last_stats
+    print(
+        f"  导航自动生成：{stats['chapters']} 章 + {stats['subsections']} 小节"
+        f"（补 id {stats['assigned_ids']} 个）"
+    )
+    print(f"  中文句中换行修正：{stats['collapsed_newlines']} 处")
+    print(f"  Mermaid 静态图已内联：{stats['diagrams']}")
+    for path in (index, artifact):
+        print(f"  {path.name:<34} {path.stat().st_size / 1024:.0f} KB")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

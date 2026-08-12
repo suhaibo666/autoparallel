@@ -1,242 +1,663 @@
-# 交接文档 · 统一源码级 Model IR 目标方案 v3
+# 交接文档 · PyNative 多维并行成本评估目标方案 v4.2
 
-> 写给**零上下文**的下一个会话。读完这一份应当能直接接着干，不需要回看聊天记录。
-> 最后更新：2026-08-05，第六轮对抗收口后。
-
----
+> 最后更新：2026-08-12（权威图 10→29 张：总体架构分层、端到端时序、两后端时序/流程、九模块契约类图、
+> Ch2/6/8/9 章节类图；Ch2–Ch9 每章加「本章核心职责」；两张后端 module-logic 图并入图 18/图 22 消除冗余；
+> 生成 HTML 内置图缩放查看器——点击任意图全屏，滚轮缩放、拖拽平移、Esc 关闭）
+>
+> 当前任务性质：目标方案设计与审查，不是 `cost_eval` 实现迁移
+>
+> 唯一权威正文：`src/index.template.html`
+>
+> 历史 spec/review 只记录形成过程；冲突时一律以权威正文为准
 
 ## 0. 三十秒版本
 
-在做一个**训练显存 / step time 仿真器**的**目标方案设计**（不是实现）。方案已过**六轮对抗评审**，
-正文 15 章、62 小节，在 `src/index.template.html`（2531 行，构建成 HTML）。
+这是一个纯代码驱动的多维混合并行训练内存与 step-time 工程预测仿真器。
 
-**当前任务不是实现，是继续找方案的漏洞并修。** 委托方明确：
-「现在不需要进行方案的实施，脱离现在的代码去做方案的漏洞排查和修复，
-只有最后的方案完全可行后才开始实施。现在不需要改代码，不读代码，仅仅进行方案的审核与修复。」
+完整主链只维护一份：见权威模板 [`src/index.template.html`](src/index.template.html) 中
+`data-diagram-id="production-pipeline"` 的 Mermaid 源，以及由它生成的 `index.html`/`artifact.html`
+同名静态 SVG。HANDOFF 不再复制一份可能漂移的 ASCII 架构图；下文 `text` 代码块仅用于 schema、公式或
+伪代码，不是第二套架构/流程图。
 
----
+- 内存只按确定的 logical kernel order 重放 `Allocate/Bind/Use/Free`，不读取 duration 或完成时刻。
+- 时间使用无资源竞争的 global progress DAG；只建模依赖、stream 次序、P2P/collective rendezvous。
+- compute duration 来自用户预采集、冻结且 MeasurementKey 精确匹配的唯一记录；communication duration
+  来自唯一选中的版本化理论公式与 route。
+- logical-rank→device 映射来自显式 ExecutionDeployment；stream 使用 device-qualified PhysicalStreamId 和
+  唯一 StreamBinding，不由实现临时选择。
+- kernel variant 在 core 中由 hardware-free selector 与 HardwareBindingPolicy 唯一解析；memory workspace
+  和 time MeasurementKey 共用同一 KernelVariantBinding，但缺 duration record 仍只阻断 time。
+- RuntimeEventPlan 已物化规范 `LogicalRankContextSet`、`ResolvedEventSemantic`（含唯一 EffectSummary）、Tensor/Storage instance binding、memory key 与
+  structural report facts；projection 不按 local ID 暗读 CodeIR/registry 进程对象。
+- blocker 使用 `BlockerInstanceId + BlockerCode + BlockerRecord` 统一表示，Diagnostic 只能规范派生；
+  Ready view 内嵌规范 `EstimateContext`；source/runtime/core/projection blocker 必须按 backend scope 传播，
+  affected blocker 非空时不可能 Ready。
+- 待预测运行的 raw trace 不是生产输入；独立 TraceFixture 只用于离线/CI conformance。
 
-## 1. 铁律（**违反即作废，无例外**）
+### 0.1 二十九张权威 Mermaid 图索引
 
-1. **不读任何仓库源代码**。不要打开 `cost_eval/`、`mindformers/`、`Megatron-LM/`、任何 `*.py`
-   （**包括** `docs/target-design-v2/tools/*.py` 与 `stage0/` 下的脚本——那是本目录自己的工具，
-   审设计时也不该读）。
-   理由（委托方原话）：「因为可能和当前的代码相差很大，不能由现有代码干扰我的设计。」
-   **例外**：你要**改**这些工具时当然可以读改；禁的是把它们当作设计输入。
-2. **不执行框架代码**。构建文档、跑门数核对器可以。
-3. 派 subagent 时，上面两条必须逐字写进 prompt——历史上有 agent 因为没写清而去读了源码。
+图的唯一有效源均位于 `src/index.template.html` 的 `mermaid-source`；`tools/build_doc.py` 在构建期将其渲染为
+静态 SVG。图负责解释关系，邻接 schema、公式与伪代码仍是规范真值。按文档序：
 
----
+| diagram ID | 权威位置与责任 |
+|---|---|
+| `production-pipeline` | §1.1；请求、逐 rank CodeIR、Runtime/Core、双投影、seal、comparison/conformance 总链 |
+| `software-architecture` | §1.2；总体软件架构分层（L1–L7 + 横切 gate-system + 离线 conformance）与九模块归属 |
+| `end-to-end-sequence` | §1.5；从 build_request_snapshot 到双后端 seal 与可选比较的端到端时序 |
+| `evidence-coverage-class` | §2.3；Estimate/三态结果、SemanticValue、EvidenceTag、Coverage、Assumption 类图 |
+| `facts-and-digests` | §2.4/§3.1；输入事实、模型/运行时/后端摘要和验证旁路 |
+| `input-facts-class` | §3 模块契约；输入快照、tagged 后端输入与请求构建结果类图 |
+| `per-rank-codeir` | §4.2/§4.3；逐 logical rank 求值、obligation disposition 与 CodeIR 汇总 |
+| `code-ir-class` | §4 模块契约；RankCodeIR 内部 op/tensor/storage/边与构建结果类图 |
+| `value-storage-identity` | §5.2/§5.3；prototype、event occurrence、Tensor/Storage instance、binding 与 initial state |
+| `op-semantic-class` | §6.3；注册快照、逐面 OpSemantic、EffectSummary 与 effect domain 类图 |
+| `semantic-effect-closure` | §6.3–§6.5；语义注册/校验、effect 闭包与 blocker 状态机 |
+| `runtime-events-class` | §7 模块契约；RuntimeEventPlan、语义物化、instance 身份与通信 intent 类图 |
+| `runtime-event-expansion` | §7/§8.1–§8.3；forward/backward/recompute/optimizer 与 P2P/collective intent 展开 |
+| `placement-binding-class` | §8.5；逻辑放置、显式部署与 kernel/stream/storage/workspace/cost 绑定类图 |
+| `core-dual-projection` | §8.5/§9.1；共享 core、memory/time candidate、联合 gate 与 scope closure |
+| `simulation-plan-class` | §9.1；请求/评估身份、Runtime/Core 权威结果、bundle authority 与双视图类图 |
+| `memory-backend-class` | §10 模块契约；MemoryEventView 逐 rank 结构、绑定与估计/见证类图 |
+| `memory-logical-replay` | §9.2/§10.1；内存模块逻辑结构与事件重放（含值门与封装边界） |
+| `memory-backend-sequence` | §10.1；内存后端与联合投影、值门、result-sealing 的交互时序 |
+| `memory-replay-flowchart` | §10.1；逐 rank 重放控制流程（事件分派、守恒断言、peak/tie） |
+| `time-backend-class` | §10 模块契约；TimeEventView progress node 三分支与绑定/估计类图 |
+| `time-progress-des` | §9.3/§10.3；时间模块逻辑结构与无竞争 DES（含 G-TIME6 与封装边界） |
+| `time-backend-sequence` | §10.3；时间后端与联合投影、G-TIME6、result-sealing 的交互时序 |
+| `time-des-flowchart` | §10.3；无竞争 DES 控制流程（空图/无环/拓扑推进/关键路径/聚合） |
+| `result-sealing-class` | §10 模块契约；source/value/seal authority 与 candidate/artifact 类图 |
+| `comparison-class` | §10 模块契约；typed arm、basis pair、逐 metric 分支与封装类图 |
+| `gate-system-class` | §12 模块契约；specification/manifest/clause、authority 与账本类图 |
+| `result-gate-comparison` | §10.4/§10.5/§12.2；source/value/seal authority、ledger、comparison 与 conformance 旁路 |
+| `conformance-class` | §12 模块契约；fixture 体系、测量 envelope/会话能力、attestation 与发布判定类图 |
 
-## 2. 三条硬前提（外部裁定，设计只能在其中求解）
+### 0.2 九组模块契约索引
 
-| 代号 | 内容 | 它删掉了什么 |
-|---|---|---|
-| **P-oracle** | 真机对照数据**仅限** op 级 duration 记录（含 op 序列本身——逐 op 计时蕴含"哪些 op 跑了、几次、什么次序"） | allocator snapshot、活跃集合、保活集合差分、各 rank 分片形状 dump、显存事件序 |
-| **P-peak** | 端到端峰值标量**同样排除**（峰值是显存量，不是 time 记录）。框架 OOM 报错文本里的数字一并排除 | 显存链的**最后一根**外部柱子 |
-| **P-noexc** | 不接受任何人工例外条款。"评审""责任人""到期日""豁免"都是**流程**不是**机制** | 全部 waiver / accepted delta / 告警式放行 |
+每组契约的 HTML anchor 即下表 locator；其中集中列出模块责任、核心结构、唯一生产者/消费者、正式入口、
+显式结果联合、blocker/InternalContractViolation 边界以及缓存与序列化不变量。
 
-**P-oracle + P-peak 的直接后果，是全案一切问题的根**：
-**时间链有外部裁判，显存链没有。**
+| module ID / locator | 核心结构与正式入口 |
+|---|---|
+| `input-facts` / `mc-input-facts` | Source/Registry/Request snapshots；`build_request_snapshot(...) -> RequestSnapshotBuildResult` |
+| `code-ir` / `mc-code-ir` | CodeIR、RankCodeIR、obligation、leaf IR types；`evaluate_source(...) -> RankCodeIRBuildResult` |
+| `runtime-events` / `mc-runtime-events` | RuntimeEventPlan、ExecEvent、semantics、autograd/lifetime/intents；`expand_runtime_semantics(...) -> RuntimeBuildResult` |
+| `memory-backend` / `mc-memory-backend` | Storage/Workspace bindings、MemoryEventView/Estimate；`build_memory_projection_candidate(...)` 与 `run_memory_backend(...)` |
+| `time-backend` / `mc-time-backend` | stream/cost/communication bindings、TimeEventView/StepTimeEstimate；`build_time_projection_candidate(...)` 与 `run_time_backend(...)` |
+| `result-sealing` / `mc-result-sealing` | candidate 与 source/value/seal authority；`run_backend_build_candidate_and_seal(...)` |
+| `gate-system` / `mc-gate-system` | GateManifest/Clause/Ledger/Blocker；`compile_gate_manifest(...)`、`run_gate_domain(...)`、ledger extension |
+| `comparison` / `mc-comparison` | typed arms、basis/source/candidate/seal；basis 派生、authority 构造与逐 metric comparison |
+| `conformance` / `mc-conformance` | fixture/report/finding/release；`run_conformance(...)` 与 `apply_release_policy(...)` |
 
-## 2b. 零逃逸六判据（每个"用户可补充信息"的通道都要过）
+## 1. v4.2 已定边界
 
-1. 可证伪性 2. 可达阻断性 3. 非普适性
-4. 被计数且被设阈——**外加一问：被设阈的量在目标配置族上必须有方差**（无方差 ⇒ 阈值退化为常量 ⇒ 不是门）
-5. **代价单调性（硬）**——强形式：*同一份配置内不存在一种填法使答案形状变好*
-6. 设置权归属（**已放弃**：真实场景里使用者就是算子语义作者）
+### 1.1 逐 rank CodeIR
 
----
+- trainer 按当前配置分配 transformer block，因此每个 logical rank 使用由 P 派生的
+  `RankEvalContext(r)` 独立求值。
+- 顶层 `CodeIR(P)` 是规范 rank 顺序的有序映射，不是一张带 rank guard 的母图。
+- CodeIR 创建后不可变；不做算子融合、消除、替换或通用图优化。
+- 对外引用使用 `(logical_rank, local_id)` 限定；physical device/stream 只在 SimulationPlanCore/投影出现。
+- 独立句法 pass 为每个候选调用 occurrence 生成 SourceObligation；guard 只作为 branch evidence，
+  不单独成为 obligation。每项恰为 CodeNode、Residual 或有证据的 ProvenNotExecuted，且双向闭合；
+  分母不能从已经生成的 IR 反推。
+- PySub 世界由 SourceSnapshot、CompileEnvFacts 与冻结 registry 封闭。未快照 hook/dispatch/monkey
+  patch 若可能改变调用图，必须阻断，不能静默静态绑定。
 
-## 3. 文件在哪
+### 1.2 microbatch 与初态身份
 
-```
-docs/target-design-v2/
-├── src/index.template.html   ← **唯一的正文源**。所有编辑改这里
-├── src/style.css
-├── index.html / artifact.html ← 构建产物，**不要手改**
-├── tools/build_doc.py        ← 构建：python tools/build_doc.py
-├── tools/gen_diagrams.py     ← 图（一份几何 → excalidraw + 内联 SVG）
-├── tools/verify_gates.py     ← **门数与一致性核对器，改门表后必跑**
-├── diagrams/*.excalidraw     ← 7 张图的可编辑源
-├── DEFECT-LEDGER.md          ← 缺陷台账 76 条（**"现状"列已过期，见 §6**）
-├── ADVERSARIAL-RECORD.md     ← 对抗记录：被推翻的结论、被否掉的做法、十组互斥修法的裁定
-├── r5-refute-tier1fixes.md   ← 第五轮反驳报告
-├── r6-refute.md              ← 第六轮反驳报告（**最新，尚有 8 条未修**）
-├── r6-editspec.md            ← 第六轮编辑规格（33 组已落盘）
-├── stage0/                   ← 立项前度量：合成图基准 + AST 探针（**已完成**）
-└── HANDOFF.md                ← 本文件
-```
+```text
+ValuePrototypeRef = RankTensorRef | RuntimeTensorRef
+StoragePrototypeRef = RankStorageRef | RuntimeStorageRef | WorkspaceRef
 
-**发布**：artifact URL `https://claude.ai/code/artifact/40d72f8c-9e00-48a0-894d-882c339359a8`
-（用 Artifact 工具、`file_path` 指向 `artifact.html` 重新发布即可保持同一链接）。
+TensorInstanceId =
+  (ValuePrototypeRef, EventId | InitialTensorRef, output_ordinal)
 
-**改完正文的标准动作**：
-
-```bash
-cd docs/target-design-v2
-python tools/build_doc.py       # 重建 index.html / artifact.html
-python tools/verify_gates.py    # 门数与一致性，不一致退出码非 0
-# 再做标签配平检查（见 §7 的片段）
-```
-
----
-
-## 4. 方案是什么（一页）
-
-**主线**：以框架源码在**策略单位元 π₀** 处的偏特化残差为模型结构的唯一入口，得到 policy-free 的
-`CoreIR`；用**纯配置描述的原子 Op 语义**补齐源码证明不了的算子契约；其后每层策略由一个
-**只增不改**的改写 pass 注入，pass 必须能重建源码在真实策略下本来会写出的东西（**PGRO**）；
-最后由显存与时间两个**只读**后端消费同一份 `SchedIR`。
-
-**层序**：`S0 事实源 → G0 CoreIR → G1 TrainIR（层内含 impl_select/fusion_logical/precision_fwd）
-→ G1.7 PrecIR → G2 ShardIR → G2.5 → G3 RematIR → G4 SchedIR → 两后端`
-
-**横切契约**：provenance 是**两条正交轴**——
-`certainty`（exact < modeled < assumed，回答"点还是区间"）× `roots`（八种闭集，回答"错了谁负责"）。
-`derived/modeled/assumed` 三个惯用名只是 `certainty` 的命名投影。
-
-**头号输出**：`oom_verdict : Q3[Bool]`（true / false / **undetermined**），
-峰值**只有区间形态**、step time **只有 `Sample` 形态**，二者都没有标量形态。
-`undetermined` 必须附**判定阻碍分解**（"要回答你的问题，先去标定这几个量"）。
-
-**门体系**：49 条目 / **真门 43** / 独立真门 41。按 oracle 分组前缀：
-`G-P*` 装载期 · `G-X*` schema · `G-C/D/E*` 纯静态 · `G-T*` 真机 · `G-B*` 代数 ·
-`G-R*` 规模 · `G-N*` 新 spec · `G-A*` 层不变量 · `G-L1/G-M1/G-M2a/G-M2b/G-Z1a` 元判据。
-
----
-
-## 5. 问题在哪（**这一节最重要**）
-
-委托方看不懂门编号，用这三类讲。**不要在报告里堆门编号，要讲这三类。**
-
-### 第一类 · 能力边界（不会因为改设计而消失）
-
-1. **能证"会 OOM"，证不了"装得下"。** 前者只要下界（碎片只会让情况更糟），后者要上界，
-   而上界含 allocator **外部碎片**，它在实测标定前给不出界。而"装得下"正是用户要的那句话。
-   这被写成一条**会变红的 CI 断言 `G-M2b`**，不是免责声明——标定推进它会自己变绿。
-2. **峰值里最大的几块恰好最不可验证**：优化器持久项（16 B/参数，是权重的 8 倍）、梯度桶、
-   重算副本、通信 buffer。它们全是"复刻框架行为"的产物：无源码可读、无标定点、无对照物。
-3. **有一格在原理上不可分辨**：梯度桶的 `free_policy` 两个取值**产生完全相同的 op 序列**
-   （归还显存是主机侧动作，不进 trace），而峰值差是**全部参数字节**。
-4. **43 道门里，拿真机数据当裁判且相互独立的只有 1 道**（`G-T1`，op 序列同构），
-   而且它只看 op 序列、看不见任何字节。其余全是"我们自己写的东西检我们自己写的东西"。
-
-### 第二类 · 自洽性 bug（可修，已修约 60 条，**仍在出新的**）
-
-不是"做不到 X"，而是"文档自己跟自己打架"。典型形态：
-
-- **头号输出在类型上算不出来**（比较的一边被定义成"扫描观测范围"，而方案规定这种东西不许参与比较）
-- **某道门在任何配置下恒红或恒绿**（恒红与恒绿一样坏——不携带信息，还淹掉真正的触发原因）
-- **两条规则不能同时成立**（"加标定点是脏化动作必须让指标变差" vs "标定推进后某门会自己变绿"）
-- **打印出来的数字自己算错**（门数已错三次）
-
-### 第三类 · 过程问题（**这是当前最需要对付的**）
-
-**每一轮修复都在制造下一轮的洞，而且比例在上升**：
-第四轮 1 条、第五轮 2 条、**第六轮 7 条**属"修复相乘"——单看任何一条修复都对，两条凑一起才出事。
-
-最典型：给 alias 判断挂了个 `replication` 根（对），同一批又把残差来源④ 的适用域钉死为三种根、
-**没包含 `replication`**（单看也对）。两条一乘 ⇒ **每个字节都算不出上界** ⇒ "装得下"结构性不可达。
-
-原因是构件越多，**两两交互的对数比构件数长得快**，而每轮修复都在加构件。
-
----
-
-## 6. 三条必须知道的教训（不知道会重复踩）
-
-**① `DEFECT-LEDGER.md` 的"现状"列不可信。** 它是三轮前建的，记的是那时的正文。
-第六轮的编辑规格流回正文逐条核实后，把 33 条候选重判成「未落地 32 / 已被间接解决 7 / 不改 6」。
-**任何时候引用台账，先回正文核实。**
-
-**② 修完一批必须再攻一轮，不能假设修完就干净。** 见第三类。
-每次派红队时，**把靶子明确指向"上一批修复引入的构件"**，并把历史上"修复引入新洞"的具体形态
-写进 prompt（r5/r6 的 prompt 可以照抄）。
-
-**③ 能机器查的一致性，就不该留给下一轮红队。** `tools/verify_gates.py` 目前管四类：
-门数与 oracle 分布、三个切分、§11.4 的镜像值域、幽灵编号（引用了门表里不存在的编号）。
-**它已经当场抓出过我第三次手数错和一个已被拆分的旧编号。**
-下一步应继续把一致性变成断言，而不是继续加构件。
-
----
-
-## 7. 好用的工作流（照做即可）
-
-**派两条 subagent，分工避免写冲突**：
-
-- **红队（只读）**：攻最近一批修复引入的构件。prompt 必须含：铁律、三条硬前提、六判据、
-  `G-M1`（恒红与恒绿一样坏）、**靶子表**（逐个列出新构件 + 攻击提示）、
-  「给构造不给意见」「攻不动的明写攻不动」「特别留意修复之间相乘」。
-- **编辑规格流（只读，出规格）**：处理台账剩余项。要求它
-  **第一产出是"回正文逐条核实"的结论**，然后给「逐字唯一锚点 + 替换文本」，并列修法必须**选一条给理由**。
-
-**落盘**：规格用锚点做字符串替换，脚本在
-`C:\Users\suhaibo\AppData\Local\Temp\claude\E--97-codes-torch-parallel\812bd784-aaed-4183-b062-2f2274bca23b\scratchpad\apply_spec.py`
-（先干跑看命中率，`--apply` 才写）。上一轮 34 组里 33 组唯一命中。
-
-**每次改完的自检片段**：
-
-```python
-import io, re
-s = io.open("src/index.template.html", encoding="utf-8").read()
-prot = re.compile(r"<(pre|script|style|svg)\b.*?</\1>", re.S | re.I)
-b = prot.sub("", s)
-print("配平:", [t for t in ("div","ul","table","p","li","tr","td","th")
-                if len(re.findall(rf"<{t}[\s>]", b)) != len(re.findall(rf"</{t}>", b))] or "无")
-h = io.open("index.html", encoding="utf-8").read()
-print("悬空锚点:", sorted(set(re.findall(r'href="#([^"]+)"', h))
-                        - set(re.findall(r'\bid="([^"]+)"', h))) or "无")
+StorageInstanceId =
+  (StoragePrototypeRef, allocation_occurrence_id)
 ```
 
-**正文风格**：中文；术语 `<code>`；强调 `<b>`；
-说明框 `<div class="cal why|bad|honest|inv"><span class="lbl">标题</span>…</div>`；
-表 `<div class="tw"><table>…</table></div>`（不换行单元格加 `class="nw"`）；
-代码块 `<pre><code>` 内用 `**粗体**`。
-**正文不写修订记录**（不出现"原方案""上一版""本轮"），那些进 `ADVERSARIAL-RECORD.md`；
-但**反面论证要保留**（"一个自然的做法是 X，它有致命性质 Y"——那是论证不是历史）。
+`allocation_occurrence_id` 区分 microbatch、recompute、prefetch、rematerialization 与 persistent live-in。
+ExecEvent 输入/输出、saved tensor、gradient relation 和 Memory Bind/Use 都引用 TensorInstanceId，
+不能使用裸 TensorId 混同不同 microbatch。
 
----
+RuntimeTensor/StorageRef 使用 `RuntimeRuleInvocationRef(rule_id, owner_origin, event_instance_key)`，承载
+backward、optimizer、通信等 rule 的每次派生对象；role-local ordinal 不能跨 invocation 复用。
+每个 storage-bearing TensorInstance 都有唯一 `TensorStorageBinding`；shape/dtype/relevant attrs 与
+`MemoryBindingKey` 随 RuntimeEventPlan 序列化。WorkspaceRef 只在 memory projection 由独立
+`WorkspaceBinding` 创建，不依赖 duration CostBinding，
+不能伪造 CodeIR identity。`LogicalInitialState` 随 RuntimeEventPlan
+传递；`SimulationInitialState` 再显式给出绑定后的 persistent live storage、初始 tensor binding 和 state version。
+每个 StorageInstance 必须恰来自 initial live-in 或一次 Allocate，二者互斥。
+`cold_start` 指参数已常驻但 lazy optimizer/runtime state 尚未创建的首个训练 step；
+`steady_state` 把已声明 persistent state 全部作为 live-in；模型构造不属于 step metric。
 
-## 8. 现在欠什么
+### 1.3 正反向与 event obligation
 
-### 8.1 立即可做
+- 每个 forward occurrence 逐 rank、逐 microbatch 实例化。
+- 每个要求梯度的 forward TensorInstance 必须有闭合的 saved-tensor、gradient producer/consumer、
+  accumulation 与参数更新关系。
+- 每个 runtime occurrence 先生成 EventObligation；每个 obligation 恰为
+  `EventId | BlockerInstanceId | NotApplicable`，coverage 按三分支守恒，每个 Event 也恰有一个反向授权。
+- `AutogradLink` 显式关联 forward/backward/recompute、saved tensor、gradient、accumulation 与 update；
+  重复 origin/microbatch 不能按位置猜配对。缺规则返回 `BLK-EVENT-SEMANTICS`。
+- recompute 产生新的 EventId、TensorInstanceId 和必要的 StorageInstanceId，但继续引用原
+  RankCodeNodeRef。
+- LogicalScheduleSpec 中必须影响实际发射/完成的条件全部 lower 为 `ScheduleConstraintEdge`；
+  `logical_kernel_order` 只是内存重放/tie-break 全序，不能替代跨 stream 执行边。
 
-`r6-refute.md` 里 **15 条成立反例只修了 7 条**，剩余 8 条 + 7 条"相乘类"里未处理的部分。
-已修：M1（来源④ 的两条准入）、M2（端点按值排序）、M3（`G-L1` 要检查器的澄清）、
-M4（`Evidence.grade` 四值同步 + 镜像表机器导出）、M6（`S_∞` 定义域扩到一切进入 `peak_interval` 的量）、
-`bypass_memo` 写进 §11.4、门数与成员修正。**其余请回 `r6-refute.md` 逐条核。**
+### 1.4 最小 effect 顺序规则
 
-台账 `DEFECT-LEDGER.md` 档 2 / 档 3 里，`r6-editspec.md` 判为「不改」的 6 条与
-「需拍板」的 3 条已裁完；其余未落地项以 `r6-editspec.md` 的核实结论为准。
+`StateRef` 是 canonical logical state location；tensor mutation 归一化到 alias root，RNG generator
+使用具名 StateRef。
 
-### 8.2 方向性建议（我给委托方的，未获答复）
+```text
+conflict(a,b) :=
+  W(a) intersects (R(b) union W(b))
+  or W(b) intersects (R(a) union W(a))
 
-**下一轮不再加构件，把能机器查的一致性全部变成断言。** 理由见 §5 第三类与 §6③。
-候选：五元组（`certainty/roots/evidence/direction/interval`）的逐量一致性、
-层不变量表与门表的交叉引用、Θ 清单与正文阈值出现处的一致性。
+overlap_permitted(a,b) :=
+  not conflict(a,b)
+  and disjoint(nonoverlap_domains(a), nonoverlap_domains(b))
 
-### 8.3 实施前的硬前置（**已完成，不必重做**）
+base_event_graph = data/required-source-control/ScheduleConstraintEdges
+canonical_base_order = stable_topological_order(base_event_graph, canonical instance key)
+for every conflicting unordered pair:
+  orient the effect edge from earlier to later in canonical_base_order
+dependencies = base edges union all required effect edges
+```
 
-- **合成图空转基准**（`stage0/bench_*.py`）：五个热循环 SoA+numpy **0.090 µs/事件**（假设 20 µs，保守 222×）；
-  **allocator 最坏实现 1294 µs/事件**（分桶 1.4 µs，差 1528×）——证实了"可到毫秒级"的担心；
-  朴素宿主对象 **153 B/事件**，`G-R1` 的 64 B 门**实测触发**。
-  **结论：成本是双峰的，把它建模成单一"每事件常数"这件事本身是错的。**
-- **AST 探针**（`stage0/probe/`，mindformers + Megatron-LM 各约 1250 个 `.py`，全量解析成功）：
-  PySub 约 **61 条构件覆盖 100%**、47 条覆盖 95%、12 条覆盖 80%；阻断项是元组解包/装饰器/`raise`/三元/`super()`
-  这类**平凡构件**，真动态特性（`eval`/`compile`/`__getattr__`）只影响个位数到十几个函数
-  ⇒ **源码偏特化路线在语法层面成立**。
-  `PolicyStateBinding` **是闭集**（24–143 条）。PGRO 主体 **421 条**"改变调用集合"的 guard，
-  嵌套 **85% 为零** ⇒ 分叉不爆炸。
-  **两条隐含假设被数据推翻**：(a)「框架无关」——import 期 monkey-patch 两框架差 **33 倍**；
-  (b)「策略主要是并行度」——实测 **MoE guard(283) > 并行度(237)**，而 MoE 多数字段属
-  `Π_semantic`（唯一没有 pass 能重建的一类）⇒ MoE 的旋钮多半不在 `sweep_dims` 里。
+`EffectDomainRef` 精确声明不可重入互斥域，不能把所有 `reentrant=false` 事件全局串行，也不能只凭
+semantic_id 猜域。必须遵守的 source order 先成为 control edge；所有 conflict 沿 base DAG 的同一拓扑全序
+定向，避免局部 pair 方向把可串行化 DAG 人为造环；phase/None/EventId 的 tie 全序固定。
+`overlap_permitted=false` 必须由已有 path 或确定 EventEdge 物化。RNG recompute 必须有 save/restore
+与版本闭合。无法确定 StateRef、顺序或物化后成环时返回 `BLK-EFFECT`。本版不建立通用 effect algebra。
 
-仍未测的三个数：每层原子 op 数 / 每事件 `Q` 实例数 / rank 类数 = `pp`。前两个需要一份
-**真实模型配置跑一次实例化**，纯静态给不了；第三个是一条设计断言，在 EP 下严格来说为假。
+### 1.5 layout/stride
 
----
+- 不建立精确 layout/stride/逐元素地址模型。
+- transpose/view 按注册语义作为 metadata alias，不预期隐式 reorder。
+- 只有明确声明为 new、dense、无 padding 的 storage 才能用 shape × dtype 派生 bytes。
+- 若 new/view 判断依赖未建模的 implicit contiguous/materialization，返回
+  `BLK-UNSUPPORTED-LAYOUT`，不能默认 contiguous。
 
-## 9. 一句话交接
+## 2. 两个后端
 
-**思路六轮没被推翻；现在修的是规范文本的自洽性，而它还没收敛，主要成因已从"原设计有洞"
-转成"修复互相干扰"。下一步的杠杆不在再读一遍文档，在把一致性变成会失败的断言。**
+### 2.1 MemoryEventView
+
+`MemoryEventView.per_rank` 是覆盖全部 logical rank 的 OrderedMap；每个 Runtime storage 先得到唯一
+`StorageBinding`，payload bytes 再按目标 device alignment 规范化；每个 `RankMemoryEventView` 含绑定后的
+initial state、BoundStorageInstance、完整 RuntimeEventPlan logical order 和规范 MemoryEvent 序列。
+`ExpectedMemoryProjection` 由 runtime plan、hardware facts、memory registry、唯一 StorageBindings/WorkspaceBindings
+纯函数式生成，要求 rank/storage/binding/use/event 集合和排序完全相等，禁止幽灵 workspace 或漏事件。
+
+```text
+LogicalAnchor =
+  step_start | before(event_id) | at(event_id) | after(event_id) | step_end
+
+stable order:
+  step_start
+  → for event in logical_kernel_order: before → at → after
+  → step_end
+
+same anchor:
+  Allocate → Bind → Use → Free → memory_event_id
+```
+
+- 每个 rank view 的 logical_kernel_order 字节等于 RuntimeEventPlan 的权威顺序；MemoryEventId 是
+  `(rank, anchor, kind, subject ids, ordinal)` 的规范 tagged tuple。
+- projection 只读取冻结 hardware alignment 并把 aligned bytes 写入 view；后端重放不再读取 raw hardware、
+  physical stream、duration、start/end、resource state 或 TimeEstimate。
+- 本版不建模多 stream 完成次序、跨 stream allocator reuse 或由完成时刻触发的提前 free。
+- 每个 RuntimeEventPlan StorageInstance 恰有一个 `LogicalLifetime(release_event_id|None)`；多个 release candidate 阻断。
+  `dependency_safe(u,r) := u==r || path_length>=1(u,r)`。非空 release 必须对全部 Use 安全；只有 None
+  才取 step_end 并记录 assumption，不搜索或任选 logical join。
+- Runtime storage 使用 RuntimeEventPlan.LogicalLifetime；workspace 使用 WorkspaceBinding 中唯一固定的
+  `before(owner event) → after(owner event)` transient lifetime，两种来源互斥。跨 event/persistent 临时区
+  必须建模成 RuntimeStorageRef。
+- peak 可发生在 `INITIAL_STATE`。
+- 峰值 tie order 为 `INITIAL_STATE < canonical MemoryEventId`；输出权威值是逐 rank peak map，cluster max
+  只是按最小 LogicalRank 打破并列的派生摘要，rank class 必须可无损展开。
+
+### 2.2 P2P 与 collective
+
+`P2PIntent` 显式记录 src/dst、send/recv EventId、channel、sequence、bytes、payload TensorInstance、
+buffer owner/lifetime 与 `protocol_semantics_ref`。公式/route 只在 time projection 的硬件成本绑定中选择。
+PP activation/gradient 和 CP ring 不得只用跨 rank
+dependency 暗示通信。
+
+v4.2 支持 `matched_rendezvous`：两端 endpoint 及其前驱都 ready 后 cohort 启动；完成后两端后继
+才能推进。eager buffering、后台 progress 或协议阈值未显式建模时阻断。P2P buffer owner/lifetime
+必须降低为明确 StorageInstance 与 LogicalAnchor，不能只留在通信标签里。
+
+collective 保留 participant endpoint/group/sequence/bytes/correlation；time projection 为整个 cohort 恰选择
+一个对全部 endpoint 适用的 algorithm/formula。本版只支持 all-participant rendezvous；非阻塞/background
+progress 未升级语义时阻断。全局 wait-for graph 同时包含：
+
+- explicit EventEdge；
+- 相邻 stream sequence；
+- P2P endpoint/channel sequence；
+- collective rendezvous/group sequence。
+
+只检查各 rank 的本地 DAG 不够；联合 graph 必须无环并可结束。
+
+通信内存只含 intent/runtime rule 显式声明的 payload、endpoint、bucket/buffer。随 algorithm 变化的通信库
+内部 scratch 本版不建模；发现依赖时阻断 memory，不能让 memory/time 暗选不同算法。
+
+### 2.3 TimeEventView
+
+```text
+ProgressNode =
+  BoundComputeEvent | BoundP2P | BoundCollective
+
+event_projection: EventId → ProgressNodeId
+  non-communication event → own node
+  every matched communication endpoint → the one cohort node
+  image(event_projection) == progress_nodes; no extra node
+
+PhysicalStreamId = (device_id, local_stream_id)
+stream_bindings = unique_stream_assignments(
+  runtime_plan, HardwareProjectionFacts, StreamAssignmentPolicy)
+
+progress_edges == canonicalize(
+  typed_project(RuntimeEventPlan.EventEdge)
+  ∪ stream adjacency
+  ∪ collective group sequence
+  ∪ P2P channel sequence)
+
+step_start_ns = 0
+for node in stable_topological_order(global_progress_graph):
+  start_ns(node) = max({0} ∪ {end_ns(pred)})
+  end_ns(node) = checked_add(start_ns(node), bound_duration_ns(node))
+empty graph → step_time=0, timeline=[], critical_path=[]
+```
+
+TimeEventView 内嵌 exact measurement+protocol snapshots，或 normalized formula AST/inputs/route 与
+NumericPolicySnapshot，并在投影时复核 digest、复算 `bound_duration_ns`；DES 只消费已校验整数，
+不回读 core/CalibrationSet/registry。endpoint quotient 后不再单独计时；只有同 intent 的
+`communication_internal` self-loop 可丢弃，其他被 quotient 成自环的 data/control/schedule/effect edge 阻断。
+ProgressNodeId 为 `tag(compute, EventId)` 或 `tag(communication, intent kind/id)`；并列拓扑/关键路径/
+step-end 按它打破。busy/overlap/stage bubble 用半开 interval union 定义，service 按 compute event 或
+communication cohort 恰计一次，并由 G-TIME6 重算。
+
+TimeEventView 还内嵌 `selected_device_domain`、`pipeline_stage_domain`，stage domain 唯一由
+RuntimeEventPlan 中完整 LogicalRankContextSet 派生而非从实际 event 反推；每个通信 node 携带规范 endpoint
+descriptor `(EventId, rank, device, stage, PhysicalStreamId)`；因此零事件 stage/空图的零值 map 与通信跨 stage 归因都不回读 core。
+View 还内嵌全局 timeline NumericPolicySnapshot 与 NumericRangeWitness；Ready 前用任意精度执行同一 DES 和
+全部 interval/busy/bubble/service 公式，任一实际输出标量越界则 `BLK-NUMERIC-RANGE`。这不会用并行节点简单总和误杀合法图，
+也保证后端不会在 Ready 后首次溢出。
+`ExpectedTimeProjection` 还逐字段固定每个 BoundComputeEvent 的 origin/rank/phase/microbatch/stage/chunk、
+StreamBinding 与 CostBinding；只保留 EventId/duration 后篡改分组字段不能过门。
+`communication_internal` edge 只有在同 intent endpoint quotient 成 self-loop 时可丢弃，其他情形必须阻断，
+不会流入不支持该 kind 的 ProgressEdge。
+
+没有 `resource_ready`、capacity reservation、resource request 或 contention arbitration。不同 stream
+且无 progress edge 的节点可完全重叠，即使物理上共享 compute/HBM/link；并发降速不建模。
+
+## 3. 成本数据、lineage 与摘要
+
+### 3.1 compute measurement
+
+`CalibrationSet` 是用户在待预测请求之前采集、规范化、冻结并版本化的 compute duration 记录与
+MeasurementProtocol snapshots；workspace 规则/记录属于独立 MemoryRegistrySnapshot。
+Structure/Runtime 只生成硬件无关 `MeasurementKeyTemplate`；core 用 HardwareProjectionFacts 与
+HardwareBindingPolicy 生成 shared KernelVariantBinding，time projection 再结合 TimeCostPolicy 补全
+`MeasurementKey`。完整 key 覆盖 semantic/kernel、精确
+shape/dtype/attrs、硬件/runtime 与 measurement_protocol_digest；
+`MeasurementProtocol` 要求隔离、同步、warmup/repetitions/statistic 和 `co_runner_none`。
+active record 的 key protocol digest、ObservationRef protocol ref、selected protocol digest 与
+TimeCostPolicy.required protocol digest 必须四者相等。
+每个 key 必须恰有一个 active record，或使用冻结且进入摘要的 reducer 预先归并。
+
+`MemoryRegistrySnapshot` 冻结普通 storage size/category、compute workspace 与 alignment 规则；每个 runtime
+storage 形成唯一 StorageBinding，每个 compute workspace 形成唯一 WorkspaceBinding。`align_up(0,a)=0`，
+其余 bytes 用 checked ceil-div/multiply，不能由实现选择 raw/aligned 两套口径。
+
+时间后端只允许 exact measurement hit；禁止插值、roofline/FLOPs/零值 fallback。0 个候选返回
+`BLK-MISSING-TIME`，多个同等候选返回 `BLK-AMBIGUOUS-COST`。生产 lookup 只消费 calibration_train；
+holdout 只评估采集/适用性误差，不参与 duration 定价；conformance_fixture 只用于发布验证。
+
+### 3.2 communication formula
+
+`CommunicationModelSnapshot` 固定 formula id/version/digest、kind、algorithm、适用域及所需
+bytes/participants/path/link-latency/bandwidth。公式只生成单个通信 cohort 的固定 duration；
+不预留 link capacity，也不使并发通信彼此降速。
+完整 NumericPolicySnapshot（Decimal precision、rounding、integer ns range、NaN/Inf/negative 规则）随
+CostBinding 嵌入；仅有 numeric policy digest 不足以复算。
+
+### 3.3 数据隔离
+
+`sample_key = hash(raw artifact digest, coordinates/window, collector, hardware/runtime, quantity, unit)`，
+不含 split label；`split_group_key = hash(run/config/protocol/hardware group)`。
+`calibration_train`、`holdout`、`conformance_fixture` 必须按 sample_key、split_group_key 与 lineage ancestor
+两两不相交；当前待预测运行不能出现在生产测量 lineage。生产进程不读取 raw profiler/TraceFixture 路径。
+digest/lineage 只能证明内容一致，不能证明测量真实或 split 独立；需要更强保证时依赖方案外的签名采集器/
+attestation 信任根，否则标为“用户提供的测量事实”。
+
+```text
+model_input_digest =
+  source/model/P/rank/code-shape bindings/compile facts
+  + evaluator/PySub/descriptor/dispatch/canonical-ID/structure-registry semantics
+model_digest = model_input_digest + canonical_payload_without_derived_digests(CodeIR)
+runtime_input_digest = model_digest + scenario + runtime semantics
+runtime_plan_digest = runtime_input_digest + canonical_payload_without_derived_digests(RuntimeEventPlan)
+simulation_core_digest = runtime_plan_digest + hardware + ExecutionDeployment + HardwareBindingPolicy
+                         + shared KernelVariantBindings
+                         + canonical_payload_without_derived_digests(SimulationPlanCore)
+memory_simulation_digest = core + MemoryRegistry + StorageBindings + WorkspaceBindings
+                           + projection/identity/policy/assumptions/backend semantics
+time_simulation_digest = core + CalibrationSet + communication snapshot + TimeCostPolicy
+                         + exact CostBindings + StreamBindings + assumptions/backend semantics
+result_digest = hash(Estimate除result_digest自身之外的value、evidence、coverage、assumptions、
+                     EstimateContext digest与上游digests)
+```
+
+所有内容摘要统一使用逐 schema 排除表：CodeIR 只排除 model_digest、RuntimePlan 只排除 runtime_plan_digest、
+Core 只排除 simulation_core_digest，各 Binding/Snapshot/Policy/EstimateContext/GateManifest/GateExecutionLedger/Estimate 只排除
+自己的派生 digest；RequestSnapshot、EvaluationInstanceIdentity、ProductionSubject/ValidationContext、
+ProjectionCandidate/ProjectionBundleAuthority、
+EstimateCandidate、backend source/value/seal authority/candidate/artifact 与 comparison source/candidate/seal authority
+也各自只排除 schema 明列的自身 digest。ExecutionDeployment、MeasurementProtocol、CommunicationFormulaRef 与
+ResolvedEventSemantic 也各自只排除自己的 deployment/protocol/formula/semantic digest。嵌套输入 digest
+保留；KernelVariantBinding 的自身字段固定名为 `kernel_variant_binding_digest`；禁止把自身置零后 hash 或由实现自行删字段。
+
+TraceFixture、ConformanceReport 和 ConformanceVerdict 不进入生产摘要、比较 basis 或缓存键。
+requested backend set 与 NotRequested 也不进入仿真摘要；memory/time result 使用独立 cache namespace。
+EvaluationInstanceIdentity 只是 request/config capability provenance，不进入 model/runtime/backend simulation digest、
+Estimate.result_digest 或模型结果 cache key。缓存命中的 backend value 只能在当前 evaluation 的
+joint projection bundle 已做 scope 闭包且该侧 Ready 后作为 proposed value，必须重跑当前 value/result-seal clauses 并形成带
+`(request_digest,evaluation_instance_digest,backend)` 的新 BackendSealArtifact；comparison 不消费裸缓存结果。
+
+## 4. 输出与严格比较
+
+```text
+BackendResult<T> =
+  Ok { estimate: Estimate<T> }
+  | Blocked { diagnostics: NonEmpty[Diagnostic] }
+  | NotRequested
+```
+
+Blocked 不得携带 null/0 value、空 timeline 或旧缓存值。memory/time 可独立成功；time blocked 不影响
+duration-independent MemoryEventView。
+所有构建阶段 Blocked 都携带 `BlockerRecord`，最终 Diagnostic 的 instance/code/stage/scope/context 必须逐字派生；
+`BlockerCode` 只分类，`BlockerInstanceId` 区分同码的不同根因，scope 由规范 BlockerScopePolicy 求值。
+`RequestSnapshot.canonical_production_evaluation_inputs.configurations` 以 ConfigRef 唯一绑定正则 P 与该配置的
+scenario/deployment input slice；`requested_backend_inputs` 对 memory/time 分别携带 `Requested{...}` 或无 payload/digest
+的 `NotRequested` 标签，未请求侧事实不得进入 request digest。`EvaluationInstanceIdentity` 由 request digest、config_ref 与 slice digest 派生。两个不含
+gate outcome 的 `ProjectionCandidate` 必须绑定同一 identity，再进入同一 `ProjectionBundleAuthority`。
+bundle 同时保留权威 RuntimeBuildResult 与 CoreBuildResult：Runtime Ready 时 core 必须精确等于对该 plan 的
+bind_core 结果，因此 plan.blocker_index 在 core 后续 Blocked 时仍然可读；Runtime Blocked 时 core 只能携相同 blocker。
+任何使 RuntimeEventPlan/Core 或 shared G-IR invocation 无法 Ready/Pass 的 blocker 必须精确 scope 到
+`{memory,time}`；单侧结构 face 问题必须保留 shared artifact，下沉到该侧 candidate/view gate。
+joint projection ledger 恰执行一次 shared structure domain，加 memory/time 两个 view domain；在产生任一
+ProjectionResult 前，必须先规范聚合 pre-plan/core、RuntimeEventPlan、两个 construction candidate 与两侧 gate 的
+全部 InputBlocker occurrence，再按 `affected_backends` 投影。这同时保证 CandidateBlocked 不丢已有 blocker，以及
+time/P2P gate 产生 `{memory,time}` scope 时 memory 不会先行 seal 为 Ok。只影响 time 的 blocker 仍允许 memory Ready；
+未请求侧始终 NotRequested；`RequestSnapshot.requested_backends` 必须精确等于 tagged map 中 Requested arm 的 key 集，
+memory-only 请求不要求或指纹化 time facts，time-only 请求同样不要求 MemoryRegistrySnapshot。
+Projection Ready 当且仅当已请求、scope-closed `affected_blockers` 为空、candidate 为 View，且显式
+`ready_prerequisites(memory|time)` 全过。Ready 之后的 backend value/report gate 失败不是用户 blocker。两组
+view prerequisite 分别是 G-IR1..3 + G-MEM1..4 / G-TIME1..5。后端取得 Ready view 后先生成不可外泄的
+`EstimateCandidate`；其 digest 覆盖 value 与 execution witness。`BackendValueGateAuthority` 绑定 source authority 与这一个
+具体 candidate，G-MEM5/6 或 G-TIME6 的每条记录必须绑定该 authority digest，不能先验正确 value 后替换。
+随后形成三态 `BackendResultCandidate(ProposedOk|ProposedBlocked|ProposedNotRequested)`；G-REP1/3 对当前 candidate
+统一校验，全部通过才形成 `BackendSealArtifact`，对外 API/缓存只暴露 artifact.result，比较器消费完整 artifact capability。
+该 capability 的身份是 `(request_digest,evaluation_instance_digest,backend)`，不可由 API 输入或反序列化构造，
+唯一构造器是当前请求/配置/backend 的 seal；digest 只证明内容完整性，不能把
+用户传入的同形 JSON 变成已验证 artifact。
+value/REP gate 自身失败进入规范排序的 `InternalContractViolation` 全集并终止请求，不得递归包装成未经同门验证的 Blocked。
+`BackendResultSourceAuthority` 固化完整 ProjectionBundleAuthority（含 Runtime/Core 两层权威结果）、该侧最终
+ProjectionResult 与 joint projection ledger；
+pre-seal ledger 必须字节级保留 shared+memory+time 的完整 bundle prefix，再只追加当前 backend value stage。
+candidate 绑定 source/value authority 与 pre-seal ledger digest；
+result-seal 记录再绑定 BackendSealAuthority+完整 BackendResultCandidate digest。sealed ledger 只作为 request validation
+audit，不进入模型 evidence/result/cache identity。不能用 builder 调用路径、局部自洽对象或未绑定 loose records 冒充 provenance。
+ProductionSubject 必须从 build artifact、evaluator/registry、production policy、backend semantics 四组 constituent digest
+复算；ProductionValidationContext 与 candidate/source authority digest 绑定 lineage/exclusion facts。
+G-REP2 仅按比较请求走独立 comparison seal，因此不存在 Ready→Estimate→gate→Ready 的环。deployment/core build 失败传播到
+两个已请求后端，未请求侧仍为 NotRequested。
+Diagnostic.subject_ref 覆盖 request/config/deployment/source/residual/event-obligation/runtime-rule/binding 等阶段；
+source_ref 可空，但每条诊断至少有一个与 blocker stage 匹配的稳定 context ref。
+每个 Ready view 内嵌唯一 `EstimateContext(evidence, coverage, assumptions, model/runtime/backend digests)`；
+projection gate 对照规范 producer，后端只能逐字复制并生成 value/result_digest，不能自由重填 metadata。
+MemoryEstimate/StepTimeEstimate 是纯 payload；coverage、assumptions、evidence 与 digests 只在外层
+Estimate 出现，不能在一个 Ok 内维护两套 metadata。
+MemoryEstimate 的权威 payload 是 `OrderedMap<LogicalRank, RankMemoryEstimate>`；cluster max/rank class
+仅为可重算派生字段。StepTimeEstimate 的 busy/overlap/bubble/service 字段都由 timeline 半开区间公式产生。
+
+```text
+ComparisonResult = {
+  comparison_axes,
+  memory: MetricComparison<MemoryDelta>,
+  time: MetricComparison<TimeDelta>
+}
+
+MetricComparison<T> =
+  ComparableDelta { comparison_basis_digest,
+                    left_simulation_digest, right_simulation_digest,
+                    delta, coverage_delta }
+  | Incomparable { basis_mismatches }
+  | Unavailable { left_status, right_status, diagnostics }
+  | NotRequested
+```
+
+`ComparisonBasis` 有规范 schema 与 hash；每个 metric 的 `ComparisonBasisPair` 同时保存 left/right basis，
+不等时从该 pair 的规范结构差异派生 Incomparable，相等时才形成 common digest。`masked_config_evaluation_input`
+从完整 `CanonicalConfigEvaluationInput` 开始；normalized P/ExecutionScenario 仅在校验过的 comparison_axes 及其
+schema-declared cross-field deterministic derivation closure 上用 sentinel mask，其余字段（包括未落入闭包的
+logical rank context、deployment 与 `other_config_indexed_production_inputs`）必须相等。microbatch 通过
+P.batching 作为 axis；未声明的 scenario 变化仍不可比。每个 metric 独立判断：basis 相同且两侧均 Ok 才返回 ComparableDelta；basis 不同返回
+Incomparable；任一侧阻断/单侧未请求返回 Unavailable；两侧均未请求返回 NotRequested。只有
+ComparableDelta 携带数值 delta。
+time 两臂必须使用同一 measurement_protocol_digest；不同统计协议 Incomparable。relative delta 固定为
+`(right-left)/left`；左基线为 0 时返回 `UndefinedZeroBaseline`，不能输出 Inf/NaN；MemoryDelta 要求
+logical-rank id set 相同。
+
+ComparisonResult 不能由裸 `compare_per_metric` 直接外泄。显式 comparison request 先构造
+`ComparisonArmAuthority(config_ref,evaluation_identity,projection_bundle_authority_digest,artifacts)`，并严格要求每个 artifact 的
+`(request_digest,evaluation_instance_digest,backend)` 与所在臂一致。
+每臂的 memory/time artifact 还必须共享字节相同的 ProjectionBundleAuthority，arm 中的 bundle digest 与
+nested authority 等式可复算；该 bundle 的 ProductionValidationContext/GateManifest 必须与当前 comparison source 字节相同，
+不能在同 request/evaluation identity 下混用旧 subject。随后构造 `ComparisonSourceAuthority`，
+绑定 RequestSnapshot、左右 typed arm、逐 metric basis pair、ProductionValidationContext
+与 GateManifest；生成不可见的 `ComparisonResultCandidate` 后，G-REP2 的逐 clause ledger 必须绑定
+ComparisonSealAuthority+当前 candidate digest。全部通过才返回 ComparisonResult；失败固定为
+`CV-COMPARISON-CONTRACT` 且无结果、缓存或后续报告。成功时形成 ComparisonSealArtifact，外部只暴露
+artifact.result；没有 comparison request 时不构造比较 candidate/artifact。
+
+## 5. 18 道结构门
+
+### IR · 3
+
+- `G-IR1`：rank/qualified identity 完整；SourceObligation 三分支双向闭合，Residual 引用唯一 BlockerRecord 且 scope 合法。
+- `G-IR2`：摘要排除表可复算；model_input 覆盖 evaluator/PySub/ID 语义，CodeIR/model digest 硬件独立。
+- `G-IR3`：EventObligation、ResolvedEventSemantic、TensorStorageBinding、structural report facts、正反向关系
+  与规范 data/control/schedule/effect 边集完整；effect 沿 base DAG 的规范拓扑全序定向。
+
+### Memory · 6
+
+- `G-MEM1`：Storage/WorkspaceBinding 唯一，alignment 等式、per-rank expected set 与 origin XOR 成立。
+- `G-MEM2`：runtime LogicalLifetime 与 workspace BoundWorkspaceLifetime 各自唯一互斥；Free/release 合法。
+- `G-MEM3`：producer 与 TensorStorageBinding 唯一，Bind/Use 指向 live storage，range/release 安全。
+- `G-MEM4`：view order/initial/storage/events 等于 ExpectedMemoryProjection；live bytes 与集合一致。
+- `G-MEM5`：作为 EstimateCandidate 后置门，每 anchor/category 精确等于该类 live bytes，分类与总和均守恒。
+- `G-MEM6`：作为 EstimateCandidate 后置门，逐 rank peak/tie、cluster max 与规范 RankClass ID/member/representative/展开可重算。
+
+### Time · 6
+
+- `G-TIME1`：deployment/device domain 合法、stage domain 来自完整 rank contexts；progress node 恰等于
+  ExpectedTimeProjection，compute 复制字段和 endpoint quotient 无漂移/幽灵；communication_internal/typed self-loop/expected edge 等式成立，图可结束。
+- `G-TIME2`：每 Event 唯一绑定 PhysicalStreamId；StreamBinding/sequence 与冻结 policy/计划精确对应；
+  schedule/effect edge 生效，cohort 占用全部 endpoint stream。
+- `G-TIME3`：P2P send/recv/src/dst/channel/sequence/bytes/protocol/buffer contract 一一匹配。
+- `G-TIME4`：collective participant/group/sequence/bytes/correlation/algorithm 跨 rank 匹配。
+- `G-TIME5`：ResolvedEventSemantic 的 hardware-free key template 正确补全；compute record/key/ObservationRef/policy
+  protocol identity 四者闭合，comm formula/route+numeric snapshot 唯一且嵌入成本可复算；任意精度 preflight 证明全部输出标量不越界。
+- `G-TIME6`：作为 EstimateCandidate 后置门，只从 Ready view/witness 重算起点0/空图0、checked ns、规范 tie 与全部聚合，无暗读 core/contention。
+
+### Report · 3
+
+- `G-REP1`：封装前按 BackendSealAuthority 验证 source/value/seal authority、BackendResultCandidate 及三分支；
+  `(request_digest,evaluation_instance_digest,backend)` 全链相等；请求只读 RequestSnapshot，Ok 的完整
+  value/witness 与 value authority 相等，Blocked 精确来自 scope-closed bundle，NotRequested 请求状态闭合。
+- `G-REP2`：只在 typed comparison arms→source→candidate→ledger→seal 路径对当前 candidate 执行；
+  左右 config_ref/evaluation identity/artifact 不可交换；同臂 artifact 共享完整 bundle/current ProductionSubject/GateManifest；
+  完整 CanonicalConfigEvaluationInput 仅 mask P/scenario axis 及跨字段派生闭包，basis pair、逐 metric sum type、
+  协议与相对差公式合法。
+- `G-REP3`：同一 evaluation 的两个 ProjectionCandidate 在 bundle authority 上联合逐 clause 验证；bundle 同时保留
+  RuntimeBuildResult/CoreBuildResult，plan blocker 不因 bind_core 失败丢失；shared build/G-IR blocker 必须双侧，shared invocation
+  恰执行一次，全部 InputBlocker occurrence 先全局聚合再按 affected_backends 派生两侧 Result；GateExecutionLedger
+  对 bundle/backend/branch/stage/clause domain 无增漏，完整 bundle prefix/context 不可覆写，value/result records 绑定当前
+  candidate；BlockerRecord/Diagnostic scope 不分叉，contract failure 不伪装 blocker；
+  sample/split/lineage/train-only 合法；fixture/verdict 不污染生产。
+
+权威正文把每个复合 gate 分解为 `GateClause`；GateManifest 以
+`GateInvocationId=(GateId,backend,branch)` 表达条件化 stage/dependency DAG。每个适用 invocation 的
+`clause_outcomes: OrderedMap<GateClauseId, GateClauseExecutionRecord>` 必须精确覆盖全部 clause；manifest map key、
+GateManifestEntry.invocation_id、record.invocation_id 三方相等，clause map key、record.clause_id 与 manifest clause_id 三方相等。
+GateClause.failure_disposition 是唯一权威，ClauseFail 只携带 failure_instances，不能重标 disposition。仅 all-pass 才派生 Pass，
+任一失败即保留完整 failed-clause set，多个 InputBlocker 全量输出，任一 InternalViolation 优先终止但仍保留完整 violation set。
+每个 gate/clause record 绑定 stage evaluation-input digest、clause id 与 predicate implementation digest；NotApplicable
+也由具内容摘要的 applicability predicate 与证据产生。账本的 stage-context map key 等于 covered stages；projection、value、
+result-seal 与 comparison 分别绑定自己的 immutable authority/candidate；projection ledger 的 domain 是
+shared structure∪memory view∪time view，backend pre-seal 保留完整 bundle prefix 后仅加本侧 value domain，sealed ledger
+再仅加本侧 result domain。extension 不得覆盖旧 prefix/context，从而
+memory/time、Ok/Blocked/NotRequested 不互相制造假依赖，也不能用游离 record 或漏跑 clause 冒充已执行门。
+每条 gate record 的 invocation key、manifest-entry payload digest、subject 与 runner 还必须逐字回对 manifest/ledger。
+每个 clause 绑定 predicate implementation digest、正例、边界负例、assertion，以及全函数
+`GateFailureDisposition = InputBlocker(BlockerCode,scope) | InternalViolation(code)`。backend value、result seal
+和 comparison gate 失败一律是 InternalViolation。GateManifest 还绑定 subject、runner 与自身 digest。
+`verify_gates.py` 只做文档 lint，不证明运行时 predicate；发布测试必须逐 clause 执行。
+
+## 6. conformance
+
+`ConformanceVerdict = pass | fail | insufficient`：
+
+- missing/extra/unresolved node、错误 branch/dependency/communication identity 是结构性 fail；
+- peak/step/start/end 等数值误差按版本化 validation policy；
+- 没有独立 fixture 时为 insufficient，不能称 pass；
+- `ConformanceReport` 必须绑定 content-addressed subject、fixture set、validation policy、GateManifest 和
+  verifier runner digests；
+- subject 必须与 ProductionValidationContext 共用同一 ProductionSubject，并从 build artifact、evaluator/registry、
+  production policy、backend semantics 四组实际 constituent digest 复算，不能接受 opaque 自填字符串；
+- `GateManifest.subject_digest == ConformanceReport.subject_digest`，runner digest 也同时匹配报告和批准清单；
+- pass 必须先调用 `derive_approved_digest_set(artifact, policy)`，逐字重算并匹配以下全部十个字段：
+  `subject_digest`、`fixture_set_digest`、`validation_policy_digest`、`gate_manifest_digest`、
+  `verifier_runner_digest`、`runner_attestation_digest`、`conformance_execution_ledger_digest`、
+  `conformance_report_digest`、`conformance_seal_artifact_digest`、`release_policy_digest`；
+- pass 还必须由部署/verifier-owned、请求/fixture/policy/approval 无法构造的
+  `ReleaseApprovalTrustRootCapability` 固定完整 ReleasePolicy 与 approval-store snapshot，限制支持的 scheme，
+  并只使用 root-owned trusted approver public key material 验证覆盖 pinned policy/store identity 与上述十字段的签名；
+  self-owned key、wrong store、unsupported scheme 或 substituted policy 即使内部 digest/signature 自洽也不得发布；
+- fail 必须阻止精确 subject；insufficient 的发布行为由显式版本化 ReleasePolicy 决定；
+- verdict 不改变生产 BackendResult，生产摘要也不反向依赖报告。
+
+CodeIR conformance 按 rank 对比并聚合 rank set；event conformance 覆盖 backward/recompute/optimizer、
+TensorInstance、P2P/collective、microbatch/pipeline 与 logical allocation timeline。
+
+离线 conformance 的会话边界已经闭合：`MeasuredExecutionEnvironment` 是 protected measurer 发行的
+不可重放 envelope，摘要覆盖 invocation、runner/executable、process/container/session identity、single-use nonce、
+execution time window、measured payload 与 measurer identity/freshness evidence；所有 fixture binding 只能在
+`ValidatedMeasurementSessionCapability` 对应的同一调用域执行，runner attestation 签完整 envelope digest，
+validator 在读取 observed/ledger 前复算并消费 nonce。跨会话重放或只替换 provenance/freshness 都是
+InternalContractViolation。这个闭包仍以部署侧 `ConformanceTrustRootCapability`、`ReleaseApprovalTrustRootCapability`、
+protected measurer、可信单调时钟、进程/容器身份提供者与 trusted approver public-key provisioning 为外部信任根；
+摘要与签名不能自行证明这些物理根可信，也不能把 offline conformance
+表述为脱离该信任根的宿主隔离证明。
+
+## 7. 缓存闭包
+
+- Source parse：source + parser/evaluator semantics + compile parser facts。
+- CodeIR lookup：`model_input_digest`，命中后重验 `model_digest`。
+- RuntimeEventPlan lookup：`runtime_input_digest`，命中后重验 `runtime_plan_digest`。
+- SimulationPlanCore：仅缓存 Ready core，以 `simulation_core_digest` 为键；CoreBuild Blocked 不伪造 core。
+- Memory/Time result：分别使用 `(memory|time_simulation_digest, result_schema_version)`。
+- 缓存 value 只能在当前 EvaluationInstanceIdentity 的 joint projection blocker closure 判定该侧 Ready 后作为 proposed value；
+  必须在当前 `(request,evaluation,backend)` 上重建 source/value/seal authority 与 BackendSealArtifact。
+- 完整 API response 默认不缓存；若缓存必须加入 requested backend set。`NotRequested` 不是 estimate cache value。
+
+## 8. 文件与工作流
+
+| 路径 | 状态与责任 |
+|---|---|
+| `src/index.template.html` | 唯一权威正文与 Mermaid 业务图源，只编辑这里 |
+| `src/style.css`、`src/mermaid.config.json` | 页面样式与固定 Mermaid 配置 |
+| `tools/render_mermaid.py` | 只调用本地 mmdc，规范化、加前缀并校验 SVG |
+| `tools/build_doc.py` | 唯一活动构建入口 |
+| `tools/verify_gates.py` | 文档合同与禁用语义 verifier；不是 runtime gate runner |
+| `index.html`、`artifact.html` | `python tools/build_doc.py` 生成，不手改 |
+| `stage0/` | 探针与阶段证据，不是生产输入 |
+
+### 8.1 Mermaid 11.16.0 离线构建闭包
+
+- `package.json` 与 `package-lock.json` 精确锁定 `@mermaid-js/mermaid-cli@11.16.0`。Node 需满足
+  `^18.19 || >=20.0`。
+- 新环境先运行 `npm ci`；若 npm cache 已含 lockfile 的全部 tarball，可使用 `npm ci --offline`。
+  这是依赖 bootstrap，读者打开生成 HTML 不需要 Node、JavaScript 或网络。
+- `python tools/build_doc.py` 只经 `tools/render_mermaid.py` 调用项目本地
+  `node_modules/.bin/mmdc`（Windows 为对应 `.cmd` launcher），不回退到 CDN、在线 Mermaid 服务或全局 mmdc。
+- `src/mermaid.config.json` 固定 `securityLevel=strict`、`htmlLabels=false`、
+  `deterministicIds=true`、`deterministicIDSeed=target-design-v2` 与 `handDrawnSeed=271828`。后者固定
+  Mermaid 11.16 复杂 class shape 内部使用的 rough geometry；渲染器再规范化 XML、属性、ID 和本地引用；
+  确定性验收必须连续构建两次并比较两个产物的 SHA-256。
+- SVG 校验拒绝 `script`、事件属性、`foreignObject`、外部 `href/src`、远程字体、`@import` 与 CSS
+  `url()`；要求 `viewBox`、唯一 `title/desc`、原生 `text/tspan`、页面级唯一 ID 和闭合本地引用。
+
+以下为 PowerShell 的活动构建与验证路径；只能由 `build_doc.py` 写 `index.html`/`artifact.html`：
+
+实现阶段必须另提供内容寻址的 `validation/gate-manifest.json` 与 runtime gate runner；它们不是当前设计文档
+linter 的产物。发布 CI 以 ConformanceReport 中的 manifest/runner digest 绑定精确制品，不能只运行
+`verify_gates.py`。
+
+从 `docs/target-design-v2`：
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+npm ci
+python tools/verify_gates.py
+python tools/build_doc.py
+python tools/verify_gates.py
+python -m unittest discover -s tools -p "test_*.py" -v
+```
+
+为复核确定性，连续执行两轮 `python tools/build_doc.py`，每轮紧接：
+
+```powershell
+Get-FileHash -Algorithm SHA256 index.html, artifact.html
+```
+
+两轮的 `index.html` hash 必须相同，两轮的 `artifact.html` hash 也必须相同。
+
+### 8.2 legacy 图资产边界
+
+以下资产仅为历史审查/回溯而保留，均为 legacy、非权威且不参与当前构建：
+
+- `tools/gen_diagrams.py`
+- `diagrams/*.excalidraw`
+- `build/svg/*.svg`
+
+活动模板不得包含 `{{SVG:*}}`，`tools/build_doc.py` 不得 import/call `gen_diagrams`，也不得读取上述目录。
+不要删除这些用户已有文件；若未来退役，应走单独的数据保留决策，而不是构建脚本顺手清理。
+
+继续实现审查时重点检查：
+
+1. 是否真的逐 rank 求值，而不是代表 rank 或母图；
+2. source/event obligation 是否有独立分母和双向映射；
+3. microbatch/recompute 是否使用 Tensor/Storage instance；
+4. ResolvedEventSemantic/TensorStorageBinding 是否让序列化 RuntimePlan 独立于隐藏 CodeIR/object table；
+5. forward/backward/saved tensor/grad accumulation 是否闭合；
+6. effect 是否沿 base DAG 的同一稳定拓扑序定向，schedule constraint 是否成为真实 edge；
+7. per-rank MemoryEventView 是否等于 ExpectedMemoryProjection 且完全不读 duration/start/end；
+8. Storage/WorkspaceBinding 的 bytes/alignment/lifetime 是否唯一，memory/time 是否可独立 Ready/Blocked；
+9. ExecutionDeployment、shared KernelVariantBinding 与 device-qualified StreamBinding 是否唯一且进入摘要；
+10. PP/CP P2P/collective 是否经 endpoint descriptor quotient 与 typed internal-edge 规则进入联合 graph；
+11. TimeEventView 是否自带 device/stage domain、protocol/numeric/bound cost，且没有 contention 隐式入口；
+12. Ready EstimateContext 与 blocker propagation 是否有唯一 producer；
+13. exact measurement/formula/route、split group 与摘要排除表是否闭合；
+14. bundle 是否同时保留 Runtime/Core result，plan blocker 在 bind_core Blocked 后是否仍完整；shared build/G-IR blocker 是否强制双侧；两侧 projection blocker 是否全局并集并按 affected_backends 闭包，且闭包前未开始任一 backend seal；
+15. comparison basis 是否从完整 CanonicalConfigEvaluationInput 构造，只 mask 已声明 axis 及跨字段确定性派生闭包；仅 `other_config_indexed_production_inputs.x` 不同是否必为 Incomparable 并定位该路径；
+16. config_ref→EvaluationInstanceIdentity→BackendSealArtifact→ComparisonArmAuthority 是否全链可复算，A/B artifact 是否不可交换，同臂 artifact 是否共享字节相同 bundle/current subject/manifest；
+17. GateClause 的 map key/record/manifest identity 是否三方相等，failure disposition 是否只从 manifest 派生；
+18. 逐 metric comparison、basis pair、scenario axis、零 baseline、分层 cache 与 NotRequested 是否保持类型闭包；
+19. ConformanceReport 是否绑定批准 subject/fixture/policy/manifest/runner，GateClause 是否逐子句有正反例。
+
+不要为本版重新引入编译器图优化、精确 layout/stride、多流完成时刻内存复用或资源竞争模型。

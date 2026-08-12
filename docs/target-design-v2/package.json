@@ -1,0 +1,12 @@
+{
+  "name": "target-design-v2-docs",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "render:mermaid": "python tools/render_mermaid.py",
+    "verify:mermaid": "python -m unittest tools.test_mermaid_render tools.test_build_doc -v"
+  },
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "11.16.0"
+  }
+}
