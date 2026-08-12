@@ -624,6 +624,7 @@ protected measurer、可信单调时钟、进程/容器身份提供者与 truste
 | `tools/verify_gates.py` | 文档合同与禁用语义 verifier；不是 runtime gate runner |
 | `index.html`、`artifact.html` | `python tools/build_doc.py` 生成，不手改 |
 | `stage0/` | 探针与阶段证据，不是生产输入 |
+| `WORKPACKAGES.md` | 实施工作包任务书（13 个 WP、6 条并发开发线与同步点、里程碑、验收标准）；schema/等式仍以权威正文为准 |
 
 ### 8.1 Mermaid 11.16.0 离线构建闭包
 
