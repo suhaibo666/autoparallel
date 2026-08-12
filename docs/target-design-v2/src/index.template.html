@@ -13,7 +13,7 @@ microbatch 的执行事件，再绑定硬件并生成两个只读视图。结果
 
 <div class="meta">
   <div><b>文档类型</b>　目标方案（To-Be）总体设计与分层设计</div>
-  <div><b>方案版本</b>　v4.2 · 2026-08-10</div>
+  <div><b>方案版本</b>　v4.2 · 2026-08-12</div>
   <div><b>产品定位</b>　允许误差的内存与 step time <b>工程预测仿真器</b></div>
   <div><b>架构边界</b>　PyNative 源码复刻；无编译器式图优化；待预测 raw trace 仅作测试 oracle，冻结 compute records 是显式成本输入</div>
 </div>
@@ -25,11 +25,15 @@ microbatch 的执行事件，再绑定硬件并生成两个只读视图。结果
 重计算与分布式优化器配置，以及目标硬件、显式 rank-device 部署、用户采集的计算算子成本数据、
 stream/cost policy 和通信公式快照，本工具回答：</p>
 <ul>
-  <li>按 tensor/storage 的显式申请和释放生命周期，预测每卡已分配内存峰值、峰值事件与构成；</li>
+  <li>按 tensor/storage 的显式申请和释放生命周期，预测每个 logical rank 所映射唯一 device 的已分配内存峰值、峰值事件与构成；</li>
   <li>按正确依赖的执行事件 DAG、stream、P2P/集合通信关系，预测单步时间和关键路径；</li>
   <li>改变并行度、microbatch、重计算、分桶或预取后，内存和时间预测如何变化；</li>
   <li>哪些语义来自源码、派生规则、标定或工程假设，以及当前覆盖和未建模项。</li>
 </ul>
+
+<p>配置差分只回答严格同口径的重分区问题：保持 world size 不变、且除已声明 comparison axes 及其确定性
+派生闭包外的生产口径逐字相同，才输出数值 delta。任何改变 world size、进而改变 logical-rank id set 的
+比较固定返回 <code>Incomparable</code>；本版不推断不同 world size 间的 rank 对齐，也不把“扩缩集群”解释为策略收益。</p>
 
 <div class="thesis">
 <b>核心契约</b>：每个配置产生两个显式状态的 <code>BackendResult</code>，分别承载
@@ -52,6 +56,17 @@ stream/cost policy 和通信公式快照，本工具回答：</p>
 <tr><td>共享资源竞争与并发降速</td><td>固定每个事件的 service duration；不同 stream 可重叠但不相互降速</td><td>本版只建模依赖、stream 次序和通信 rendezvous</td></tr>
 <tr><td>通信库内部、随 algorithm 变化的隐式 scratch</td><td>只计算 intent/runtime rule 显式声明的 payload、endpoint、bucket/buffer；发现隐式 scratch 依赖则阻断内存侧</td><td>避免 memory 与 time 各自暗选不同通信算法</td></tr>
 </table></div>
+
+<div class="cal why"><span class="lbl">离线验证的部署档位与威胁模型</span>
+<pre><code>ConformanceDeploymentProfile := local_integrity | hardened_attestation
+local_integrity is the default conformance deployment profile
+hardened_attestation is optional</code></pre>
+<p>默认 <code>local_integrity</code> 面向单一信任域内的本地开发与普通 CI：它假定 CI/verifier 进程及其
+artifact store 可信，负责复算全部 content digest、执行完整 fixture binding domain、检查 record/finding/
+coverage 守恒并由 observed output 唯一派生 verdict；它不宣称抵抗恶意 runner 伪造或跨会话重放。
+只有多方共享 CI、第三方 runner 或合规发布把伪造报告/重放测量 envelope 纳入威胁模型时，才启用可选
+<code>hardened_attestation</code>，增加 runner 与 release 双外部信任根、签名、single-use nonce、受信单调时间窗和
+process/container identity。两档都严格位于生产预测链之外。</p></div>
 
 <h3 id="c0-3">0.3 如何阅读预测值</h3>
 <p><code>value</code> 表示“按当前结构、语义规则、成本模型和配置仿真得到的预测”；
@@ -173,7 +188,7 @@ gate-system 以逐 clause 账本横切 L5–L7；conformance 只存在于离线 
 <tr><td class="nw"><a href="#mc-result-sealing"><code>result-sealing</code></a></td><td class="nw">L7 封装</td><td>把后端执行经 source/value/seal authority 与三态 candidate 封装为不可伪造 BackendSealArtifact</td><td class="nw"><code>run_backend_build_candidate_and_seal</code></td><td>BackendResultSourceAuthority → <code>BackendSealBuildResult</code></td></tr>
 <tr><td class="nw"><a href="#mc-gate-system"><code>gate-system</code></a></td><td class="nw">横切 L5–L7</td><td>编译 GateManifest，按条件化 stage/dependency DAG 逐 clause 执行 18 道结构门并维护不可覆写账本</td><td class="nw"><code>compile_gate_manifest</code><br><code>run_gate_domain</code></td><td>subject + specifications + runner → <code>GateExecutionLedger</code></td></tr>
 <tr><td class="nw"><a href="#mc-comparison"><code>comparison</code></a></td><td class="nw">L7 比较</td><td>对同请求两个已封装配置结果做严格同口径逐 metric 比较，口径不同派生 Incomparable</td><td class="nw"><code>derive_comparison_basis_pair</code><br><code>build_and_seal_comparison</code></td><td>RequestSnapshot + 左右 arm artifacts → <code>ComparisonResult</code>（经 seal）</td></tr>
-<tr><td class="nw"><a href="#mc-conformance"><code>conformance</code></a></td><td class="nw">离线验证</td><td>以冻结 fixture 对 content-addressed ProductionSubject 做离线一致性验证与发布判定，不进入生产摘要</td><td class="nw"><code>run_conformance</code><br><code>apply_release_policy</code></td><td>fixtures + validation policy + 信任根 → <code>ConformanceReport</code> / <code>ReleaseDecision</code></td></tr>
+<tr><td class="nw"><a href="#mc-conformance"><code>conformance</code></a></td><td class="nw">离线验证</td><td>以冻结 fixture 对 content-addressed ProductionSubject 做离线一致性验证；默认 local integrity，可选 hardened attestation，均不进入生产摘要</td><td class="nw"><code>run_local_integrity_conformance</code><br><code>run_conformance</code><br><code>apply_release_policy</code></td><td>fixtures + validation policy → 本地 verdict；可选信任根 → hardened <code>ConformanceReport</code> / <code>ReleaseDecision</code></td></tr>
 </table></div>
 
 <h3 id="c1-3">1.3 全局不变量</h3>
@@ -303,7 +318,8 @@ SemanticValue&lt;T&gt;:
   calibration_domain: Domain | None
 
 Coverage:
-  source_obligations_total, source_nodes_planned
+  source_obligations_total, source_obligations_planned
+  source_nodes_planned
   source_residual, source_proven_not_executed
   event_obligations_total, planned_events
   blocked_event_obligations, not_applicable_event_obligations
@@ -317,14 +333,32 @@ Coverage:
 
 <p>Coverage 是覆盖事实，不是置信概率。源码 obligation 的分母由当前源码、配置与 rank context 在生成 IR
 之前独立枚举；event obligation 的分母由冻结训练语义规则枚举，二者不得从已生成节点反推。
-必须满足 <code>source_total = planned + residual + proven_not_executed</code> 与
-<code>event_total = planned + blocked + not_applicable</code>；每项恰落入一个桶。
+必须满足
+<code>source_obligations_total == source_obligations_planned + source_residual + source_proven_not_executed</code> 与
+<code>event_obligations_total == planned_events + blocked_event_obligations + not_applicable_event_obligations</code>；
+每项恰落入一个桶。当前 SourceObligation.disposition 与 CodeNode 是一对一授权，因此还必须满足
+<code>source_obligations_planned == source_nodes_planned</code>；两个字段仍分别保留 obligation 数与 node 数，
+未来若 schema 显式引入一对多 lowering，不得复用 node count 冒充守恒式中的 obligation count。
 100% op coverage 不能证明 stream、lifetime 或 collective 规则正确；
 一个 duration 来自标定，也不能替代对 event DAG 的验证。报告不得自动生成没有统计依据的 confidence 百分比。</p>
 
 <p>EvidenceTag 具有 basis-specific 必填约束：source 必须有 source_ref；measured/calibrated 必须有
 ObservationRef、单位和适用域；modeled communication 必须有 CommunicationFormulaRef 与全部公式输入；
 assumed 必须有 AssumptionId。仅填写通用 rule_id 不能把证据升级为相应 quality。</p>
+
+<pre><code>quality_from_basis(EvidenceTag.basis):
+  source -> exact
+  derived -> derived
+  measured | calibrated -> calibrated
+  modeled | assumed -> estimated
+
+SemanticValue.quality :=
+  unknown iff SemanticValue.value == unknown
+  otherwise quality_from_basis(resolve(SemanticValue.evidence_ref).basis)</code></pre>
+<p>该映射是总函数而不是实现选择：<code>measured</code> 表示直接观测，<code>calibrated</code> 表示经具名 reducer/
+协议形成的标定记录，二者在五值 quality 中都归为 <code>calibrated</code>；<code>modeled</code> 与
+<code>assumed</code> 都不能升级为 derived/exact。unknown 分支只表达缺失语义，evidence_ref 必须定位缺失
+obligation/诊断证据，其 basis 不得把 unknown 升级为已知值。</p>
 
 <figure class="mermaid-figure" data-diagram-id="evidence-coverage-class" data-title="输出与证据契约类图" data-description="Estimate/BackendResult 三态、逐表达式 SemanticValue、逐面 EvidenceTag、守恒 Coverage 与显式 Assumption 的组成关系。"><pre class="mermaid-source"><code>classDiagram
   direction LR
@@ -418,6 +452,7 @@ result_digest :=
   MeasurementProtocol    -&gt; { protocol_digest }
   TimeCostPolicy         -&gt; { policy_digest }
   NumericPolicySnapshot  -&gt; { numeric_policy_digest }
+  MemoryNumericPolicySnapshot -&gt; { memory_numeric_policy_digest }
   CommunicationFormulaRef -&gt; { digest }
   CommunicationModelSnapshot -&gt; { communication_model_digest }
   MemoryRegistrySnapshot -&gt; { memory_registry_digest }
@@ -462,6 +497,11 @@ result_digest :=
   FixtureSet             -&gt; { fixture_set_digest }
   ValidationPolicy       -&gt; { validation_policy_digest }
   VerifierRunner         -&gt; { verifier_runner_digest }
+  LocalIntegrityInvocationAuthority -&gt; { local_integrity_invocation_digest }
+  LocalIntegrityExecutionRecord -&gt; { local_integrity_execution_record_digest }
+  LocalIntegrityObservedOutput -&gt; { local_integrity_observed_output_digest }
+  LocalIntegrityExecutionLedger -&gt; { local_integrity_execution_ledger_digest }
+  LocalIntegrityReport   -&gt; { local_integrity_report_digest }
   TrustStoreSnapshot     -&gt; { trust_store_snapshot_digest }
   RunnerAttestationPolicy -&gt; { runner_attestation_policy_digest }
   MeasuredExecutionEnvironment -&gt; { measured_execution_environment_digest }
@@ -708,7 +748,7 @@ config-indexed 输入进入 <code>RequestSnapshot</code> 的唯一生产入口�
 <tr><td><code>ExecutionScenario</code></td><td>输入 shape/dtype、microbatch occurrence、step 模式与 persistent live-in</td><td>CodeIR / events / SimulationPlanCore</td><td>显式版本化</td></tr>
 <tr><td><code>CompileEnvFacts</code></td><td>framework/runtime/version、source feature flags、静态 import/config facts</td><td>CodeIR</td><td>显式快照</td></tr>
 <tr><td>Registry snapshots</td><td>结构、运行时、内存和时间语义</td><td>各自消费阶段</td><td>内容寻址</td></tr>
-<tr><td><code>HardwareProfile</code></td><td>device、capacity、topology、link latency/bandwidth、alignment</td><td>SimulationPlanCore / projections</td><td>机器与运行时指纹</td></tr>
+<tr><td><code>HardwareProfile</code></td><td>device、topology、link latency/bandwidth、alignment、physical stream</td><td>SimulationPlanCore / projections</td><td>机器与运行时指纹；不含 HBM 容量</td></tr>
 <tr><td><code>ExecutionDeployment</code></td><td>logical rank 到物理 device 的显式规范映射</td><td>SimulationPlanCore</td><td>全覆盖、设备限定且一一映射</td></tr>
 <tr><td><code>HardwareBindingPolicySnapshot</code></td><td>硬件相关 kernel variant 的成本无关唯一 selector</td><td>SimulationPlanCore</td><td>内容寻址、0/多候选阻断</td></tr>
 <tr><td><code>CalibrationSet</code></td><td>用户预采集并冻结的 compute duration records 与 protocol snapshots</td><td>time compute 成本求值</td><td>精确 key、版本、ObservationRef 与 split</td></tr>
@@ -750,7 +790,6 @@ CompileEnvFacts:
 
 HardwareProfile:
   devices
-  memory_capacity
   topology
   bandwidth
   link_latency
@@ -776,10 +815,12 @@ HardwareBindingPolicySnapshot:
   policy_digest</code></pre>
 
 <p>模型/workload 字段只存在于 ModelSpec，当前策略字段只存在于 normalized P；不得在两个容器中
-重复声明后再设隐式优先级。物理 machine、设备容量、互联和 allocator 常量单独进入
+重复声明后再设隐式优先级。物理 machine、互联、allocator alignment 与 physical stream 单独进入
 <code>HardwareProfile</code>，不得被源码求值器读取。ExecutionDeployment 必须显式覆盖全部 logical rank，
 每个 rank 恰映射到 HardwareProfile 中一个 device；本版禁止多个 logical rank 共置同一 device，因为无
 contention 模型无法解释其性能。映射不完整、重复或引用不存在 device 时以 BLK-CONFIG 阻断两侧。
+设备 HBM 容量属于上层规划器输入，不属于 HardwareProfile、SimulationPlanCore 或任一生产摘要；评估内核
+因此既不能据此产生 capacity/OOM 判断，也不会因无关容量数字变化而改变 cache identity。
 <code>LogicalRankContext</code> 只含由 P 派生的逻辑坐标，
 不含 physical device 或 stream；规范顺序为 logical-rank 坐标字典序。<code>cold_start</code> 指参数已经
 常驻、但 lazy optimizer/runtime state 尚未创建的首个训练 step；<code>steady_state</code> 则把全部已声明
@@ -795,7 +836,9 @@ ConfigRef 在请求内唯一，比较仅能引用该 map 中的 key。</p>
 
 <pre><code>normalize(raw_config, framework_defaults) -&gt; normalized config P
 validate(P):
-  world_size = dp × tp × pp × cp × ep_adjustment
+  world_size = dp × tp × pp × cp
+  EP is a subgroup carved from the dp × tp × cp rank region
+  (dp × tp × cp) mod ep == 0
   dimensions and groups are positive
   stage/layer and expert assignments are legal
   schedule references existing logical stages
@@ -810,7 +853,7 @@ record。禁止插值、roofline、FLOPs 或零值回退。某次待预测运行
 标定集，否则会形成隐式真机依赖和数据泄漏。</p>
 
 <pre><code>ObservationRef:
-  dataset_manifest_digest, run_id, observation_id
+  calibration_train_manifest_digest, run_id, observation_id
   raw_artifact_digest, lineage_root_digest
   sample_key, split_group_key
   source_digest, model_digest, normalized_config_digest
@@ -818,7 +861,15 @@ record。禁止插值、roofline、FLOPs 或零值回退。某次待预测运行
   quantity, normalized_unit
   collector_id, collector_version, captured_at
   measurement_protocol_ref: ProtocolDigest
-  split: calibration_train | holdout | conformance_fixture
+  split: calibration_train
+
+OfflineObservationRef:
+  offline_manifest_digest: holdout_manifest_digest | conformance_fixture_manifest_digest
+  run_id, observation_id, raw_artifact_digest, lineage_root_digest
+  sample_key, split_group_key, source_digest, model_digest, normalized_config_digest
+  hardware_and_runtime_fingerprint, quantity, normalized_unit
+  collector_id, collector_version, captured_at, measurement_protocol_ref
+  split: holdout | conformance_fixture
 
 sample_key :=
   hash(raw_artifact_digest, sample coordinates/window,
@@ -854,7 +905,11 @@ ComputeMeasurementRecord:
 CalibrationSet:
   active_compute_records: Map[MeasurementKey, ComputeMeasurementRecord]
   measurement_protocols: Map[ProtocolDigest, MeasurementProtocol]
-  dataset_manifest_digest
+  calibration_train_manifest_digest
+  for every record in active_compute_records:
+    record.observation_ref.split == calibration_train
+    record.observation_ref.calibration_train_manifest_digest ==
+      CalibrationSet.calibration_train_manifest_digest
 
 TimeCostPolicy:
   required_measurement_protocol_digest
@@ -915,7 +970,12 @@ TimeCostPolicy.required_measurement_protocol_digest</code>；这四个身份不�
 被选 FormulaRef.numeric_policy_digest 必须等于 TimeCostPolicy.numeric_policy.numeric_policy_digest。
 NumericPolicySnapshot 的完整 payload 随 CostBinding 嵌入，digest 不能替代 precision/rounding/数值域。</p>
 
-<p>dataset manifest 必须在使用前提交内容摘要；calibration_train、holdout 与 conformance_fixture
+<p><code>calibration_train_manifest_digest</code> 只覆盖生产可见的 train manifest 与
+active_compute_records；每个生产 ObservationRef 必须是 calibration_train 并引用同一 train digest，
+CalibrationSet 中出现任何 holdout/conformance record 都是契约错误。完整采集批次必须为三个 split
+分别冻结 manifest：<code>holdout_manifest_digest and conformance_fixture_manifest_digest are offline-only</code>，
+二者只通过 OfflineObservationRef 进入离线质量/conformance artifact，绝不进入 CalibrationSet、time_simulation_digest、comparison basis
+或生产 cache key。calibration_train、holdout 与 conformance_fixture
 不仅 ID 不相交，<code>sample_key</code>、<code>split_group_key</code> 与任何 lineage ancestor 也不得跨 split。
 同一 run/config/protocol/hardware group 不能拆到 train/holdout 两侧。当前待预测 run 不得进入
 生产 lineage。生产 lookup 只消费 calibration_train；holdout 只评估采集协议与测量误差，
@@ -1587,12 +1647,23 @@ optimizer 事件、AutogradLink、saved tensor 与通信 intent，每个 occurre
   rule_digest :=
     hash(canonical_payload_without_derived_digests(RuntimeRuleSnapshot))
 
+EPDispatchCombineExpansionObligation:
+  obligation_id
+  origin: RankCodeNodeRef | RuntimeRuleInvocationRef
+  instance_key: (phase, microbatch, pipeline_stage,
+                 virtual_chunk, logical_rank, repeat_ordinal)
+  role: dispatch | combine
+  expected_collective_kind: all_to_all
+  disposition: CollectiveCorrelationId
+             | BlockerInstanceId
+             | NotApplicable(ep_is_one_or_no_routed_expert, evidence)
+
 Runtime expansion output reuses:
   RuntimeBuildResult, RuntimeEventPlan, RuntimeRuleInvocationRef
   ExecEvent, ResolvedEventSemantic
   TensorInstance, StorageInstance, TensorStorageBinding
   LogicalInitialState, AutogradLink
-  P2PIntent, CollectiveIntent</code></pre>
+  P2PIntent, CollectiveIntent, EPDispatchCombineExpansionObligation</code></pre>
 
 <h4 id="mc-runtime-events-classdiagram">类图</h4>
 <figure class="mermaid-figure" data-diagram-id="runtime-events-class" data-title="runtime-events 模块类图" data-description="RuntimeEventPlan 与 ExecEvent、obligation、语义物化、instance 身份、autograd 与通信 intent 的组成关系。"><pre class="mermaid-source"><code>classDiagram
@@ -1609,6 +1680,7 @@ Runtime expansion output reuses:
   class AutogradLink
   class P2PIntent
   class CollectiveIntent
+  class EPDispatchCombineExpansionObligation
   class ScheduleConstraintEdge
   class LogicalInitialState
   class RuntimeBuildResult
@@ -1624,6 +1696,7 @@ Runtime expansion output reuses:
   AutogradLink --&gt; ExecEvent : forward backward recompute 关联
   P2PIntent --&gt; ExecEvent : send 与 recv endpoint
   CollectiveIntent --&gt; ExecEvent : participant endpoints
+  EPDispatchCombineExpansionObligation --&gt; CollectiveIntent : dispatch/combine 双向授权
   RuntimeRuleSnapshot ..&gt; ExecEvent : RuntimeRuleInvocationRef 展开
   RuntimeBuildResult --&gt; RuntimeEventPlan : Ready</code></pre><figcaption><b>图 12 · runtime-events 模块类图。</b><span class="src">解释图；本契约与 §7.1 Event schema 为规范。</span></figcaption></figure>
 
@@ -1648,6 +1721,7 @@ Runtime expansion output reuses:
   <li>每个 microbatch、repeat、recompute 和 phase occurrence 均产生独立 EventId/TensorInstanceId/必要的 StorageInstanceId；CodeIR identity 只作为 origin；</li>
   <li>要求梯度的每个 forward instance 与其 backward、saved tensor、gradient relation、accumulation 和 update 通过唯一 AutogradLink 正反向双向闭合；</li>
   <li>PP activation/gradient 与 CP ring 必须各生成显式 send、recv endpoint 和 P2PIntent；每个 P2PIntent 恰匹配一对 src/dst/channel/sequence/bytes/payload/protocol endpoint。</li>
+  <li>每个适用的 routed-expert phase/occurrence 必须为 EP dispatch 与 combine 各生成一条 <code>EPDispatchCombineExpansionObligation</code>，并分别闭合为显式 all-to-all CollectiveIntent；仅 <code>ep=1</code> 或无 routed expert 时可携证据 NotApplicable，不能用普通跨-rank dependency 代替。</li>
   <li>每个 collective endpoint 恰属于一个 CollectiveIntent，且 intent 的 participant/group/sequence/bytes 集合反向恰等于全部 endpoint；普通跨-rank dependency 不能替代通信 intent。</li>
   <li>data/control 基础依赖、required effect edge 与 schedule edge 按 6.4、7.5 节的 precedence 闭合；logical_kernel_order 覆盖全部事件且不读取硬件、duration 或完成时刻。</li>
 </ul>
@@ -1670,6 +1744,7 @@ Runtime expansion output reuses:
   logical_placements: [LogicalPlacement]
   collective_intents: [CollectiveIntent]
   p2p_intents: [P2PIntent]
+  ep_dispatch_combine_obligations: [EPDispatchCombineExpansionObligation]
   storage_lifetimes: [LogicalLifetime]
   structural_report_facts: StructuralReportFacts
   blocker_index: Map[BlockerInstanceId, BlockerRecord]
@@ -1808,6 +1883,9 @@ recompute event:
 <p>optimizer、梯度累加、参数/状态更新和分布式优化器事件由当前 OptimizerSpec、
 ParallelSpec 与注册运行时语义实例化。源码显式 collective 直接引用其 CodeNode；
 框架派生 collective 使用 RuntimeRuleInvocationRef，并保留 group、rank、sequence、bytes 和 correlation id。
+每个 routed-expert forward/backward/recompute occurrence 都必须按具名
+<code>EPDispatchCombineExpansionObligation</code> 展开 dispatch/combine 两个 all-to-all cohort；
+<code>ep=1</code> 或 dense 分支必须显式 NotApplicable，不得静默省略。
 PP activation/gradient 与 CP ring 的点对点通信必须生成显式 send/recv endpoint 与 P2PIntent，
 不得只用普通跨 rank dependency 暗示消息。</p>
 
@@ -1846,7 +1924,7 @@ rank-device 部署、shared KernelVariantBinding 与 stream/storage/workspace/co
 <h3 id="c8-2">8.2 Collective correlation</h3>
 <pre><code>CollectiveIntent:
   correlation_id
-  kind
+  kind: ep_dispatch_all_to_all | ep_combine_all_to_all | other_collective
   group_id
   sequence_in_group
   participants
@@ -1859,6 +1937,10 @@ rank-device 部署、shared KernelVariantBinding 与 stream/storage/workspace/co
 endpoint Event。collective 的存在来自源码或具名运行时语义；网络算法、route 和服务时间由 time projection
 一次性为整个 cohort 选择。本版 collective 只支持 all_participant_rendezvous：全部 endpoint 及前驱 ready
 后启动，完成后统一释放后继；非阻塞/background progress 若未显式升级语义则以 BLK-COLLECTIVE 阻断。</p>
+<p>EP 的 dispatch/combine 不属于 generic collective：每条适用的 EPDispatchCombineExpansionObligation 必须
+恰解析到同 phase/occurrence、同 ep_group 的对应 kind/correlation，且每个该 kind CollectiveIntent 也必须反向
+解析到唯一 obligation。dispatch 或 combine 任一缺失、重复、participant/bytes 不闭合时以 BLK-COLLECTIVE
+阻断受影响后端。</p>
 
 <h3 id="c8-3">8.3 P2P correlation</h3>
 <pre><code>P2PIntent:
@@ -1891,7 +1973,7 @@ exists path of length &gt;= 1 from use_event to release_event</code>。
 非 persistent StorageInstance 才一律锚定到 step_end 并记录固定 assumption。
 不搜索“下一个 join”，也不让实现任选 anchor；只有 persistence 或 storage identity 本身未知才阻断内存侧。</p>
 
-<figure class="mermaid-figure" data-diagram-id="runtime-event-expansion" data-title="训练事件与通信展开" data-description="从 CodeIR 和场景义务展开逐 microbatch 正反向、重算、优化器与 PP、CP、collective 通信实例。"><pre class="mermaid-source"><code>flowchart LR
+<figure class="mermaid-figure" data-diagram-id="runtime-event-expansion" data-title="训练事件与通信展开" data-description="从 CodeIR 和场景义务展开逐 microbatch 正反向、重算、优化器与 PP、CP、EP collective 通信实例。"><pre class="mermaid-source"><code>flowchart LR
   codeir["CodeIR(P)"] --&gt; obligations["EventObligation set"]
   runtimeInputs["ExecutionScenario / independent microbatch occurrences / Runtime semantic registry"] --&gt; obligations
   obligations --&gt; forward["Forward ExecEvent per microbatch"]
@@ -1906,7 +1988,8 @@ exists path of length &gt;= 1 from use_event to release_event</code>。
   obligations --&gt; recvEndpoint["RecvEndpoint"]
   sendEndpoint --&gt;|channel_id / sequence_in_channel / bytes_expr match| p2p["P2PIntent / PP activation, PP gradient or CP ring / matched_rendezvous"]
   recvEndpoint --&gt;|channel_id / sequence_in_channel / bytes_expr match| p2p
-  obligations --&gt; collective["CollectiveIntent / all_participant_rendezvous"]
+  obligations --&gt; epObligation["EPDispatchCombineExpansionObligation / dispatch or combine / explicit NotApplicable"]
+  epObligation --&gt; collective["CollectiveIntent / EP all-to-all or other collective / all_participant_rendezvous"]
   forward --&gt; edges["Data, control, schedule and effect EventEdge set"]
   backward --&gt; edges
   recompute --&gt; edges
@@ -1917,7 +2000,7 @@ exists path of length &gt;= 1 from use_event to release_event</code>。
   edges --&gt; plan
   class codeir ir
   class runtimeInputs input
-  class obligations,forward,backward,recompute,optimizer,closure,sendEndpoint,recvEndpoint,edges,plan plan
+  class obligations,forward,backward,recompute,optimizer,closure,sendEndpoint,recvEndpoint,epObligation,edges,plan plan
   class p2p,collective semantic</code></pre><figcaption><b>图 13 · 训练事件与通信展开。</b><span class="src">解释图；相邻 event、autograd 与 rendezvous schema 为规范。</span></figcaption></figure>
 
 <h3 id="c8-5">8.5 Hardware binding</h3>
@@ -2499,6 +2582,8 @@ RankMemoryEventView:
 MemoryEventView:
   per_rank: OrderedMap[LogicalRank, RankMemoryEventView]
   derived_rank_classes: [RankClass]
+  memory_numeric_policy: MemoryNumericPolicySnapshot
+  numeric_range_witness: MemoryNumericRangeWitness
   memory_projection_semantics_digest
   estimate_context: EstimateContext</code></pre>
 
@@ -2536,6 +2621,18 @@ require MemoryEventView == canonical ExpectedMemoryProjection
 require MemoryEventView.memory_projection_semantics_digest ==
         memory_projection_semantics_snapshot.
           memory_projection_semantics_snapshot_digest
+expected_memory_numeric_range_witness :=
+  unbounded_integer_memory_preflight(
+    ExpectedMemoryProjection,
+    exact initial/category/live/peak/cluster-max byte aggregation formulas
+      of Chapter 10,
+    MemoryEventView.memory_numeric_policy)
+require MemoryEventView.memory_numeric_policy ==
+        memory_projection_semantics_snapshot.memory_numeric_policy
+require MemoryEventView.numeric_range_witness ==
+        expected_memory_numeric_range_witness
+require expected_memory_numeric_range_witness.all_output_scalars_within_integer_range
+otherwise InputBlocker(BLK-NUMERIC-RANGE, memory)
 require no extra/missing rank, storage instance, binding, use or event</code></pre>
 
 <p>该等式在 projection gate 执行；每个 RuntimePlan storage 恰有一个 StorageBinding，每个 workspace selector
@@ -2754,12 +2851,27 @@ gate authority 或 allocator 真值。</p>
   lifetime_rule_id
   workspace_lifetime_rule_id
   rank_projection_rule_id
+  memory_numeric_policy: MemoryNumericPolicySnapshot
   memory_projection_semantics_snapshot_digest :=
     hash(canonical_payload_without_derived_digests(
            MemoryProjectionSemanticsSnapshot))
 
 memory_projection_semantics_snapshot :=
   unique_memory_projection_semantics_snapshot(MEMORY_BACKEND_SEMANTIC_VERSION)
+
+MemoryNumericPolicySnapshot:
+  arithmetic: unbounded_integer_preflight_then_checked_uint_bytes
+  integer_bytes_min: 0
+  integer_bytes_max
+  memory_numeric_policy_digest :=
+    hash(canonical_payload_without_derived_digests(MemoryNumericPolicySnapshot))
+
+MemoryNumericRangeWitness:
+  memory_numeric_policy_digest
+  unbounded_reference_digest
+  scalar_min_max_by_output_family:
+    storage | initial | category | live | peak | cluster_max
+  all_output_scalars_within_integer_range: true
 
 MemoryTimelineEntry:
   logical_rank: LogicalRank
@@ -2772,6 +2884,7 @@ MemoryTimelineEntry:
 MemoryExecutionWitness:
   memory_execution_input_digest
   memory_projection_semantics_digest
+  memory_numeric_range_witness: MemoryNumericRangeWitness
   per_rank_replay_order:
     OrderedMap&lt;LogicalRank, NonEmpty&lt;INITIAL_STATE | MemoryEventId&gt;&gt;
   per_rank_timeline_digest: OrderedMap&lt;LogicalRank, Digest&gt;
@@ -2797,8 +2910,12 @@ MEMORY_REPLAY_SEMANTICS_VERSION := "logical-kernel-order-replay/v1"</code></pre>
   class RankMemoryEstimate
   class MemoryEstimate
   class MemoryProjectionSemanticsSnapshot
+  class MemoryNumericPolicySnapshot
+  class MemoryNumericRangeWitness
   MemoryEventView "1" *-- "1..*" RankMemoryEventView : per_rank OrderedMap
   MemoryEventView --&gt; MemoryProjectionSemanticsSnapshot : digest 复核
+  MemoryProjectionSemanticsSnapshot *-- MemoryNumericPolicySnapshot
+  MemoryEventView *-- MemoryNumericRangeWitness : Ready 前任意精度见证
   RankMemoryEventView *-- SimulationInitialState
   RankMemoryEventView *-- BoundStorageInstance
   RankMemoryEventView *-- MemoryEvent : 规范 anchor 全序
@@ -2833,6 +2950,17 @@ expected_memory_projection(
 
 require view.memory_projection_semantics_digest ==
         memory_projection_semantics_snapshot.memory_projection_semantics_snapshot_digest
+expected_memory_numeric_range_witness :=
+  unbounded_integer_memory_preflight(
+    expected_memory_projection(core, memory_registry, storage_bindings,
+      workspace_bindings, memory_projection_semantics_snapshot),
+    exact initial/category/live/peak/cluster-max byte aggregation formulas,
+    memory_projection_semantics_snapshot.memory_numeric_policy)
+require view.memory_numeric_policy ==
+        memory_projection_semantics_snapshot.memory_numeric_policy
+require view.numeric_range_witness == expected_memory_numeric_range_witness
+require expected_memory_numeric_range_witness.all_output_scalars_within_integer_range
+otherwise InputBlocker(BLK-NUMERIC-RANGE, memory)
 
 run_memory_backend(
   view: MemoryEventView
@@ -2856,6 +2984,7 @@ expected_memory_execution(
   witness.memory_execution_input_digest == hash(canonical(view))
   witness.memory_projection_semantics_digest ==
     view.memory_projection_semantics_digest
+  witness.memory_numeric_range_witness == view.numeric_range_witness
   witness.replay_semantics_digest ==
     hash(MEMORY_REPLAY_SEMANTICS_VERSION, witness.memory_projection_semantics_digest)
   return Completed { value, witness }
@@ -2868,7 +2997,7 @@ initial state、release anchor 与完整 MemoryEvent 集合；backend
 
 <h4 id="mc-memory-backend-outcomes">成功与阻断语义</h4>
 <p>构造器按 request 决定 CandidateView、CandidateBlocked 或 CandidateNotRequested；缺失 memory face
-形成 memory-scoped construction blocker，已验证输入下出现 identity/digest/集合自相矛盾则返回
+或任意精度 byte preflight 越出冻结整数域时形成 memory-scoped construction blocker，已验证输入下出现 identity/digest/集合自相矛盾则返回
 <code>InternalContractViolation</code>。只有最终 ProjectionResult Ready 才调用
 <code>run_memory_backend</code>；后端要么 Completed(value,witness)，要么报告实现侧 InternalViolation，
 不得在 value 阶段新造输入 BlockerRecord。</p>
@@ -2877,6 +3006,7 @@ initial state、release anchor 与完整 MemoryEvent 集合；backend
 <ul>
   <li><code>MEMORY_BACKEND_SEMANTIC_VERSION</code> 必须唯一产生不可变且字节确定的 MemoryProjectionSemanticsSnapshot；调用方不得传入或改写其 digest，完整 snapshot 进入 memory_simulation_digest。</li>
   <li><code>MemoryEventView.per_rank.keys</code> 精确等于规范 logical-rank 集合；每 rank 从 initial state 开始，按 logical_kernel_order 的 before/at/after 与规范 MemoryEventId 顺序重放。</li>
+  <li>完整 MemoryNumericPolicySnapshot 随 MemoryProjectionSemanticsSnapshot 进入 memory_simulation_digest；Ready 前必须以任意精度整数复算 storage/initial/category/live/peak/cluster-max 全部 byte 标量并生成 MemoryNumericRangeWitness，任一越界只产生 memory-scoped BLK-NUMERIC-RANGE。</li>
   <li>每个 storage 起点恰为 initial live-in 或一次 Allocate；每个非 persistent storage 有唯一 release rule 和一次 Free；Bind/Use 只解析到 live storage。</li>
   <li>每个 MemoryTimelineEntry 的 category breakdown 与 live storage 集合守恒；MemoryEstimate.per_rank 由完整 timeline 唯一派生，cluster_max_peak_allocated_bytes 取完整 rank map 的最大值。</li>
   <li>峰值并列顺序固定为 <code>INITIAL_STATE &lt; all canonical MemoryEventId</code>，rank 并列固定取最小 LogicalRank。</li>
@@ -2894,7 +3024,8 @@ initial state、release anchor 与完整 MemoryEvent 集合；backend
   storageBindings --&gt; simInitial
   expected --&gt; view["MemoryEventView per logical rank"]
   simInitial --&gt; view
-  view --&gt; order["Canonical logical_kernel_order and anchor order"]
+  view --&gt; preflight["Unbounded-integer byte preflight / MemoryNumericRangeWitness"]
+  preflight --&gt; order["Canonical logical_kernel_order and anchor order"]
   order --&gt; events["MemoryEvent / Allocate, Bind, Use, Free"]
   events --&gt; replay["Per-rank live storage map replay"]
   simInitial --&gt; replay
@@ -2904,7 +3035,7 @@ initial state、release anchor 与完整 MemoryEvent 集合；backend
   valueGate --&gt; sealB["result-sealing boundary / candidate to artifact"]
   excluded["No duration, completion time, capacity or cross-stream reuse contention"] -.-&gt;|forbidden input| replay
   class runtime,logicalInitial,storageBindings,workspaceBindings input
-  class expected,simInitial,view,order,events plan
+  class expected,simInitial,view,preflight,order,events plan
   class replay,rankEstimate,cluster,sealB backend
   class valueGate semantic
   class excluded note</code></pre><figcaption><b>图 18 · 内存模块逻辑结构与事件重放。</b><span class="src">解释图；相邻 replay 算法与模块契约为规范。</span></figcaption></figure>
@@ -2936,6 +3067,10 @@ cluster_max_peak_allocated_bytes := peak_allocated_bytes[cluster_max_rank]</code
 恰好一次 Free，初态也可成为峰值 anchor。
 alias/view/in-place 只 Bind 到已有 storage，不重复计数。后端不模拟 pool、split、merge、coalesce、
 reserved、外部碎片、容量检查或首次分配失败。</p>
+<p>进入重放前，projection constructor 必须以任意精度整数执行与本节完全相同的 initial sum、逐类别
+加减、live total、per-rank peak 与 cluster max 公式；MemoryNumericRangeWitness 证明每个实际输出 byte
+标量落在冻结 MemoryNumericPolicySnapshot 的整数域内。Ready 后的 checked add/sub 因而不能首次发现溢出；
+越界在投影阶段以 memory-scoped BLK-NUMERIC-RANGE 表达，不得 wrap、saturate 或改用浮点。</p>
 
 <p>内存后端与联合投影、值门和封装的交互时序（模块内部管线并入上方图示的门与封装边界节点）：</p>
 <figure class="mermaid-figure" data-diagram-id="memory-backend-sequence" data-title="内存后端交互时序" data-description="Ready MemoryEventView 从联合投影产生后，run_memory_backend 逐 rank 重放并交给值门与 result-sealing 的时序。"><pre class="mermaid-source"><code>%%{init: {"themeVariables": {"useGradient": false}}}%%
@@ -3905,6 +4040,22 @@ Comparable；左 baseline 为零时 relative 分支必须是 <code>UndefinedZero
 <code>right-left</code> 计算。basis 不同必须输出逐路径 BasisMismatch；单侧不可用必须携带左右状态和诊断；
 两侧都未请求才是 NotRequested。authority、candidate 或 G-REP2 失败是
 <code>InternalContractViolation</code>，不得伪装成 backend blocker。</p>
+<pre><code>requested metric branch priority:
+  NotRequested &gt; Incomparable &gt; Unavailable &gt; ComparableDelta
+  Incomparable takes precedence over Unavailable
+
+compare_per_metric_from_authority(source, metric):
+  if metric not in source.request_snapshot.comparison_request.requested_metrics:
+    return NotRequested
+  pair := source.canonical_comparison_basis_pairs[metric]
+  if pair.basis_mismatches is non-empty:
+    return Incomparable { pair.basis_mismatches }
+  left_status, right_status := sealed backend statuses for metric
+  if left_status is not Ok or right_status is not Ok:
+    return Unavailable { left_status, right_status, canonical diagnostics }
+  return ComparableDelta derived from both Ok estimates and pair.common digest</code></pre>
+<p>符号 <code>&gt;</code> 表示先判分支，而不是严重级别。特别地，请求 metric 同时出现 basis mismatch 与
+Blocked/单侧 NotRequested 时固定返回 Incomparable；状态不可用不能掩盖“比较口径本来就不同”的事实。</p>
 
 <h4 id="mc-comparison-invariants">不变量</h4>
 <ul>
@@ -3913,6 +4064,7 @@ Comparable；左 baseline 为零时 relative 分支必须是 <code>UndefinedZero
   <li>令 <code>snapshot := request.canonical_production_evaluation_inputs.common_inputs.comparison_schema_snapshot</code>；comparison axes 必须绑定其 <code>comparison_schema_snapshot_digest</code>，declared_paths 必须属于 allowed_axis_paths，且 <code>derivation_closure == derive_closure(snapshot, declared_paths)</code>。closure 只由 snapshot 的 root schema 与 cross-field rules 推导，调用者不能增加路径；</li>
   <li><code>canonical_comparison_basis_pairs</code> 精确覆盖 requested metrics；<code>derive_comparison_basis_pair recomputes</code> 当前 RequestSnapshot 中的 schema snapshot、declared paths 与完整 closure 后，才从完整 CanonicalConfigEvaluationInput mask；<code>G-REP2 recomputes</code> 同一等式并逐 metric 对照当前 authority/candidate，不能信任调用方携带的 closure 或旧 basis pair；</li>
   <li>config identity、左右 basis 与同 metric 状态分别判定；registry/calibration/fallback/assumption、measurement protocol、numeric/backend semantics 或未声明扩展字段不同均形成 BasisMismatch，不能伪装成策略收益；</li>
+  <li>逐 metric 必须按固定优先级 NotRequested、Incomparable、Unavailable、ComparableDelta 判定；basis mismatch 与非 Ok 状态同时存在时 Incomparable 胜出，G-REP2 必须复算同一分支函数。</li>
   <li>CoverageDelta 只在 ComparableDelta 内由两侧 Estimate.coverage 规范派生；任何非 ComparableDelta 分支都不携带数值 delta。</li>
 </ul>
 <p>negative fixture: inject other_config_indexed_production_inputs.x into derivation closure；验证器必须拒绝该调用方扩展，且若左右该字段不同，
@@ -4000,11 +4152,15 @@ basis 消失。microbatch 可作为 P.batching comparison axis，其 determinist
 derivation closure 一同 mask；任意未声明 scenario 或 other config input 变化仍使 basis 不同。time ComparableDelta 的两臂还必须使用相同
 measurement_protocol_digest；不同 statistic/warmup/repetition 口径一律 Incomparable。
 MemoryDelta 还要求两臂 logical-rank id set 相同；本版不猜测不同 world-size 间的 rank 对齐。
+因此任何 world size 变化都会因 logical-rank id set mismatch 固定产生 Incomparable；同 world size 下改变
+TP/PP/DP/CP/EP 的重分区，才可能在其余 basis 相同且对应路径已声明为 comparison axes 时产生 delta。
 跨配置 assumption/fallback scope 不以 EventId 比较，而规范成
 <code>(source/runtime semantic origin, instance role, logical-rank coordinate)</code> 后比较。
-每个 metric 的 ComparisonBasisPair 同时保存左右两份 basis：不等则从 pair 的规范结构差异派生
-Incomparable；仅 basis 逐字节相同且两侧均 Ok 才使用 common_comparison_basis_digest 产生 ComparableDelta；
-任一侧 Blocked 或仅单侧 NotRequested 返回 Unavailable；两侧均未请求才返回 NotRequested。
+每个 metric 的 ComparisonBasisPair 同时保存左右两份 basis；逐 metric 分支固定按
+NotRequested → Incomparable → Unavailable → ComparableDelta 求值。对 requested metric，basis 不等先从 pair
+的规范结构差异派生 Incomparable，因此 mismatch 与 Blocked 同时存在时仍返回 Incomparable；仅 basis 逐字节
+相同且两侧均 Ok 才使用 common_comparison_basis_digest 产生 ComparableDelta；basis 相同但任一侧 Blocked
+或仅单侧 NotRequested 才返回 Unavailable；metric 未请求返回 NotRequested。
 任何非 ComparableDelta 分支都不携带数值 delta。relative delta 明确定义为
 <code>(right-left)/left</code>；left baseline 为 0 时必须返回 UndefinedZeroBaseline，不能输出 Inf/NaN。
 比较仍只表示“按当前模型的差”，不是实机收益。</p>
@@ -4168,7 +4324,7 @@ RuntimeBuildResult、CoreBuildResult 或 shared G-IR invocation 无法为 Ready/
 <tr><td class="nw"><code>BLK-MISSING-MEMORY</code></td><td>bytes/workspace/lifecycle 无合法规则，或依赖本版不支持的通信算法内部 scratch</td><td>内存侧</td><td>缺失 memory face</td></tr>
 <tr><td class="nw"><code>BLK-UNSUPPORTED-LAYOUT</code></td><td>storage identity/bytes 依赖未建模的隐式 reorder/contiguous</td><td>内存侧</td><td>算子、输入关系与缺失规则</td></tr>
 <tr><td class="nw"><code>BLK-MISSING-TIME</code></td><td>compute 无用户测量命中，或通信缺公式/参数</td><td>时间侧</td><td>measurement key 或 formula inputs</td></tr>
-<tr><td class="nw"><code>BLK-NUMERIC-RANGE</code></td><td>任意精度 preflight 的任一 timeline/aggregate 标量超出冻结整数域</td><td>时间侧</td><td>NumericPolicySnapshot、NumericRangeWitness 与越界字段</td></tr>
+<tr><td class="nw"><code>BLK-NUMERIC-RANGE</code></td><td>任意精度 preflight 的任一 byte 或 time timeline/aggregate 标量超出对应冻结整数域</td><td>受影响侧：MemoryNumericRangeWitness 只阻断内存；NumericRangeWitness 只阻断时间</td><td>对应 numeric policy、range witness 与越界字段</td></tr>
 <tr><td class="nw"><code>BLK-AMBIGUOUS-COST</code></td><td>workspace、精确测量、通信公式或 route 存在多个同等最优候选</td><td>受影响侧</td><td>selector key、specificity 与全部并列候选</td></tr>
 <tr><td class="nw"><code>BLK-STREAM</code></td><td>physical stream assignment 无候选、歧义或引用不存在</td><td>时间侧</td><td>EventId、selector、device-qualified candidates</td></tr>
 <tr><td class="nw"><code>BLK-LIFECYCLE</code></td><td>多 release candidate、unsafe release、double alloc/free、越界 Bind 或 use-after-free</td><td>内存侧</td><td>StorageInstance、LogicalLifetime 与 logical-anchor 事件链</td></tr>
@@ -4241,13 +4397,13 @@ Blocked 侧没有 null/0 数值、空 timeline 或上次缓存结果。</p>
 <h3 id="c12-2">12.2 完整结构门</h3>
 <div class="tw"><table>
 <tr><th class="nw">编号</th><th>断言</th><th>失败说明</th><th class="nw">类别</th></tr>
-<tr data-gate="G-IR1"><td class="nw"><code>G-IR1</code></td><td>logical rank 集合完整；rank-qualified identity 唯一且引用存在；每个 source obligation 恰为 CodeNode、引用唯一 BlockerRecord 的 Residual 或有 guard 证据的 ProvenNotExecuted，且与生成对象双向闭合；BlockerInstanceId/BlockerCode 分离、scope 等于 BlockerScopePolicy；source coverage 守恒</td><td>漏 rank、身份碰撞、幽灵引用、同码根因覆盖、scope 任填或源码 occurrence 静默消失</td><td class="nw">IR</td></tr>
+<tr data-gate="G-IR1"><td class="nw"><code>G-IR1</code></td><td>logical rank 集合完整；rank-qualified identity 唯一且引用存在；每个 source obligation 恰为 CodeNode、引用唯一 BlockerRecord 的 Residual 或有 guard 证据的 ProvenNotExecuted，且与生成对象双向闭合；BlockerInstanceId/BlockerCode 分离、scope 等于 BlockerScopePolicy；source_obligations_total 按三个 obligation 桶守恒，且当前一对一 schema 中 source_obligations_planned == source_nodes_planned</td><td>漏 rank、身份碰撞、obligation/node 单位混用、幽灵引用、同码根因覆盖、scope 任填或源码 occurrence 静默消失</td><td class="nw">IR</td></tr>
 <tr data-gate="G-IR2"><td class="nw"><code>G-IR2</code></td><td>每个 RankCodeIR 不含硬件字段；model_input_digest 覆盖 evaluator/PySub/规范 ID 语义；model_digest 按排除表复算 canonical payload 且更换 HardwareProfile 不变</td><td>摘要自引用、求值器语义或硬件事实进入错误身份层</td><td class="nw">IR</td></tr>
 <tr data-gate="G-IR3"><td class="nw"><code>G-IR3</code></td><td>event obligation 三分支与 coverage 守恒；source_model_digest、logical_rank_contexts、ResolvedEventSemantic（含唯一 effect summary）、Tensor/Storage instance/binding、structural report facts 与 CodeIR/runtime lowering 精确闭合；BlockerRecord 无丢失；AutogradLink 完整；effect edge 沿 base DAG 规范拓扑全序，最终规范边集无环</td><td>隐藏 CodeIR lookup、漏/多事件、context/effect/instance/binding 漂移、blocker 丢失、正反向不闭合或局部 effect 定向造环</td><td class="nw">IR</td></tr>
 <tr data-gate="G-MEM1"><td class="nw"><code>G-MEM1</code></td><td>部署/shared KernelVariantBinding 完整；每个 runtime storage 有唯一 StorageBinding，每个 compute workspace 有唯一 WorkspaceBinding；alignment 等式、per_rank keys/expected storage set 与 initial XOR Allocate 全部成立</td><td>bytes/alignment 任择、漏 rank、幽灵 workspace、漏/重复分配、伪造 identity 或 live-in 双计</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-MEM2"><td class="nw"><code>G-MEM2</code></td><td>每个 runtime storage 恰有一个 LogicalLifetime；每个 workspace 恰有一个互斥的 before(owner)→after(owner) BoundWorkspaceLifetime；非 persistent 恰一次 Free，显式 runtime release 对全部 Use dependency_safe</td><td>多/缺 lifetime、隐藏 workspace 生命周期、unsafe release、泄漏、double free 或自行选择 join</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-MEM3"><td class="nw"><code>G-MEM3</code></td><td>每个 TensorInstance 有唯一 producer；每个 storage-bearing tensor 有且仅有一个权威 TensorStorageBinding；Bind/Use 精确投影并解析到 live StorageInstance，range 位于 root 内，release 对全部 Use 安全</td><td>microbatch/alias 猜配、use-after-free、越界 view 或过早释放</td><td class="nw">Memory</td></tr>
-<tr data-gate="G-MEM4"><td class="nw"><code>G-MEM4</code></td><td>每个 rank view 的 order 等于 RuntimeEventPlan order，initial/storage/events 等于 ExpectedMemoryProjection 且规范排序；逐事件 live bytes 非负并与集合一致</td><td>投影增漏、重排或事件重放状态分叉</td><td class="nw">Memory</td></tr>
+<tr data-gate="G-MEM4"><td class="nw"><code>G-MEM4</code></td><td>每个 rank view 的 order 等于 RuntimeEventPlan order，initial/storage/events 等于 ExpectedMemoryProjection 且规范排序；完整 MemoryNumericPolicySnapshot 与任意精度 MemoryNumericRangeWitness 可复算并证明 storage/initial/category/live/peak/cluster-max 全部 byte 标量在域内；逐事件 live bytes 非负并与集合一致</td><td>投影增漏、重排、byte 聚合溢出或事件重放状态分叉</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-MEM5"><td class="nw"><code>G-MEM5</code></td><td>作为 backend_value_postcondition，对 EstimateCandidate 重放所得每个 anchor/category breakdown 精确等于该类别 live storage bytes，且所有类别之和等于 live_allocated</td><td>类别错归、漏项或重复计数</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-MEM6"><td class="nw"><code>G-MEM6</code></td><td>作为 backend_value_postcondition，每 rank 峰值等于 candidate timeline 最大值；tie order 固定；cluster max 与 RankClass ID/member/representative/summary 由完整 per-rank map 规范派生</td><td>报告与仿真分叉、class identity 任择、漏 rank 或并列结果不确定</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-TIME1"><td class="nw"><code>G-TIME1</code></td><td>部署/variant 与 selected device domain 精确，stage domain 逐字来自 logical_rank_contexts；progress_nodes/event_projection 恰等于 ExpectedTimeProjection，BoundComputeEvent 的 origin/rank/phase/microbatch/stage/chunk/cost/stream 全字段相等且 occupied_streams(compute)==OrderedSet{physical_stream_id}，通信 endpoint quotient 无幽灵；communication_internal 类型闭合、expected edge 等式成立且图可结束</td><td>零事件 stage 丢失、compute 分组字段篡改、singleton stream 映射错误、domain/endpoint/节点/边投影遗漏、非法 internal/self-loop、跨 rank wait cycle 或调度越序</td><td class="nw">Time</td></tr>
@@ -4257,7 +4413,7 @@ Blocked 侧没有 null/0 数值、空 timeline 或上次缓存结果。</p>
 <tr data-gate="G-TIME5"><td class="nw"><code>G-TIME5</code></td><td>每 compute 从 ResolvedEventSemantic 的权威 template+shared variant 补全 key并绑定唯一精确 record/protocol，record key、ObservationRef、selected protocol 与 TimeCostPolicy 的 protocol digest 四者相等；每通信绑定唯一 formula/route；timeline NumericPolicySnapshot 完整，成本有限非负，任意精度 preflight/NumericRangeWitness 证明全部输出标量不越界</td><td>隐藏 CodeIR lookup、错误 template、越域/歧义成本、protocol identity 断链、公式/舍入不等式、NaN 或聚合溢出</td><td class="nw">Time</td></tr>
 <tr data-gate="G-TIME6"><td class="nw"><code>G-TIME6</code></td><td>作为 backend_value_postcondition，仅从 Ready view 与 execution witness 重算 EstimateCandidate：起点/空图、checked ns、makespan、规范 tie 与全部 busy/overlap/bubble/service 等式正确；无 contention；同 time digest timeline 一致</td><td>暗读 core、溢出、空图/domain/聚合错误、偷偷建模竞争或不确定性</td><td class="nw">Time</td></tr>
 <tr data-gate="G-REP1"><td class="nw"><code>G-REP1</code></td><td>封装前按 BackendSealAuthority 校验 source/value/seal authority、BackendResultCandidate 与各自 digest；(request_digest, evaluation_instance_digest, backend) 在 source、candidate 与 artifact 全链相等；requested backend 只从 RequestSnapshot 派生；ProposedOk 的完整 EstimateCandidate value/witness 与 value-gate subject 相等且 metadata/result_digest 唯一；ProposedBlocked 精确来自 scope-closed bundle projection 且无 value；ProposedNotRequested 仅对应 request 未请求</td><td>配置身份丢失、来源局部自洽、请求双真值、换 value 复用 Pass、分支绕门、metadata 改写、blocked 冒充或错误 NotRequested</td><td class="nw">Report</td></tr>
-<tr data-gate="G-REP2"><td class="nw"><code>G-REP2</code></td><td>仅在 typed ComparisonArmAuthority→ComparisonSourceAuthority→ComparisonResultCandidate→comparison ledger→seal 路径对当前 candidate 执行；左右 config_ref、EvaluationInstanceIdentity 与每个 BackendSealArtifact 精确闭合；每臂全部 artifact 必须共享字节相同的 ProjectionBundleAuthority，且其 ProductionValidationContext/GateManifest 与当前 ComparisonSourceAuthority 相同；ComparisonBasisPair 从完整 CanonicalConfigEvaluationInput 出发，仅对 P/scenario axes 及跨字段确定性派生闭包规范 mask，time protocol 同口径；逐 metric 仅两侧 Ok+basis 相同产生 ComparableDelta；fractional_change=(right-left)/left，零 baseline 用 UndefinedZeroBaseline</td><td>同臂混用 bundle/旧 subject、A/B artifact 对调、比较绕过门、复用旧记录、microbatch/场景/扩展配置偷变、部分结果/零基线不可表达，或成本/假设变化被误作策略收益</td><td class="nw">Report</td></tr>
+<tr data-gate="G-REP2"><td class="nw"><code>G-REP2</code></td><td>仅在 typed ComparisonArmAuthority→ComparisonSourceAuthority→ComparisonResultCandidate→comparison ledger→seal 路径对当前 candidate 执行；左右 config_ref、EvaluationInstanceIdentity 与每个 BackendSealArtifact 精确闭合；每臂全部 artifact 必须共享字节相同的 ProjectionBundleAuthority，且其 ProductionValidationContext/GateManifest 与当前 ComparisonSourceAuthority 相同；ComparisonBasisPair 从完整 CanonicalConfigEvaluationInput 出发，仅对 P/scenario axes 及跨字段确定性派生闭包规范 mask，time protocol 同口径；逐 metric 固定按 NotRequested→Incomparable→Unavailable→ComparableDelta 判定，basis mismatch 优先于非 Ok 状态，仅两侧 Ok+basis 相同产生 ComparableDelta；fractional_change=(right-left)/left，零 baseline 用 UndefinedZeroBaseline</td><td>同臂混用 bundle/旧 subject、A/B artifact 对调、比较绕过门、复用旧记录、microbatch/场景/扩展配置偷变、分支优先级不确定、部分结果/零基线不可表达，或成本/假设变化被误作策略收益</td><td class="nw">Report</td></tr>
 <tr data-gate="G-REP3"><td class="nw"><code>G-REP3</code></td><td>同一 EvaluationInstanceIdentity 的两个 ProjectionCandidate 在 ProjectionBundleAuthority 上联合逐 clause 验证；bundle 同时保留并精确复算 RuntimeBuildResult/CoreBuildResult，Ready plan 的 blocker_index 不因 bind_core 失败丢失；shared build/G-IR blocker 必须精确影响两侧，shared invocation 恰执行一次；所有 InputBlocker occurrence 全局聚合并按 affected_backends 闭包后才同时派生两个 ProjectionResult；GateExecutionLedger 的 map key/record/manifest clause 三方 identity 等式、manifest-owned disposition、backend/branch/stage/clause domain 全部精确，完整 bundle prefix/context 不可覆写；value/result records 绑定当前 candidate；三分支都先过 seal；REP/value/comparison gate 失败只产生 <code>InternalViolation { violation: canonical_internal_violation_union(all_internal_violations) }</code>；ProductionSubject/lineage/split/exclusion 可复算</td><td>丢 runtime blocker、单侧 blocker 摧毁 shared artifact、跨 backend blocker 漏传、因果倒置、门/子句增漏或换记录、disposition 重标、账本重贴、authority/candidate/value 分叉、Blocked/NotRequested/比较绕门、contract failure 伪装 blocker或测试数据污染预测</td><td class="nw">Report</td></tr>
 </table></div>
 
@@ -4870,10 +5026,16 @@ sequenceDiagram
 <p>本模块只在测试目录或 CI 中，以冻结 fixture 对精确 content-addressed <code>ProductionSubject</code> 和
 GateManifest 做独立验证并给出发布判定。fixture、finding、report 与 release decision 全部 outside production digests and cache keys；
 生产 API、仿真进程、comparison basis 和缓存查找不得读取它们。Conformance verdict does not alter BackendResult，
-也不能补齐、改写或重新封装任何生产结果。</p>
+也不能补齐、改写或重新封装任何生产结果。默认 local_integrity 只承诺单一可信 CI 边界内的内容完整性、
+完整执行域与守恒；后续 trust store、measurement envelope、runner signature 和 release approval 双信任根全部
+只属于可选 hardened_attestation profile。</p>
 
 <h4 id="mc-conformance-data">核心数据结构</h4>
-<pre><code>TraceFixture:
+<pre><code>ConformanceDeploymentProfile := local_integrity | hardened_attestation
+local_integrity is the default conformance deployment profile
+hardened_attestation is optional
+
+TraceFixture:
   isolated_input_and_trace_payload
   expected_clause_outcome
   expected_failure_disposition | NotApplicable
@@ -4897,6 +5059,7 @@ FixtureSet:
 
 ValidationPolicy:
   schema_version, structural_and_numeric_rules
+  local_integrity_insufficient_disposition: allow | block
   validation_policy_digest :=
     hash(canonical_payload_without_derived_digests(ValidationPolicy))
 
@@ -4904,6 +5067,68 @@ VerifierRunner:
   runner_id, runner_version, executable_artifact_digest
   verifier_runner_digest := hash(canonical_payload_without_derived_digests(VerifierRunner))
 
+LocalIntegrityInvocationAuthority:
+  deployment_profile: local_integrity
+  production_subject: ProductionSubject
+  fixture_set: FixtureSet
+  validation_policy: ValidationPolicy
+  gate_manifest: GateManifest
+  verifier_runner: VerifierRunner
+  local_integrity_invocation_digest :=
+    hash(canonical_payload_without_derived_digests(LocalIntegrityInvocationAuthority))
+
+LocalIntegrityExecutionRecord:
+  fixture_ref, target_invocation_id, target_clause_id
+  fixture_digest
+  evaluation_input_digest := hash(authority.local_integrity_invocation_digest,
+    authority.verifier_runner.verifier_runner_digest,
+    canonical(binding), binding.fixture_binding_digest)
+  observed_clause_output_digest
+  observed_clause_outcome, finding_ids: OrderedSet&lt;FindingId&gt;
+  local_integrity_execution_record_digest :=
+    hash(canonical_payload_without_derived_digests(LocalIntegrityExecutionRecord))
+
+LocalIntegrityObservedOutput:
+  execution_records: OrderedMap&lt;FixtureRef, LocalIntegrityExecutionRecord&gt;
+  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
+  coverage_gaps: OrderedSet&lt;GateClauseId&gt;
+  local_integrity_observed_output_digest :=
+    hash(canonical execution_records, findings, coverage_gaps)
+    == hash(canonical_payload_without_derived_digests(LocalIntegrityObservedOutput))
+
+LocalIntegrityExecutionLedger:
+  local_integrity_invocation_digest
+  subject_digest, fixture_set_digest, validation_policy_digest
+  gate_manifest_digest, verifier_runner_digest
+  observed_output: LocalIntegrityObservedOutput
+  local_integrity_observed_output_digest :=
+    observed_output.local_integrity_observed_output_digest
+  expected_binding_domain: OrderedSet&lt;FixtureRef&gt;
+  local_integrity_execution_ledger_digest :=
+    hash(canonical_payload_without_derived_digests(LocalIntegrityExecutionLedger))
+
+LocalIntegrityReport:
+  assurance: local_integrity_non_adversarial
+  production_subject: ProductionSubject
+  local_integrity_invocation_digest, local_integrity_observed_output_digest
+  fixture_set_digest, validation_policy_digest, gate_manifest_digest
+  verifier_runner_digest, local_integrity_execution_ledger_digest
+  verdict: pass | fail | insufficient
+  findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
+  local_integrity_report_digest :=
+    hash(canonical_payload_without_derived_digests(LocalIntegrityReport))
+
+LocalIntegrityDecision :=
+  LocallyAllowed { subject_digest, local_integrity_report_digest }
+  | LocallyBlocked { subject_digest, reasons: NonEmpty&lt;ReleaseBlockReason&gt; }
+
+LocalIntegrityRunResult :=
+  Completed { report: LocalIntegrityReport,
+              ledger: LocalIntegrityExecutionLedger,
+              decision: LocalIntegrityDecision }
+  | InternalViolation { violation: InternalContractViolation }
+
+hardened_attestation-only schemas:
 TrustStoreSnapshot:
   schema_version
   trusted_key_material_by_id:
@@ -4966,6 +5191,7 @@ ValidatedMeasurementSessionCapability:
   // created only by validate_and_consume_measurement_envelope in the current call
 
 ConformanceInvocationAuthority:
+  deployment_profile: hardened_attestation
   production_subject: ProductionSubject
   fixture_set: FixtureSet
   validation_policy: ValidationPolicy
@@ -5106,7 +5332,7 @@ ConformanceReport.findings: OrderedMap&lt;FindingId, ConformanceFinding&gt;
 ConformanceReport and ReleasePolicy reuse the authoritative schemas in 12.4.</code></pre>
 
 <h4 id="mc-conformance-classdiagram">类图</h4>
-<figure class="mermaid-figure" data-diagram-id="conformance-class" data-title="conformance 模块类图" data-description="fixture 体系、invocation authority、测量 envelope 与会话能力、attestation、报告封装与发布判定的关系。"><pre class="mermaid-source"><code>classDiagram
+<figure class="mermaid-figure" data-diagram-id="conformance-class" data-title="conformance 模块类图" data-description="fixture 体系、默认 local-integrity 路径，以及可选 hardened measurement/attestation/approval 路径的关系。"><pre class="mermaid-source"><code>classDiagram
   direction LR
   class TraceFixture
   class FixtureBinding
@@ -5115,6 +5341,11 @@ ConformanceReport and ReleasePolicy reuse the authoritative schemas in 12.4.</co
   class VerifierRunner
   class GateManifest
   class ProductionSubject
+  class LocalIntegrityInvocationAuthority
+  class LocalIntegrityObservedOutput
+  class LocalIntegrityExecutionLedger
+  class LocalIntegrityReport
+  class LocalIntegrityDecision
   class ConformanceInvocationAuthority
   class ConformanceTrustRootCapability
   class MeasuredExecutionEnvironment
@@ -5130,6 +5361,15 @@ ConformanceReport and ReleasePolicy reuse the authoritative schemas in 12.4.</co
   class ReleaseDecision
   FixtureBinding *-- TraceFixture
   FixtureSet "1" *-- "1..*" FixtureBinding : bindings
+  LocalIntegrityInvocationAuthority *-- ProductionSubject
+  LocalIntegrityInvocationAuthority *-- FixtureSet
+  LocalIntegrityInvocationAuthority *-- ValidationPolicy
+  LocalIntegrityInvocationAuthority *-- GateManifest
+  LocalIntegrityInvocationAuthority *-- VerifierRunner
+  LocalIntegrityInvocationAuthority --&gt; LocalIntegrityObservedOutput : 执行完整 binding domain
+  LocalIntegrityObservedOutput --&gt; LocalIntegrityExecutionLedger : records/findings/gaps 守恒
+  LocalIntegrityExecutionLedger --&gt; LocalIntegrityReport : observed output 唯一派生
+  LocalIntegrityReport --&gt; LocalIntegrityDecision : 默认可信 CI 边界
   ConformanceInvocationAuthority *-- ProductionSubject
   ConformanceInvocationAuthority *-- FixtureSet
   ConformanceInvocationAuthority *-- ValidationPolicy
@@ -5149,7 +5389,44 @@ ConformanceReport and ReleasePolicy reuse the authoritative schemas in 12.4.</co
   ReleaseApprovalTrustRootCapability ..&gt; ReleaseDecision : 固定 policy 与 approval store</code></pre><figcaption><b>图 29 · conformance 模块类图。</b><span class="src">解释图；本契约核心数据结构与接口等式为规范。</span></figcaption></figure>
 
 <h4 id="mc-conformance-interface">接口定义</h4>
-<pre><code>run_conformance(
+<pre><code>run_local_integrity_conformance(
+  authority: LocalIntegrityInvocationAuthority
+) -&gt; LocalIntegrityRunResult
+
+local_integrity threat model assumes the CI/verifier process and artifact store are trusted
+hardened_attestation is only required when runner forgery or report replay is in scope
+
+run_local_integrity_conformance equations:
+  require authority.deployment_profile == local_integrity
+  recompute authority.production_subject and subject_digest
+  recompute every FixtureBinding, nested TraceFixture and fixture_set_digest
+  recompute ValidationPolicy, GateManifest including every clause, and VerifierRunner
+  recompute local_integrity_invocation_digest only after all nested recomputations
+  require authority.gate_manifest.subject_digest ==
+          authority.production_subject.subject_digest
+  expected_domain := exact keys(authority.fixture_set.bindings)
+  execute every binding exactly once in expected_domain with authority.verifier_runner
+  derive LocalIntegrityExecutionRecord and canonical LocalIntegrityObservedOutput
+    only from those executions
+  require ledger.expected_binding_domain == expected_domain
+  require keys(ledger.observed_output.execution_records) == expected_domain
+  recompute every record key, fixture/input/output/record digest, finding and coverage gap
+  require execution-record, finding and coverage-gap conservation
+  derive LocalIntegrityReport verdict only from observed output and ValidationPolicy:
+    fail iff policy-classified failure findings are non-empty
+    else insufficient iff exact evidence or coverage gaps are non-empty
+    otherwise verdict := pass
+  derive LocalIntegrityDecision:
+    fail -&gt; LocallyBlocked
+    insufficient -&gt; authority.validation_policy.local_integrity_insufficient_disposition
+    pass -&gt; LocallyAllowed
+  any schema/digest/domain/conservation/derivation failure -&gt; one InternalViolation;
+    no report, ledger or decision
+  no trust root, signature, nonce, monotonic time, process identity or container identity
+    is read or synthesized in this profile
+
+hardened_attestation interface (optional):
+run_conformance(
   authority: ConformanceInvocationAuthority,
   trust_root: ConformanceTrustRootCapability,
   measured_environment: MeasuredExecutionEnvironment
@@ -5473,9 +5750,16 @@ policy 中的 key id 只是经外部 root 认证后的选择器，不能充当�
 <h4 id="mc-conformance-outcomes">成功与阻断语义</h4>
 <p>每个 manifest clause 必须同时有 positive fixture 与 negative-boundary fixture，并验证预期
 failure disposition；只有 complete, valid execution 对全部已声明 binding 执行且守恒后，coverage gap 才使 verdict 为 insufficient 而不是 pass。结构/数值不符产生 fail 和逐 clause
-ConformanceFinding；缺独立证据产生 insufficient。release policy 对 pass/fail/insufficient 三态分别处理：fail
-总是阻断精确 subject，pass 只有 <code>approved == derive_approved_digest_set(artifact, policy)</code>、全部十个字段逐字相等且外部 release trust root 验签有效才允许，insufficient 的 allow/block 必须由版本化
-ReleasePolicy 明示，不能默认为 pass。</p>
+ConformanceFinding；缺独立证据产生 insufficient。两档都要求 fail 阻断精确 subject，insufficient 的
+allow/block 必须显式版本化，不能默认为 pass。默认 local_integrity 在上述可信 CI 威胁模型内由
+LocalIntegrityReport 与 ValidationPolicy 直接派生 LocallyAllowed/LocallyBlocked，并明确标注
+<code>local_integrity_non_adversarial</code>；它不得声称 runner 身份、freshness 或抗重放。只有可选
+hardened_attestation 的 pass 才要求 <code>approved == derive_approved_digest_set(artifact, policy)</code>、
+全部十个字段逐字相等且外部 release trust root 验签有效。</p>
+<p>local_integrity 负例至少覆盖 nested digest 篡改、binding subset/superset、重复/缺失 execution record、
+finding/coverage-gap 守恒破坏和 caller 提交 forged verdict；这些都必须在报告/decision 构造前形成单一 ICV。
+以下 runner attestation、measurement envelope 与 release approval 信任负例只适用于
+<code>hardened_attestation</code>，不得成为默认 profile 的部署前置条件。</p>
 <p>发布负例必须包含 <code>negative fixture: no execution but forged all-pass</code>、
 <code>negative fixture: forged runner attestation</code>、<code>negative fixture: forged ApprovedDigestSet</code> 与
 <code>negative fixture: tampered execution record or observed output</code>。前三者不能靠自填 digest 获得 capability，
@@ -5507,7 +5791,13 @@ measurer evidence 验证时失败；change only measurer_identity_and_freshness_
 因此 provenance/freshness 不是摘要外旁注。</p>
 
 <h4 id="mc-conformance-invariants">不变量</h4>
+<p>下列凡引用 ConformanceTrustRootCapability、MeasuredExecutionEnvironment、RunnerAttestation、
+ReleaseApprovalArtifact 或 ReleaseApprovalTrustRootCapability 的不变量，仅在
+<code>deployment_profile == hardened_attestation</code> 时适用。local_integrity 必须改为使用上文
+LocalIntegrityInvocationAuthority/ledger/report 的摘要重算、完整 binding domain 与守恒等式，并且这些
+hardened 字段在其输入域中不存在，不能填 NotApplicable 后复用 hardened seal 冒充同等 assurance。</p>
 <ul>
+  <li>两个 profile 是互斥 tagged path：local_integrity 是默认值且只输出 local_integrity_non_adversarial assurance；hardened_attestation 必须显式请求并完整满足双外部信任根栈，任何实现不得自动升级或降级 profile。</li>
   <li>report.production_subject 必须由 build artifact、evaluator/registry、production policy、backend semantics 四组 constituent 重算，report.subject_digest、manifest.subject_digest 与 approval.authority.approved.subject_digest 逐字相等；</li>
   <li>fixture_set_digest、validation_policy_digest、gate_manifest_digest、verifier_runner_digest 必须分别由 invocation authority 的实际 FixtureSet、ValidationPolicy、GateManifest、VerifierRunner 重算并与 report/approval artifact 逐字相等；</li>
   <li>invocation authority 只固定 TrustStoreSnapshotRef 与 RunnerAttestationPolicyRef；完整 store/policy 只能由外部 ConformanceTrustRootCapability 提供并复算，validator 只使用 root policy-selected key/scheme 与 root store-owned trusted key material，runner/请求/fixture 无权自带或替换验签 key/scheme；</li>
@@ -5554,7 +5844,8 @@ IRConformance(predicted, fixture):
 dependency 或通信 identity 是结构性 fail；数值误差按版本化 validation policy 判定。没有独立 fixture
 时为 insufficient，不得称 pass，也不推导零误差。</p>
 
-<pre><code>ConformanceReport:
+<pre><code>hardened_attestation report/release schemas:
+ConformanceReport:
   production_subject: ProductionSubject
   subject_digest := production_subject.subject_digest
   conformance_invocation_digest
@@ -5601,7 +5892,7 @@ release approval signature covers canonical_tuple(
   trusted_approver_key_id, approval_signature_scheme,
   canonical(all ten fields of derive_approved_digest_set(artifact, policy)))</code></pre>
 
-<p>ConformanceReport 必须经 ConformanceInvocationAuthority 绑定精确被测 content-addressed subject、fixture 集合、判定 policy、GateManifest
+<p>在可选 hardened_attestation profile 中，ConformanceReport 必须经 ConformanceInvocationAuthority 绑定精确被测 content-addressed subject、fixture 集合、判定 policy、GateManifest
 和 verifier runner，并绑定同一 non-replayable measurement envelope、canonical observed output 与受信 runner signature；旧报告、旧 session envelope
 或自选弱 fixture/policy 不能套用于任何字段变化后的 build/registry/policy 组合。
 报告、ProductionValidationContext 与 GateManifest 引用的是同一个 ProductionSubject；consumer 必须从
@@ -5614,6 +5905,10 @@ ReleasePolicy 与 approval store 的完整 payload/digest 都等于该 root 固�
 <code>approved == derive_approved_digest_set(artifact, policy)</code> 的全部十个字段命中批准 store snapshot 时才可发布；fail 必须阻止该 subject；
 insufficient 的处理由显式 ReleasePolicy 决定，
 不得被当作 pass。该引用始终从报告指向生产 subject，生产摘要不得反向读取报告。</p>
+<p>默认 local_integrity 使用 §mc-conformance 的 LocalIntegrityReport/Decision：同样绑定并复算 subject、fixture、
+policy、manifest、runner、observed output 与完整 ledger，但 assurance 固定为
+<code>local_integrity_non_adversarial</code>，不含也不暗示 measurement envelope、runner signature 或 release
+approval trust root。consumer 必须按 tagged profile 展示 assurance，不能把 LocallyAllowed 命名为 attested release。</p>
 
 <h3 id="c12-5">12.5 采集侵入边界</h3>
 <p>默认 fixture 通过框架标准 profiler、memory tracker 和独立 runner/launch 配置采集，
@@ -5623,10 +5918,13 @@ insufficient 的处理由显式 ReleasePolicy 决定，
 <h3 id="c12-6">12.6 测试数据与生产隔离</h3>
 <p>TraceFixture、IRConformance report 和 schedule conformance report 只存在于测试目录、CI artifact
 与验证 runner。生产 API、请求 schema、缓存查找和仿真进程不得读取它们。
-CI 必须因 conformance fail 阻止对应 <code>subject_digest</code> 发布；pass 也只有在 signed approval artifact 通过部署/verifier-owned、
+CI 必须因 conformance fail 阻止对应 <code>subject_digest</code> 发布；hardened_attestation 的 pass 只有在 signed approval artifact 通过部署/verifier-owned、
 请求与 validation artifacts 无法构造的 <code>ReleaseApprovalTrustRootCapability</code> 验证，且 policy/store payload 与 digest、
 root-supported scheme、root-owned trusted approver public key material 均闭合，再满足
 <code>approved == derive_approved_digest_set(artifact, policy)</code> 的 all ten approved digest fields 全部逐字匹配时才可放行。
+上述 signed approval 条件只适用于显式 hardened_attestation。默认 local_integrity 的 pass 在单一可信 CI
+边界内按 LocalIntegrityDecision 放行，并必须保留 local_integrity_non_adversarial 标签；insufficient 仍按
+ValidationPolicy 的显式 disposition 处理，不能默认放行或伪称 attested。
 verdict 不改变生产 BackendResult。
 已经发布的仿真器在没有 fixture 时仍按相同生产输入返回相同预测。ConformanceReport 必须引用被测
 subject，禁止生产摘要、比较 basis 或缓存键反向依赖验证制品。</p>
@@ -5792,6 +6090,8 @@ Tensor/StorageInstance、effect edge、P2P/collective identity、bytes、formula
 <tr><td class="nw">D14</td><td>P2P/collective 使用全局 progress，资源竞争不建模</td><td>覆盖 PP/CP 通信与 rendezvous，同时保持本版时间机制边界</td></tr>
 <tr><td class="nw">D15</td><td>compute 用 exact user measurement record，communication 用理论公式</td><td>目标 key 无精确记录就阻断，不用插值或 roofline 替代计算算子实测</td></tr>
 <tr><td class="nw">D16</td><td>通信内存只含显式 intent/runtime buffers</td><td>algorithm-dependent 库内部 scratch 未建模；发现依赖时阻断内存侧，不与 time 暗选不同算法</td></tr>
+<tr><td class="nw">D17</td><td>不内置自动策略搜索器</td><td>内核只提供单配置求值、显式 sweep 与严格同口径比较；搜索策略属于外层消费者</td></tr>
+<tr><td class="nw">D18</td><td>Conformance 默认 local integrity、强鉴证可选</td><td>普通可信 CI 只需摘要重算、完整执行域与守恒；多方/合规威胁模型才承担双信任根与抗重放成本</td></tr>
 </table></div>
 
 <h3 id="c14-2">14.2 主要误差来源</h3>
@@ -5823,21 +6123,30 @@ stream、overlap 和 collective schedule 的真实误差状态为“未评估”
 <p>TraceFixture 是固定独立测试样本，用于发现结构或调度偏差；CalibrationSet 是用户预采集后经过
 规范化、版本化、域标注和独立质量验证的 compute 成本数据。生产 lookup 只使用 calibration_train 中
 精确匹配且唯一的 active record；holdout 只评估采集/适用性误差，不参与 duration 定价。前者不能进入
-生产请求或 cache lookup，后者必须进入相应 backend simulation digest。
+生产请求或 cache lookup；CalibrationSet 的 calibration_train_manifest_digest 必须进入 time simulation digest，
+而 holdout/conformance-fixture 各自的 offline manifest digest 不得进入任何生产摘要。
 把待预测运行的 raw trace 转换成即时标定输入不属于本方案。</p>
 
 <div class="cal honest"><span class="lbl">外部信任根</span>
 <p>sample_key、digest 与 lineage 只能证明规范内容的一致性，不能单独证明测量真实、未篡改、
 train/holdout 真正独立或样本有代表性。需要更强保证时，采集器身份、原始 artifact、时间窗和硬件环境
-必须由方案外的签名/attestation 信任根背书；没有该信任根时报告明确标为“用户提供的测量事实”。</p></div>
+可由方案外的签名/attestation 信任根背书；默认 local_integrity 明确标为“用户提供的测量事实/非对抗性本地验证”，
+只有显式 hardened_attestation 才声称其外部信任根与 freshness/replay 保证。</p></div>
 
 <h3 id="c14-5">14.5 最终能力边界</h3>
 <div class="cal honest"><span class="lbl">本方案最终交付的能力</span>
 <p>给定当前源码、当前配置、完整 rank context/scenario 和必需语义，逐 rank 生成硬件无关且可追溯的
 CodeIR，展开正反向、microbatch、P2P/collective 与 effect-order 完整的训练事件，绑定 exact 用户 compute
-测量和通信公式后输出每卡预测 allocated peak、预测 step time、timeline、关键路径、构成、coverage、
+测量和通信公式后输出每 logical rank 所映射唯一 device 的预测 allocated peak、预测 step time、timeline、关键路径、构成、coverage、
 assumptions 和严格同口径配置差分；结构不完整时明确阻断；
 有独立真机 fixture 时追加 conformance 与误差报告。</p></div>
+
+<div class="cal honest"><span class="lbl">与 Chapter 0 等价的非目标全集</span>
+<p><code>§14.5 capability boundary inherits all ten non-goals from §0.2</code>：最终交付明确不包含
+① capacity/OOM 结论，② allocator reserved/外部碎片，③形式化正确性证明，④静态图编译优化，
+⑤在线真机回放，⑥自动策略搜索器，⑦按多 stream 完成时刻推导内存复用，
+⑧ layout/stride 隐式重排猜测，⑨共享资源竞争/并发降速模型，⑩通信库 algorithm-dependent 隐式 scratch。
+此列表与 §0.2 是同一规范边界的完整重述；任何增删必须同时修改两处与门禁，不能把本节当作较短子集维护。</p></div>
 
 <div class="cal why"><span class="lbl">为什么这一形态符合多维并行规划</span>
 <p>TP/PP/DP/CP/EP、microbatch、重计算、分桶和预取首先改变逐 rank 源码分支、运行时事件、

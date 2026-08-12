@@ -1,8 +1,8 @@
 # 交接文档 · PyNative 多维并行成本评估目标方案 v4.2
 
-> 最后更新：2026-08-12（权威图 10→29 张：总体架构分层、端到端时序、两后端时序/流程、九模块契约类图、
-> Ch2/6/8/9 章节类图；Ch2–Ch9 每章加「本章核心职责」；两张后端 module-logic 图并入图 18/图 22 消除冗余；
-> 生成 HTML 内置图缩放查看器——点击任意图全屏，滚轮缩放、拖拽平移、Esc 关闭）
+> 最后更新：2026-08-12（完成 v4.2 设计复审修订：比较分支优先级、coverage 单位、quality↔basis、
+> train-only manifest、EP 通信 obligation、memory 数值预检、conformance 部署 profile 与十项能力边界；
+> 权威图共 29 张，生成 HTML 内置图缩放查看器）
 >
 > 当前任务性质：目标方案设计与审查，不是 `cost_eval` 实现迁移
 >
@@ -33,6 +33,8 @@
   Ready view 内嵌规范 `EstimateContext`；source/runtime/core/projection blocker 必须按 backend scope 传播，
   affected blocker 非空时不可能 Ready。
 - 待预测运行的 raw trace 不是生产输入；独立 TraceFixture 只用于离线/CI conformance。
+- conformance 默认采用可信 CI/进程/制品库内的 `local_integrity` profile；只有多方共享 CI、合规或对抗性
+  runner/replay 威胁场景才启用可选 `hardened_attestation` profile。
 
 ### 0.1 二十九张权威 Mermaid 图索引
 
@@ -69,7 +71,7 @@
 | `comparison-class` | §10 模块契约；typed arm、basis pair、逐 metric 分支与封装类图 |
 | `gate-system-class` | §12 模块契约；specification/manifest/clause、authority 与账本类图 |
 | `result-gate-comparison` | §10.4/§10.5/§12.2；source/value/seal authority、ledger、comparison 与 conformance 旁路 |
-| `conformance-class` | §12 模块契约；fixture 体系、测量 envelope/会话能力、attestation 与发布判定类图 |
+| `conformance-class` | §12 模块契约；默认 local-integrity 与可选 hardened envelope/attestation/release 判定类图 |
 
 ### 0.2 九组模块契约索引
 
@@ -86,7 +88,7 @@
 | `result-sealing` / `mc-result-sealing` | candidate 与 source/value/seal authority；`run_backend_build_candidate_and_seal(...)` |
 | `gate-system` / `mc-gate-system` | GateManifest/Clause/Ledger/Blocker；`compile_gate_manifest(...)`、`run_gate_domain(...)`、ledger extension |
 | `comparison` / `mc-comparison` | typed arms、basis/source/candidate/seal；basis 派生、authority 构造与逐 metric comparison |
-| `conformance` / `mc-conformance` | fixture/report/finding/release；`run_conformance(...)` 与 `apply_release_policy(...)` |
+| `conformance` / `mc-conformance` | fixture/report/finding/release；默认 `run_local_integrity_conformance(...)` 与可选 hardened `run_conformance(...)` |
 
 ## 1. v4.2 已定边界
 
@@ -138,6 +140,8 @@ backward、optimizer、通信等 rule 的每次派生对象；role-local ordinal
   accumulation 与参数更新关系。
 - 每个 runtime occurrence 先生成 EventObligation；每个 obligation 恰为
   `EventId | BlockerInstanceId | NotApplicable`，coverage 按三分支守恒，每个 Event 也恰有一个反向授权。
+- 每个适用的 routed-expert occurrence 还必须生成一对 `EPDispatchCombineExpansionObligation`：dispatch 与
+  combine 各自恰解析为一个 all-to-all CollectiveIntent；`ep=1` 或 dense path 必须显式为 `NotApplicable`。
 - `AutogradLink` 显式关联 forward/backward/recompute、saved tensor、gradient、accumulation 与 update；
   重复 origin/microbatch 不能按位置猜配对。缺规则返回 `BLK-EVENT-SEMANTICS`。
 - recompute 产生新的 EventId、TensorInstanceId 和必要的 StorageInstanceId，但继续引用原
@@ -207,6 +211,9 @@ same anchor:
   `(rank, anchor, kind, subject ids, ordinal)` 的规范 tagged tuple。
 - projection 只读取冻结 hardware alignment 并把 aligned bytes 写入 view；后端重放不再读取 raw hardware、
   physical stream、duration、start/end、resource state 或 TimeEstimate。
+- `MemoryEventView` 内嵌 `MemoryNumericPolicySnapshot` 与 `MemoryNumericRangeWitness`；projection 先用任意精度整数
+  对 storage/workspace、initial/category/live/peak 与 cluster-max 全部 byte 聚合做预检，再收窄到有界无符号整数。
+  任一值越界固定产生 memory-scoped `BLK-NUMERIC-RANGE`，不能把首次溢出推迟到 Ready 后端。
 - 本版不建模多 stream 完成次序、跨 stream allocator reuse 或由完成时刻触发的提前 free。
 - 每个 RuntimeEventPlan StorageInstance 恰有一个 `LogicalLifetime(release_event_id|None)`；多个 release candidate 阻断。
   `dependency_safe(u,r) := u==r || path_length>=1(u,r)`。非空 release 必须对全部 Use 安全；只有 None
@@ -315,6 +322,10 @@ storage 形成唯一 StorageBinding，每个 compute workspace 形成唯一 Work
 时间后端只允许 exact measurement hit；禁止插值、roofline/FLOPs/零值 fallback。0 个候选返回
 `BLK-MISSING-TIME`，多个同等候选返回 `BLK-AMBIGUOUS-COST`。生产 lookup 只消费 calibration_train；
 holdout 只评估采集/适用性误差，不参与 duration 定价；conformance_fixture 只用于发布验证。
+`ObservationRef` 与 `CalibrationSet` 只绑定 `calibration_train_manifest_digest`；
+`CalibrationSet.active_compute_records` 中每条记录的 split 必须是 calibration_train 且引用同一个 train digest；
+`holdout_manifest_digest` 和 `conformance_fixture_manifest_digest` 是 offline-only，绝不进入 CalibrationSet、
+time simulation digest、comparison basis 或生产 cache key。
 
 ### 3.2 communication formula
 
@@ -330,8 +341,8 @@ CostBinding 嵌入；仅有 numeric policy digest 不足以复算。
 不含 split label；`split_group_key = hash(run/config/protocol/hardware group)`。
 `calibration_train`、`holdout`、`conformance_fixture` 必须按 sample_key、split_group_key 与 lineage ancestor
 两两不相交；当前待预测运行不能出现在生产测量 lineage。生产进程不读取 raw profiler/TraceFixture 路径。
-digest/lineage 只能证明内容一致，不能证明测量真实或 split 独立；需要更强保证时依赖方案外的签名采集器/
-attestation 信任根，否则标为“用户提供的测量事实”。
+digest/lineage 只能证明内容一致，不能证明测量真实或 split 独立；默认 `local_integrity` profile 将其标为
+“用户提供的测量事实”。需要抵抗恶意 runner 或重放时，显式启用 `hardened_attestation` profile 的签名采集器与信任根。
 
 ```text
 model_input_digest =
@@ -440,13 +451,16 @@ MetricComparison<T> =
   | NotRequested
 ```
 
-`ComparisonBasis` 有规范 schema 与 hash；每个 metric 的 `ComparisonBasisPair` 同时保存 left/right basis，
+`ComparisonBasis` 有规范 schema 与 hash；每个 metric 的分支优先级固定为
+`NotRequested > Incomparable > Unavailable > ComparableDelta`：未请求先返回 NotRequested；已请求且 basis
+不同时返回 Incomparable，即使某侧同时 Blocked 也由 Incomparable 胜出；basis 相同后才判断非 Ok 为
+Unavailable，最后两侧均 Ok 才产生 ComparableDelta。每个 metric 的 `ComparisonBasisPair` 同时保存 left/right basis，
 不等时从该 pair 的规范结构差异派生 Incomparable，相等时才形成 common digest。`masked_config_evaluation_input`
 从完整 `CanonicalConfigEvaluationInput` 开始；normalized P/ExecutionScenario 仅在校验过的 comparison_axes 及其
 schema-declared cross-field deterministic derivation closure 上用 sentinel mask，其余字段（包括未落入闭包的
 logical rank context、deployment 与 `other_config_indexed_production_inputs`）必须相等。microbatch 通过
-P.batching 作为 axis；未声明的 scenario 变化仍不可比。每个 metric 独立判断：basis 相同且两侧均 Ok 才返回 ComparableDelta；basis 不同返回
-Incomparable；任一侧阻断/单侧未请求返回 Unavailable；两侧均未请求返回 NotRequested。只有
+P.batching 作为 axis；未声明的 scenario 变化仍不可比。world size 改变会改变 logical-rank id set，固定返回
+Incomparable；只有 world size 相同、固定集群内重分区的配置才可能继续进入同 basis 比较。只有
 ComparableDelta 携带数值 delta。
 time 两臂必须使用同一 measurement_protocol_digest；不同统计协议 Incomparable。relative delta 固定为
 `(right-left)/left`；左基线为 0 时返回 `UndefinedZeroBaseline`，不能输出 Inf/NaN；MemoryDelta 要求
@@ -530,6 +544,17 @@ memory/time、Ok/Blocked/NotRequested 不互相制造假依赖，也不能用游
 
 ## 6. conformance
 
+`ConformanceDeploymentProfile = local_integrity | hardened_attestation`。`local_integrity` 是默认 profile，
+其威胁模型是假定 CI/verifier 进程与 content-addressed artifact store 可信；它通过完整 binding domain、嵌套摘要
+复算、集合/守恒检查和派生 verdict 检测误配、损坏与非恶意实现错误，但不声称抵抗恶意 runner、报告伪造或重放。
+该路径使用 `run_local_integrity_conformance(...)`，输出必须标记
+`assurance = local_integrity_non_adversarial`，且不读取 signature、nonce、time window、process/container identity。
+
+`hardened_attestation` 是可选部署 profile，只用于多方共享 CI、合规或明确需要抵抗恶意 runner/重放的环境；
+它保留 `run_conformance(...)` 的 dual trust roots、public-key registry、签名、single-use nonce、单调时间窗及
+process/container/session identity，并且只有该 profile 可以形成 signed release approval。以下 attestation 与
+批准清单约束均只适用于 hardened profile。
+
 `ConformanceVerdict = pass | fail | insufficient`：
 
 - missing/extra/unresolved node、错误 branch/dependency/communication identity 是结构性 fail；
@@ -554,7 +579,7 @@ memory/time、Ok/Blocked/NotRequested 不互相制造假依赖，也不能用游
 CodeIR conformance 按 rank 对比并聚合 rank set；event conformance 覆盖 backward/recompute/optimizer、
 TensorInstance、P2P/collective、microbatch/pipeline 与 logical allocation timeline。
 
-离线 conformance 的会话边界已经闭合：`MeasuredExecutionEnvironment` 是 protected measurer 发行的
+可选 hardened conformance 的会话边界已经闭合：`MeasuredExecutionEnvironment` 是 protected measurer 发行的
 不可重放 envelope，摘要覆盖 invocation、runner/executable、process/container/session identity、single-use nonce、
 execution time window、measured payload 与 measurer identity/freshness evidence；所有 fixture binding 只能在
 `ValidatedMeasurementSessionCapability` 对应的同一调用域执行，runner attestation 签完整 envelope digest，
@@ -641,15 +666,18 @@ Get-FileHash -Algorithm SHA256 index.html, artifact.html
 继续实现审查时重点检查：
 
 1. 是否真的逐 rank 求值，而不是代表 rank 或母图；
-2. source/event obligation 是否有独立分母和双向映射；
+2. source obligation 是否按 obligation 单位守恒，`source_obligations_planned == source_nodes_planned` 是否显式成立，
+   event obligation 是否有独立分母和双向映射；
 3. microbatch/recompute 是否使用 Tensor/Storage instance；
 4. ResolvedEventSemantic/TensorStorageBinding 是否让序列化 RuntimePlan 独立于隐藏 CodeIR/object table；
 5. forward/backward/saved tensor/grad accumulation 是否闭合；
 6. effect 是否沿 base DAG 的同一稳定拓扑序定向，schedule constraint 是否成为真实 edge；
-7. per-rank MemoryEventView 是否等于 ExpectedMemoryProjection 且完全不读 duration/start/end；
+7. per-rank MemoryEventView 是否等于 ExpectedMemoryProjection、完全不读 duration/start/end，且 byte 聚合是否先做
+   任意精度预检并生成 memory numeric witness；
 8. Storage/WorkspaceBinding 的 bytes/alignment/lifetime 是否唯一，memory/time 是否可独立 Ready/Blocked；
 9. ExecutionDeployment、shared KernelVariantBinding 与 device-qualified StreamBinding 是否唯一且进入摘要；
 10. PP/CP P2P/collective 是否经 endpoint descriptor quotient 与 typed internal-edge 规则进入联合 graph；
+    EP routed-expert occurrence 是否逐次产生配对的 dispatch/combine all-to-all obligation；
 11. TimeEventView 是否自带 device/stage domain、protocol/numeric/bound cost，且没有 contention 隐式入口；
 12. Ready EstimateContext 与 blocker propagation 是否有唯一 producer；
 13. exact measurement/formula/route、split group 与摘要排除表是否闭合；
@@ -657,7 +685,10 @@ Get-FileHash -Algorithm SHA256 index.html, artifact.html
 15. comparison basis 是否从完整 CanonicalConfigEvaluationInput 构造，只 mask 已声明 axis 及跨字段确定性派生闭包；仅 `other_config_indexed_production_inputs.x` 不同是否必为 Incomparable 并定位该路径；
 16. config_ref→EvaluationInstanceIdentity→BackendSealArtifact→ComparisonArmAuthority 是否全链可复算，A/B artifact 是否不可交换，同臂 artifact 是否共享字节相同 bundle/current subject/manifest；
 17. GateClause 的 map key/record/manifest identity 是否三方相等，failure disposition 是否只从 manifest 派生；
-18. 逐 metric comparison、basis pair、scenario axis、零 baseline、分层 cache 与 NotRequested 是否保持类型闭包；
-19. ConformanceReport 是否绑定批准 subject/fixture/policy/manifest/runner，GateClause 是否逐子句有正反例。
+18. 逐 metric comparison 是否严格执行 `NotRequested > Incomparable > Unavailable > ComparableDelta`，world-size
+    变化是否固定 Incomparable，basis pair、scenario axis、零 baseline、分层 cache 与 NotRequested 是否保持类型闭包；
+19. 默认 local-integrity 与可选 hardened-attestation 的威胁模型、输入和 release 能力是否隔离；报告是否绑定
+    subject/fixture/policy/manifest/runner，GateClause 是否逐子句有正反例。
 
-不要为本版重新引入编译器图优化、精确 layout/stride、多流完成时刻内存复用或资源竞争模型。
+不要为本版重新引入 capacity/OOM verdict、编译器图优化、精确 layout/stride、多流完成时刻内存复用、
+通信内部 scratch、资源竞争/并发降速、形式证明、online trace replay 或自动 policy searcher。

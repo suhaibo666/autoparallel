@@ -142,6 +142,22 @@ class VerifyGatesContractTest(unittest.TestCase):
                 "time-backend",
                 "occupied_streams(node)) for node in order",
             ),
+            (
+                "runtime-events",
+                "EPDispatchCombineExpansionObligation:",
+            ),
+            (
+                "memory-backend",
+                "unbounded_integer_memory_preflight(",
+            ),
+            (
+                "comparison",
+                "NotRequested > Incomparable > Unavailable > ComparableDelta",
+            ),
+            (
+                "conformance",
+                "local_integrity is the default conformance deployment profile",
+            ),
         )
 
         for module, token in cases:
@@ -156,6 +172,40 @@ class VerifyGatesContractTest(unittest.TestCase):
                 errors = validate(replace_in_module(template, module, token, "MUTATED"))
                 self.assertTrue(
                     any(module in error and token in error for error in errors),
+                    errors,
+                )
+
+    def test_review_remediation_global_contracts_are_mutation_sensitive(self) -> None:
+        required_contracts = (
+            "source_obligations_planned",
+            "quality_from_basis",
+            "calibration_train_manifest_digest",
+            "record.observation_ref.split == calibration_train",
+            "MemoryNumericRangeWitness",
+            "Incomparable takes precedence over Unavailable",
+            "EP is a subgroup carved from the dp × tp × cp rank region",
+            "§14.5 capability boundary inherits all ten non-goals from §0.2",
+        )
+        for required_contract in required_contracts:
+            with self.subTest(required_contract=required_contract):
+                self.assertIn(required_contract, verify_gates.REQUIRED_TEXT)
+                html = p1_document().replace(required_contract, "REMOVED")
+                errors = validate(html)
+                self.assertTrue(
+                    any(required_contract in error for error in errors),
+                    errors,
+                )
+
+        for stale_contract in (
+            "memory_capacity",
+            "dataset_manifest_digest",
+            "ep_adjustment",
+        ):
+            with self.subTest(stale_contract=stale_contract):
+                self.assertIn(stale_contract, verify_gates.FORBIDDEN_TEXT)
+                errors = validate(p1_document("\n" + stale_contract))
+                self.assertTrue(
+                    any(stale_contract in error for error in errors),
                     errors,
                 )
 
@@ -1293,6 +1343,7 @@ class VerifyGatesContractTest(unittest.TestCase):
             "MeasurementProtocol": "protocol_digest",
             "TimeCostPolicy": "policy_digest",
             "NumericPolicySnapshot": "numeric_policy_digest",
+            "MemoryNumericPolicySnapshot": "memory_numeric_policy_digest",
             "CommunicationFormulaRef": "digest",
             "CommunicationModelSnapshot": "communication_model_digest",
             "MemoryRegistrySnapshot": "memory_registry_digest",
@@ -1337,6 +1388,11 @@ class VerifyGatesContractTest(unittest.TestCase):
             "FixtureSet": "fixture_set_digest",
             "ValidationPolicy": "validation_policy_digest",
             "VerifierRunner": "verifier_runner_digest",
+            "LocalIntegrityInvocationAuthority": "local_integrity_invocation_digest",
+            "LocalIntegrityExecutionRecord": "local_integrity_execution_record_digest",
+            "LocalIntegrityObservedOutput": "local_integrity_observed_output_digest",
+            "LocalIntegrityExecutionLedger": "local_integrity_execution_ledger_digest",
+            "LocalIntegrityReport": "local_integrity_report_digest",
             "TrustStoreSnapshot": "trust_store_snapshot_digest",
             "RunnerAttestationPolicy": "runner_attestation_policy_digest",
             "MeasuredExecutionEnvironment": "measured_execution_environment_digest",
