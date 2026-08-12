@@ -1,7 +1,8 @@
 # 交接文档 · PyNative 多维并行成本评估目标方案 v4.2
 
-> 最后更新：2026-08-12（完成 v4.2 设计复审修订：比较分支优先级、coverage 单位、quality↔basis、
-> train-only manifest、EP 通信 obligation、memory 数值预检、conformance 部署 profile 与十项能力边界；
+> 最后更新：2026-08-12（完成 v4.2 设计复审修订及 editorial closure：比较 request-level 分支、
+> registry snapshot/digest 分层、ExecEvent self-ref、CodeIR assemble 写入时机、发布边界 fixture 与 pairwise API；
+> coverage 单位、quality↔basis、train-only manifest、EP 通信 obligation、memory 数值预检、conformance 部署 profile；
 > 权威图共 29 张，生成 HTML 内置图缩放查看器）
 >
 > 当前任务性质：目标方案设计与审查，不是 `cost_eval` 实现迁移
@@ -104,6 +105,10 @@
   分母不能从已经生成的 IR 反推。
 - PySub 世界由 SourceSnapshot、CompileEnvFacts 与冻结 registry 封闭。未快照 hook/dispatch/monkey
   patch 若可能改变调用图，必须阻断，不能静默静态绑定。
+- StructureRegistrySnapshot 与 RuntimeRegistrySnapshot 是两个独立冻结快照：前者进入 model_input_digest，
+  后者进入 runtime_input_digest 且不得进入 model_input_digest，不能合并后污染 CodeIR cache key。
+- `assemble_code_ir` 先写入 canonical `logical_rank_order`、per_rank、blocker_index 与 model_input_digest，
+  再按 §2.4 排除表计算并写入 model_digest，Ready CodeIR 不得缺任一字段。
 
 ### 1.2 microbatch 与初态身份
 
@@ -140,6 +145,8 @@ backward、optimizer、通信等 rule 的每次派生对象；role-local ordinal
   accumulation 与参数更新关系。
 - 每个 runtime occurrence 先生成 EventObligation；每个 obligation 恰为
   `EventId | BlockerInstanceId | NotApplicable`，coverage 按三分支守恒，每个 Event 也恰有一个反向授权。
+- 每个 ExecEvent 必须满足 `resolved_semantic_ref == event_id`，只能索引自身 EventId 对应的唯一
+  ResolvedEventSemantic，不能跨事件借用 EffectSummary。
 - 每个适用的 routed-expert occurrence 还必须生成一对 `EPDispatchCombineExpansionObligation`：dispatch 与
   combine 各自恰解析为一个 all-to-all CollectiveIntent；`ep=1` 或 dense path 必须显式为 `NotApplicable`。
 - `AutogradLink` 显式关联 forward/backward/recompute、saved tensor、gradient、accumulation 与 update；
@@ -147,7 +154,7 @@ backward、optimizer、通信等 rule 的每次派生对象；role-local ordinal
 - recompute 产生新的 EventId、TensorInstanceId 和必要的 StorageInstanceId，但继续引用原
   RankCodeNodeRef。
 - LogicalScheduleSpec 中必须影响实际发射/完成的条件全部 lower 为 `ScheduleConstraintEdge`；
-  `logical_kernel_order` 只是内存重放/tie-break 全序，不能替代跨 stream 执行边。
+  `logical_kernel_order` 只是内存重放/tie-break 全序，不能替代真实 issue/completion 执行边。
 
 ### 1.4 最小 effect 顺序规则
 
@@ -306,7 +313,7 @@ StreamBinding 与 CostBinding；只保留 EventId/duration 后篡改分组字段
 
 `CalibrationSet` 是用户在待预测请求之前采集、规范化、冻结并版本化的 compute duration 记录与
 MeasurementProtocol snapshots；workspace 规则/记录属于独立 MemoryRegistrySnapshot。
-Structure/Runtime 只生成硬件无关 `MeasurementKeyTemplate`；core 用 HardwareProjectionFacts 与
+Structure snapshot 生成硬件无关 `MeasurementKeyTemplate`，Runtime snapshot 只驱动后续事件展开；core 用 HardwareProjectionFacts 与
 HardwareBindingPolicy 生成 shared KernelVariantBinding，time projection 再结合 TimeCostPolicy 补全
 `MeasurementKey`。完整 key 覆盖 semantic/kernel、精确
 shape/dtype/attrs、硬件/runtime 与 measurement_protocol_digest；
@@ -452,7 +459,8 @@ MetricComparison<T> =
 ```
 
 `ComparisonBasis` 有规范 schema 与 hash；每个 metric 的分支优先级固定为
-`NotRequested > Incomparable > Unavailable > ComparableDelta`：未请求先返回 NotRequested；已请求且 basis
+`NotRequested > Incomparable > Unavailable > ComparableDelta`：仅当 metric 不在
+`ComparisonRequest.requested_metrics` 时返回 NotRequested；已请求且 basis
 不同时返回 Incomparable，即使某侧同时 Blocked 也由 Incomparable 胜出；basis 相同后才判断非 Ok 为
 Unavailable，最后两侧均 Ok 才产生 ComparableDelta。每个 metric 的 `ComparisonBasisPair` 同时保存 left/right basis，
 不等时从该 pair 的规范结构差异派生 Incomparable，相等时才形成 common digest。`masked_config_evaluation_input`
@@ -465,6 +473,9 @@ ComparableDelta 携带数值 delta。
 time 两臂必须使用同一 measurement_protocol_digest；不同统计协议 Incomparable。relative delta 固定为
 `(right-left)/left`；左基线为 0 时返回 `UndefinedZeroBaseline`，不能输出 Inf/NaN；MemoryDelta 要求
 logical-rank id set 相同。
+左右臂绑定同一份 RequestSnapshot，因此合法 authority 不存在 per-arm 请求分叉；此类 artifact 身份错误在
+ComparisonSourceAuthority 构造阶段就是 InternalContractViolation。正式 ComparisonRequest 每次只封装一个
+left/right pair；K 配置 sweep 另行输出逐配置结果与摘要，N 路 delta 由调用方组合多个成对请求。
 
 ComparisonResult 不能由裸 `compare_per_metric` 直接外泄。显式 comparison request 先构造
 `ComparisonArmAuthority(config_ref,evaluation_identity,projection_bundle_authority_digest,artifacts)`，并严格要求每个 artifact 的
@@ -541,6 +552,8 @@ memory/time、Ok/Blocked/NotRequested 不互相制造假依赖，也不能用游
 `GateFailureDisposition = InputBlocker(BlockerCode,scope) | InternalViolation(code)`。backend value、result seal
 和 comparison gate 失败一律是 InternalViolation。GateManifest 还绑定 subject、runner 与自身 digest。
 `verify_gates.py` 只做文档 lint，不证明运行时 predicate；发布测试必须逐 clause 执行。
+权威正文所称“发布级边界 fixtures”同时包括应被拒绝的畸形输入，以及应产生指定 scoped disposition 的
+合法 blocker；例如 BLK-MISSING-TIME 仅阻断 time 是后者，不表示该正确行为本身应被拒绝。
 
 ## 6. conformance
 
@@ -669,7 +682,7 @@ Get-FileHash -Algorithm SHA256 index.html, artifact.html
 2. source obligation 是否按 obligation 单位守恒，`source_obligations_planned == source_nodes_planned` 是否显式成立，
    event obligation 是否有独立分母和双向映射；
 3. microbatch/recompute 是否使用 Tensor/Storage instance；
-4. ResolvedEventSemantic/TensorStorageBinding 是否让序列化 RuntimePlan 独立于隐藏 CodeIR/object table；
+4. ExecEvent.resolved_semantic_ref 是否恒等于自身 event_id；ResolvedEventSemantic/TensorStorageBinding 是否让序列化 RuntimePlan 独立于隐藏 CodeIR/object table；
 5. forward/backward/saved tensor/grad accumulation 是否闭合；
 6. effect 是否沿 base DAG 的同一稳定拓扑序定向，schedule constraint 是否成为真实 edge；
 7. per-rank MemoryEventView 是否等于 ExpectedMemoryProjection、完全不读 duration/start/end，且 byte 聚合是否先做
@@ -680,13 +693,14 @@ Get-FileHash -Algorithm SHA256 index.html, artifact.html
     EP routed-expert occurrence 是否逐次产生配对的 dispatch/combine all-to-all obligation；
 11. TimeEventView 是否自带 device/stage domain、protocol/numeric/bound cost，且没有 contention 隐式入口；
 12. Ready EstimateContext 与 blocker propagation 是否有唯一 producer；
-13. exact measurement/formula/route、split group 与摘要排除表是否闭合；
+13. Structure/Runtime 是否保持两个独立快照并分别进入 model/runtime input digest；exact measurement/formula/route、split group 与摘要排除表是否闭合；
 14. bundle 是否同时保留 Runtime/Core result，plan blocker 在 bind_core Blocked 后是否仍完整；shared build/G-IR blocker 是否强制双侧；两侧 projection blocker 是否全局并集并按 affected_backends 闭包，且闭包前未开始任一 backend seal；
 15. comparison basis 是否从完整 CanonicalConfigEvaluationInput 构造，只 mask 已声明 axis 及跨字段确定性派生闭包；仅 `other_config_indexed_production_inputs.x` 不同是否必为 Incomparable 并定位该路径；
 16. config_ref→EvaluationInstanceIdentity→BackendSealArtifact→ComparisonArmAuthority 是否全链可复算，A/B artifact 是否不可交换，同臂 artifact 是否共享字节相同 bundle/current subject/manifest；
 17. GateClause 的 map key/record/manifest identity 是否三方相等，failure disposition 是否只从 manifest 派生；
 18. 逐 metric comparison 是否严格执行 `NotRequested > Incomparable > Unavailable > ComparableDelta`，world-size
-    变化是否固定 Incomparable，basis pair、scenario axis、零 baseline、分层 cache 与 NotRequested 是否保持类型闭包；
+    变化是否固定 Incomparable，NotRequested 是否只由 request.requested_metrics 决定，pairwise API 与 sweep summary
+    是否分离，basis pair、scenario axis、零 baseline、分层 cache 是否保持类型闭包；
 19. 默认 local-integrity 与可选 hardened-attestation 的威胁模型、输入和 release 能力是否隔离；报告是否绑定
     subject/fixture/policy/manifest/runner，GateClause 是否逐子句有正反例。
 

@@ -492,7 +492,7 @@ stream/cost policy 和通信公式快照，本工具回答：</p>
 <tr><td>形式化正确性证明</td><td>结构门只检查内部契约；真实误差由独立验证集评估</td><td>alias、lifetime、stream 和 duration 都可能存在模型误差</td></tr>
 <tr><td>静态图编译优化</td><td>不增加算子合并、消除、替换或通用图变换</td><td>PyNative 模式以当前源码可见结构为权威</td></tr>
 <tr><td>在线真机回放</td><td>运行时预测不读取 raw trace</td><td>trace 是验证 IR 的测试手段，不是强依赖输入</td></tr>
-<tr><td>自动策略搜索器</td><td>提供单配置求值和多配置比较接口</td><td>搜索器可在外层调用评估内核</td></tr>
+<tr><td>自动策略搜索器</td><td>提供单配置求值、K 配置 sweep 摘要和显式 left/right 成对比较接口</td><td>N 路比较与搜索策略由外层组合多个成对请求并调用评估内核</td></tr>
 <tr><td>按多 stream 完成时刻推导内存复用</td><td>内存只按确定的逻辑 kernel 顺序重放；无显式同步安全点时延长生命周期</td><td>本版不让未知或模型化 duration 决定 alloc/free 顺序</td></tr>
 <tr><td>layout/stride 引发的隐式重排</td><td><code>transpose/view</code> 视为元数据 alias；只有源码或已注册语义显式 copy 才产生新 storage</td><td>本版不猜测后端是否隐式 contiguous；无法排除物化时阻断内存侧</td></tr>
 <tr><td>共享资源竞争与并发降速</td><td>固定每个事件的 service duration；不同 stream 可重叠但不相互降速</td><td>本版只建模依赖、stream 次序和通信 rendezvous</td></tr>
@@ -3305,6 +3305,7 @@ raw trace 的环境分界，并给出并行配置的唯一正则形。</div>
 
 <h4 id="mc-input-facts-boundary">职责边界</h4>
 <p>本模块只冻结源码、配置、scenario、注册表、硬件与标定事实，并把它们组装为不可变<code>RequestSnapshot</code>；它不求值 CodeIR、不展开运行事件，也不执行 memory/time 后端。<code>MemoryRegistrySnapshot</code> 与 <code>TimeCostPolicy</code> 沿用 3.4 节的权威定义，不得在请求层复制 bytes、workspace、duration 或通信公式成为第二真值。</p>
+<p><code>StructureRegistrySnapshot and RuntimeRegistrySnapshot are distinct frozen snapshots</code>：前者的 <code>structure_registry_digest</code> 是 <code>model_input_digest</code> 的直接输入，后者的<code>runtime_registry_digest</code> 是 <code>runtime_input_digest</code> 的直接输入；<code>runtime_registry_digest is excluded from model_input_digest</code>。请求层不得把两者合并为一个快照，否则只改变 runtime event expansion 的规则也会错误污染 CodeIR cache key。</p>
 
 <h4 id="mc-input-facts-data">核心数据结构</h4>
 <pre><code>NormalizedParallelConfig := normalized config P
@@ -5720,11 +5721,18 @@ assemble_code_ir algorithm:
   blockers := rank_build_blocker_union(rank_inputs, rank_results)
   if any rank result is Blocked:
     return Blocked { blockers: require_non_empty(blockers) }
-  return Ready {
-    code_ir.per_rank := all Ready rank_ir values
-    code_ir.blocker_index := blockers indexed by BlockerInstanceId
-    code_ir.model_input_digest := model_input_digest
-  }
+  logical_rank_order := canonical LogicalRank order of rank_inputs.keys
+  per_rank := OrderedMap in logical_rank_order of all Ready rank_ir values
+  blocker_index := blockers indexed by BlockerInstanceId
+  code_ir_payload_without_model_digest := canonical CodeIR schema payload of
+    { per_rank, logical_rank_order, blocker_index, model_input_digest }
+  model_digest := hash(model_input_digest, code_ir_payload_without_model_digest)
+  require code_ir_payload_without_model_digest ==
+          canonical_payload_without_derived_digests(returned code_ir)
+  return Ready { code_ir := CodeIR {
+    per_rank, logical_rank_order, blocker_index,
+    model_input_digest, model_digest
+  } }
 
 minimum union witness:
   r0 Ready residual {A} + r1 Blocked {B}
@@ -6794,13 +6802,14 @@ SimulationInitialState。</p>
 <h3 id="c6-1">6.1 注册域隔离</h3>
 <div class="tw"><table>
 <tr><th>注册域</th><th>提供什么</th><th>主要消费者</th><th>缺失后果</th></tr>
-<tr><td>Structure/Runtime</td><td>调用绑定、shape/dtype、storage、autograd、effects、event expansion</td><td>CodeIR / RuntimeEventPlan</td><td>结构或受影响事件阻断</td></tr>
+<tr><td>Structure</td><td>调用绑定、shape/dtype、storage、autograd 与 effects</td><td>CodeIR</td><td>结构阻断</td></tr>
+<tr><td>Runtime</td><td>训练派生规则、lifetime、initial state 与 event expansion</td><td>RuntimeEventPlan</td><td>受影响事件阻断</td></tr>
 <tr><td>Memory</td><td>bytes、category、workspace 与 alignment rule</td><td>MemoryEventView</td><td>只阻断内存侧</td></tr>
 <tr><td>Time</td><td>compute measurement lookup、P2P/collective formula 与 progress lowering</td><td>TimeEventView</td><td>只阻断时间侧</td></tr>
 </table></div>
 
-<p>三域物理隔离并分别冻结快照。Structure/Runtime 域不能 import HardwareProfile；
-Memory 与 Time 域不能修改 CodeIR 或 RuntimeEventPlan。</p>
+<p>上表按四类消费域分层；其中 Structure 与 Runtime 不是一个合并注册域，而是分别由<code>StructureRegistrySnapshot</code> 和 <code>RuntimeRegistrySnapshot</code> 冻结的两个快照，依次进入
+model-input 与 runtime-input 摘要阶段。两者都不能 import HardwareProfile；Memory 与 Time 是后端输入域，不能修改 CodeIR 或 RuntimeEventPlan。</p>
 
 <h3 id="c6-2">6.2 OpSemantic 的逐面值</h3>
 <pre><code>OpSemantic:
@@ -8713,7 +8722,12 @@ Runtime expansion output reuses:
   config: NormalizedParallelConfig,
   scenario: ExecutionScenario,
   registry: RuntimeRegistrySnapshot
-) -&gt; RuntimeBuildResult | InternalContractViolation</code></pre>
+) -&gt; RuntimeBuildResult | InternalContractViolation
+
+for every event in a Ready RuntimeEventPlan:
+  require event.resolved_semantic_ref == event.event_id
+  require plan.resolved_event_semantics[event.resolved_semantic_ref].event_id ==
+          event.event_id</code></pre>
 
 <h4 id="mc-runtime-events-outcomes">成功与阻断语义</h4>
 <p><code>Ready</code> 表示已生成可规范序列化的 RuntimeEventPlan；可定位到某个 EventObligation 的缺失语义保留在 plan.blocker_index，并按 <code>BlockerScopePolicy</code> 写出精确 <code>affected_backends</code>，从而允许不受影响后端部分成功。<code>Blocked</code> 仅表示 CodeIR/config/scenario 或冻结 Runtime registry
@@ -8722,6 +8736,7 @@ Runtime expansion output reuses:
 <h4 id="mc-runtime-events-invariants">不变量</h4>
 <ul>
   <li>每个 microbatch、repeat、recompute 和 phase occurrence 均产生独立 EventId/TensorInstanceId/必要的 StorageInstanceId；CodeIR identity 只作为 origin；</li>
+  <li>每个 ExecEvent 的 resolved_semantic_ref 必须等于自身 event_id，并唯一索引同 event_id 的 ResolvedEventSemantic；该字段不能跨事件复用语义。</li>
   <li>要求梯度的每个 forward instance 与其 backward、saved tensor、gradient relation、accumulation 和 update 通过唯一 AutogradLink 正反向双向闭合；</li>
   <li>PP activation/gradient 与 CP ring 必须各生成显式 send、recv endpoint 和 P2PIntent；每个 P2PIntent 恰匹配一对 src/dst/channel/sequence/bytes/payload/protocol endpoint。</li>
   <li>每个适用的 routed-expert phase/occurrence 必须为 EP dispatch 与 combine 各生成一条 <code>EPDispatchCombineExpansionObligation</code>，并分别闭合为显式 all-to-all CollectiveIntent；仅 <code>ep=1</code> 或无 routed expert 时可携证据 NotApplicable，不能用普通跨-rank dependency 代替。</li>
@@ -8844,7 +8859,7 @@ LogicalLifetime:
 StorageInstance 与 TensorStorageBinding；后续不得通过 opaque local ID 暗读 CodeIR 或进程内对象表。
 runtime rule origin 表达没有直接源码调用点的框架派生事件。每个 EventObligation 恰有一个
 EventId、BlockerInstanceId 或 NotApplicable disposition；coverage 按三分支守恒。每个 ExecEvent 也恰由一个
-obligation 授权。依赖只以计划级 EventEdge 为权威，节点局部邻接若存在只能由它派生。每个 RuntimeEventPlan.storage_instances 中的 StorageInstance 恰有一个 LogicalLifetime；同一 runtime storage 的多个 release candidate 不能任选，必须以
+obligation 授权，且 <code>resolved_semantic_ref == event_id</code>，因此只索引<code>resolved_event_semantics[event_id]</code> 的同一事件语义；依赖只以计划级 EventEdge 为权威，节点局部邻接若存在只能由它派生。每个 RuntimeEventPlan.storage_instances 中的 StorageInstance 恰有一个 LogicalLifetime；同一 runtime storage 的多个 release candidate 不能任选，必须以
 BLK-LIFECYCLE 阻断。EventEdge.kind 是投影与诊断的规范输入，不能在后端凭端点类型重新猜测。<code>logical_kernel_order</code> 覆盖全部
 EventId 且无重复，尊重数据/control/effect 依赖和 LogicalScheduleSpec，最终以稳定 EventId 打破平局；它不读取 hardware、physical stream、duration 或运行时完成时刻。
 G-IR3 必须把上述 logical_rank_contexts、semantic snapshot、instance binding 与结构报告事实逐项对照
@@ -8881,7 +8896,7 @@ PP activation/gradient 与 CP ring 的点对点通信必须生成显式 send/rec
 <h3 id="c7-5">7.5 Microbatch 与 pipeline</h3>
 <p>每个 microbatch、pipeline stage、virtual chunk 和 phase 生成独立事件实例。
 LogicalScheduleSpec 中任何必须约束实际发射/完成先后的条件，都必须由版本化 lowering 生成
-ScheduleConstraintEdge 并进入 RuntimeEventPlan.dependencies；跨 stream 约束不能只写进 total order。<code>logical_kernel_order</code> 只是内存重放和确定性 tie-break 的全序，不能替代执行依赖。逻辑 schedule 不指定物理 stream 或 duration。
+ScheduleConstraintEdge 并进入 RuntimeEventPlan.dependencies；任何这类实际发射/完成约束都不能只写进 total order。<code>logical_kernel_order</code> 只是内存重放和确定性 tie-break 的全序，不能替代执行依赖。逻辑 schedule 不指定物理 stream 或 duration。
 warmup、steady、cooldown 和 bubble 由后续 DES 在完整事件图上产生。</p>
 
 <h3 id="c7-6">7.6 禁止的结构变化</h3>
@@ -18662,8 +18677,8 @@ compare_per_metric_from_authority(
 <p><code>compare_per_metric_from_authority</code> 只构造未封装 value；10.5 节现行<code>build_and_seal_comparison</code> 仍是运行 G-REP2 并产生 <code>ComparisonSealArtifact</code> 的唯一入口，不能把 candidate 直接当成已发布比较结果。</p>
 
 <h4 id="mc-comparison-outcomes">成功与阻断语义</h4>
-<p>每个请求 metric 恰产生 <code>ComparableDelta</code>、<code>Incomparable</code>、<code>Unavailable</code> 或 <code>NotRequested</code>。只有左右同 metric 均为 Ok 且 basis 字节相同才可
-Comparable；左 baseline 为零时 relative 分支必须是 <code>UndefinedZeroBaseline</code>，absolute delta 仍按<code>right-left</code> 计算。basis 不同必须输出逐路径 BasisMismatch；单侧不可用必须携带左右状态和诊断；两侧都未请求才是 NotRequested。authority、candidate 或 G-REP2 失败是<code>InternalContractViolation</code>，不得伪装成 backend blocker。</p>
+<p>ComparisonResult 中每个 metric tag 恰产生 <code>ComparableDelta</code>、<code>Incomparable</code>、<code>Unavailable</code> 或 <code>NotRequested</code>；<code>NotRequested iff metric not in ComparisonRequest.requested_metrics</code>。只有左右同 metric 均为 Ok 且 basis 字节相同才可
+Comparable；左 baseline 为零时 relative 分支必须是 <code>UndefinedZeroBaseline</code>，absolute delta 仍按<code>right-left</code> 计算。basis 不同必须输出逐路径 BasisMismatch；已请求 metric 的任一非 Ok 状态必须由 Unavailable 携带左右状态和诊断。authority、candidate 或 G-REP2 失败是<code>InternalContractViolation</code>，不得伪装成 backend blocker。</p>
 <pre><code>requested metric branch priority:
   NotRequested &gt; Incomparable &gt; Unavailable &gt; ComparableDelta
   Incomparable takes precedence over Unavailable
@@ -18678,8 +18693,7 @@ compare_per_metric_from_authority(source, metric):
   if left_status is not Ok or right_status is not Ok:
     return Unavailable { left_status, right_status, canonical diagnostics }
   return ComparableDelta derived from both Ok estimates and pair.common digest</code></pre>
-<p>符号 <code>&gt;</code> 表示先判分支，而不是严重级别。特别地，请求 metric 同时出现 basis mismatch 与
-Blocked/单侧 NotRequested 时固定返回 Incomparable；状态不可用不能掩盖“比较口径本来就不同”的事实。</p>
+<p>符号 <code>&gt;</code> 表示先判分支，而不是严重级别。特别地，请求 metric 同时出现 basis mismatch 与任一非 Ok backend 状态时固定返回 Incomparable；状态不可用不能掩盖“比较口径本来就不同”的事实。左右臂绑定同一份字节相同的 RequestSnapshot，因此合法 authority 不可能出现只有一臂请求该 metric 的状态；这种 artifact/request 身份分叉必须在构造 ComparisonSourceAuthority 时作为 InternalContractViolation 拒绝，不是 Unavailable 的防御性分支。</p>
 
 <h4 id="mc-comparison-invariants">不变量</h4>
 <ul>
@@ -18775,8 +18789,8 @@ measurement_protocol_digest；不同 statistic/warmup/repetition 口径一律 In
 MemoryDelta 还要求两臂 logical-rank id set 相同；本版不猜测不同 world-size 间的 rank 对齐。因此任何 world size 变化都会因 logical-rank id set mismatch 固定产生 Incomparable；同 world size 下改变
 TP/PP/DP/CP/EP 的重分区，才可能在其余 basis 相同且对应路径已声明为 comparison axes 时产生 delta。跨配置 assumption/fallback scope 不以 EventId 比较，而规范成<code>(source/runtime semantic origin, instance role, logical-rank coordinate)</code> 后比较。每个 metric 的 ComparisonBasisPair 同时保存左右两份 basis；逐 metric 分支固定按
 NotRequested → Incomparable → Unavailable → ComparableDelta 求值。对 requested metric，basis 不等先从 pair
-的规范结构差异派生 Incomparable，因此 mismatch 与 Blocked 同时存在时仍返回 Incomparable；仅 basis 逐字节相同且两侧均 Ok 才使用 common_comparison_basis_digest 产生 ComparableDelta；basis 相同但任一侧 Blocked
-或仅单侧 NotRequested 才返回 Unavailable；metric 未请求返回 NotRequested。任何非 ComparableDelta 分支都不携带数值 delta。relative delta 明确定义为<code>(right-left)/left</code>；left baseline 为 0 时必须返回 UndefinedZeroBaseline，不能输出 Inf/NaN。比较仍只表示“按当前模型的差”，不是实机收益。</p>
+的规范结构差异派生 Incomparable，因此 mismatch 与 Blocked 同时存在时仍返回 Incomparable；仅 basis 逐字节相同且两侧均 Ok 才使用 common_comparison_basis_digest 产生 ComparableDelta；basis 相同但任一侧非 Ok
+才返回 Unavailable；metric 不在 ComparisonRequest.requested_metrics 时返回 NotRequested。任何非 ComparableDelta 分支都不携带数值 delta。relative delta 明确定义为<code>(right-left)/left</code>；left baseline 为 0 时必须返回 UndefinedZeroBaseline，不能输出 Inf/NaN。比较仍只表示“按当前模型的差”，不是实机收益。</p>
 
 <pre><code>ComparisonArmAuthority:
   config_ref: ConfigRef
@@ -18990,8 +19004,8 @@ Blocked 侧没有 null/0 数值、空 timeline 或上次缓存结果。</p>
 <div class="tw"><table>
 <tr><th class="nw">编号</th><th>断言</th><th>失败说明</th><th class="nw">类别</th></tr>
 <tr data-gate="G-IR1"><td class="nw"><code>G-IR1</code></td><td>logical rank 集合完整；rank-qualified identity 唯一且引用存在；每个 source obligation 恰为 CodeNode、引用唯一 BlockerRecord 的 Residual 或有 guard 证据的 ProvenNotExecuted，且与生成对象双向闭合；BlockerInstanceId/BlockerCode 分离、scope 等于 BlockerScopePolicy；source_obligations_total 按三个 obligation 桶守恒，且当前一对一 schema 中 source_obligations_planned == source_nodes_planned</td><td>漏 rank、身份碰撞、obligation/node 单位混用、幽灵引用、同码根因覆盖、scope 任填或源码 occurrence 静默消失</td><td class="nw">IR</td></tr>
-<tr data-gate="G-IR2"><td class="nw"><code>G-IR2</code></td><td>每个 RankCodeIR 不含硬件字段；model_input_digest 覆盖 evaluator/PySub/规范 ID 语义；model_digest 按排除表复算 canonical payload 且更换 HardwareProfile 不变</td><td>摘要自引用、求值器语义或硬件事实进入错误身份层</td><td class="nw">IR</td></tr>
-<tr data-gate="G-IR3"><td class="nw"><code>G-IR3</code></td><td>event obligation 三分支与 coverage 守恒；source_model_digest、logical_rank_contexts、ResolvedEventSemantic（含唯一 effect summary）、Tensor/Storage instance/binding、structural report facts 与 CodeIR/runtime lowering 精确闭合；BlockerRecord 无丢失；AutogradLink 完整；effect edge 沿 base DAG 规范拓扑全序，最终规范边集无环</td><td>隐藏 CodeIR lookup、漏/多事件、context/effect/instance/binding 漂移、blocker 丢失、正反向不闭合或局部 effect 定向造环</td><td class="nw">IR</td></tr>
+<tr data-gate="G-IR2"><td class="nw"><code>G-IR2</code></td><td>每个 RankCodeIR 不含硬件字段；logical_rank_order 等于 per_rank key 的规范 LogicalRank 顺序；model_input_digest 覆盖 evaluator/PySub/规范 ID 语义；全部非派生 CodeIR 字段固定后，model_digest 按排除表复算 canonical payload 且更换 HardwareProfile 不变</td><td>rank 顺序漏写、摘要自引用、求值器语义或硬件事实进入错误身份层</td><td class="nw">IR</td></tr>
+<tr data-gate="G-IR3"><td class="nw"><code>G-IR3</code></td><td>event obligation 三分支与 coverage 守恒；每个 ExecEvent.resolved_semantic_ref 等于自身 event_id；source_model_digest、logical_rank_contexts、ResolvedEventSemantic（含唯一 effect summary）、Tensor/Storage instance/binding、structural report facts 与 CodeIR/runtime lowering 精确闭合；BlockerRecord 无丢失；AutogradLink 完整；effect edge 沿 base DAG 规范拓扑全序，最终规范边集无环</td><td>隐藏 CodeIR lookup、跨 event 语义引用、漏/多事件、context/effect/instance/binding 漂移、blocker 丢失、正反向不闭合或局部 effect 定向造环</td><td class="nw">IR</td></tr>
 <tr data-gate="G-MEM1"><td class="nw"><code>G-MEM1</code></td><td>部署/shared KernelVariantBinding 完整；每个 runtime storage 有唯一 StorageBinding，每个 compute workspace 有唯一 WorkspaceBinding；alignment 等式、per_rank keys/expected storage set 与 initial XOR Allocate 全部成立</td><td>bytes/alignment 任择、漏 rank、幽灵 workspace、漏/重复分配、伪造 identity 或 live-in 双计</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-MEM2"><td class="nw"><code>G-MEM2</code></td><td>每个 runtime storage 恰有一个 LogicalLifetime；每个 workspace 恰有一个互斥的 before(owner)→after(owner) BoundWorkspaceLifetime；非 persistent 恰一次 Free，显式 runtime release 对全部 Use dependency_safe</td><td>多/缺 lifetime、隐藏 workspace 生命周期、unsafe release、泄漏、double free 或自行选择 join</td><td class="nw">Memory</td></tr>
 <tr data-gate="G-MEM3"><td class="nw"><code>G-MEM3</code></td><td>每个 TensorInstance 有唯一 producer；每个 storage-bearing tensor 有且仅有一个权威 TensorStorageBinding；Bind/Use 精确投影并解析到 live StorageInstance，range 位于 root 内，release 对全部 Use 安全</td><td>microbatch/alias 猜配、use-after-free、越界 view 或过早释放</td><td class="nw">Memory</td></tr>
@@ -20343,7 +20357,9 @@ backend pre-seal ledger 字节级保留该完整 bundle 前缀，只追加当前
 又保留 pre-seal 前缀，只追加当前 backend result-seal stage。dependency closure 只在 base 中验证，任何阶段都不得重跑、增漏、覆盖或重贴 record/context。
 ClauseFail 不携带 disposition；每个 failure occurrence 仅继承对应 manifest GateClause 的
 manifest-owned failure_disposition。每个 assertion_witness_digest 覆盖 evaluation_input_digest、clause_id、
-predicate_implementation_digest 与实际断言结果；ClauseFail.failure_instances 逐个覆盖所有失败 occurrence，不能压缩或任选。applicability predicate 为假时 outcome 必须是带证据的 NotApplicable；适用 invocation 的所有适用 dependency 必须 Pass。每个 manifest-derived InputBlocker occurrence 生成独立、规范排序的 BlockerRecord；只要任一 failed clause 的 manifest-owned disposition 是 InternalViolation 就终止并保留全部规范 violation set，不得任选。发布负例至少包含：clause map value 对调、记录内 clause_id 错误、manifest clause_id 重复、predicate digest 错配、
+predicate_implementation_digest 与实际断言结果；ClauseFail.failure_instances 逐个覆盖所有失败 occurrence，不能压缩或任选。applicability predicate 为假时 outcome 必须是带证据的 NotApplicable；适用 invocation 的所有适用 dependency 必须 Pass。每个 manifest-derived InputBlocker occurrence 生成独立、规范排序的 BlockerRecord；只要任一 failed clause 的 manifest-owned disposition 是 InternalViolation 就终止并保留全部规范 violation set，不得任选。以下发布级边界 fixtures 同时包含两类期望：畸形输入必须被拒绝，以及合法 scoped blocker 必须产生列明的
+disposition；后者用于验证边界行为正确，不表示该正确行为本身应被拒绝。fixtures 至少包含：
+clause map value 对调、记录内 clause_id 错误、manifest clause_id 重复、predicate digest 错配、
 failed_clause_ids 增漏、RuntimePlan blocker 与独立 construction blocker 并存、time G-TIME3 产生<code>{memory,time}</code> scope 后两侧均 Blocked、BLK-MISSING-TIME 仅阻断 time，以及 A/B artifact 对调必须失败。还必须覆盖：A/B 仅有一个未声明为 axis 或派生字段的 <code>other_config_indexed_production_inputs.x</code> 不同时，比较必须为 Incomparable 且 mismatch 精确指向该规范路径；Ready RuntimeEventPlan 已含 blocker b 且 bind_core 产生 c 时最终精确保留<code>{b,c}</code>；Runtime/Core/shared G-IR 的单侧 blocker 必须被 verifier 拒绝；同一 comparison arm 的 memory/time
 artifact 来自不同 bundle 或不同 ProductionSubject/GateManifest 必须失败。这样 stage/dependency 形成按实际请求/分支求值的 DAG：G-IR1..3 属于
 structure_prerequisite；G-MEM1..4 与 G-TIME1..5 分别属于对应 view prerequisite 且只依赖 structure；
@@ -22676,7 +22692,7 @@ subject，禁止生产摘要、比较 basis 或缓存键反向依赖验证制品
 <tr><td>事件展开</td><td>R 个事件、D 条 base 依赖、C 个冲突 pair</td><td><code>O((R + D) log R + C)</code>，最坏 C=O(R²)</td><td>稳定拓扑序、origin index、instance binding 与 effect edges</td></tr>
 <tr><td>Memory replay</td><td>M 个内存事件</td><td><code>O(M)</code></td><td>live storage map、分类计数、峰值快照</td></tr>
 <tr><td>Time DES</td><td>V 个 progress node、D 条边</td><td><code>O((V + D) log V)</code></td><td>global progress DAG、stream sequence、communication cohort</td></tr>
-<tr><td>配置比较</td><td>K 个配置</td><td>K 次独立求值 + <code>O(K)</code> 聚合</td><td>结果与摘要表</td></tr>
+<tr><td>配置 sweep</td><td>K 个配置</td><td>K 次独立求值 + <code>O(K)</code> 聚合</td><td>逐配置结果与摘要表；sealed delta 每个请求只覆盖一个 left/right pair</td></tr>
 </table></div>
 
 <h3 id="c13-2">13.2 配置 sweep</h3>
@@ -22765,7 +22781,8 @@ else:
     comparison = no ComparisonResult</code></pre>
 
 <p>每个配置、每个 logical rank 直接从源码生成自己的 RankCodeIR，再组成 CodeIR(P)；不把多配置或多 rank 备择揉成一张条件图。每次求值的身份唯一来自 RequestSnapshot 中 config_ref 对应的规范 input slice 和
-EvaluationInstanceIdentity；循环变量 P 或外层 map key 都不是 artifact provenance。可以缓存不受变化字段影响的源码解析和注册 DSL 编译结果，但不得缓存一个配置的 CodeIR 作为另一配置的权威结构。</p>
+EvaluationInstanceIdentity；循环变量 P 或外层 map key 都不是 artifact provenance。可以缓存不受变化字段影响的源码解析和注册 DSL 编译结果，但不得缓存一个配置的 CodeIR 作为另一配置的权威结构。该循环对 K 个配置生成逐配置结果和 sweep summary；正式 <code>ComparisonRequest</code> 每次只封装一个
+left/right pair。调用方若需要 N 路 delta，必须显式组合多个成对请求，本内核不隐式生成全 pair 矩阵。</p>
 
 <h3 id="c13-3">13.3 缓存分层</h3>
 <div class="tw"><table>
@@ -22819,7 +22836,7 @@ Tensor/StorageInstance、effect edge、P2P/collective identity、bytes、formula
 <tr><td class="nw">D14</td><td>P2P/collective 使用全局 progress，资源竞争不建模</td><td>覆盖 PP/CP 通信与 rendezvous，同时保持本版时间机制边界</td></tr>
 <tr><td class="nw">D15</td><td>compute 用 exact user measurement record，communication 用理论公式</td><td>目标 key 无精确记录就阻断，不用插值或 roofline 替代计算算子实测</td></tr>
 <tr><td class="nw">D16</td><td>通信内存只含显式 intent/runtime buffers</td><td>algorithm-dependent 库内部 scratch 未建模；发现依赖时阻断内存侧，不与 time 暗选不同算法</td></tr>
-<tr><td class="nw">D17</td><td>不内置自动策略搜索器</td><td>内核只提供单配置求值、显式 sweep 与严格同口径比较；搜索策略属于外层消费者</td></tr>
+<tr><td class="nw">D17</td><td>不内置自动策略搜索器</td><td>内核只提供单配置求值、K 配置 sweep 摘要与显式 left/right 成对比较；N 路组合和搜索策略属于外层消费者</td></tr>
 <tr><td class="nw">D18</td><td>Conformance 默认 local integrity、强鉴证可选</td><td>普通可信 CI 只需摘要重算、完整执行域与守恒；多方/合规威胁模型才承担双信任根与抗重放成本</td></tr>
 </table></div>
 

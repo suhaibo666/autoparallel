@@ -41,6 +41,8 @@ REQUIRED_TEXT = (
     'data-module="runtime-events"',
     "StructureRegistrySnapshot",
     "RuntimeRegistrySnapshot",
+    "StructureRegistrySnapshot and RuntimeRegistrySnapshot are distinct frozen snapshots",
+    "runtime_registry_digest is excluded from model_input_digest",
     "CommonProductionInputs",
     "RequestedBackendInput",
     "requested_backend_inputs",
@@ -103,6 +105,7 @@ REQUIRED_TEXT = (
     "RuntimeTensorRef",
     "AutogradLink",
     "ScheduleConstraintEdge",
+    "require event.resolved_semantic_ref == event.event_id",
     "LogicalLifetime",
     "dependency_safe",
     "WorkspaceBinding",
@@ -252,6 +255,7 @@ REQUIRED_TEXT = (
     "hardened_attestation is optional",
     "NotRequested &gt; Incomparable &gt; Unavailable &gt; ComparableDelta",
     "Incomparable takes precedence over Unavailable",
+    "NotRequested iff metric not in ComparisonRequest.requested_metrics",
     "EPDispatchCombineExpansionObligation",
     "world_size = dp × tp × pp × cp",
     "EP is a subgroup carved from the dp × tp × cp rank region",
@@ -372,6 +376,8 @@ FORBIDDEN_TEXT = (
     "memory_capacity",
     "dataset_manifest_digest",
     "ep_adjustment",
+    "两侧都未请求才是 NotRequested",
+    "单侧 NotRequested",
 )
 
 EXPECTED_GATES = {
@@ -415,6 +421,8 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
     "input-facts": (
         "canonical_utf8_source_bytes: ByteString",
         "content_digest := hash(canonical_utf8_source_bytes)",
+        "StructureRegistrySnapshot and RuntimeRegistrySnapshot are distinct frozen snapshots",
+        "runtime_registry_digest is excluded from model_input_digest",
         "blocker_scope_policy_snapshot: BlockerScopePolicySnapshot",
         "gate_specification_set_snapshot: GateSpecificationSet",
         "gate_specification_set_ref: GateSpecificationSetRef",
@@ -459,6 +467,7 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "RuntimeRuleSnapshot:",
         "EPDispatchCombineExpansionObligation:",
         "role: dispatch | combine",
+        "require event.resolved_semantic_ref == event.event_id",
         "expand_runtime_semantics( code_ir: CodeIR, config: NormalizedParallelConfig, scenario: ExecutionScenario, registry: RuntimeRegistrySnapshot ) -> RuntimeBuildResult | InternalContractViolation",
     ),
     "memory-backend": (
@@ -698,6 +707,7 @@ MODULE_CONTRACT_REQUIRED_TEXT = {
         "NotRequested",
         "NotRequested > Incomparable > Unavailable > ComparableDelta",
         "Incomparable takes precedence over Unavailable",
+        "NotRequested iff metric not in ComparisonRequest.requested_metrics",
         "UndefinedZeroBaseline",
         "registry/calibration/fallback/assumption",
     ),

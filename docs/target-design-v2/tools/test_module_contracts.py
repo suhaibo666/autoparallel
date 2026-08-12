@@ -350,6 +350,9 @@ class ModuleContractStructureTest(unittest.TestCase):
             "Ready residual_blocker_records",
             "Blocked blockers",
             "model_input_digest 按 2.4 节现行公式从 rank_inputs 重算",
+            "logical_rank_order := canonical LogicalRank order of rank_inputs.keys",
+            "code_ir_payload_without_model_digest := canonical CodeIR schema payload of",
+            "model_digest := hash(model_input_digest, code_ir_payload_without_model_digest)",
             "r0 Ready residual {A} + r1 Blocked {B}",
             "Blocked {A, B}",
         ):
@@ -396,6 +399,26 @@ class ModuleContractStructureTest(unittest.TestCase):
         self.assertIn("正反向双向闭合", text)
         self.assertIn("microbatch", text)
         self.assertIn("Blocked 仅", text)
+
+    def test_editorial_closure_keeps_request_event_and_registry_authorities_unique(self) -> None:
+        input_text = self.contract_text("input-facts")
+        runtime_text = self.contract_text("runtime-events")
+        comparison_text = self.contract_text("comparison")
+
+        for token in (
+            "StructureRegistrySnapshot and RuntimeRegistrySnapshot are distinct frozen snapshots",
+            "runtime_registry_digest is excluded from model_input_digest",
+        ):
+            self.assertIn(token, input_text)
+        self.assertIn(
+            "require event.resolved_semantic_ref == event.event_id", runtime_text
+        )
+        self.assertIn(
+            "NotRequested iff metric not in ComparisonRequest.requested_metrics",
+            comparison_text,
+        )
+        self.assertNotIn("两侧都未请求才是 NotRequested", comparison_text)
+        self.assertNotIn("单侧 NotRequested", comparison_text)
 
     def test_memory_backend_contract_uses_current_projection_and_replay_truth(self) -> None:
         text = self.contract_text("memory-backend")

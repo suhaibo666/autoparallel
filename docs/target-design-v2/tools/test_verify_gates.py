@@ -209,6 +209,48 @@ class VerifyGatesContractTest(unittest.TestCase):
                     errors,
                 )
 
+    def test_editorial_closure_contracts_are_section_local_and_mutation_sensitive(self) -> None:
+        template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
+        cases = (
+            (
+                "input-facts",
+                "StructureRegistrySnapshot and RuntimeRegistrySnapshot are distinct frozen snapshots",
+            ),
+            (
+                "input-facts",
+                "runtime_registry_digest is excluded from model_input_digest",
+            ),
+            (
+                "runtime-events",
+                "require event.resolved_semantic_ref == event.event_id",
+            ),
+            (
+                "comparison",
+                "NotRequested iff metric not in ComparisonRequest.requested_metrics",
+            ),
+        )
+
+        for module, token in cases:
+            with self.subTest(module=module, token=token):
+                self.assertIn(token, verify_gates.MODULE_CONTRACT_REQUIRED_TEXT[module])
+                errors = validate(replace_in_module(template, module, token, "MUTATED"))
+                self.assertTrue(
+                    any(module in error and token in error for error in errors),
+                    errors,
+                )
+
+        for stale_phrase in (
+            "两侧都未请求才是 NotRequested",
+            "单侧 NotRequested",
+        ):
+            with self.subTest(stale_phrase=stale_phrase):
+                self.assertIn(stale_phrase, verify_gates.FORBIDDEN_TEXT)
+                errors = validate(template + "\n" + stale_phrase)
+                self.assertTrue(
+                    any(stale_phrase in error for error in errors),
+                    errors,
+                )
+
     def test_module_fixture_locator_is_attribute_order_independent(self) -> None:
         template = (ROOT / "src" / "index.template.html").read_text(encoding="utf-8")
         original_tag = (
